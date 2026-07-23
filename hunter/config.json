@@ -1,0 +1,9 @@
+{
+  "workRoot": "data",
+  "dbPath": "data/hunter.db",
+  "ompBin": "omp",
+  "hunt": { "capNewTokens": 200000, "maxWallS": 1800, "maxFindings": 8 },
+  "fix": { "capNewTokens": 150000, "maxWallS": 2700 },
+  "budget": { "interactiveReserve7d": 0.25, "deny5hAbove": 0.85, "staleAfterS": 1800 },
+  "serve": { "port": 8377 }
+}

@@ -1,0 +1,348 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hunter</title>
+<style>
+  :root {
+    --bg: #101214; --panel: #16191c; --panel2: #1b1f23; --line: #262b30;
+    --fg: #c8cdd2; --dim: #7a838c; --faint: #4d555d;
+    --green: #4cbf6b; --red: #e05252; --amber: #d9a441; --blue: #5aa0e0;
+    --purple: #a07ae0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.45 "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 60px; }
+  h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--dim); margin: 26px 0 8px; font-weight: 600;
+  }
+  h2 .n { color: var(--faint); }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 3px; font: inherit; font-size: 12px; padding: 3px 10px;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--dim); }
+  button:disabled { opacity: .5; cursor: default; }
+
+  /* ops strip */
+  #ops {
+    display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    padding: 10px 12px; margin-top: 12px;
+  }
+  #windows { display: flex; gap: 18px; flex-wrap: wrap; flex: 1; }
+  .win { min-width: 190px; }
+  .win .lab { display: flex; justify-content: space-between; font-size: 11px; color: var(--dim); }
+  .win .lab b { color: var(--fg); font-weight: 600; }
+  .bar { height: 6px; background: #0b0d0e; border-radius: 3px; margin: 4px 0 3px; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 3px; }
+  .win .sub { font-size: 11px; color: var(--faint); }
+  .ok    { background: var(--green); }
+  .bad   { background: var(--red); }
+  .stale { background: var(--amber); }
+  #opsRight { text-align: right; min-width: 220px; }
+  #lastEvent { font-size: 11px; color: var(--dim); margin-top: 6px; max-width: 340px;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* finding cards */
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    padding: 8px 10px; margin-bottom: 8px;
+  }
+  .card .top { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .badge {
+    font-size: 10px; padding: 1px 6px; border-radius: 3px; border: 1px solid var(--line);
+    text-transform: uppercase; letter-spacing: .05em;
+  }
+  .sev-high, .sev-critical { color: var(--red); border-color: var(--red); }
+  .sev-medium { color: var(--amber); border-color: var(--amber); }
+  .sev-low { color: var(--dim); }
+  .fp { font-size: 10px; color: var(--faint); }
+  .card .sum { font-weight: 600; margin: 4px 0; }
+  .card .loc { font-size: 11px; color: var(--dim); }
+  .card details { margin: 6px 0 2px; }
+  .card details summary { cursor: pointer; color: var(--dim); font-size: 11px; }
+  .card pre {
+    white-space: pre-wrap; background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 3px; padding: 6px 8px; font-size: 11.5px; margin: 6px 0; color: var(--fg);
+  }
+  .acts { display: flex; gap: 6px; margin-top: 6px; }
+  .acts .q { border-color: var(--green); color: var(--green); }
+  .acts .r { border-color: var(--red); color: var(--red); }
+
+  /* pipeline */
+  #pipeline { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .col { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 8px; }
+  .col h3 { margin: 0 0 6px; font-size: 10px; text-transform: uppercase;
+            letter-spacing: .1em; color: var(--dim); font-weight: 600; }
+  .col .item { border-top: 1px solid var(--line); padding: 5px 0; font-size: 12px; }
+  .col .item:first-of-type { border-top: none; }
+  .col .item .m { color: var(--faint); font-size: 10.5px; }
+
+  /* tables / feeds */
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--dim); font-weight: 600; font-size: 10.5px; text-transform: uppercase; letter-spacing: .08em; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  th.num { text-align: right; }
+  .state-running { color: var(--blue); }
+  .state-done { color: var(--green); }
+  .state-killed, .state-failed { color: var(--red); }
+
+  #events { background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+            padding: 8px 10px; font-size: 11.5px; }
+  #events .ev { padding: 2px 0; color: var(--dim); }
+  #events .ev .t { color: var(--faint); }
+  #events .ev .k { color: var(--purple); }
+  .empty { color: var(--faint); font-size: 12px; padding: 4px 0; }
+  #err { color: var(--red); font-size: 11px; margin-top: 6px; display: none; }
+</style>
+</head>
+<body>
+<main>
+  <div id="ops">
+    <div id="windows"><span class="empty">no window data</span></div>
+    <div id="opsRight">
+      <button id="runCycle">Run Cycle</button>
+      <div id="lastEvent">&nbsp;</div>
+    </div>
+  </div>
+  <div id="err"></div>
+
+  <h2>Inbox <span class="n" id="nInbox"></span></h2>
+  <div id="inbox"></div>
+
+  <h2>Pipeline</h2>
+  <div id="pipeline"></div>
+
+  <h2>Suppressed <span class="n" id="nSupp"></span></h2>
+  <details><summary>rejected / wontfix</summary><div id="suppressed"></div></details>
+
+  <h2>Jobs</h2>
+  <div id="jobs"></div>
+
+  <h2>Events</h2>
+  <div id="events"></div>
+</main>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function ktok(n) {
+  if (n == null) return "–";
+  if (n < 1000) return String(n);
+  return Math.round(n / 1000) + "k";
+}
+function ts(ms) {
+  if (!ms) return "–";
+  return new Date(ms).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+}
+function countdown(ms) {
+  if (!ms) return "";
+  let d = Math.round((ms - Date.now()) / 1000);
+  const sign = d < 0 ? "-" : "";
+  d = Math.abs(d);
+  const h = Math.floor(d / 3600), m = Math.floor((d % 3600) / 60);
+  return sign + (h ? h + "h" + String(m).padStart(2, "0") + "m" : m + "m");
+}
+function dur(j) {
+  if (!j.started_at) return "–";
+  const end = j.finished_at || Date.now();
+  return Math.round((end - j.started_at) / 1000) + "s";
+}
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let body = null;
+  try { body = await r.json(); } catch (e) {}
+  return { status: r.status, body };
+}
+
+// ---- verdict actions -------------------------------------------------
+
+async function verdict(id, status, needReason) {
+  let reason = null;
+  if (needReason) {
+    reason = prompt(`Reason for ${status} (required):`);
+    if (reason === null) return;               // cancelled
+    reason = reason.trim();
+    if (!reason) { alert("A non-empty reason is required."); return; }
+  }
+  const r = await api("/api/verdict", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, status, ...(reason ? { reason } : {}) }),
+  });
+  if (r.status !== 200) alert("verdict failed: " + (r.body && r.body.error || r.status));
+  refresh();
+}
+
+async function runCycle() {
+  const btn = $("runCycle");
+  btn.disabled = true;
+  const r = await api("/api/cycle", { method: "POST" });
+  if (r.status === 409) {
+    btn.textContent = "busy";
+    setTimeout(() => { btn.textContent = "Run Cycle"; btn.disabled = false; }, 2500);
+  } else {
+    btn.textContent = r.status === 202 ? "started…" : "error";
+    setTimeout(() => { btn.textContent = "Run Cycle"; btn.disabled = false; }, 2500);
+  }
+  refresh();
+}
+$("runCycle").addEventListener("click", runCycle);
+
+// ---- renderers ---------------------------------------------------------
+
+function renderWindows(windows) {
+  const keys = Object.keys(windows).sort();
+  if (!keys.length) { $("windows").innerHTML = '<span class="empty">no window data</span>'; return; }
+  $("windows").innerHTML = keys.map(k => {
+    const w = windows[k];
+    const pct = w.used_fraction == null ? null : Math.min(100, Math.round(w.used_fraction * 100));
+    const cls = w.stale ? "stale" : (w.status === "exhausted" || (pct !== null && pct >= 100)) ? "bad" : "ok";
+    const label = k.replace(/^anthropic:/, "");
+    return `<div class="win">
+      <div class="lab"><b>${esc(label)}</b><span>${pct == null ? "?" : pct + "%"}${w.stale ? " ⚠stale" : ""}</span></div>
+      <div class="bar"><i class="${cls}" style="width:${pct ?? 0}%"></i></div>
+      <div class="sub">resets ${ts(w.resets_at)}${w.resets_at ? " (" + countdown(w.resets_at) + ")" : ""} · probed ${Math.round(w.age_s / 60)}m ago</div>
+    </div>`;
+  }).join("");
+}
+
+function findingCard(f, withActions) {
+  const sev = esc(f.severity || "?");
+  const conf = f.confidence != null ? Math.round(f.confidence * 100) + "%" : "?";
+  const loc = `${esc(f.file || "")}${f.line ? ":" + f.line : ""}${f.symbol ? " · " + esc(f.symbol) : ""}`;
+  const detail = (f.detail || "").trim();
+  const plan = (f.evidence_plan || "").trim();
+  return `<div class="card">
+    <div class="top">
+      <span class="badge sev-${sev}">${sev} · ${conf}</span>
+      <span class="badge">${esc(f.bug_class || "")}</span>
+      <span class="fp">#${f.id} ${esc(f.fingerprint)}</span>
+    </div>
+    <div class="sum">${esc(f.summary)}</div>
+    <div class="loc">${loc}${f.introduced_by ? " · introduced by " + esc(f.introduced_by) : ""}</div>
+    ${detail || plan ? `<details><summary>detail + evidence plan</summary>
+      ${detail ? `<pre>${esc(detail)}</pre>` : ""}
+      ${plan ? `<pre>evidence plan:\n${esc(plan)}</pre>` : ""}
+    </details>` : ""}
+    ${withActions ? `<div class="acts">
+      <button class="q" onclick="verdict(${f.id},'queued',false)">Queue fix</button>
+      <button class="r" onclick="verdict(${f.id},'rejected',true)">Reject</button>
+      <button class="r" onclick="verdict(${f.id},'wontfix',true)">Wontfix</button>
+      <button onclick="verdict(${f.id},'note',false)">Note</button>
+    </div>` : ""}
+  </div>`;
+}
+
+function renderPipeline(findings) {
+  const cols = [
+    ["queued", f => f.status === "queued"],
+    ["fixing", f => f.status === "fixing"],
+    ["pr_open", f => f.status === "pr_open"],
+    ["merged", f => f.status === "merged"],
+  ];
+  $("pipeline").innerHTML = cols.map(([name, pred]) => {
+    const items = findings.filter(pred);
+    const body = items.length ? items.map(f => `<div class="item">
+        #${f.id} ${esc(f.summary)}
+        <div class="m">${esc(f.file || "")}${f.pr_url ? ` · <a href="${esc(f.pr_url)}" target="_blank">PR</a>` : ""}</div>
+      </div>`).join("") : '<div class="empty">—</div>';
+    return `<div class="col"><h3>${name} (${items.length})</h3>${body}</div>`;
+  }).join("");
+}
+
+function renderJobs(jobs) {
+  if (!jobs.length) { $("jobs").innerHTML = '<div class="empty">no jobs yet</div>'; return; }
+  $("jobs").innerHTML = `<table>
+    <tr><th>id</th><th>kind</th><th>repo</th><th>state</th>
+        <th class="num">tokens</th><th class="num">calls</th><th class="num">dur</th><th>killed</th></tr>
+    ${jobs.map(j => `<tr>
+      <td>${j.id}</td><td>${esc(j.kind)}</td><td>${esc(j.repo_name)}</td>
+      <td class="state-${esc(j.state)}">${esc(j.state)}</td>
+      <td class="num">${ktok(j.tokens_new)}</td>
+      <td class="num">${j.calls ?? "–"}</td>
+      <td class="num">${dur(j)}</td>
+      <td>${esc(j.killed_reason || "")}</td>
+    </tr>`).join("")}
+  </table>`;
+}
+
+function renderEvents(events) {
+  const evs = events.slice(0, 30);
+  if (!evs.length) { $("events").innerHTML = '<div class="empty">quiet</div>'; return; }
+  $("events").innerHTML = evs.map(e =>
+    `<div class="ev"><span class="t">${ts(e.at)}</span> <span class="k">${esc(e.kind)}</span> ${esc(e.message)}</div>`
+  ).join("");
+  const last = evs[0];
+  $("lastEvent").textContent = `${ts(last.at)} ${last.kind}: ${last.message}`;
+}
+
+// ---- main loop -----------------------------------------------------------
+
+async function refresh() {
+  try {
+    const [summary, findings, jobs, events] = await Promise.all([
+      api("/api/summary"), api("/api/findings"), api("/api/jobs"), api("/api/events"),
+    ]);
+    if ([summary, findings, jobs, events].some(r => r.status !== 200)) {
+      throw new Error("api error");
+    }
+    const s = summary.body, all = findings.body;
+
+    renderWindows(s.windows || {});
+
+    const inbox = all.filter(f => f.status === "new");
+    $("nInbox").textContent = `(${inbox.length})`;
+    $("inbox").innerHTML = inbox.length
+      ? inbox.map(f => findingCard(f, true)).join("")
+      : '<div class="empty">inbox zero</div>';
+
+    renderPipeline(all);
+
+    const supp = all.filter(f => f.status === "rejected" || f.status === "wontfix");
+    $("nSupp").textContent = `(${supp.length})`;
+    $("suppressed").innerHTML = supp.length
+      ? supp.map(f => `<div class="card">
+          <div class="top"><span class="badge">${esc(f.status)}</span>
+          <span class="fp">#${f.id} ${esc(f.fingerprint)}</span></div>
+          <div class="sum">${esc(f.summary)}</div>
+          <div class="loc">${esc(f.verdict_reason || "(no reason)")}</div>
+        </div>`).join("")
+      : '<div class="empty">nothing suppressed</div>';
+
+    renderJobs(jobs.body);
+    renderEvents(events.body);
+
+    const btn = $("runCycle");
+    if (s.cycle_running) {
+      btn.textContent = "cycle running…"; btn.disabled = true;
+    } else if (btn.textContent === "cycle running…") {
+      btn.textContent = "Run Cycle"; btn.disabled = false;
+    }
+    $("err").style.display = "none";
+  } catch (e) {
+    $("err").textContent = "refresh failed: " + e;
+    $("err").style.display = "block";
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
