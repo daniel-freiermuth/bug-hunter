@@ -92,13 +92,19 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         proc.wait(timeout=10)
 
 
-def run_worker(cfg: Config, cwd: Path, prompt: str, cap_tokens: int, max_wall_s: int) -> RunResult:
+def run_worker(cfg: Config, cwd: Path, prompt: str, cap_tokens: int, max_wall_s: int,
+               model: str | None = None) -> RunResult:
     before = _snapshot()
     t0 = time.time()
     spawn_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t0)) + ".000Z"
+    cmd = [cfg.omp_bin, "-p", prompt]
+    if model:
+        cmd += [f"--model={model}"]
+    if cfg.model_smol:
+        cmd += [f"--smol={cfg.model_smol}"]
     out = tempfile.TemporaryFile(mode="w+")
     proc = subprocess.Popen(
-        [cfg.omp_bin, "-p", prompt],
+        cmd,
         cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
         start_new_session=True,
     )

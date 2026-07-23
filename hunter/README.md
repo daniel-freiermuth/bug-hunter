@@ -45,5 +45,11 @@ idle → 15min. Every wake passes the budget gate before spending anything.
 ## Config
 
 `config.json`: per-kind token caps and wall clocks, weekly interactive
-reserve, 5h deny threshold, UI port. Findings statuses: new → queued →
-fixing → pr_open → merged, or rejected / wontfix / note.
+reserve, 5h deny threshold, UI port. `models` selects worker models
+(fuzzy names, e.g. "opus" — anything omp's `--model` accepts):
+`default` for all workers, `smol` for omp's lightweight helper tasks,
+`hunt`/`fix` as per-kind overrides; `null` inherits omp's configured
+default. Note: Anthropic tracks per-model-class weekly limits
+(`anthropic:7d:<class>`), so splitting hunt and fix across classes taps
+two budgets. Findings statuses: new → queued → fixing → pr_open →
+merged, or rejected / wontfix / note.

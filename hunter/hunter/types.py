@@ -48,6 +48,14 @@ class Config:
     stale_after_s: int = 1800
     serve_port: int = 8377
     poll_s: float = 2.0
+    model_default: str | None = None    # --model for all workers (None = omp default)
+    model_smol: str | None = None       # --smol helper model for lightweight subtasks
+    model_hunt: str | None = None       # per-kind overrides of model_default
+    model_fix: str | None = None
+
+    def model_for(self, kind: str) -> str | None:
+        override = self.model_hunt if kind == "hunt" else self.model_fix
+        return override or self.model_default
 
     @staticmethod
     def load(path: Path | None = None) -> "Config":
@@ -73,6 +81,10 @@ class Config:
             stale_after_s=raw.get("budget", {}).get("staleAfterS", 1800),
             serve_port=raw.get("serve", {}).get("port", 8377),
             poll_s=raw.get("pollS", 2.0),
+            model_default=raw.get("models", {}).get("default"),
+            model_smol=raw.get("models", {}).get("smol"),
+            model_hunt=raw.get("models", {}).get("hunt"),
+            model_fix=raw.get("models", {}).get("fix"),
         )
 
 

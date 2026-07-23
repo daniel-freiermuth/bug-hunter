@@ -126,7 +126,8 @@ def run_hunt(store, cfg: Config, repo: dict, force: bool = False) -> dict:
         out_path, cfg.hunt_max_findings,
     )
     store.update_job(job, state="running")
-    rr = runner.run_worker(cfg, rpath, prompt, dec.cap_tokens, cfg.hunt_max_wall_s)
+    rr = runner.run_worker(cfg, rpath, prompt, dec.cap_tokens, cfg.hunt_max_wall_s,
+                           model=cfg.model_for("hunt"))
     state = _record_job(store, job, rr)
 
     summary: dict = {"kind": "hunt", "repo": rname, "job": job, "state": state,
@@ -205,7 +206,8 @@ def run_fix(store, cfg: Config, finding: dict) -> dict:
     store.set_status(fid, "fixing")
     store.update_job(job, state="running")
     prompt = build_fix_prompt(finding, worktree, branch, repo)
-    rr = runner.run_worker(cfg, worktree, prompt, dec.cap_tokens, cfg.fix_max_wall_s)
+    rr = runner.run_worker(cfg, worktree, prompt, dec.cap_tokens, cfg.fix_max_wall_s,
+                           model=cfg.model_for("fix"))
     state = _record_job(store, job, rr)
     summary: dict = {"kind": "fix", "finding": fid, "job": job, "state": state,
                      "branch": branch, "tokens_new": rr.tokens_new}
