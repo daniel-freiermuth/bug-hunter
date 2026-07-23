@@ -2,7 +2,8 @@
 
 Self-hosted detail.dev-style bug hunter funded by spare Claude-subscription
 capacity. Registers repos, hunts latent bugs with headless `omp -p` workers,
-you triage in a local UI, fix workers ship draft PRs. Design + measured
+you triage in a local UI, fix workers ship draft PRs and follow up on PR
+feedback. Design + measured
 grounding: ../IDEA.md, ../EXPERIMENT-*.md.
 
 Python 3.14 stdlib only. State in `data/hunter.db` (SQLite).
@@ -20,7 +21,7 @@ python3 -m hunter serve          # UI only, no scheduler
 
 Other commands: `repos`, `findings [--status S]`, `verdict FID STATUS
 [--reason ...]`, `ingest FILE --repo NAME`, `jobs`, `events`, `hunt REPO
-[--force]`, `fix FID`.
+[--force]`, `fix FID`, `sync` (refresh PR state, no tokens).
 
 Production shape: `hunter.service` (systemd user unit, installed) runs the
 daemon permanently. It idles at zero token cost and wakes on a policy:
@@ -41,6 +42,15 @@ idle → 15min. Every wake passes the budget gate before spending anything.
   open findings are listed so the hunter must argue novelty.
 - **Playbooks** (`playbooks/*.md`): hunt output is incremental (kill-safe);
   fixes are evidence-first with commit-per-step (kill = resumable).
+- **PR loop** (`sync_prs`/`run_engage`): each cycle first syncs every open
+  PR via `gh pr view` (free — no worker). Merged → finding `merged`;
+  closed-unmerged → `rejected` (feeds the suppression corpus). Open PRs are
+  flagged `needs_attention` on new comments/reviews, `CHANGES_REQUESTED`,
+  merge conflicts, or failing checks; an engage worker (fix budget/model)
+  then checks out the PR branch, addresses ONLY the feedback, pushes
+  commits, and posts a reply comment (or withdraws via `WITHDRAW.md`).
+- **Cycle order**: sync PRs → engage stalest flagged PR → fix oldest queued
+  finding → hunt.
 
 ## Config
 

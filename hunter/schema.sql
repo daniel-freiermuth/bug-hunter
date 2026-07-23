@@ -73,8 +73,23 @@ CREATE TABLE IF NOT EXISTS window_log (
 CREATE TABLE IF NOT EXISTS events (
   id            INTEGER PRIMARY KEY,
   at            INTEGER NOT NULL,
-  kind          TEXT NOT NULL,             -- cycle|hunt|fix|verdict|ship|deny|error
+  kind          TEXT NOT NULL,             -- cycle|hunt|fix|engage|verdict|ship|deny|error
   message       TEXT NOT NULL,
   job_id        INTEGER,
   finding_id    INTEGER
+);
+
+-- PR engagement state — one row per shipped finding, refreshed by sync_prs.
+-- Additive (v2): existing DBs pick it up via CREATE TABLE IF NOT EXISTS.
+CREATE TABLE IF NOT EXISTS pr_state (
+  finding_id    INTEGER PRIMARY KEY REFERENCES findings(id),
+  pr_number     INTEGER,
+  state         TEXT,                      -- OPEN | MERGED | CLOSED
+  mergeable     TEXT,                      -- MERGEABLE | CONFLICTING | UNKNOWN
+  checks        TEXT,                      -- short rollup summary ("2 pass / 1 fail")
+  head_ref      TEXT,                      -- PR branch name (push/worktree target)
+  last_activity_at INTEGER,                -- newest comment/review timestamp (epoch ms)
+  last_engaged_activity_at INTEGER,        -- activity high-water mark we responded to
+  needs_attention TEXT,                    -- comma-joined reasons; NULL = calm
+  synced_at     INTEGER
 );

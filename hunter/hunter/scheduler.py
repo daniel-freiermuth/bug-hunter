@@ -3,13 +3,15 @@ run_cycle never raises (the loop that calls it must survive anything).
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 from . import budget, runner
 from .ingest import ingest_findings
-from .playbooks import build_fix_prompt, build_hunt_prompt
+from .playbooks import build_engage_prompt, build_fix_prompt, build_hunt_prompt
 from .types import Config, now_ms
 
 
@@ -266,6 +268,274 @@ def run_fix(store, cfg: Config, finding: dict) -> dict:
     return summary
 
 
+# -- pr sync ----------------------------------------------------------------
+
+_PR_URL_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)")
+_FAIL_CONCLUSIONS = ("FAILURE", "TIMED_OUT", "CANCELLED")
+_REJECT_CLOSED = ("PR closed without merge — treat this bug class/location"
+                  " as human-rejected")
+
+
+def _iso_ms(ts: str | None) -> int:
+    """gh ISO-8601 timestamp -> epoch ms (0 when absent/unparseable)."""
+    if not ts:
+        return 0
+    try:
+        return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def _latest_activity_ms(pr: dict) -> int:
+    stamps = [_iso_ms(c.get("createdAt")) for c in pr.get("comments") or []]
+    stamps += [_iso_ms(r.get("submittedAt")) for r in pr.get("reviews") or []]
+    return max(stamps, default=0)
+
+
+def _checks_summary(rollup: list | None) -> tuple[str | None, bool]:
+    """(short human summary, any_failing) from a statusCheckRollup list."""
+    if not rollup:
+        return None, False
+    concl = [(c.get("conclusion") or c.get("state") or "").upper() for c in rollup]
+    failing = sum(1 for c in concl if c in _FAIL_CONCLUSIONS)
+    passing = sum(1 for c in concl if c in ("SUCCESS", "NEUTRAL", "SKIPPED"))
+    pending = len(concl) - failing - passing
+    parts = [f"{passing} pass"]
+    if failing:
+        parts.append(f"{failing} fail")
+    if pending:
+        parts.append(f"{pending} pending")
+    return " / ".join(parts), failing > 0
+
+
+def sync_prs(store, cfg: Config) -> dict:
+    """Refresh pr_state for every pr_open finding. gh reads only — no tokens,
+    never raises; a gh failure logs an event and skips that PR."""
+    summary = {"synced": 0, "merged": 0, "closed": 0, "attention": 0, "errors": 0}
+    for f in store.list_findings(status="pr_open"):
+        fid, url = f["id"], f.get("pr_url") or ""
+        m = _PR_URL_RE.match(url)
+        if not m:
+            store.log_event("error", f"sync #{fid}: unparseable pr_url {url!r}",
+                            finding_id=fid)
+            summary["errors"] += 1
+            continue
+        slug, num = m.group(1), int(m.group(2))
+        rc, out = _run(["gh", "pr", "view", str(num), "-R", slug, "--json",
+                        "state,mergedAt,mergeable,reviewDecision,statusCheckRollup,"
+                        "comments,reviews,updatedAt,headRefName"], timeout=30)
+        if rc != 0:
+            store.log_event("error", f"sync #{fid}: gh pr view failed: {out[-300:]}",
+                            finding_id=fid)
+            summary["errors"] += 1
+            continue
+        try:
+            pr = json.loads(out)
+        except ValueError:
+            store.log_event("error", f"sync #{fid}: bad gh JSON: {out[:200]}",
+                            finding_id=fid)
+            summary["errors"] += 1
+            continue
+
+        state = (pr.get("state") or "").upper()
+        if state == "MERGED":
+            store.set_status(fid, "merged")
+            store.upsert_pr_state(fid, pr_number=num, state=state,
+                                  needs_attention=None, synced_at=now_ms())
+            store.log_event("ship", f"#{fid} PR merged: {url}", finding_id=fid)
+            summary["merged"] += 1
+            continue
+        if state == "CLOSED":
+            store.set_status(fid, "rejected", verdict_reason=_REJECT_CLOSED)
+            store.upsert_pr_state(fid, pr_number=num, state=state,
+                                  needs_attention=None, synced_at=now_ms())
+            store.log_event("verdict", f"#{fid} PR closed without merge: {url}",
+                            finding_id=fid)
+            summary["closed"] += 1
+            continue
+
+        prev = store.get_pr_state(fid)
+        last_activity = _latest_activity_ms(pr)
+        checks, failing = _checks_summary(pr.get("statusCheckRollup"))
+        if prev is None or prev.get("last_engaged_activity_at") is None:
+            # First sync: the PR-creation chatter is our own — baseline the
+            # watermark at the PR's current activity without flagging.
+            engaged = max(_iso_ms(pr.get("updatedAt")), last_activity)
+        else:
+            engaged = prev["last_engaged_activity_at"]
+
+        reasons = []
+        if last_activity > (engaged or 0):
+            reasons.append("new_comments")
+        if (pr.get("reviewDecision") or "").upper() == "CHANGES_REQUESTED":
+            reasons.append("changes_requested")
+        if (pr.get("mergeable") or "").upper() == "CONFLICTING":
+            reasons.append("conflict")
+        if failing:
+            reasons.append("checks_failing")
+        attention = ",".join(reasons) or None
+
+        store.upsert_pr_state(
+            fid, pr_number=num, state=state, mergeable=pr.get("mergeable"),
+            checks=checks, head_ref=pr.get("headRefName"),
+            last_activity_at=last_activity, last_engaged_activity_at=engaged,
+            needs_attention=attention, synced_at=now_ms(),
+        )
+        if attention and (prev is None or prev.get("needs_attention") != attention):
+            store.log_event("engage", f"#{fid} PR #{num} needs attention: {attention}",
+                            finding_id=fid)
+        summary["synced"] += 1
+        if attention:
+            summary["attention"] += 1
+    return summary
+
+
+# -- engage -----------------------------------------------------------------
+
+def run_engage(store, cfg: Config, finding: dict) -> dict:
+    fid = finding["id"]
+    repo = store.get_repo(finding["repo_id"])
+    if repo is None:
+        store.log_event("error", f"engage #{fid}: repo {finding['repo_id']} missing",
+                        finding_id=fid)
+        return {"error": "repo missing"}
+    ps = store.get_pr_state(fid)
+    if not ps or not ps.get("pr_number") or not ps.get("head_ref"):
+        store.log_event("error", f"engage #{fid}: no pr_state/head_ref — sync first",
+                        finding_id=fid)
+        return {"error": "no pr_state"}
+    slug = _owner_repo(repo["url"])
+    if not slug:
+        store.log_event("error", f"engage #{fid}: unparseable repo url {repo['url']!r}",
+                        finding_id=fid)
+        return {"error": "unparseable repo url"}
+    rpath = repo["path"]
+    num, head_ref = ps["pr_number"], ps["head_ref"]
+
+    worktree = cfg.work_root / "wt" / f"e{fid}"
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    if worktree.exists():
+        _run(["git", "-C", rpath, "worktree", "remove", "--force", str(worktree)])
+        store.log_event("engage", f"#{fid}: reclaimed stale worktree from prior attempt",
+                        finding_id=fid)
+
+    rc, out = _run(["git", "-C", rpath, "fetch", "origin", head_ref], timeout=600)
+    if rc != 0:
+        store.log_event("error", f"engage #{fid}: fetch {head_ref} failed: {out[-300:]}",
+                        finding_id=fid)
+        return {"error": f"fetch failed: {out[-300:]}"}
+    rc, out = _run(["git", "-C", rpath, "worktree", "add", "--detach",
+                    str(worktree), f"origin/{head_ref}"])
+    if rc != 0:
+        store.log_event("error", f"engage #{fid}: worktree add failed: {out[-300:]}",
+                        finding_id=fid)
+        return {"error": f"worktree add failed: {out[-300:]}"}
+    # Best effort: put the branch itself on HEAD (push works detached too).
+    _run(["git", "-C", str(worktree), "checkout", "-B", head_ref,
+          f"origin/{head_ref}"])
+
+    def _drop_worktree() -> None:
+        _run(["git", "-C", rpath, "worktree", "remove", "--force", str(worktree)])
+
+    windows = budget.read_windows()
+    dec = budget.decide(cfg, "fix", windows)
+    if not dec.allow:
+        _drop_worktree()
+        job = store.create_job("engage", repo["id"], finding_id=fid)
+        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
+        store.log_event("deny", f"engage #{fid}: {dec.reason}", job_id=job,
+                        finding_id=fid)
+        return {"denied": dec.reason, "job": job}
+
+    rc, out = _run(["gh", "pr", "view", str(num), "-R", slug, "--json",
+                    "title,body,comments,reviews,statusCheckRollup"], timeout=30)
+    pr = None
+    if rc == 0:
+        try:
+            pr = json.loads(out)
+        except ValueError:
+            pr = None
+    if pr is None:
+        store.log_event("error", f"engage #{fid}: gh pr view failed: {out[-300:]}",
+                        finding_id=fid)
+        _drop_worktree()
+        return {"error": "gh pr view failed"}
+
+    job = store.create_job("engage", repo["id"], finding_id=fid,
+                           cap_tokens=dec.cap_tokens)
+    store.update_job(job, state="running")
+    prompt = build_engage_prompt(worktree, head_ref, repo, pr,
+                                 ps.get("needs_attention") or "")
+    rr = runner.run_worker(cfg, worktree, prompt, dec.cap_tokens, cfg.fix_max_wall_s,
+                           model=cfg.model_for("fix"))
+    state = _record_job(store, job, rr)
+    summary: dict = {"kind": "engage", "finding": fid, "job": job, "state": state,
+                     "pr": num, "tokens_new": rr.tokens_new}
+
+    # (a) Worker concluded the fix should be abandoned.
+    withdraw = worktree / "WITHDRAW.md"
+    if withdraw.exists():
+        reason = withdraw.read_text()
+        _run(["gh", "pr", "close", str(num), "-R", slug, "--comment", reason[:800]],
+             timeout=60)
+        store.set_status(fid, "rejected", verdict_reason=reason[:500])
+        store.upsert_pr_state(fid, state="CLOSED", needs_attention=None,
+                              synced_at=now_ms())
+        store.log_event("verdict",
+                        f"#{fid} withdrawn by engage worker: "
+                        f"{reason.splitlines()[0][:120] if reason else ''}",
+                        job_id=job, finding_id=fid)
+        _drop_worktree()
+        summary["outcome"] = "withdrawn"
+        return summary
+
+    # (b) Push new commits, post the reply comment.
+    failure = None if state == "done" else f"worker {state}"
+    pushed = replied = False
+    if failure is None:
+        rc, commits = _run(["git", "-C", str(worktree), "log",
+                            f"origin/{head_ref}..HEAD", "--oneline"])
+        if rc == 0 and commits:
+            rc, out = _run(["git", "-C", str(worktree), "push",
+                            _ssh_url(repo["url"]), f"HEAD:{head_ref}"], timeout=600)
+            if rc == 0:
+                pushed = True
+            else:
+                failure = f"push failed: {out[-300:]}"
+    if failure is None:
+        reply = worktree / "PR-REPLY.md"
+        if reply.exists():
+            rc, out = _run(["gh", "pr", "comment", str(num), "-R", slug,
+                            "--body-file", str(reply)], timeout=60)
+            if rc == 0:
+                replied = True
+            else:
+                failure = f"gh pr comment failed: {out[-300:]}"
+
+    # (c) Failure: keep the worktree and the attention flag — retry next cycle.
+    if failure is not None:
+        if state == "done":
+            store.update_job(job, state="failed", notes=failure)
+        tail = (rr.stdout_tail or "")[-300:]
+        store.log_event("engage", f"#{fid} incomplete ({failure}); worktree kept"
+                        f" at {worktree}. tail: {tail}", job_id=job, finding_id=fid)
+        summary.update(outcome="retry", failure=failure, worktree=str(worktree))
+        return summary
+
+    # Watermark: activity up to the sync snapshot is handled; when we just
+    # posted our own comment, advance to now so it never re-triggers
+    # new_comments on the next sync.
+    engaged_mark = now_ms() if replied else (ps.get("last_activity_at") or now_ms())
+    store.upsert_pr_state(fid, last_engaged_activity_at=engaged_mark,
+                          needs_attention=None, synced_at=now_ms())
+    did = [b for b, on in (("pushed", pushed), ("replied", replied)) if on] or ["no-op"]
+    store.log_event("engage", f"#{fid} PR #{num} engaged ({', '.join(did)})",
+                    job_id=job, finding_id=fid)
+    _drop_worktree()
+    summary.update(outcome="engaged", pushed=pushed, replied=replied)
+    return summary
+
+
 # -- cycle ------------------------------------------------------------------
 
 def run_cycle(store, cfg: Config, force_repo: str | None = None) -> dict:
@@ -273,8 +543,14 @@ def run_cycle(store, cfg: Config, force_repo: str | None = None) -> dict:
         windows = budget.read_windows()
         store.log_window(list(windows.values()))
 
+        # (0) Cheap PR sync — gh reads only, no tokens.
+        sync = sync_prs(store, cfg) if store.list_findings(status="pr_open") else None
+
+        attention = store.list_attention()
         queued = store.list_findings(status="queued")
-        if queued:
+        if attention:
+            result = run_engage(store, cfg, attention[0])  # stalest sync first
+        elif queued:
             result = run_fix(store, cfg, queued[-1])  # DESC -> last = oldest
         else:
             repos = [r for r in store.list_repos() if r["enabled"]]
@@ -292,12 +568,21 @@ def run_cycle(store, cfg: Config, force_repo: str | None = None) -> dict:
                 result = run_hunt(store, cfg, target)
             else:
                 result = {"idle": "no queued findings, no enabled repos"}
+                if sync is not None:
+                    result["sync"] = sync
                 store.log_event("cycle", "idle: nothing to do")
                 return result
 
+        if sync is not None:
+            result["sync"] = sync
         line = ", ".join(f"{k}={v}" for k, v in result.items()
                          if k in ("kind", "repo", "finding", "job", "state",
                                   "outcome", "skipped", "denied", "error"))
+        if sync is not None:
+            line = (line + "; " if line else "") + (
+                "prsync " + "/".join(f"{sync[k]}{k[0]}" for k in
+                                     ("synced", "merged", "closed",
+                                      "attention", "errors")))
         store.log_event("cycle", line or str(result))
         return result
     except Exception as e:  # noqa: BLE001 — the cycle loop must survive anything

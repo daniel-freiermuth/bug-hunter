@@ -20,6 +20,12 @@ _JOB_COLUMNS = {
     "finding_id",
 }
 
+_PR_STATE_COLUMNS = {
+    "pr_number", "state", "mergeable", "checks", "head_ref",
+    "last_activity_at", "last_engaged_activity_at", "needs_attention",
+    "synced_at",
+}
+
 _FINDING_KEYS = (
     "fingerprint", "file", "symbol", "line", "bug_class", "severity",
     "confidence", "summary", "detail", "evidence_plan", "introduced_by",
@@ -131,6 +137,35 @@ class Store:
         return _rows(self.db.execute(
             f"SELECT * FROM findings WHERE repo_id = ? AND status IN ({ph}) ORDER BY id",
             (repo_id, *ACTIVE_STATUSES),
+        ))
+
+    # -- pr state --------------------------------------------------------
+    def get_pr_state(self, fid: int) -> dict | None:
+        r = self.db.execute(
+            "SELECT * FROM pr_state WHERE finding_id = ?", (fid,)).fetchone()
+        return dict(r) if r else None
+
+    def upsert_pr_state(self, fid: int, **fields) -> None:
+        bad = set(fields) - _PR_STATE_COLUMNS
+        if bad:
+            raise ValueError(f"invalid pr_state fields: {bad}")
+        cols = ", ".join(fields)
+        ph = ",".join("?" * (len(fields) + 1))
+        sets = ", ".join(f"{k} = excluded.{k}" for k in fields)
+        self.db.execute(
+            f"INSERT INTO pr_state (finding_id, {cols}) VALUES ({ph})"
+            f" ON CONFLICT(finding_id) DO UPDATE SET {sets}",
+            (fid, *fields.values()),
+        )
+        self.db.commit()
+
+    def list_attention(self) -> list[dict]:
+        """pr_open findings whose PR needs a response, stalest sync first."""
+        return _rows(self.db.execute(
+            "SELECT f.*, p.pr_number, p.head_ref, p.needs_attention, p.synced_at"
+            " FROM findings f JOIN pr_state p ON p.finding_id = f.id"
+            " WHERE p.needs_attention IS NOT NULL AND f.status = 'pr_open'"
+            " ORDER BY p.synced_at"
         ))
 
     # -- jobs ----------------------------------------------------------

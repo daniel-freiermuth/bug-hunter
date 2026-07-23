@@ -105,6 +105,11 @@ def cmd_cycle(store: Store, cfg: Config, args) -> None:
     print(json.dumps(run_cycle(store, cfg, force_repo=force_repo), default=str))
 
 
+def cmd_sync(store: Store, cfg: Config, args) -> None:
+    from .scheduler import sync_prs
+    print(json.dumps(sync_prs(store, cfg)))
+
+
 def cmd_serve(store: Store, cfg: Config, args) -> None:
     from .server import serve
     if args.port:
@@ -168,6 +173,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("cycle", help="run one scheduler cycle")
     p.add_argument("--repo", default=None)
     p.set_defaults(fn=cmd_cycle)
+
+    sub.add_parser("sync", help="refresh pr_state for open PRs (gh only,"
+                   " no tokens)").set_defaults(fn=cmd_sync)
 
     p = sub.add_parser("serve", help="run the triage UI")
     p.add_argument("--port", type=int, default=None)
