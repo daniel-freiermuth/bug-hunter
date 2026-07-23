@@ -13,16 +13,19 @@ Python 3.14 stdlib only. State in `data/hunter.db` (SQLite).
 cd hunter
 python3 -m hunter init
 python3 -m hunter add-repo NAME https://github.com/owner/repo [--branch main]
-python3 -m hunter cycle          # one scheduling step: fix queued findings, else hunt
-python3 -m hunter serve          # triage UI at http://127.0.0.1:8377
+python3 -m hunter daemon         # run forever: UI (:8377) + scheduler loop
+python3 -m hunter cycle          # one manual scheduling step
+python3 -m hunter serve          # UI only, no scheduler
 ```
 
 Other commands: `repos`, `findings [--status S]`, `verdict FID STATUS
 [--reason ...]`, `ingest FILE --repo NAME`, `jobs`, `events`, `hunt REPO
 [--force]`, `fix FID`.
 
-Continuous operation = `cycle` on a timer (cron/systemd); each cycle is
-budget-gated and does at most one job. Not yet wired: window-chaining daemon.
+Production shape: `hunter.service` (systemd user unit, installed) runs the
+daemon permanently. It idles at zero token cost and wakes on a policy:
+after a job → 60s (drain the queue); budget denied → sleep to the 5h reset;
+idle → 15min. Every wake passes the budget gate before spending anything.
 
 ## How it decides
 

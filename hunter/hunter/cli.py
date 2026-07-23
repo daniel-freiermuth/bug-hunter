@@ -112,6 +112,13 @@ def cmd_serve(store: Store, cfg: Config, args) -> None:
     serve(cfg)
 
 
+def cmd_daemon(store: Store, cfg: Config, args) -> None:
+    from .server import daemon
+    if args.port:
+        cfg.serve_port = args.port
+    daemon(cfg)
+
+
 # -- parser ---------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -165,6 +172,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("serve", help="run the triage UI")
     p.add_argument("--port", type=int, default=None)
     p.set_defaults(fn=cmd_serve)
+
+    p = sub.add_parser("daemon", help="run forever: UI + budget-gated scheduler loop")
+    p.add_argument("--port", type=int, default=None)
+    p.set_defaults(fn=cmd_daemon)
 
     return ap
 

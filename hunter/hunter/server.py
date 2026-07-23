@@ -208,3 +208,62 @@ def serve(cfg: Config) -> None:
         pass
     finally:
         httpd.server_close()
+
+
+def daemon(cfg: Config) -> None:
+    """Run forever: UI server + scheduler loop in one process.
+
+    The loop shares _cycle_lock with POST /api/cycle, so manual and timed
+    cycles never overlap. Idling costs zero tokens — every wake goes through
+    the budget gate, which is where all spending decisions live.
+
+    Wake policy:
+      - a job ran            -> 60s   (drain the queue quickly)
+      - budget denied        -> until the 5h reset (+2min), capped at 30min
+      - idle / no new work   -> 15min (upstream may push commits)
+      - error                -> 5min
+    """
+    import signal as _signal
+    import time as _time
+
+    httpd = make_server(cfg)
+    threading.Thread(target=httpd.serve_forever, name="hunter-ui", daemon=True).start()
+    print(f"hunter daemon: ui http://127.0.0.1:{httpd.server_address[1]}/ — scheduler loop live", flush=True)
+
+    stop = threading.Event()
+    for sig in (_signal.SIGTERM, _signal.SIGINT):
+        _signal.signal(sig, lambda *_: stop.set())
+
+    from . import budget, scheduler
+    from .store import Store
+
+    while not stop.is_set():
+        sleep_s = 15 * 60
+        if _cycle_lock.acquire(blocking=False):
+            try:
+                store = Store(cfg)
+                summary = scheduler.run_cycle(store, cfg)
+                if "error" in summary:
+                    sleep_s = 5 * 60
+                elif summary.get("state") in ("done", "killed", "failed"):
+                    sleep_s = 60
+                elif summary.get("denied"):
+                    w5 = budget.read_windows().get("anthropic:5h")
+                    if w5 and w5.resets_at:
+                        until = (w5.resets_at / 1000) - _time.time() + 120
+                        sleep_s = max(60, min(until, 30 * 60))
+                    else:
+                        sleep_s = 30 * 60
+                print(f"cycle: {json.dumps(summary)[:200]} -> sleep {sleep_s:.0f}s", flush=True)
+            except Exception as exc:
+                traceback.print_exc()
+                sleep_s = 5 * 60
+            finally:
+                _cycle_lock.release()
+        else:
+            sleep_s = 60  # a UI-triggered cycle is running
+        stop.wait(sleep_s)
+
+    httpd.shutdown()
+    httpd.server_close()
+    print("hunter daemon: stopped", flush=True)
