@@ -96,13 +96,18 @@ def run_hunt(store, cfg: Config, repo: dict, force: bool = False) -> dict:
     else:
         rc, base = _run(["git", "-C", str(rpath), "rev-list", "-1",
                          "--before=3 weeks ago", head])
-        if not base:
-            rc, roots = _run(["git", "-C", str(rpath), "rev-list",
-                              "--max-parents=0", head])
-            base = roots.splitlines()[-1] if roots else head
+        scope = "the last ~3 weeks of commits"
+        if not base or base == head:
+            # Quiet repo: a time window is empty — take the last 30 commits.
+            rc, base = _run(["git", "-C", str(rpath), "rev-parse", f"{head}~30"])
+            scope = "the last 30 commits (repo quiet for >3 weeks)"
+            if rc != 0 or not base:
+                rc, roots = _run(["git", "-C", str(rpath), "rev-list",
+                                  "--max-parents=0", head])
+                base = roots.splitlines()[-1] if roots else head
+                scope = "the full history (small repo)"
         diff_range = f"{base}..{head}"
-        scope_note = ("First hunt for this repo: the last ~3 weeks of commits"
-                      f" (base {base[:12]}).")
+        scope_note = f"First hunt for this repo: {scope} (base {base[:12]})."
 
     windows = budget.read_windows()
     dec = budget.decide(cfg, "hunt", windows)
@@ -162,6 +167,15 @@ def run_fix(store, cfg: Config, finding: dict) -> dict:
     branch = f"fix/{slug}-{fid}"
     worktree = cfg.work_root / "wt" / f"f{fid}"
     worktree.parent.mkdir(parents=True, exist_ok=True)
+
+    # Retry after a kill/failure: reclaim the salvage worktree and branch —
+    # committed proof/fix steps live on the branch, but a fresh worker starts
+    # from a clean base (its playbook re-verifies the bug anyway).
+    if worktree.exists():
+        _run(["git", "-C", rpath, "worktree", "remove", "--force", str(worktree)])
+        _run(["git", "-C", rpath, "branch", "-D", branch])
+        store.log_event("fix", f"#{fid}: reclaimed stale worktree from prior attempt",
+                        finding_id=fid)
 
     rc, out = _run(["git", "-C", rpath, "worktree", "add", "-b", branch,
                     str(worktree), f"origin/{db}"])
