@@ -11,7 +11,7 @@ from pathlib import Path
 
 from . import budget, runner
 from .ingest import ingest_findings
-from .playbooks import build_engage_prompt, build_fix_prompt, build_hunt_prompt
+from .playbooks import build_engage_prompt, build_fix_prompt, build_hunt_prompt, build_recheck_prompt
 from .types import Config, now_ms
 
 
@@ -150,6 +150,107 @@ def run_hunt(store, cfg: Config, repo: dict, force: bool = False) -> dict:
                         f" ({rr.tokens_new} tok)", job_id=job)
     if state == "done":
         store.set_last_hunt(rid, head)
+    return summary
+
+
+# -- recheck ----------------------------------------------------------------
+
+def run_recheck(store, cfg: Config, finding: dict) -> dict:
+    """Re-evaluate a finding against the current codebase. Human-triggered only."""
+    fid = finding["id"]
+    if finding["status"] != "new":
+        return {"skipped": f"finding #{fid} is {finding['status']!r}, not 'new'"}
+    repo = store.get_repo(finding["repo_id"])
+    if repo is None:
+        store.log_event("error", f"recheck #{fid}: repo {finding['repo_id']} missing",
+                        finding_id=fid)
+        return {"error": "repo missing"}
+    rname, rpath, db = repo["name"], repo["path"], repo["default_branch"]
+    rpath = Path(rpath)
+
+    # Ensure clone + fast-forward to latest default branch.
+    if not rpath.exists():
+        rpath.parent.mkdir(parents=True, exist_ok=True)
+        rc, out = _run(["git", "clone", repo["url"], str(rpath)], timeout=600)
+        if rc != 0:
+            store.log_event("error", f"recheck #{fid}: clone failed: {out[-300:]}",
+                            finding_id=fid)
+            return {"error": f"clone failed: {out[-300:]}"}
+    for cmd in (["git", "fetch", "origin"], ["git", "checkout", db],
+                ["git", "pull", "--ff-only"]):
+        rc, out = _run(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+        if rc != 0:
+            store.log_event("error", f"recheck #{fid}: {' '.join(cmd)} failed: {out[-300:]}",
+                            finding_id=fid)
+            return {"error": f"{' '.join(cmd)} failed: {out[-300:]}"}
+
+    # Budget gate — recheck is investigative, like hunt.
+    windows = budget.read_windows()
+    dec = budget.decide(cfg, "hunt", windows)
+    if not dec.allow:
+        job = store.create_job("recheck", repo["id"], finding_id=fid)
+        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
+        store.log_event("deny", f"recheck #{fid}: {dec.reason}", job_id=job,
+                        finding_id=fid)
+        return {"denied": dec.reason, "job": job}
+
+    job = store.create_job("recheck", repo["id"], finding_id=fid,
+                           cap_tokens=dec.cap_tokens)
+    out_path = cfg.work_root / "out" / f"recheck{fid}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt = build_recheck_prompt(finding, repo, out_path)
+    store.update_job(job, state="running")
+    rr = runner.run_worker(cfg, rpath, prompt, dec.cap_tokens, cfg.hunt_max_wall_s,
+                           model=cfg.model_for("hunt"))
+    state = _record_job(store, job, rr)
+    summary: dict = {"kind": "recheck", "finding": fid, "job": job, "state": state,
+                     "tokens_new": rr.tokens_new}
+
+    # Post-process verdict file.
+    verdict = None
+    if out_path.exists():
+        try:
+            verdict = json.loads(out_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            verdict = None
+
+    if not isinstance(verdict, dict) or verdict.get("verdict") not in (
+            "confirmed", "stale", "invalid"):
+        store.log_event("recheck",
+                        f"#{fid}: job {job} {state}, verdict file missing/unparseable",
+                        job_id=job, finding_id=fid)
+        summary["outcome"] = "failed"
+        return summary
+
+    v = verdict["verdict"]
+    reason = (verdict.get("reason") or "")[:500]
+
+    if v == "confirmed":
+        store.update_finding_analysis(
+            fid,
+            summary=verdict.get("updated_summary"),
+            detail=verdict.get("updated_detail"),
+            confidence=verdict.get("updated_confidence"),
+            severity=verdict.get("updated_severity"),
+        )
+        store.log_event("recheck", f"#{fid} confirmed: {reason}",
+                        job_id=job, finding_id=fid)
+        summary["outcome"] = "confirmed"
+    elif v == "stale":
+        store.set_status(fid, "wontfix",
+                         verdict_reason=f"recheck: {reason}")
+        store.log_event("recheck", f"#{fid} stale: {reason}",
+                        job_id=job, finding_id=fid)
+        summary["outcome"] = "stale"
+    elif v == "invalid":
+        store.set_status(fid, "rejected",
+                         verdict_reason=f"recheck: {reason}")
+        store.log_event("recheck", f"#{fid} invalid: {reason}",
+                        job_id=job, finding_id=fid)
+        summary["outcome"] = "invalid"
+
+    summary["verdict"] = v
+    summary["reason"] = reason
     return summary
 
 

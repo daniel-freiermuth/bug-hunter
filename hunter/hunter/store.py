@@ -215,3 +215,23 @@ class Store:
                 (t, w.limit_id, w.used_fraction, w.status, w.resets_at, int(w.age_s)),
             )
         self.db.commit()
+
+    def update_finding_analysis(self, fid: int, summary: str | None = None,
+                                detail: str | None = None,
+                                confidence: float | None = None,
+                                severity: str | None = None) -> None:
+        """Update analysis fields only (summary/detail/confidence/severity).
+        Never touches status or verdict_reason."""
+        sets: list[str] = ["updated_at = ?"]
+        args: list = [now_ms()]
+        if summary is not None:
+            sets.append("summary = ?"); args.append(summary)
+        if detail is not None:
+            sets.append("detail = ?"); args.append(detail)
+        if confidence is not None:
+            sets.append("confidence = ?"); args.append(float(confidence))
+        if severity is not None:
+            sets.append("severity = ?"); args.append(severity)
+        args.append(fid)
+        self.db.execute(f"UPDATE findings SET {', '.join(sets)} WHERE id = ?", args)
+        self.db.commit()

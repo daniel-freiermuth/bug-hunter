@@ -99,6 +99,14 @@ def cmd_fix(store: Store, cfg: Config, args) -> None:
     print(json.dumps(run_fix(store, cfg, finding), default=str))
 
 
+
+def cmd_recheck(store: Store, cfg: Config, args) -> None:
+    from .scheduler import run_recheck
+    finding = store.get_finding(args.fid)
+    if finding is None:
+        sys.exit(f"error: no finding #{args.fid}")
+    print(json.dumps(run_recheck(store, cfg, finding), default=str))
+
 def cmd_cycle(store: Store, cfg: Config, args) -> None:
     from .scheduler import run_cycle
     force_repo = _repo_or_die(store, args.repo)["name"] if args.repo else None
@@ -169,6 +177,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("fix", help="run a fix for one finding")
     p.add_argument("fid", type=int)
     p.set_defaults(fn=cmd_fix)
+
+    p = sub.add_parser("recheck", help="re-evaluate a finding against current code")
+    p.add_argument("fid", type=int)
+    p.set_defaults(fn=cmd_recheck)
 
     p = sub.add_parser("cycle", help="run one scheduler cycle")
     p.add_argument("--repo", default=None)

@@ -21,7 +21,7 @@ python3 -m hunter serve          # UI only, no scheduler
 
 Other commands: `repos`, `findings [--status S]`, `verdict FID STATUS
 [--reason ...]`, `ingest FILE --repo NAME`, `jobs`, `events`, `hunt REPO
-[--force]`, `fix FID`, `sync` (refresh PR state, no tokens).
+[--force]`, `fix FID`, `recheck FID`, `sync` (refresh PR state, no tokens).
 
 Production shape: `hunter.service` (systemd user unit, installed) runs the
 daemon permanently. It idles at zero token cost and wakes on a policy:
@@ -51,6 +51,11 @@ idle → 15min. Every wake passes the budget gate before spending anything.
   commits, and posts a reply comment (or withdraws via `WITHDRAW.md`).
 - **Cycle order**: sync PRs → engage stalest flagged PR → fix oldest queued
   finding → hunt.
+- **Recheck** (`recheck FID` or the Recheck button in the UI): re-evaluates
+  a finding in status `new` against the CURRENT codebase with an adversarial
+  second opinion. Uses the hunt budget/model. Outcomes: `confirmed` (updates
+  analysis fields, status stays `new`), `stale` (→ `wontfix`), or `invalid`
+  (→ `rejected`). Human-triggered only — never part of the automatic cycle.
 
 ## Config
 

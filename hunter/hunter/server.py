@@ -136,6 +136,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._verdict()
             if url.path == "/api/cycle":
                 return self._cycle()
+            if url.path == "/api/recheck":
+                return self._recheck()
             return self._error(404, "not found")
         except (ValueError, json.JSONDecodeError) as exc:
             self._error(400, str(exc))
@@ -189,6 +191,42 @@ class Handler(BaseHTTPRequestHandler):
                 _cycle_lock.release()
 
         threading.Thread(target=run, name="hunter-cycle", daemon=True).start()
+        self._json({"started": True}, 202)
+
+    def _recheck(self) -> None:
+        body = self._body_json()
+        fid = body.get("id")
+        if not isinstance(fid, int):
+            return self._error(400, "id must be an integer")
+        store = self._store()
+        finding = store.get_finding(fid)
+        if finding is None:
+            return self._error(404, f"no finding {fid}")
+        if finding["status"] != "new":
+            return self._error(400, f"finding #{fid} is {finding['status']!r}, not 'new'")
+        if not _cycle_lock.acquire(blocking=False):
+            return self._json({"error": "busy"}, 409)
+        cfg = self.cfg
+
+        def run():
+            try:
+                from . import scheduler
+                from .store import Store
+                s = Store(cfg)
+                try:
+                    f = s.get_finding(fid)
+                    if f:
+                        scheduler.run_recheck(s, cfg, f)
+                except Exception as exc:
+                    traceback.print_exc()
+                    try:
+                        s.log_event("error", f"recheck failed: {exc}")
+                    except Exception:
+                        pass
+            finally:
+                _cycle_lock.release()
+
+        threading.Thread(target=run, name="hunter-recheck", daemon=True).start()
         self._json({"started": True}, 202)
 
 

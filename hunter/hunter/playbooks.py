@@ -99,3 +99,13 @@ def build_engage_prompt(worktree: Path, head_ref: str, repo: dict, pr: dict,
         "CHECKS": esc(_checks_lines(pr.get("statusCheckRollup"))),
         "ATTENTION": attention or "(none recorded)",
     })
+
+
+def build_recheck_prompt(finding: dict, repo: dict, out_path: Path) -> str:
+    subset = {k: finding.get(k) for k in _FINDING_PROMPT_KEYS}
+    return _render((PLAYBOOK_DIR / "recheck.md").read_text(), {
+        "REPO_PATH": repo["path"],
+        "REPO_NAME": repo["name"],
+        "FINDING_JSON": json.dumps(subset, indent=2),
+        "OUT_PATH": str(out_path),
+    })
