@@ -6,12 +6,10 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .types import BUG_CLASSES, Row
+from .types import BUG_CLASSES, SEVERITIES, Row
 
 if TYPE_CHECKING:
     from .store import Store
-
-_SEVERITIES = ("high", "medium", "low")
 
 
 def ingest_findings(store: Store, repo_id: int, findings_path: Path) -> dict[str, int]:
@@ -57,7 +55,7 @@ def _validate(f: Any) -> str | None:
         return "missing fingerprint"
     if f.get("bug_class") not in BUG_CLASSES:
         return f"unknown bug_class {f.get('bug_class')!r}"
-    if f.get("severity") not in _SEVERITIES:
+    if f.get("severity") not in SEVERITIES:
         return f"unknown severity {f.get('severity')!r}"
     try:
         float(f.get("confidence", 0.0))

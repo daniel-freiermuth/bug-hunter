@@ -131,6 +131,7 @@ class Handler(BaseHTTPRequestHandler):
         store = self._store()
         status = (qs.get("status") or [None])[0] or None  # type: ignore[list-item]
         repo_key = (qs.get("repo") or [None])[0] or None  # type: ignore[list-item]
+        severity = (qs.get("severity") or [None])[0] or None  # type: ignore[list-item]
         repo_id: int | None = None
         if repo_key is not None:
             key: int | str = int(repo_key) if repo_key.isdigit() else repo_key
@@ -139,7 +140,11 @@ class Handler(BaseHTTPRequestHandler):
                 msg = f"unknown repo {repo_key!r}"
                 raise ValueError(msg)
             repo_id = repo["id"]
-        return store.list_findings(status=status, repo_id=repo_id)  # type: ignore[no-any-return]
+        return store.list_findings(  # type: ignore[no-any-return]
+            status=status,
+            repo_id=repo_id,
+            min_severity=severity,
+        )
 
     # -- POST -------------------------------------------------------------
 

@@ -136,7 +136,7 @@
     <div class="sep"></div>
     <label>class</label><select id="fClass"><option value="">all</option></select>
     <div class="sep"></div>
-    <label>severity</label><select id="fSev"><option value="">all</option>
+    <label>min severity</label><select id="fSev"><option value="">all</option>
       <option>high</option><option>medium</option><option>low</option></select>
     <div class="sep"></div>
     <label>min confidence</label>
@@ -382,15 +382,15 @@ async function refresh() {
     const fConf = parseInt($("fConf").value, 10) / 100;
     const fSort = $("fSort").value;
 
+    const sevRank = {high: 3, medium: 2, low: 1};
     let filtered = inbox.filter(f => {
       if (fRepo && !f.fingerprint.startsWith(fRepo + ":")) return false;
       if (fClass && f.bug_class !== fClass) return false;
-      if (fSev && f.severity !== fSev) return false;
+      if (fSev && (sevRank[f.severity]||0) < (sevRank[fSev]||0)) return false;
       if ((f.confidence || 0) < fConf) return false;
       return true;
     });
 
-    const sevRank = {high: 3, medium: 2, low: 1};
     if (fSort === "score") {
       filtered.sort((a, b) =>
         ((sevRank[b.severity]||0) * (b.confidence||0)) -

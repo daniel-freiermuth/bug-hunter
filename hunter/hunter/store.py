@@ -12,6 +12,7 @@ from .types import (
     SUPPRESSED_STATUSES,
     Config,
     Row,
+    Severity,
     WindowState,
     now_ms,
 )
@@ -147,7 +148,12 @@ class Store:
         r = self.db.execute("SELECT * FROM findings WHERE id = ?", (fid,)).fetchone()
         return dict(r) if r else None
 
-    def list_findings(self, status: str | None = None, repo_id: int | None = None) -> list[Row]:
+    def list_findings(
+        self,
+        status: str | None = None,
+        repo_id: int | None = None,
+        min_severity: str | None = None,
+    ) -> list[Row]:
         q = "SELECT * FROM findings"
         args: list[Any] = []
         conds: list[str] = []
@@ -157,6 +163,11 @@ class Store:
         if repo_id:
             conds.append("repo_id = ?")
             args.append(repo_id)
+        if min_severity:
+            allowed = Severity.at_or_above(Severity.from_str(min_severity))
+            ph = ",".join("?" * len(allowed))
+            conds.append(f"severity IN ({ph})")
+            args.extend(allowed)
         if conds:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY id DESC"

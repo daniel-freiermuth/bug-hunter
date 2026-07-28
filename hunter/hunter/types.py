@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +43,28 @@ class BugClass(StrEnum):
     LOGIC = "logic"
 
 
+class Severity(IntEnum):
+    """Ordered severity — higher value = more severe."""
+
+    LOW = 1
+    MEDIUM = 2
+    HIGH = 3
+
+    @classmethod
+    def from_str(cls, s: str) -> Severity:
+        """Parse a severity string (case-insensitive)."""
+        try:
+            return cls[s.upper()]
+        except KeyError:
+            msg = f"unknown severity {s!r} (expected {', '.join(m.name.lower() for m in cls)})"
+            raise ValueError(msg) from None
+
+    @classmethod
+    def at_or_above(cls, minimum: Severity) -> tuple[str, ...]:
+        """Severity string values at or above *minimum*."""
+        return tuple(m.name.lower() for m in cls if m >= minimum)
+
+
 FINDING_STATUSES: tuple[Status, ...] = tuple(Status)
 SUPPRESSED_STATUSES: tuple[Status, ...] = (Status.REJECTED, Status.WONTFIX)
 ACTIVE_STATUSES: tuple[Status, ...] = (
@@ -64,6 +86,7 @@ VERDICT_STATUSES: tuple[Status, ...] = (
 )
 REASON_REQUIRED: tuple[Status, ...] = (Status.REJECTED, Status.WONTFIX)
 BUG_CLASSES: tuple[BugClass, ...] = tuple(BugClass)
+SEVERITIES: tuple[str, ...] = tuple(m.name.lower() for m in Severity)
 
 
 def now_ms() -> int:

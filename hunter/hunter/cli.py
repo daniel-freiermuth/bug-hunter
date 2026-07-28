@@ -73,7 +73,11 @@ def cmd_repos(store: Store, cfg: Config, args: argparse.Namespace) -> None:
 def cmd_findings(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     repo_id = _repo_or_die(store, args.repo)["id"] if args.repo else None
     _fmt(
-        store.list_findings(status=args.status, repo_id=repo_id),
+        store.list_findings(
+            status=args.status,
+            repo_id=repo_id,
+            min_severity=args.severity,
+        ),
         [
             "id",
             "repo_id",
@@ -225,6 +229,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("findings", help="list findings")
     p.add_argument("--status", default=None)
     p.add_argument("--repo", default=None)
+    p.add_argument(
+        "--severity",
+        default=None,
+        choices=["low", "medium", "high"],
+        help="minimum severity (inclusive: medium shows medium+high)",
+    )
     p.set_defaults(fn=cmd_findings)
 
     p = sub.add_parser("verdict", help="triage a finding")

@@ -12,12 +12,14 @@ from hunter.types import (
     ACTIVE_STATUSES,
     FINDING_STATUSES,
     REASON_REQUIRED,
+    SEVERITIES,
     SUPPRESSED_STATUSES,
     VERDICT_STATUSES,
     BudgetDecision,
     BugClass,
     Config,
     RunResult,
+    Severity,
     Status,
     WindowState,
     now_ms,
@@ -75,6 +77,35 @@ class TestBugClass:
 
     def test_member_count(self):
         assert len(BugClass) == 6
+
+
+# ── Severity enum ────────────────────────────────────────────────────
+
+
+class TestSeverity:
+    def test_ordering(self):
+        assert Severity.LOW < Severity.MEDIUM < Severity.HIGH
+
+    def test_from_str(self):
+        assert Severity.from_str("low") is Severity.LOW
+        assert Severity.from_str("MEDIUM") is Severity.MEDIUM
+        assert Severity.from_str("High") is Severity.HIGH
+
+    def test_from_str_invalid(self):
+        with pytest.raises(ValueError, match="unknown severity"):
+            Severity.from_str("critical")
+
+    def test_at_or_above_high(self):
+        assert Severity.at_or_above(Severity.HIGH) == ("high",)
+
+    def test_at_or_above_medium(self):
+        assert set(Severity.at_or_above(Severity.MEDIUM)) == {"medium", "high"}
+
+    def test_at_or_above_low(self):
+        assert set(Severity.at_or_above(Severity.LOW)) == {"low", "medium", "high"}
+
+    def test_severities_tuple(self):
+        assert set(SEVERITIES) == {"low", "medium", "high"}
 
 
 # ── Status tuples ────────────────────────────────────────────────────

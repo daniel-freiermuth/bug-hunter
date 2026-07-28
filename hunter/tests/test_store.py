@@ -133,6 +133,35 @@ class TestFindings:
         assert len(store.list_findings(repo_id=r1)) == 1
         assert len(store.list_findings(repo_id=r2)) == 1
 
+    def test_list_findings_min_severity_high(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.upsert_finding(rid, _make_finding(fingerprint="fp1", severity="low"))
+        store.upsert_finding(rid, _make_finding(fingerprint="fp2", severity="medium"))
+        store.upsert_finding(rid, _make_finding(fingerprint="fp3", severity="high"))
+        assert len(store.list_findings(min_severity="high")) == 1
+
+    def test_list_findings_min_severity_medium(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.upsert_finding(rid, _make_finding(fingerprint="fp1", severity="low"))
+        store.upsert_finding(rid, _make_finding(fingerprint="fp2", severity="medium"))
+        store.upsert_finding(rid, _make_finding(fingerprint="fp3", severity="high"))
+        assert len(store.list_findings(min_severity="medium")) == 2
+
+    def test_list_findings_min_severity_low(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.upsert_finding(rid, _make_finding(fingerprint="fp1", severity="low"))
+        store.upsert_finding(rid, _make_finding(fingerprint="fp2", severity="medium"))
+        store.upsert_finding(rid, _make_finding(fingerprint="fp3", severity="high"))
+        assert len(store.list_findings(min_severity="low")) == 3
+
+    def test_list_findings_min_severity_combined_with_status(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        fid1, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp1", severity="high"))
+        _fid2, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp2", severity="high"))
+        store.set_status(fid1, "queued")
+        # fid2 stays "new"
+        assert len(store.list_findings(status="new", min_severity="high")) == 1
+
 
 # -- set_status ------------------------------------------------------------
 
