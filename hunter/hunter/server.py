@@ -15,7 +15,7 @@ import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
 from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
@@ -69,6 +69,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- GET --------------------------------------------------------------
 
+    _STATIC_TYPES: ClassVar[dict[str, str]] = {
+        ".js": "application/javascript; charset=utf-8",
+        ".css": "text/css; charset=utf-8",
+        ".map": "application/json",
+    }
+
     def do_GET(self) -> None:
         url = urlparse(self.path)
         qs = parse_qs(url.query)
@@ -80,6 +86,15 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._send(200, page.read_bytes(), "text/html; charset=utf-8")
                 return
+            # Static assets (js, css, sourcemaps)
+            if not url.path.startswith("/api/"):
+                suffix = url.path.rsplit(".", 1)[-1] if "." in url.path else ""
+                ctype = self._STATIC_TYPES.get("." + suffix)
+                if ctype:
+                    asset = UI_DIR / url.path.lstrip("/")
+                    if asset.is_file() and UI_DIR in asset.resolve().parents:
+                        self._send(200, asset.read_bytes(), ctype)
+                        return
             if url.path == "/api/summary":
                 self._json(self._summary())
                 return

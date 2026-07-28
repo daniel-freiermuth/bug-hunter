@@ -4,7 +4,7 @@
 set dotenv-load := false
 
 # Run all quality checks (format, lint, typecheck, test).
-check: fmt-check lint typecheck test
+check: fmt-check lint typecheck typecheck-ui test
 
 # Check formatting (no changes).
 fmt-check:
@@ -22,9 +22,17 @@ lint:
 lint-fix:
     ruff check --fix hunter/ tests/
 
-# Strict type checking with mypy.
+# Strict type checking — Python.
 typecheck:
     mypy --strict hunter/
+
+# Strict type checking — UI TypeScript.
+typecheck-ui:
+    npx tsc --project ui/tsconfig.json
+
+# Bundle UI TypeScript → ui/app.js.
+build-ui:
+    npx esbuild ui/src/app.ts --bundle --outfile=ui/app.js --sourcemap --target=es2022 --format=iife
 
 # Run the test suite.
 test *ARGS:
@@ -34,5 +42,13 @@ test *ARGS:
 test-one NAME *ARGS:
     pytest tests/{{ NAME }}.py -v {{ ARGS }}
 
-# Format, lint-fix, then full check (handy before committing).
-fix: fmt lint-fix check
+# Format, lint-fix, build UI, then full check (handy before committing).
+fix: fmt lint-fix build-ui check
+
+# Build UI then start the daemon (UI + scheduler loop).
+daemon *ARGS: build-ui
+    python3 -m hunter daemon {{ ARGS }}
+
+# Build UI then start serve-only (no scheduler loop).
+serve *ARGS: build-ui
+    python3 -m hunter serve {{ ARGS }}
