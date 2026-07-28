@@ -511,6 +511,13 @@ async function refresh(): Promise<void> {
     const s = summary.body!;
     const all = findings.body!;
 
+    // Snapshot open <details> elements before DOM rebuild.
+    const openDetails = new Set<string>();
+    for (const d of document.querySelectorAll("details[open]")) {
+      const id = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.parentElement?.id;
+      if (id) openDetails.add(id);
+    }
+
     renderWindows(s.windows || {});
 
     // ---- populate filter dropdowns (preserve selection) ----
@@ -593,6 +600,12 @@ async function refresh(): Promise<void> {
     renderStats(stats.body!);
     renderJobs(jobs.body!);
     renderEvents(events.body!);
+
+    // Restore open <details> elements after DOM rebuild.
+    for (const d of document.querySelectorAll("details")) {
+      const id = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.parentElement?.id;
+      if (id && openDetails.has(id)) d.open = true;
+    }
 
     const btn = $button("runCycle");
     if (s.cycle_running) {
