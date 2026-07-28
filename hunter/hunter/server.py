@@ -202,32 +202,11 @@ class Handler(BaseHTTPRequestHandler):
         finding = store.get_finding(fid)
         if finding is None:
             return self._error(404, f"no finding {fid}")
-        if finding["status"] != "new":
+        if finding["status"] not in ("new",):
             return self._error(400, f"finding #{fid} is {finding['status']!r}, not 'new'")
-        if not _cycle_lock.acquire(blocking=False):
-            return self._json({"error": "busy"}, 409)
-        cfg = self.cfg
-
-        def run():
-            try:
-                from . import scheduler
-                from .store import Store
-                s = Store(cfg)
-                try:
-                    f = s.get_finding(fid)
-                    if f:
-                        scheduler.run_recheck(s, cfg, f)
-                except Exception as exc:
-                    traceback.print_exc()
-                    try:
-                        s.log_event("error", f"recheck failed: {exc}")
-                    except Exception:
-                        pass
-            finally:
-                _cycle_lock.release()
-
-        threading.Thread(target=run, name="hunter-recheck", daemon=True).start()
-        self._json({"started": True}, 202)
+        store.set_status(fid, "rechecking")
+        store.log_event("recheck", f"#{fid} queued for recheck", finding_id=fid)
+        self._json({"queued": True, "finding": store.get_finding(fid)})
 
 
 def make_server(cfg: Config, port: int | None = None) -> ThreadingHTTPServer:

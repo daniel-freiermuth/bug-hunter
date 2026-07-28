@@ -19,12 +19,12 @@ OMP_SESSIONS_DIR = Path.home() / ".omp/agent/sessions"
 OMP_AGENT_DB = Path.home() / ".omp/agent/agent.db"
 
 FINDING_STATUSES = (
-    "new", "queued", "fixing", "pr_open", "merged", "rejected", "wontfix", "note",
+    "new", "rechecking", "queued", "fixing", "pr_open", "merged", "rejected", "wontfix", "note",
 )
 # Verdicts that feed the suppression corpus (hunt prompt "known non-bugs")
 SUPPRESSED_STATUSES = ("rejected", "wontfix")
 # Statuses that block re-hunting the same fingerprint entirely
-ACTIVE_STATUSES = ("new", "queued", "fixing", "pr_open", "merged", "note")
+ACTIVE_STATUSES = ("new", "rechecking", "queued", "fixing", "pr_open", "merged", "note")
 
 BUG_CLASSES = ("boundary", "error-path", "race", "contract-drift", "leak", "logic")
 

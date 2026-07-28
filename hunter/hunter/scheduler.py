@@ -158,8 +158,8 @@ def run_hunt(store, cfg: Config, repo: dict, force: bool = False) -> dict:
 def run_recheck(store, cfg: Config, finding: dict) -> dict:
     """Re-evaluate a finding against the current codebase. Human-triggered only."""
     fid = finding["id"]
-    if finding["status"] != "new":
-        return {"skipped": f"finding #{fid} is {finding['status']!r}, not 'new'"}
+    if finding["status"] != "rechecking":
+        return {"skipped": f"finding #{fid} is {finding['status']!r}, not 'rechecking'"}
     repo = store.get_repo(finding["repo_id"])
     if repo is None:
         store.log_event("error", f"recheck #{fid}: repo {finding['repo_id']} missing",
@@ -190,6 +190,7 @@ def run_recheck(store, cfg: Config, finding: dict) -> dict:
     if not dec.allow:
         job = store.create_job("recheck", repo["id"], finding_id=fid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
+        store.set_status(fid, "new")  # un-queue so the button reappears
         store.log_event("deny", f"recheck #{fid}: {dec.reason}", job_id=job,
                         finding_id=fid)
         return {"denied": dec.reason, "job": job}
@@ -216,6 +217,7 @@ def run_recheck(store, cfg: Config, finding: dict) -> dict:
 
     if not isinstance(verdict, dict) or verdict.get("verdict") not in (
             "confirmed", "stale", "invalid"):
+        store.set_status(fid, "new")  # restore — recheck inconclusive
         store.log_event("recheck",
                         f"#{fid}: job {job} {state}, verdict file missing/unparseable",
                         job_id=job, finding_id=fid)
@@ -233,6 +235,7 @@ def run_recheck(store, cfg: Config, finding: dict) -> dict:
             confidence=verdict.get("updated_confidence"),
             severity=verdict.get("updated_severity"),
         )
+        store.set_status(fid, "new")  # back to inbox with improved analysis
         store.log_event("recheck", f"#{fid} confirmed: {reason}",
                         job_id=job, finding_id=fid)
         summary["outcome"] = "confirmed"
@@ -647,10 +650,13 @@ def run_cycle(store, cfg: Config, force_repo: str | None = None) -> dict:
         # (0) Cheap PR sync — gh reads only, no tokens.
         sync = sync_prs(store, cfg) if store.list_findings(status="pr_open") else None
 
+        rechecking = store.list_findings(status="rechecking")
         attention = store.list_attention()
         queued = store.list_findings(status="queued")
         if attention:
             result = run_engage(store, cfg, attention[0])  # stalest sync first
+        elif rechecking:
+            result = run_recheck(store, cfg, rechecking[-1])  # DESC -> last = oldest
         elif queued:
             result = run_fix(store, cfg, queued[-1])  # DESC -> last = oldest
         else:

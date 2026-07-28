@@ -206,16 +206,13 @@ async function runCycle() {
 
 async function recheck(id) {
   const btn = document.getElementById("rc" + id);
-  if (btn) { btn.disabled = true; btn.textContent = "Rechecking\u2026"; }
+  if (btn) { btn.disabled = true; btn.textContent = "Queuing\u2026"; }
   const r = await api("/api/recheck", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id }),
   });
-  if (r.status === 409) {
-    alert("A cycle or recheck is already running.");
-    if (btn) { btn.disabled = false; btn.textContent = "Recheck"; }
-  } else if (r.status !== 202) {
+  if (r.status !== 200) {
     alert("recheck failed: " + (r.body && r.body.error || r.status));
     if (btn) { btn.disabled = false; btn.textContent = "Recheck"; }
   }
@@ -271,6 +268,7 @@ function findingCard(f, withActions) {
 
 function renderPipeline(findings) {
   const cols = [
+    ["rechecking", f => f.status === "rechecking"],
     ["queued", f => f.status === "queued"],
     ["fixing", f => f.status === "fixing"],
     ["pr_open", f => f.status === "pr_open"],
