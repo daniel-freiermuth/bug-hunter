@@ -1,12 +1,13 @@
-"""Budget policy — linear ramp over the 7-day window.
+"""Budget policy -- linear ramp over the 7-day window.
 
 Core rule: if fraction p of the 7-day window has elapsed, the scavenger may
-have consumed at most p × (1 − interactive_reserve) of the budget. This
+have consumed at most p * (1 - interactive_reserve) of the budget. This
 spreads spending evenly and guarantees the reserve is never touched.
 
 The 5h window is a short-horizon gate (deny when near-exhausted so the human
-isn't locked out mid-afternoon). Stale or missing data → always deny.
+isn't locked out mid-afternoon). Stale or missing data -> always deny.
 """
+
 from __future__ import annotations
 
 import sqlite3
@@ -15,6 +16,7 @@ import time
 from .types import OMP_AGENT_DB, BudgetDecision, Config, WindowState
 
 _CONSERVATIVE_CAP = 120_000
+_WEEK_MS = 7 * 24 * 3600 * 1000
 
 
 def read_windows() -> dict[str, WindowState]:
@@ -25,8 +27,10 @@ def read_windows() -> dict[str, WindowState]:
         db = sqlite3.connect(f"file:{OMP_AGENT_DB}?mode=ro", uri=True)
         db.row_factory = sqlite3.Row
         rows = db.execute(
-            "SELECT limit_id, used_fraction, status, resets_at, MAX(recorded_at) AS recorded_at"
-            " FROM usage_history WHERE limit_id LIKE 'anthropic:%' GROUP BY limit_id"
+            "SELECT limit_id, used_fraction, status, resets_at,"
+            " MAX(recorded_at) AS recorded_at"
+            " FROM usage_history WHERE limit_id LIKE 'anthropic:%'"
+            " GROUP BY limit_id"
         ).fetchall()
         db.close()
     except sqlite3.Error:
@@ -50,37 +54,38 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
     now_ms = time.time() * 1000
 
     if not windows:
-        return BudgetDecision(False, "no window data — deny until fresh")
+        return BudgetDecision(False, "no window data -- deny until fresh")
 
     fresh = {k: w for k, w in windows.items() if w.age_s <= cfg.stale_after_s}
     if not fresh:
-        return BudgetDecision(False, "window data stale or missing — deny until fresh")
+        return BudgetDecision(False, "window data stale or missing -- deny until fresh")
 
     # -- 5h gate: don't lock the human out mid-session -----------------------
     w5 = fresh.get("anthropic:5h")
-    if w5 is not None:
-        if w5.status == "exhausted" or (w5.used_fraction or 0) >= cfg.deny_5h_above:
-            return BudgetDecision(False, f"5h window at {w5.used_fraction} ({w5.status})")
+    if w5 is not None and (
+        w5.status == "exhausted" or (w5.used_fraction or 0) >= cfg.deny_5h_above
+    ):
+        return BudgetDecision(False, f"5h window at {w5.used_fraction} ({w5.status})")
 
     # -- 7d linear ramp: spend proportionally to elapsed time ----------------
-    scavenge_ceiling = 1.0 - cfg.interactive_reserve_7d   # e.g. 0.75
-    WEEK_MS = 7 * 24 * 3600 * 1000
+    scavenge_ceiling = 1.0 - cfg.interactive_reserve_7d  # e.g. 0.75
 
     for lid, w in fresh.items():
         if ":7d" not in lid or w.used_fraction is None:
             continue
         if w.resets_at and w.resets_at > now_ms:
-            started_ms = w.resets_at - WEEK_MS
-            elapsed_frac = min((now_ms - started_ms) / WEEK_MS, 1.0)
+            started_ms = w.resets_at - _WEEK_MS
+            elapsed_frac = min((now_ms - started_ms) / _WEEK_MS, 1.0)
         else:
-            elapsed_frac = 1.0   # can't compute → assume end-of-window
+            elapsed_frac = 1.0  # can't compute -> assume end-of-window
         allowed = elapsed_frac * scavenge_ceiling
         used = w.used_fraction
         if used >= allowed:
             return BudgetDecision(
                 False,
-                f"{lid}: used {used:.2f} ≥ ramp {allowed:.2f} "
-                f"(elapsed {elapsed_frac:.1%} × ceiling {scavenge_ceiling:.2f})")
+                f"{lid}: used {used:.2f} >= ramp {allowed:.2f} "
+                f"(elapsed {elapsed_frac:.1%} x ceiling {scavenge_ceiling:.2f})",
+            )
 
     # -- allowed: scale cap by remaining ramp headroom -----------------------
     # Find the tightest 7d limit's remaining ramp room
@@ -88,8 +93,8 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
     for lid, w in fresh.items():
         if ":7d" not in lid or w.used_fraction is None or not w.resets_at:
             continue
-        started_ms = w.resets_at - WEEK_MS
-        elapsed_frac = min((now_ms - started_ms) / WEEK_MS, 1.0)
+        started_ms = w.resets_at - _WEEK_MS
+        elapsed_frac = min((now_ms - started_ms) / _WEEK_MS, 1.0)
         allowed = elapsed_frac * scavenge_ceiling
         headroom = (allowed - w.used_fraction) / scavenge_ceiling if scavenge_ceiling else 0
         min_headroom = min(min_headroom, headroom)
@@ -97,6 +102,7 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
     cap = base
     if min_headroom < 0.1:
         cap = base // 2
-    reason = (f"ok (ramp headroom {min_headroom:.1%})"
-              + (", cap halved" if min_headroom < 0.1 else ""))
+    reason = f"ok (ramp headroom {min_headroom:.1%})" + (
+        ", cap halved" if min_headroom < 0.1 else ""
+    )
     return BudgetDecision(True, reason, cap)

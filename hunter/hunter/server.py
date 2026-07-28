@@ -5,16 +5,20 @@ Thread safety: a fresh Store (own sqlite connection) per request.
 Heavy modules (store, budget, scheduler) are imported lazily inside
 handlers so the server module stays importable while siblings build.
 """
+
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
+import time
 import traceback
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from .types import FINDING_STATUSES, VERDICT_STATUSES, REASON_REQUIRED, Config, UI_DIR
+from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
 
 # One cycle at a time, across all request threads.
 _cycle_lock = threading.Lock()
@@ -27,11 +31,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- plumbing ---------------------------------------------------------
 
-    def log_message(self, fmt, *args):  # keep stdout for the operator
-        pass
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        pass  # keep stdout for the operator
 
-    def _store(self):
+    def _store(self) -> Any:
         from .store import Store
+
         return Store(self.cfg)
 
     def _send(self, status: int, body: bytes, ctype: str) -> None:
@@ -42,51 +47,61 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _json(self, obj, status: int = 200) -> None:
+    def _json(self, obj: object, status: int = 200) -> None:
         self._send(status, json.dumps(obj).encode(), "application/json")
 
     def _error(self, status: int, message: str) -> None:
         self._json({"error": message}, status)
 
-    def _body_json(self) -> dict:
+    def _body_json(self) -> Row:
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""
         if not raw:
-            raise ValueError("empty body")
+            msg = "empty body"
+            raise ValueError(msg)
         obj = json.loads(raw)
         if not isinstance(obj, dict):
-            raise ValueError("body must be a JSON object")
+            msg = "body must be a JSON object"
+            raise TypeError(msg)
         return obj
 
     # -- GET --------------------------------------------------------------
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         url = urlparse(self.path)
         qs = parse_qs(url.query)
         try:
             if url.path in ("/", "/index.html"):
                 page = UI_DIR / "index.html"
                 if not page.is_file():
-                    return self._error(404, "ui/index.html missing")
-                return self._send(200, page.read_bytes(), "text/html; charset=utf-8")
+                    self._error(404, "ui/index.html missing")
+                    return
+                self._send(200, page.read_bytes(), "text/html; charset=utf-8")
+                return
             if url.path == "/api/summary":
-                return self._json(self._summary())
+                self._json(self._summary())
+                return
             if url.path == "/api/findings":
-                return self._json(self._findings(qs))
+                self._json(self._findings(qs))
+                return
             if url.path == "/api/jobs":
-                return self._json(self._store().list_jobs(limit=50))
+                self._json(self._store().list_jobs(limit=50))
+                return
             if url.path == "/api/repos":
-                return self._json(self._store().list_repos())
+                self._json(self._store().list_repos())
+                return
             if url.path == "/api/events":
-                return self._json(self._store().recent_events(limit=100))
-            return self._error(404, "not found")
-        except Exception as exc:  # surface, don't kill the thread
+                self._json(self._store().recent_events(limit=100))
+                return
+            self._error(404, "not found")
+        except Exception as exc:
             traceback.print_exc()
             self._error(500, f"{type(exc).__name__}: {exc}")
 
-    def _summary(self) -> dict:
+    def _summary(self) -> Row:
         from . import budget
-        windows = {}
+
+        windows: Row = {}
         for limit_id, w in budget.read_windows().items():
             windows[limit_id] = {
                 "used_fraction": w.used_fraction,
@@ -96,7 +111,7 @@ class Handler(BaseHTTPRequestHandler):
                 "stale": w.stale,
             }
         store = self._store()
-        counts = {s: 0 for s in FINDING_STATUSES}
+        counts: dict[str, int] = dict.fromkeys(FINDING_STATUSES, 0)
         counts.update(Counter(f["status"] for f in store.list_findings()))
         last_cycle = next(
             (e for e in store.recent_events(limit=500) if e["kind"] == "cycle"),
@@ -110,31 +125,35 @@ class Handler(BaseHTTPRequestHandler):
             "cycle_running": _cycle_lock.locked(),
         }
 
-    def _findings(self, qs: dict) -> list[dict]:
+    def _findings(self, qs: dict[str, list[str]]) -> list[Row]:
         store = self._store()
-        status = (qs.get("status") or [None])[0] or None
-        repo_key = (qs.get("repo") or [None])[0] or None
-        repo_id = None
+        status = (qs.get("status") or [None])[0] or None  # type: ignore[list-item]
+        repo_key = (qs.get("repo") or [None])[0] or None  # type: ignore[list-item]
+        repo_id: int | None = None
         if repo_key is not None:
-            key = int(repo_key) if repo_key.isdigit() else repo_key
+            key: int | str = int(repo_key) if repo_key.isdigit() else repo_key
             repo = store.get_repo(key)
             if repo is None:
-                raise ValueError(f"unknown repo {repo_key!r}")
+                msg = f"unknown repo {repo_key!r}"
+                raise ValueError(msg)
             repo_id = repo["id"]
-        return store.list_findings(status=status, repo_id=repo_id)
+        return store.list_findings(status=status, repo_id=repo_id)  # type: ignore[no-any-return]
 
     # -- POST -------------------------------------------------------------
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         url = urlparse(self.path)
         try:
             if url.path == "/api/verdict":
-                return self._verdict()
+                self._verdict()
+                return
             if url.path == "/api/cycle":
-                return self._cycle()
+                self._cycle()
+                return
             if url.path == "/api/recheck":
-                return self._recheck()
-            return self._error(404, "not found")
+                self._recheck()
+                return
+            self._error(404, "not found")
         except (ValueError, json.JSONDecodeError) as exc:
             self._error(400, str(exc))
         except Exception as exc:
@@ -147,15 +166,22 @@ class Handler(BaseHTTPRequestHandler):
         status = body.get("status")
         reason = (body.get("reason") or "").strip() or None
         if not isinstance(fid, int):
-            return self._error(400, "id must be an integer")
+            self._error(400, "id must be an integer")
+            return
         if status not in VERDICT_STATUSES:
-            return self._error(400, f"status must be one of {list(VERDICT_STATUSES)}")
+            self._error(
+                400,
+                f"status must be one of {list(VERDICT_STATUSES)}",
+            )
+            return
         if status in REASON_REQUIRED and not reason:
-            return self._error(400, f"reason required for status {status!r}")
+            self._error(400, f"reason required for status {status!r}")
+            return
         store = self._store()
         finding = store.get_finding(fid)
         if finding is None:
-            return self._error(404, f"no finding {fid}")
+            self._error(404, f"no finding {fid}")
+            return
         store.set_status(fid, status, verdict_reason=reason)
         store.log_event(
             "verdict",
@@ -167,22 +193,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _cycle(self) -> None:
         if not _cycle_lock.acquire(blocking=False):
-            return self._json({"error": "busy"}, 409)
+            self._json({"error": "busy"}, 409)
+            return
         cfg = self.cfg
 
-        def run():
+        def run() -> None:
             try:
                 from . import scheduler
                 from .store import Store
+
                 store = Store(cfg)
                 try:
                     scheduler.run_cycle(store, cfg)
                 except Exception as exc:
                     traceback.print_exc()
-                    try:
+                    with contextlib.suppress(Exception):
                         store.log_event("error", f"cycle failed: {exc}")
-                    except Exception:
-                        pass
             finally:
                 _cycle_lock.release()
 
@@ -193,13 +219,19 @@ class Handler(BaseHTTPRequestHandler):
         body = self._body_json()
         fid = body.get("id")
         if not isinstance(fid, int):
-            return self._error(400, "id must be an integer")
+            self._error(400, "id must be an integer")
+            return
         store = self._store()
         finding = store.get_finding(fid)
         if finding is None:
-            return self._error(404, f"no finding {fid}")
-        if finding["status"] not in ("new",):
-            return self._error(400, f"finding #{fid} is {finding['status']!r}, not 'new'")
+            self._error(404, f"no finding {fid}")
+            return
+        if finding["status"] != "new":
+            self._error(
+                400,
+                f"finding #{fid} is {finding['status']!r}, not 'new'",
+            )
+            return
         store.set_status(fid, "rechecking")
         store.log_event("recheck", f"#{fid} queued for recheck", finding_id=fid)
         self._json({"queued": True, "finding": store.get_finding(fid)})
@@ -209,6 +241,7 @@ class _Server(ThreadingHTTPServer):
     allow_reuse_address = True
     allow_reuse_port = True
 
+
 def make_server(cfg: Config, port: int | None = None) -> _Server:
     Handler.cfg = cfg
     addr = ("127.0.0.1", port or cfg.serve_port)
@@ -217,9 +250,10 @@ def make_server(cfg: Config, port: int | None = None) -> _Server:
     except OSError as e:
         if e.errno == 98:  # EADDRINUSE
             raise SystemExit(
-                f"error: port {addr[1]} already in use — is another hunter instance running?\n"
+                f"error: port {addr[1]} already in use"
+                " -- is another hunter instance running?\n"
                 f"  check: ss -tlnp | grep {addr[1]}\n"
-                f"  or:    systemctl --user status hunter.service"
+                "  or:    systemctl --user status hunter.service"
             ) from None
         raise
     httpd.daemon_threads = True
@@ -228,7 +262,9 @@ def make_server(cfg: Config, port: int | None = None) -> _Server:
 
 def serve(cfg: Config) -> None:
     httpd = make_server(cfg)
-    print(f"hunter ui: http://127.0.0.1:{httpd.server_address[1]}/")
+    print(
+        f"hunter ui: http://127.0.0.1:{httpd.server_address[1]}/",
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -241,7 +277,7 @@ def daemon(cfg: Config) -> None:
     """Run forever: UI server + scheduler loop in one process.
 
     The loop shares _cycle_lock with POST /api/cycle, so manual and timed
-    cycles never overlap. Idling costs zero tokens — every wake goes through
+    cycles never overlap. Idling costs zero tokens -- every wake goes through
     the budget gate, which is where all spending decisions live.
 
     Wake policy:
@@ -251,38 +287,47 @@ def daemon(cfg: Config) -> None:
       - error                -> 5min
     """
     import signal as _signal
-    import time as _time
 
     httpd = make_server(cfg)
     threading.Thread(target=httpd.serve_forever, name="hunter-ui", daemon=True).start()
-    print(f"hunter daemon: ui http://127.0.0.1:{httpd.server_address[1]}/ — scheduler loop live", flush=True)
+    print(
+        f"hunter daemon: ui http://127.0.0.1:{httpd.server_address[1]}/ -- scheduler loop live",
+        flush=True,
+    )
 
     stop = threading.Event()
     for sig in (_signal.SIGTERM, _signal.SIGINT):
-        _signal.signal(sig, lambda *_: stop.set())
+        _signal.signal(sig, lambda *_args: stop.set())
 
     from . import budget, scheduler
     from .store import Store
 
     while not stop.is_set():
-        sleep_s = 15 * 60
+        sleep_s: float = 15 * 60
         if _cycle_lock.acquire(blocking=False):
             try:
                 store = Store(cfg)
                 summary = scheduler.run_cycle(store, cfg)
                 if "error" in summary:
                     sleep_s = 5 * 60
-                elif summary.get("state") in ("done", "killed", "failed"):
+                elif summary.get("state") in (
+                    "done",
+                    "killed",
+                    "failed",
+                ):
                     sleep_s = 60
                 elif summary.get("denied"):
                     w5 = budget.read_windows().get("anthropic:5h")
                     if w5 and w5.resets_at:
-                        until = (w5.resets_at / 1000) - _time.time() + 120
-                        sleep_s = max(60, min(until, 30 * 60))
+                        until = (w5.resets_at / 1000) - time.time() + 120
+                        sleep_s = max(60.0, min(until, 30 * 60))
                     else:
                         sleep_s = 30 * 60
-                print(f"cycle: {json.dumps(summary)[:200]} -> sleep {sleep_s:.0f}s", flush=True)
-            except Exception as exc:
+                print(
+                    f"cycle: {json.dumps(summary)[:200]} -> sleep {sleep_s:.0f}s",
+                    flush=True,
+                )
+            except Exception:
                 traceback.print_exc()
                 sleep_s = 5 * 60
             finally:

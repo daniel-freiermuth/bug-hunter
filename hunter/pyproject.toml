@@ -1,0 +1,137 @@
+[project]
+name = "hunter"
+version = "0.1.0"
+description = "Idle-Token Bug Hunter -- automated code review orchestrator"
+requires-python = ">=3.13"
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+warn_unreachable = true
+enable_error_code = [
+    "ignore-without-code",
+    "redundant-cast",
+    "truthy-bool",
+    "truthy-iterable",
+    "unused-awaitable",
+]
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "N",      # pep8-naming
+    "UP",     # pyupgrade
+    "ANN",    # flake8-annotations
+    "ASYNC",  # flake8-async
+    "S",      # flake8-bandit (security)
+    "B",      # flake8-bugbear
+    "A",      # flake8-builtins
+    "COM",    # flake8-commas
+    "C4",     # flake8-comprehensions
+    "DTZ",    # flake8-datetimez
+    "T10",    # flake8-debugger
+    "FA",     # flake8-future-annotations
+    "ISC",    # flake8-implicit-str-concat
+    "ICN",    # flake8-import-conventions
+    "LOG",    # flake8-logging
+    "G",      # flake8-logging-format
+    "PIE",    # flake8-pie
+    "PT",     # flake8-pytest-style
+    "Q",      # flake8-quotes
+    "RSE",    # flake8-raise
+    "RET",    # flake8-return
+    "SLF",    # flake8-self
+    "SLOT",   # flake8-slots
+    "SIM",    # flake8-simplify
+    "TID",    # flake8-tidy-imports
+    "TCH",    # flake8-type-checking
+    "ARG",    # flake8-unused-arguments
+    "PTH",    # flake8-use-pathlib
+    "PGH",    # pygrep-hooks
+    "PL",     # pylint
+    "TRY",    # tryceratops
+    "FLY",    # flynt
+    "PERF",   # perflint
+    "FURB",   # refurb
+    "RUF",    # ruff-specific
+]
+ignore = [
+    "S603",     # subprocess call - check for execution of untrusted input (we run git/gh)
+    "S607",     # starting a process with a partial executable path (intentional for git/gh/omp)
+    "TRY003",   # avoid specifying long messages outside exception class (too noisy)
+    "TRY300",   # consider moving return into else block (unclear benefit)
+    "TRY301",   # abstract raise to inner function (over-engineering)
+    "PLR0913",  # too many arguments to function call (domain complexity)
+    "PLR0917",  # too many positional arguments (domain complexity)
+    "PLR2004",  # magic value used in comparison (too noisy for numeric thresholds)
+    "COM812",   # missing trailing comma (conflicts with formatter)
+    "ISC001",   # single-line implicit string concatenation (conflicts with formatter)
+    "ANN401",   # dynamically typed expressions (Any) disallowed -- allow sparingly
+    "SIM115",   # use context manager for opening files (TemporaryFile lifetime)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",     # use of assert in tests
+    "S108",     # tmp paths in test data (harmless)
+    "ANN",      # annotations not required in tests
+    "ARG",      # unused arguments (fixtures)
+    "PLR0913",  # too many arguments (test parameterization)
+    "SLF001",   # private member access (testing internals)
+    "TC003",    # Path used at runtime in tests
+    "PT017",    # assertion on exception (test style)
+]
+# CLI handlers share a uniform (store, cfg, args) signature for dispatch.
+"hunter/cli.py" = [
+    "ARG001",   # unused args in uniform handler signatures
+    "PLC0415",  # lazy imports to avoid loading heavy modules at parse time
+]
+# Server uses lazy imports for thread safety and to keep the module importable
+# while siblings are still being built.
+"hunter/server.py" = [
+    "PLC0415",  # lazy imports (thread safety, startup ordering)
+    "PLR0911",  # too many return statements in do_GET (route dispatch)
+]
+# Store uses assert for lastrowid (which is guaranteed non-None after INSERT),
+# and builds SQL from known column sets (not user input).
+"hunter/store.py" = [
+    "S101",     # assert on lastrowid (known non-None after INSERT)
+    "S608",     # SQL injection false positives (columns from known sets)
+]
+# Forge base class has intentionally unused arguments (interface stubs).
+"hunter/forge.py" = [
+    "ARG002",   # unused method args in base class stubs
+]
+# Scheduler functions are inherently complex (multi-step orchestration).
+# Store is used at runtime (not just for type checking).
+"hunter/scheduler.py" = [
+    "PLR0911",  # too many return statements (multi-step orchestration)
+    "PLR0912",  # too many branches (multi-step orchestration)
+    "PLR0915",  # too many statements (multi-step orchestration)
+    "TC001",    # Store is used at runtime, not just type checking
+]
+# Path is used at runtime (not just for type annotations).
+"hunter/runner.py" = [
+    "TC003",    # Path used at runtime for file operations
+]
+"hunter/playbooks.py" = [
+    "TC003",    # Path used at runtime for file I/O
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

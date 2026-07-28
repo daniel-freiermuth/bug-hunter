@@ -1,4 +1,5 @@
 """CLI entry point: python3 -m hunter <command>."""
+
 from __future__ import annotations
 
 import argparse
@@ -8,21 +9,25 @@ from pathlib import Path
 
 from .ingest import ingest_findings
 from .store import Store
-from .types import Config, VERDICT_STATUSES, REASON_REQUIRED
+from .types import REASON_REQUIRED, VERDICT_STATUSES, Config, Row
 
 
-def _fmt(rows: list[dict], cols: list[str]) -> None:
+def _fmt(rows: list[Row], cols: list[str]) -> None:
     if not rows:
         print("(none)")
         return
     widths = [max(len(c), *(len(str(r.get(c, ""))) for r in rows)) for c in cols]
-    print("  ".join(c.ljust(w) for c, w in zip(cols, widths)))
+    print("  ".join(c.ljust(w) for c, w in zip(cols, widths, strict=True)))
     for r in rows:
-        print("  ".join(str(r.get(c, "") if r.get(c) is not None else "").ljust(w)
-                        for c, w in zip(cols, widths)))
+        print(
+            "  ".join(
+                str(r.get(c, "") if r.get(c) is not None else "").ljust(w)
+                for c, w in zip(cols, widths, strict=True)
+            )
+        )
 
 
-def _repo_or_die(store: Store, name: str) -> dict:
+def _repo_or_die(store: Store, name: str) -> Row:
     repo = store.get_repo(name)
     if repo is None:
         sys.exit(f"error: unknown repo {name!r} (see: python3 -m hunter repos)")
@@ -31,12 +36,14 @@ def _repo_or_die(store: Store, name: str) -> dict:
 
 # -- command handlers -----------------------------------------------------
 
-def cmd_init(store: Store, cfg: Config, args) -> None:
+
+def cmd_init(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     print(f"db ready at {cfg.db_path}")
 
 
-def cmd_add_repo(store: Store, cfg: Config, args) -> None:
+def cmd_add_repo(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     from .forge import FORGE_NAMES, detect_forge
+
     forge = args.forge
     if forge is None:
         forge = detect_forge(args.url)
@@ -47,90 +54,133 @@ def cmd_add_repo(store: Store, cfg: Config, args) -> None:
     print(f"repo #{rid} {args.name} ({forge}) -> {path}")
 
 
-def cmd_repos(store: Store, cfg: Config, args) -> None:
-    _fmt(store.list_repos(),
-         ["id", "name", "url", "forge", "default_branch", "last_hunt_sha", "enabled"])
+def cmd_repos(store: Store, cfg: Config, args: argparse.Namespace) -> None:
+    _fmt(
+        store.list_repos(),
+        [
+            "id",
+            "name",
+            "url",
+            "forge",
+            "default_branch",
+            "last_hunt_sha",
+            "enabled",
+        ],
+    )
 
 
-def cmd_findings(store: Store, cfg: Config, args) -> None:
+def cmd_findings(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     repo_id = _repo_or_die(store, args.repo)["id"] if args.repo else None
-    _fmt(store.list_findings(status=args.status, repo_id=repo_id),
-         ["id", "repo_id", "status", "severity", "confidence", "bug_class",
-          "file", "line", "summary"])
+    _fmt(
+        store.list_findings(status=args.status, repo_id=repo_id),
+        [
+            "id",
+            "repo_id",
+            "status",
+            "severity",
+            "confidence",
+            "bug_class",
+            "file",
+            "line",
+            "summary",
+        ],
+    )
 
 
-def cmd_verdict(store: Store, cfg: Config, args) -> None:
+def cmd_verdict(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     if args.status in REASON_REQUIRED and not args.reason:
-        sys.exit(f"error: --reason is required for verdict '{args.status}'"
-                 " (it feeds the suppression corpus)")
+        sys.exit(
+            f"error: --reason is required for verdict '{args.status}'"
+            " (it feeds the suppression corpus)"
+        )
     if store.get_finding(args.fid) is None:
         sys.exit(f"error: no finding #{args.fid}")
     store.set_status(args.fid, args.status, verdict_reason=args.reason)
-    store.log_event("verdict", f"finding #{args.fid} -> {args.status}"
-                    + (f": {args.reason}" if args.reason else ""),
-                    finding_id=args.fid)
+    store.log_event(
+        "verdict",
+        f"finding #{args.fid} -> {args.status}" + (f": {args.reason}" if args.reason else ""),
+        finding_id=args.fid,
+    )
     print(f"finding #{args.fid} -> {args.status}")
 
 
-def cmd_ingest(store: Store, cfg: Config, args) -> None:
+def cmd_ingest(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     repo = _repo_or_die(store, args.repo)
     counts = ingest_findings(store, repo["id"], Path(args.file))
     print(json.dumps(counts))
 
 
-def cmd_jobs(store: Store, cfg: Config, args) -> None:
-    _fmt(store.list_jobs(),
-         ["id", "kind", "repo_id", "finding_id", "state", "tokens_new",
-          "calls", "exit_code", "killed_reason"])
+def cmd_jobs(store: Store, cfg: Config, args: argparse.Namespace) -> None:
+    _fmt(
+        store.list_jobs(),
+        [
+            "id",
+            "kind",
+            "repo_id",
+            "finding_id",
+            "state",
+            "tokens_new",
+            "calls",
+            "exit_code",
+            "killed_reason",
+        ],
+    )
 
 
-def cmd_events(store: Store, cfg: Config, args) -> None:
+def cmd_events(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     for e in reversed(store.recent_events()):
         print(f"{e['at']}  [{e['kind']}]  {e['message']}")
 
 
-def cmd_hunt(store: Store, cfg: Config, args) -> None:
-    from .scheduler import run_hunt  # built separately; may not exist yet
+def cmd_hunt(store: Store, cfg: Config, args: argparse.Namespace) -> None:
+    from .scheduler import run_hunt
+
     repo = _repo_or_die(store, args.repo)
     print(json.dumps(run_hunt(store, cfg, repo, force=args.force), default=str))
 
 
-def cmd_fix(store: Store, cfg: Config, args) -> None:
+def cmd_fix(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     from .scheduler import run_fix
+
     finding = store.get_finding(args.fid)
     if finding is None:
         sys.exit(f"error: no finding #{args.fid}")
     print(json.dumps(run_fix(store, cfg, finding), default=str))
 
 
-
-def cmd_recheck(store: Store, cfg: Config, args) -> None:
+def cmd_recheck(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     from .scheduler import run_recheck
+
     finding = store.get_finding(args.fid)
     if finding is None:
         sys.exit(f"error: no finding #{args.fid}")
     print(json.dumps(run_recheck(store, cfg, finding), default=str))
 
-def cmd_cycle(store: Store, cfg: Config, args) -> None:
+
+def cmd_cycle(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     from .scheduler import run_cycle
+
     force_repo = _repo_or_die(store, args.repo)["name"] if args.repo else None
     print(json.dumps(run_cycle(store, cfg, force_repo=force_repo), default=str))
 
 
-def cmd_sync(store: Store, cfg: Config, args) -> None:
+def cmd_sync(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     from .scheduler import sync_prs
+
     print(json.dumps(sync_prs(store, cfg)))
 
 
-def cmd_serve(store: Store, cfg: Config, args) -> None:
+def cmd_serve(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     from .server import serve
+
     if args.port:
         cfg.serve_port = args.port
     serve(cfg)
 
 
-def cmd_daemon(store: Store, cfg: Config, args) -> None:
+def cmd_daemon(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     from .server import daemon
+
     if args.port:
         cfg.serve_port = args.port
     daemon(cfg)
@@ -138,10 +188,15 @@ def cmd_daemon(store: Store, cfg: Config, args) -> None:
 
 # -- parser ---------------------------------------------------------------
 
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="hunter", description="Idle-Token Bug Hunter")
-    ap.add_argument("--config", type=Path, default=None,
-                    help="path to config.json (default: hunter/config.json)")
+    ap.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="path to config.json (default: hunter/config.json)",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init", help="create/upgrade the database").set_defaults(fn=cmd_init)
@@ -150,8 +205,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("url")
     p.add_argument("--branch", default="main")
-    p.add_argument("--forge", default=None, choices=["github", "gitlab"],
-                   help="forge type (auto-detected from URL if omitted)")
+    p.add_argument(
+        "--forge",
+        default=None,
+        choices=["github", "gitlab"],
+        help="forge type (auto-detected from URL if omitted)",
+    )
     p.set_defaults(fn=cmd_add_repo)
 
     sub.add_parser("repos", help="list repos").set_defaults(fn=cmd_repos)
@@ -192,14 +251,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", default=None)
     p.set_defaults(fn=cmd_cycle)
 
-    sub.add_parser("sync", help="refresh pr_state for open PRs/MRs"
-                   " (no tokens)").set_defaults(fn=cmd_sync)
+    sub.add_parser("sync", help="refresh pr_state for open PRs/MRs (no tokens)").set_defaults(
+        fn=cmd_sync
+    )
 
     p = sub.add_parser("serve", help="run the triage UI")
     p.add_argument("--port", type=int, default=None)
     p.set_defaults(fn=cmd_serve)
 
-    p = sub.add_parser("daemon", help="run forever: UI + budget-gated scheduler loop")
+    p = sub.add_parser(
+        "daemon",
+        help="run forever: UI + budget-gated scheduler loop",
+    )
     p.add_argument("--port", type=int, default=None)
     p.set_defaults(fn=cmd_daemon)
 

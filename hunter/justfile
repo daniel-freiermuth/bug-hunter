@@ -1,0 +1,38 @@
+# Idle-Token Bug Hunter — development tasks
+# Usage: cd hunter && just check
+
+set dotenv-load := false
+
+# Run all quality checks (format, lint, typecheck, test).
+check: fmt-check lint typecheck test
+
+# Check formatting (no changes).
+fmt-check:
+    ruff format --check hunter/ tests/
+
+# Auto-format in place.
+fmt:
+    ruff format hunter/ tests/
+
+# Lint with ruff.
+lint:
+    ruff check hunter/ tests/
+
+# Lint and auto-fix what's safe.
+lint-fix:
+    ruff check --fix hunter/ tests/
+
+# Strict type checking with mypy.
+typecheck:
+    mypy --strict hunter/
+
+# Run the test suite.
+test *ARGS:
+    pytest tests/ {{ ARGS }}
+
+# Run a single test file.  e.g. just test-one test_store
+test-one NAME *ARGS:
+    pytest tests/{{ NAME }}.py -v {{ ARGS }}
+
+# Format, lint-fix, then full check (handy before committing).
+fix: fmt lint-fix check

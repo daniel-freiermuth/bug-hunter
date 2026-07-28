@@ -1,13 +1,15 @@
-"""Worker runner — spawns headless omp, meters its ledger, kills at cap.
+"""Worker runner -- spawns headless omp, meters its ledger, kills at cap.
 
 The cap design (exp1b): never trust harness cooperation. The worker's session
 JSONL is written live under ~/.omp/agent/sessions/; we watch it and SIGTERM
 the process group at the token threshold. The ledger survives kills cleanly
 (observed: zero corrupt lines after SIGTERM; partial trailing line possible
-mid-write — skipped).
+mid-write -- skipped).
 """
+
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import signal
@@ -22,15 +24,15 @@ from .types import OMP_SESSIONS_DIR, Config, RunResult
 def ledger_usage(session_file: Path, since_iso: str = "") -> tuple[int, int]:
     """Sum 'new' tokens (input+output+cacheWrite) and call count.
 
-    `since_iso` filters to records newer than the given UTC ISO timestamp —
+    ``since_iso`` filters to records newer than the given UTC ISO timestamp --
     required when omp REUSES a prior session file for the same cwd (observed:
-    a second `omp -p` run appends to the existing JSONL). The ledger's
+    a second ``omp -p`` run appends to the existing JSONL). The ledger's
     fixed-format timestamps ("2026-07-23T15:38:23.224Z") compare
     lexicographically.
     """
     tokens = calls = 0
     try:
-        with open(session_file) as fh:
+        with session_file.open() as fh:
             for line in fh:
                 try:
                     rec = json.loads(line)
@@ -42,7 +44,9 @@ def ledger_usage(session_file: Path, since_iso: str = "") -> tuple[int, int]:
                 u = msg.get("usage")
                 if u and msg.get("role") == "assistant":
                     calls += 1
-                    tokens += (u.get("input") or 0) + (u.get("output") or 0) + (u.get("cacheWrite") or 0)
+                    tokens += (
+                        (u.get("input") or 0) + (u.get("output") or 0) + (u.get("cacheWrite") or 0)
+                    )
     except OSError:
         pass
     return tokens, calls
@@ -63,7 +67,7 @@ def _discover(before: dict[Path, int], cwd: Path) -> Path | None:
     candidate whose parent dir name fuzzily matches the cwd, else the most
     recently modified candidate.
     """
-    candidates = []
+    candidates: list[Path] = []
     for p, size in _snapshot().items():
         old = before.get(p)
         if old is None or size > old:
@@ -71,13 +75,16 @@ def _discover(before: dict[Path, int], cwd: Path) -> Path | None:
     if not candidates:
         return None
     slug = str(cwd).replace("/", "-").strip("-")
-    matches = [p for p in candidates
-               if slug in p.parent.name.strip("-") or p.parent.name.strip("-") in slug]
+    matches = [
+        p
+        for p in candidates
+        if slug in p.parent.name.strip("-") or p.parent.name.strip("-") in slug
+    ]
     pool = matches or candidates
     return max(pool, key=lambda p: p.stat().st_mtime)
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
+def _kill_tree(proc: subprocess.Popen[str] | subprocess.Popen[bytes]) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -85,15 +92,19 @@ def _kill_tree(proc: subprocess.Popen) -> None:
     try:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
-        try:
+        with contextlib.suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
         proc.wait(timeout=10)
 
 
-def run_worker(cfg: Config, cwd: Path, prompt: str, cap_tokens: int, max_wall_s: int,
-               model: str | None = None) -> RunResult:
+def run_worker(
+    cfg: Config,
+    cwd: Path,
+    prompt: str,
+    cap_tokens: int,
+    max_wall_s: int,
+    model: str | None = None,
+) -> RunResult:
     before = _snapshot()
     t0 = time.time()
     spawn_iso = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t0)) + ".000Z"
@@ -105,7 +116,9 @@ def run_worker(cfg: Config, cwd: Path, prompt: str, cap_tokens: int, max_wall_s:
     out = tempfile.TemporaryFile(mode="w+")
     proc = subprocess.Popen(
         cmd,
-        cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
+        cwd=cwd,
+        stdout=out,
+        stderr=subprocess.STDOUT,
         start_new_session=True,
     )
     session: Path | None = None

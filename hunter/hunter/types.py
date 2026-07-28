@@ -4,11 +4,15 @@ Everything is stdlib. Config lives in hunter/config.json next to the package
 dir; paths in config are resolved relative to the project root (the directory
 containing the hunter/ package tree).
 """
+
+from __future__ import annotations
+
 import json
 import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # .../hunter
 SCHEMA_PATH = PROJECT_ROOT / "schema.sql"
@@ -16,6 +20,7 @@ PLAYBOOK_DIR = PROJECT_ROOT / "playbooks"
 UI_DIR = PROJECT_ROOT / "ui"
 OMP_SESSIONS_DIR = Path.home() / ".omp/agent/sessions"
 OMP_AGENT_DB = Path.home() / ".omp/agent/agent.db"
+
 
 class Status(StrEnum):
     NEW = "new"
@@ -28,6 +33,7 @@ class Status(StrEnum):
     WONTFIX = "wontfix"
     NOTE = "note"
 
+
 class BugClass(StrEnum):
     BOUNDARY = "boundary"
     ERROR_PATH = "error-path"
@@ -36,18 +42,36 @@ class BugClass(StrEnum):
     LEAK = "leak"
     LOGIC = "logic"
 
-FINDING_STATUSES = tuple(Status)
-SUPPRESSED_STATUSES = (Status.REJECTED, Status.WONTFIX)
-ACTIVE_STATUSES = (Status.NEW, Status.RECHECKING, Status.QUEUED, Status.FIXING,
-                   Status.PR_OPEN, Status.MERGED, Status.NOTE)
+
+FINDING_STATUSES: tuple[Status, ...] = tuple(Status)
+SUPPRESSED_STATUSES: tuple[Status, ...] = (Status.REJECTED, Status.WONTFIX)
+ACTIVE_STATUSES: tuple[Status, ...] = (
+    Status.NEW,
+    Status.RECHECKING,
+    Status.QUEUED,
+    Status.FIXING,
+    Status.PR_OPEN,
+    Status.MERGED,
+    Status.NOTE,
+)
 # Human verdicts allowed from the UI/CLI
-VERDICT_STATUSES = (Status.QUEUED, Status.REJECTED, Status.WONTFIX, Status.NOTE, Status.MERGED)
-REASON_REQUIRED = (Status.REJECTED, Status.WONTFIX)
-BUG_CLASSES = tuple(BugClass)
+VERDICT_STATUSES: tuple[Status, ...] = (
+    Status.QUEUED,
+    Status.REJECTED,
+    Status.WONTFIX,
+    Status.NOTE,
+    Status.MERGED,
+)
+REASON_REQUIRED: tuple[Status, ...] = (Status.REJECTED, Status.WONTFIX)
+BUG_CLASSES: tuple[BugClass, ...] = tuple(BugClass)
 
 
 def now_ms() -> int:
     return int(time.time() * 1000)
+
+
+# Type alias for rows returned from SQLite (dict with str keys).
+Row = dict[str, Any]
 
 
 @dataclass
@@ -65,9 +89,9 @@ class Config:
     stale_after_s: int = 1800
     serve_port: int = 8377
     poll_s: float = 2.0
-    model_default: str | None = None    # --model for all workers (None = omp default)
-    model_smol: str | None = None       # --smol helper model for lightweight subtasks
-    model_hunt: str | None = None       # per-kind overrides of model_default
+    model_default: str | None = None  # --model for all workers (None = omp default)
+    model_smol: str | None = None  # --smol helper model for lightweight subtasks
+    model_hunt: str | None = None  # per-kind overrides of model_default
     model_fix: str | None = None
 
     def model_for(self, kind: str) -> str | None:
@@ -75,9 +99,9 @@ class Config:
         return override or self.model_default
 
     @staticmethod
-    def load(path: Path | None = None) -> "Config":
+    def load(path: Path | None = None) -> Config:
         p = path or (PROJECT_ROOT / "config.json")
-        raw = json.loads(p.read_text()) if p.exists() else {}
+        raw: dict[str, Any] = json.loads(p.read_text()) if p.exists() else {}
         root = PROJECT_ROOT
 
         def rp(v: str) -> Path:
@@ -108,11 +132,12 @@ class Config:
 @dataclass
 class RunResult:
     """Outcome of one worker run (see runner.run_worker)."""
+
     exit_code: int | None
-    killed_reason: str | None       # None | "cap" | "wallclock"
-    tokens_new: int                 # input + output + cacheWrite from the ledger
+    killed_reason: str | None  # None | "cap" | "wallclock"
+    tokens_new: int  # input + output + cacheWrite from the ledger
     calls: int
-    session_file: str | None        # the worker's JSONL, for post-mortems
+    session_file: str | None  # the worker's JSONL, for post-mortems
     duration_s: float
     stdout_tail: str = ""
 
@@ -121,9 +146,9 @@ class RunResult:
 class WindowState:
     limit_id: str
     used_fraction: float | None
-    status: str | None              # ok | exhausted | ...
-    resets_at: int | None           # epoch ms
-    recorded_at: int                # epoch ms — when omp probed it
+    status: str | None  # ok | exhausted | ...
+    resets_at: int | None  # epoch ms
+    recorded_at: int  # epoch ms -- when omp probed it
     age_s: float = field(default=0.0)
 
     @property
@@ -135,4 +160,4 @@ class WindowState:
 class BudgetDecision:
     allow: bool
     reason: str
-    cap_tokens: int = 0             # effective per-job cap when allowed
+    cap_tokens: int = 0  # effective per-job cap when allowed
