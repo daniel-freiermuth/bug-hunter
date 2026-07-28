@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 from pathlib import Path
 
@@ -192,6 +193,12 @@ def cmd_daemon(store: Store, cfg: Config, args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="hunter", description="Idle-Token Bug Hunter")
     ap.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="enable verbose (DEBUG) logging",
+    )
+    ap.add_argument(
         "--config",
         type=Path,
         default=None,
@@ -269,8 +276,22 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+_LOG_FORMAT = "%(asctime)s %(levelname)-5s %(name)s  %(message)s"
+_LONG_RUNNING = {"serve", "daemon"}
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+
+    # Logging: verbose → DEBUG, long-running → INFO, else WARNING.
+    if args.verbose:
+        level = logging.DEBUG
+    elif args.cmd in _LONG_RUNNING:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
+    logging.basicConfig(format=_LOG_FORMAT, level=level)
+
     cfg = Config.load(args.config)
     store = Store(cfg)
     try:

@@ -10,15 +10,17 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import threading
 import time
-import traceback
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
+
+log = logging.getLogger(__name__)
 
 # One cycle at a time, across all request threads.
 _cycle_lock = threading.Lock()
@@ -32,7 +34,7 @@ class Handler(BaseHTTPRequestHandler):
     # -- plumbing ---------------------------------------------------------
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        pass  # keep stdout for the operator
+        log.debug(format, *args)
 
     def _store(self) -> Any:
         from .store import Store
@@ -94,9 +96,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(self._store().recent_events(limit=100))
                 return
             self._error(404, "not found")
-        except Exception as exc:
-            traceback.print_exc()
-            self._error(500, f"{type(exc).__name__}: {exc}")
+        except Exception:
+            log.exception("GET %s", self.path)
+            self._error(500, "internal error")
 
     def _summary(self) -> Row:
         from . import budget
@@ -156,9 +158,9 @@ class Handler(BaseHTTPRequestHandler):
             self._error(404, "not found")
         except (ValueError, json.JSONDecodeError) as exc:
             self._error(400, str(exc))
-        except Exception as exc:
-            traceback.print_exc()
-            self._error(500, f"{type(exc).__name__}: {exc}")
+        except Exception:
+            log.exception("POST %s", self.path)
+            self._error(500, "internal error")
 
     def _verdict(self) -> None:
         body = self._body_json()
@@ -205,10 +207,10 @@ class Handler(BaseHTTPRequestHandler):
                 store = Store(cfg)
                 try:
                     scheduler.run_cycle(store, cfg)
-                except Exception as exc:
-                    traceback.print_exc()
+                except Exception:
+                    log.exception("cycle failed")
                     with contextlib.suppress(Exception):
-                        store.log_event("error", f"cycle failed: {exc}")
+                        store.log_event("error", "cycle failed (see logs)")
             finally:
                 _cycle_lock.release()
 
@@ -262,9 +264,7 @@ def make_server(cfg: Config, port: int | None = None) -> _Server:
 
 def serve(cfg: Config) -> None:
     httpd = make_server(cfg)
-    print(
-        f"hunter ui: http://127.0.0.1:{httpd.server_address[1]}/",
-    )
+    log.info("ui http://127.0.0.1:%d/", httpd.server_address[1])
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -290,9 +290,9 @@ def daemon(cfg: Config) -> None:
 
     httpd = make_server(cfg)
     threading.Thread(target=httpd.serve_forever, name="hunter-ui", daemon=True).start()
-    print(
-        f"hunter daemon: ui http://127.0.0.1:{httpd.server_address[1]}/ -- scheduler loop live",
-        flush=True,
+    log.info(
+        "daemon started: ui http://127.0.0.1:%d/ -- scheduler loop live",
+        httpd.server_address[1],
     )
 
     stop = threading.Event()
@@ -323,12 +323,13 @@ def daemon(cfg: Config) -> None:
                         sleep_s = max(60.0, min(until, 30 * 60))
                     else:
                         sleep_s = 30 * 60
-                print(
-                    f"cycle: {json.dumps(summary)[:200]} -> sleep {sleep_s:.0f}s",
-                    flush=True,
+                log.info(
+                    "cycle: %s -> sleep %ds",
+                    json.dumps(summary)[:200],
+                    sleep_s,
                 )
             except Exception:
-                traceback.print_exc()
+                log.exception("cycle crashed")
                 sleep_s = 5 * 60
             finally:
                 _cycle_lock.release()
@@ -338,4 +339,4 @@ def daemon(cfg: Config) -> None:
 
     httpd.shutdown()
     httpd.server_close()
-    print("hunter daemon: stopped", flush=True)
+    log.info("daemon stopped")
