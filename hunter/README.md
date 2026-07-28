@@ -23,10 +23,20 @@ Other commands: `repos`, `findings [--status S]`, `verdict FID STATUS
 [--reason ...]`, `ingest FILE --repo NAME`, `jobs`, `events`, `hunt REPO
 [--force]`, `fix FID`, `recheck FID`, `sync` (refresh PR state, no tokens).
 
-Production shape: `hunter.service` (systemd user unit, installed) runs the
-daemon permanently. It idles at zero token cost and wakes on a policy:
-after a job → 60s (drain the queue); budget denied → sleep to the 5h reset;
-idle → 15min. Every wake passes the budget gate before spending anything.
+### Install as a service
+
+The systemd unit is checked in at `hunter.service`. Install once:
+
+```sh
+cp hunter.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now hunter.service
+loginctl enable-linger $USER   # survive logout
+```
+
+It idles at zero token cost and wakes on a policy: after a job → 60s
+(drain the queue); budget denied → sleep to the 5h reset; idle → 15min.
+Every wake passes the budget gate before spending anything.
 
 ## How it decides
 
