@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import sys
 import threading
 import time
 from collections import Counter
@@ -30,11 +31,15 @@ class Handler(BaseHTTPRequestHandler):
     cfg: Config  # set by make_server()
     server_version = "hunter/1"
     protocol_version = "HTTP/1.1"
+    timeout = 15  # keep-alive timeout: close idle connections after 15s
 
     # -- plumbing ---------------------------------------------------------
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
         log.debug(format, *args)
+
+    def log_error(self, format: str, *args: Any) -> None:  # noqa: A002
+        log.warning(format, *args)
 
     def _store(self) -> Any:
         from .store import Store
@@ -278,6 +283,14 @@ class Handler(BaseHTTPRequestHandler):
 class _Server(ThreadingHTTPServer):
     allow_reuse_address = True
     allow_reuse_port = True
+    request_queue_size = 64  # default 5 is too low for burst page loads
+
+    def handle_error(
+        self,
+        request: Any,  # noqa: ARG002
+        client_address: tuple[str, int],
+    ) -> None:
+        log.warning("connection error from %s: %s", client_address, sys.exc_info()[1])
 
 
 def make_server(cfg: Config, port: int | None = None) -> _Server:
