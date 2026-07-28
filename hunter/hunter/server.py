@@ -207,7 +207,17 @@ class Handler(BaseHTTPRequestHandler):
 
 def make_server(cfg: Config, port: int | None = None) -> ThreadingHTTPServer:
     Handler.cfg = cfg
-    httpd = ThreadingHTTPServer(("127.0.0.1", port or cfg.serve_port), Handler)
+    addr = ("127.0.0.1", port or cfg.serve_port)
+    try:
+        httpd = ThreadingHTTPServer(addr, Handler)
+    except OSError as e:
+        if e.errno == 98:  # EADDRINUSE
+            raise SystemExit(
+                f"error: port {addr[1]} already in use — is another hunter instance running?\n"
+                f"  check: ss -tlnp | grep {addr[1]}\n"
+                f"  or:    systemctl --user status hunter.service"
+            ) from None
+        raise
     httpd.daemon_threads = True
     return httpd
 
