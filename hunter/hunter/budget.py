@@ -67,7 +67,8 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
     if weekly_pressure >= 0.8 * scavenge_ceiling:
         cap = base // 2
         reason = f"weekly pressure {weekly_pressure:.2f} near reserve — cap halved"
+
     if not fresh:
-        cap = min(cap, _CONSERVATIVE_CAP)
-        reason = "all window data stale — conservative cap"
+        return BudgetDecision(False, "window data stale or missing — deny until fresh")
+
     return BudgetDecision(True, reason, cap)
