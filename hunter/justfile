@@ -47,7 +47,7 @@ fix: fmt lint-fix build-ui check
 
 # Build UI then start the daemon (UI + scheduler loop).
 daemon *ARGS: build-ui
-    python3 -m hunter daemon {{ ARGS }}
+    python3 -m hunter {{ ARGS }} daemon
 
 # Build UI then start serve-only (no scheduler loop).
 serve *ARGS: build-ui
