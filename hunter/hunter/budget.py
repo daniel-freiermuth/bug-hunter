@@ -1,8 +1,8 @@
 """Budget policy -- linear ramp over the 7-day window.
 
 Core rule: if fraction p of the 7-day window has elapsed, the scavenger may
-have consumed at most p * (1 - interactive_reserve) of the budget. This
-spreads spending evenly and guarantees the reserve is never touched.
+have consumed at most p of the total budget.  This spreads spending evenly
+across the week.
 
 The 5h window is a short-horizon gate (deny when near-exhausted so the human
 isn't locked out mid-afternoon). Stale or missing data -> always deny.
@@ -68,7 +68,6 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
         return BudgetDecision(False, f"5h window at {w5.used_fraction} ({w5.status})")
 
     # -- 7d linear ramp: spend proportionally to elapsed time ----------------
-    scavenge_ceiling = 1.0 - cfg.interactive_reserve_7d  # e.g. 0.75
 
     for lid, w in fresh.items():
         if ":7d" not in lid or w.used_fraction is None:
@@ -78,13 +77,12 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
             elapsed_frac = min((now_ms - started_ms) / _WEEK_MS, 1.0)
         else:
             elapsed_frac = 1.0  # can't compute -> assume end-of-window
-        allowed = elapsed_frac * scavenge_ceiling
+        allowed = elapsed_frac
         used = w.used_fraction
         if used >= allowed:
             return BudgetDecision(
                 False,
-                f"{lid}: used {used:.2f} >= ramp {allowed:.2f} "
-                f"(elapsed {elapsed_frac:.1%} x ceiling {scavenge_ceiling:.2f})",
+                f"{lid}: used {used:.2f} >= ramp {allowed:.2f} (elapsed {elapsed_frac:.1%})",
             )
 
     # -- allowed: scale cap by remaining ramp headroom -----------------------
@@ -95,8 +93,8 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
             continue
         started_ms = w.resets_at - _WEEK_MS
         elapsed_frac = min((now_ms - started_ms) / _WEEK_MS, 1.0)
-        allowed = elapsed_frac * scavenge_ceiling
-        headroom = (allowed - w.used_fraction) / scavenge_ceiling if scavenge_ceiling else 0
+        allowed = elapsed_frac
+        headroom = allowed - w.used_fraction
         min_headroom = min(min_headroom, headroom)
 
     cap = base

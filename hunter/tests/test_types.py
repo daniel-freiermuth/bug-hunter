@@ -147,7 +147,6 @@ class TestConfig:
         assert cfg.hunt_max_findings == 8
         assert cfg.fix_cap_tokens == 150_000
         assert cfg.fix_max_wall_s == 2700
-        assert cfg.interactive_reserve_7d == 0.25
         assert cfg.deny_5h_above == 0.85
         assert cfg.stale_after_s == 1800
         assert cfg.serve_port == 8377
@@ -197,7 +196,6 @@ class TestConfig:
             "hunt": {"capNewTokens": 100_000, "maxWallS": 600, "maxFindings": 3},
             "fix": {"capNewTokens": 50_000, "maxWallS": 900},
             "budget": {
-                "interactiveReserve7d": 0.30,
                 "deny5hAbove": 0.90,
                 "staleAfterS": 900,
             },
@@ -222,7 +220,6 @@ class TestConfig:
         assert cfg.hunt_max_findings == 3
         assert cfg.fix_cap_tokens == 50_000
         assert cfg.fix_max_wall_s == 900
-        assert cfg.interactive_reserve_7d == 0.30
         assert cfg.deny_5h_above == 0.90
         assert cfg.stale_after_s == 900
         assert cfg.serve_port == 9999

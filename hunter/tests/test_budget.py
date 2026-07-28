@@ -21,7 +21,6 @@ def _cfg(**overrides) -> Config:
         "db_path": Path("/tmp/test.db"),
         "hunt_cap_tokens": 200_000,
         "fix_cap_tokens": 150_000,
-        "interactive_reserve_7d": 0.25,
         "deny_5h_above": 0.85,
         "stale_after_s": 1800,
     }
@@ -113,13 +112,14 @@ def test_5h_at_exact_threshold_deny():
 
 
 def test_7d_used_above_ramp_deny():
-    """7d used_fraction exceeds linear ramp → deny."""
-    cfg = _cfg(interactive_reserve_7d=0.25)
-    # resets_at at midpoint → elapsed_frac ≈ 0.5, ceiling = 0.75 → allowed ≈ 0.375
+    """7d used_fraction exceeds linear ramp -> deny."""
+    cfg = _cfg()
+    # resets_at at midpoint -> elapsed_frac ~ 0.5, allowed ~ 0.5
+    # used = 0.55 -> clearly above ramp -> deny
     windows = _healthy_windows()
     windows["anthropic:7d"] = _ws(
         "anthropic:7d",
-        used_fraction=0.50,
+        used_fraction=0.55,
         resets_at=_NOW_MS + _WEEK_MS // 2,
     )
     d = decide(cfg, "hunt", windows)
@@ -159,20 +159,18 @@ def test_kind_selects_base_cap():
 
 def test_low_headroom_halves_cap():
     """When ramp headroom < 0.1, cap should be halved."""
-    cfg = _cfg(interactive_reserve_7d=0.25)
-    # Craft a 7d window so headroom is tiny:
-    # elapsed_frac ~ 0.5 → allowed = 0.5 * 0.75 = 0.375
-    # used = 0.35 → headroom = (0.375 - 0.35) / 0.75 ≈ 0.033 (< 0.1)
+    cfg = _cfg()
+    # elapsed_frac = 0.5 -> allowed = 0.5
+    # used = 0.47 -> headroom = 0.03 (< 0.1)
     windows = _healthy_windows()
     windows["anthropic:7d"] = _ws(
         "anthropic:7d",
-        used_fraction=0.35,
+        used_fraction=0.47,
         resets_at=_NOW_MS + _WEEK_MS // 2,
     )
-    # Ensure model-class window also has low headroom
     windows["anthropic:7d:model-class"] = _ws(
         "anthropic:7d:model-class",
-        used_fraction=0.35,
+        used_fraction=0.47,
         resets_at=_NOW_MS + _WEEK_MS // 2,
     )
     d = decide(cfg, "hunt", windows)

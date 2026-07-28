@@ -84,7 +84,6 @@ class Config:
     hunt_max_findings: int = 8
     fix_cap_tokens: int = 150_000
     fix_max_wall_s: int = 2700
-    interactive_reserve_7d: float = 0.25
     deny_5h_above: float = 0.85
     stale_after_s: int = 1800
     serve_port: int = 8377
@@ -117,7 +116,6 @@ class Config:
             hunt_max_findings=raw.get("hunt", {}).get("maxFindings", 8),
             fix_cap_tokens=raw.get("fix", {}).get("capNewTokens", 150_000),
             fix_max_wall_s=raw.get("fix", {}).get("maxWallS", 2700),
-            interactive_reserve_7d=raw.get("budget", {}).get("interactiveReserve7d", 0.25),
             deny_5h_above=raw.get("budget", {}).get("deny5hAbove", 0.85),
             stale_after_s=raw.get("budget", {}).get("staleAfterS", 1800),
             serve_port=raw.get("serve", {}).get("port", 8377),
