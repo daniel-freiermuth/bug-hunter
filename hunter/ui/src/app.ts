@@ -534,8 +534,9 @@ async function refresh(): Promise<void> {
     // Snapshot open <details> elements before DOM rebuild.
     const openDetails = new Set<string>();
     for (const d of document.querySelectorAll("details[open]")) {
-      const id = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.parentElement?.id;
-      if (id) openDetails.add(id);
+      const card = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.parentElement?.id ?? "";
+      const label = d.querySelector("summary")?.textContent ?? "";
+      if (card) openDetails.add(card + "|" + label);
     }
 
     renderWindows(s.windows || {});
@@ -623,8 +624,9 @@ async function refresh(): Promise<void> {
 
     // Restore open <details> elements after DOM rebuild.
     for (const d of document.querySelectorAll("details")) {
-      const id = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.parentElement?.id;
-      if (id && openDetails.has(id)) d.open = true;
+      const card = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.parentElement?.id ?? "";
+      const label = d.querySelector("summary")?.textContent ?? "";
+      if (card && openDetails.has(card + "|" + label)) d.open = true;
     }
 
     const btn = $button("runCycle");
