@@ -105,6 +105,18 @@
   #events .ev .k { color: var(--purple); }
   .empty { color: var(--faint); font-size: 12px; padding: 4px 0; }
   #err { color: var(--red); font-size: 11px; margin-top: 6px; display: none; }
+
+  /* filter bar */
+  #filters {
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    margin-bottom: 10px; font-size: 12px;
+  }
+  #filters select, #filters input[type=range] {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 3px; font: inherit; font-size: 12px; padding: 2px 6px;
+  }
+  #filters label { color: var(--dim); font-size: 11px; }
+  #filters .sep { border-left: 1px solid var(--line); height: 20px; }
 </style>
 </head>
 <body>
@@ -119,6 +131,25 @@
   <div id="err"></div>
 
   <h2>Inbox <span class="n" id="nInbox"></span></h2>
+  <div id="filters">
+    <label>repo</label><select id="fRepo"><option value="">all</option></select>
+    <div class="sep"></div>
+    <label>class</label><select id="fClass"><option value="">all</option></select>
+    <div class="sep"></div>
+    <label>severity</label><select id="fSev"><option value="">all</option>
+      <option>high</option><option>medium</option><option>low</option></select>
+    <div class="sep"></div>
+    <label>min confidence</label>
+    <input type="range" id="fConf" min="0" max="100" value="0" step="5">
+    <span id="fConfVal">0%</span>
+    <div class="sep"></div>
+    <label>sort</label><select id="fSort">
+      <option value="score">severity × confidence</option>
+      <option value="newest">newest first</option>
+      <option value="oldest">oldest first</option>
+      <option value="repo">by repo</option>
+    </select>
+  </div>
   <div id="inbox"></div>
 
   <h2>Pipeline</h2>
@@ -140,6 +171,19 @@
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"']/g,
   c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+function _populateSelect(id, values) {
+  const el = $(id), prev = el.value;
+  const existing = new Set([...el.options].slice(1).map(o => o.value));
+  const wanted = new Set(values);
+  // add missing
+  for (const v of values) {
+    if (!existing.has(v)) { const o = document.createElement("option"); o.value = o.textContent = v; el.appendChild(o); }
+  }
+  // remove stale (keep "all")
+  for (const o of [...el.options].slice(1)) { if (!wanted.has(o.value)) o.remove(); }
+  el.value = wanted.has(prev) ? prev : "";
+}
 
 function ktok(n) {
   if (n == null) return "–";
@@ -324,11 +368,45 @@ async function refresh() {
 
     renderWindows(s.windows || {});
 
+    // ---- populate filter dropdowns (preserve selection) ----
     const inbox = all.filter(f => f.status === "new");
-    $("nInbox").textContent = `(${inbox.length})`;
-    $("inbox").innerHTML = inbox.length
-      ? inbox.map(f => findingCard(f, true)).join("")
-      : '<div class="empty">inbox zero</div>';
+    const repos = [...new Set(all.map(f => f.fingerprint.split(":")[0]))].sort();
+    const classes = [...new Set(inbox.map(f => f.bug_class).filter(Boolean))].sort();
+    _populateSelect("fRepo", repos);
+    _populateSelect("fClass", classes);
+
+    // ---- apply filters ----
+    const fRepo = $("fRepo").value;
+    const fClass = $("fClass").value;
+    const fSev = $("fSev").value;
+    const fConf = parseInt($("fConf").value, 10) / 100;
+    const fSort = $("fSort").value;
+
+    let filtered = inbox.filter(f => {
+      if (fRepo && !f.fingerprint.startsWith(fRepo + ":")) return false;
+      if (fClass && f.bug_class !== fClass) return false;
+      if (fSev && f.severity !== fSev) return false;
+      if ((f.confidence || 0) < fConf) return false;
+      return true;
+    });
+
+    const sevRank = {high: 3, medium: 2, low: 1};
+    if (fSort === "score") {
+      filtered.sort((a, b) =>
+        ((sevRank[b.severity]||0) * (b.confidence||0)) -
+        ((sevRank[a.severity]||0) * (a.confidence||0)));
+    } else if (fSort === "newest") {
+      filtered.sort((a, b) => (b.created_at||0) - (a.created_at||0));
+    } else if (fSort === "oldest") {
+      filtered.sort((a, b) => (a.created_at||0) - (b.created_at||0));
+    } else if (fSort === "repo") {
+      filtered.sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
+    }
+
+    $("nInbox").textContent = `(${filtered.length}/${inbox.length})`;
+    $("inbox").innerHTML = filtered.length
+      ? filtered.map(f => findingCard(f, true)).join("")
+      : '<div class="empty">' + (inbox.length ? 'all filtered out' : 'inbox zero') + '</div>';
 
     renderPipeline(all);
 
@@ -358,6 +436,10 @@ async function refresh() {
     $("err").style.display = "block";
   }
 }
+
+// filter controls trigger immediate re-render
+for (const id of ["fRepo", "fClass", "fSev", "fSort"]) $(id).onchange = refresh;
+$("fConf").oninput = function() { $("fConfVal").textContent = this.value + "%"; refresh(); };
 
 refresh();
 setInterval(refresh, 5000);

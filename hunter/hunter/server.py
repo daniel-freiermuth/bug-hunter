@@ -205,11 +205,15 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"queued": True, "finding": store.get_finding(fid)})
 
 
-def make_server(cfg: Config, port: int | None = None) -> ThreadingHTTPServer:
+class _Server(ThreadingHTTPServer):
+    allow_reuse_address = True
+    allow_reuse_port = True
+
+def make_server(cfg: Config, port: int | None = None) -> _Server:
     Handler.cfg = cfg
     addr = ("127.0.0.1", port or cfg.serve_port)
     try:
-        httpd = ThreadingHTTPServer(addr, Handler)
+        httpd = _Server(addr, Handler)
     except OSError as e:
         if e.errno == 98:  # EADDRINUSE
             raise SystemExit(
