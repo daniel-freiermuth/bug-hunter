@@ -85,22 +85,4 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
                 f"{lid}: used {used:.2f} >= ramp {allowed:.2f} (elapsed {elapsed_frac:.1%})",
             )
 
-    # -- allowed: scale cap by remaining ramp headroom -----------------------
-    # Find the tightest 7d limit's remaining ramp room
-    min_headroom = 1.0
-    for lid, w in fresh.items():
-        if ":7d" not in lid or w.used_fraction is None or not w.resets_at:
-            continue
-        started_ms = w.resets_at - _WEEK_MS
-        elapsed_frac = min((now_ms - started_ms) / _WEEK_MS, 1.0)
-        allowed = elapsed_frac
-        headroom = allowed - w.used_fraction
-        min_headroom = min(min_headroom, headroom)
-
-    cap = base
-    if min_headroom < 0.1:
-        cap = base // 2
-    reason = f"ok (ramp headroom {min_headroom:.1%})" + (
-        ", cap halved" if min_headroom < 0.1 else ""
-    )
-    return BudgetDecision(True, reason, cap)
+    return BudgetDecision(True, "ok", base)

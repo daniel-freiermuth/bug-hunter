@@ -150,38 +150,3 @@ def test_kind_selects_base_cap():
     df = decide(cfg, "fix", _healthy_windows())
     assert dh.cap_tokens == 300_000
     assert df.cap_tokens == 100_000
-
-
-# ---------------------------------------------------------------------------
-# Low headroom → cap halved
-# ---------------------------------------------------------------------------
-
-
-def test_low_headroom_halves_cap():
-    """When ramp headroom < 0.1, cap should be halved."""
-    cfg = _cfg()
-    # elapsed_frac = 0.5 -> allowed = 0.5
-    # used = 0.47 -> headroom = 0.03 (< 0.1)
-    windows = _healthy_windows()
-    windows["anthropic:7d"] = _ws(
-        "anthropic:7d",
-        used_fraction=0.47,
-        resets_at=_NOW_MS + _WEEK_MS // 2,
-    )
-    windows["anthropic:7d:model-class"] = _ws(
-        "anthropic:7d:model-class",
-        used_fraction=0.47,
-        resets_at=_NOW_MS + _WEEK_MS // 2,
-    )
-    d = decide(cfg, "hunt", windows)
-    assert d.allow
-    assert d.cap_tokens == 200_000 // 2
-    assert "halved" in d.reason
-
-
-def test_normal_headroom_full_cap():
-    """When ramp headroom >= 0.1, cap stays at full base."""
-    d = decide(_cfg(), "hunt", _healthy_windows())
-    assert d.allow
-    assert d.cap_tokens == 200_000
-    assert "halved" not in d.reason
