@@ -14,11 +14,7 @@ from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .types import FINDING_STATUSES, Config, UI_DIR
-
-# Verdicts a human may assign from the UI.
-VERDICT_STATUSES = ("queued", "rejected", "wontfix", "note", "merged")
-REASON_REQUIRED = ("rejected", "wontfix")
+from .types import FINDING_STATUSES, VERDICT_STATUSES, REASON_REQUIRED, Config, UI_DIR
 
 # One cycle at a time, across all request threads.
 _cycle_lock = threading.Lock()

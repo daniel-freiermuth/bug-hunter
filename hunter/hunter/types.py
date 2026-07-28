@@ -4,11 +4,10 @@ Everything is stdlib. Config lives in hunter/config.json next to the package
 dir; paths in config are resolved relative to the project root (the directory
 containing the hunter/ package tree).
 """
-from __future__ import annotations
-
 import json
 import time
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # .../hunter
@@ -18,15 +17,33 @@ UI_DIR = PROJECT_ROOT / "ui"
 OMP_SESSIONS_DIR = Path.home() / ".omp/agent/sessions"
 OMP_AGENT_DB = Path.home() / ".omp/agent/agent.db"
 
-FINDING_STATUSES = (
-    "new", "rechecking", "queued", "fixing", "pr_open", "merged", "rejected", "wontfix", "note",
-)
-# Verdicts that feed the suppression corpus (hunt prompt "known non-bugs")
-SUPPRESSED_STATUSES = ("rejected", "wontfix")
-# Statuses that block re-hunting the same fingerprint entirely
-ACTIVE_STATUSES = ("new", "rechecking", "queued", "fixing", "pr_open", "merged", "note")
+class Status(StrEnum):
+    NEW = "new"
+    RECHECKING = "rechecking"
+    QUEUED = "queued"
+    FIXING = "fixing"
+    PR_OPEN = "pr_open"
+    MERGED = "merged"
+    REJECTED = "rejected"
+    WONTFIX = "wontfix"
+    NOTE = "note"
 
-BUG_CLASSES = ("boundary", "error-path", "race", "contract-drift", "leak", "logic")
+class BugClass(StrEnum):
+    BOUNDARY = "boundary"
+    ERROR_PATH = "error-path"
+    RACE = "race"
+    CONTRACT_DRIFT = "contract-drift"
+    LEAK = "leak"
+    LOGIC = "logic"
+
+FINDING_STATUSES = tuple(Status)
+SUPPRESSED_STATUSES = (Status.REJECTED, Status.WONTFIX)
+ACTIVE_STATUSES = (Status.NEW, Status.RECHECKING, Status.QUEUED, Status.FIXING,
+                   Status.PR_OPEN, Status.MERGED, Status.NOTE)
+# Human verdicts allowed from the UI/CLI
+VERDICT_STATUSES = (Status.QUEUED, Status.REJECTED, Status.WONTFIX, Status.NOTE, Status.MERGED)
+REASON_REQUIRED = (Status.REJECTED, Status.WONTFIX)
+BUG_CLASSES = tuple(BugClass)
 
 
 def now_ms() -> int:

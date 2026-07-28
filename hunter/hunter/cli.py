@@ -8,9 +8,7 @@ from pathlib import Path
 
 from .ingest import ingest_findings
 from .store import Store
-from .types import Config
-
-VERDICT_STATUSES = ("queued", "rejected", "wontfix", "note", "merged")
+from .types import Config, VERDICT_STATUSES, REASON_REQUIRED
 
 
 def _fmt(rows: list[dict], cols: list[str]) -> None:
@@ -56,7 +54,7 @@ def cmd_findings(store: Store, cfg: Config, args) -> None:
 
 
 def cmd_verdict(store: Store, cfg: Config, args) -> None:
-    if args.status in ("rejected", "wontfix") and not args.reason:
+    if args.status in REASON_REQUIRED and not args.reason:
         sys.exit(f"error: --reason is required for verdict '{args.status}'"
                  " (it feeds the suppression corpus)")
     if store.get_finding(args.fid) is None:
