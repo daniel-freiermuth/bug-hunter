@@ -70,6 +70,44 @@ interface ApiResult<T> {
   body: T | null;
 }
 
+interface KindStats {
+  kind: string;
+  jobs: number;
+  done: number;
+  failed: number;
+  killed: number;
+  denied: number;
+  total_tokens: number | null;
+  total_calls: number | null;
+  avg_tokens: number | null;
+  total_usage_delta: number | null;
+  models: string | null;
+}
+
+interface FindingStats {
+  finding_id: number;
+  fingerprint: string;
+  status: string;
+  severity: string;
+  jobs: number;
+  total_tokens: number | null;
+  total_calls: number | null;
+  total_usage_delta: number | null;
+}
+
+interface Stats {
+  totals: {
+    jobs: number;
+    total_tokens: number | null;
+    total_calls: number | null;
+    total_usage_delta: number | null;
+    done: number;
+    denied: number;
+  };
+  by_kind: KindStats[];
+  by_finding: FindingStats[];
+}
+
 // ---------------------------------------------------------------------------
 // Severity ranking
 // ---------------------------------------------------------------------------
@@ -393,20 +431,80 @@ function renderEvents(events: Event[]): void {
   $("lastEvent").textContent = `${ts(last.at)} ${last.kind}: ${last.message}`;
 }
 
+function pct(v: number | null): string {
+  return v != null ? (v * 100).toFixed(2) + "%" : "\u2013";
+}
+
+function renderStats(stats: Stats): void {
+  const t = stats.totals;
+  let html = `<div style="margin:8px 0;font-size:12px">
+    <b>Totals:</b> ${t.jobs} jobs \u00b7 ${ktok(t.total_tokens)} tokens
+    \u00b7 ${t.total_calls ?? 0} calls \u00b7 ${t.done} done \u00b7 ${t.denied} denied
+    \u00b7 usage: ${pct(t.total_usage_delta)}
+  </div>`;
+
+  if (stats.by_kind.length) {
+    html += `<table>
+      <tr><th>kind</th><th class="num">jobs</th><th class="num">done</th>
+          <th class="num">failed</th><th class="num">killed</th><th class="num">denied</th>
+          <th class="num">tokens</th><th class="num">avg</th>
+          <th class="num">usage \u0394</th><th>models</th></tr>
+      ${stats.by_kind
+        .map(
+          (k) => `<tr>
+        <td>${esc(k.kind)}</td>
+        <td class="num">${k.jobs}</td><td class="num">${k.done}</td>
+        <td class="num">${k.failed}</td><td class="num">${k.killed}</td>
+        <td class="num">${k.denied}</td>
+        <td class="num">${ktok(k.total_tokens)}</td>
+        <td class="num">${ktok(k.avg_tokens)}</td>
+        <td class="num">${pct(k.total_usage_delta)}</td>
+        <td>${esc(k.models || "")}</td>
+      </tr>`,
+        )
+        .join("")}
+    </table>`;
+  }
+
+  if (stats.by_finding.length) {
+    html += `<div style="margin-top:10px"><b>Per finding:</b></div><table>
+      <tr><th>#</th><th>fingerprint</th><th>status</th><th>sev</th>
+          <th class="num">jobs</th><th class="num">tokens</th>
+          <th class="num">calls</th><th class="num">usage \u0394</th></tr>
+      ${stats.by_finding
+        .map(
+          (f) => `<tr>
+        <td>${f.finding_id}</td><td class="fp">${esc(f.fingerprint)}</td>
+        <td>${esc(f.status)}</td><td>${esc(f.severity)}</td>
+        <td class="num">${f.jobs}</td><td class="num">${ktok(f.total_tokens)}</td>
+        <td class="num">${f.total_calls ?? "\u2013"}</td>
+        <td class="num">${pct(f.total_usage_delta)}</td>
+      </tr>`,
+        )
+        .join("")}
+    </table>`;
+  }
+
+  $("stats").innerHTML = html || '<div class="empty">no job data yet</div>';
+}
+
 // ---------------------------------------------------------------------------
 // Main refresh loop
 // ---------------------------------------------------------------------------
 
 async function refresh(): Promise<void> {
   try {
-    const [summary, findings, jobs, events] = await Promise.all([
+    const [summary, findings, jobs, events, stats] = await Promise.all([
       api<Summary>("/api/summary"),
       api<Finding[]>("/api/findings"),
       api<Job[]>("/api/jobs"),
       api<Event[]>("/api/events"),
+      api<Stats>("/api/stats"),
     ]);
     if (
-      [summary, findings, jobs, events].some((r) => r.status !== 200)
+      [summary, findings, jobs, events, stats].some(
+        (r) => r.status !== 200,
+      )
     ) {
       throw new Error("api error");
     }
@@ -492,6 +590,7 @@ async function refresh(): Promise<void> {
           .join("")
       : '<div class="empty">nothing suppressed</div>';
 
+    renderStats(stats.body!);
     renderJobs(jobs.body!);
     renderEvents(events.body!);
 

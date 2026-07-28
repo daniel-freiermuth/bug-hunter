@@ -110,6 +110,16 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/events":
                 self._json(self._store().recent_events(limit=100))
                 return
+            if url.path == "/api/stats":
+                store = self._store()
+                self._json(
+                    {
+                        "totals": store.stats_totals(),
+                        "by_kind": store.stats_by_kind(),
+                        "by_finding": store.stats_by_finding(),
+                    }
+                )
+                return
             self._error(404, "not found")
         except Exception:
             log.exception("GET %s", self.path)

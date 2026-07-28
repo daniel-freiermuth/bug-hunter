@@ -27,6 +27,8 @@ _JOB_COLUMNS = {
     "exit_code",
     "killed_reason",
     "notes",
+    "model",
+    "usage_delta",
     "started_at",
     "finished_at",
     "finding_id",
@@ -70,12 +72,18 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA_PATH.read_text())
         self.db.commit()
-        # Migration: add forge column for existing DBs created before v2.
-        try:
-            self.db.execute("SELECT forge FROM repos LIMIT 1")
-        except sqlite3.OperationalError:
-            self.db.execute("ALTER TABLE repos ADD COLUMN forge TEXT NOT NULL DEFAULT 'github'")
-            self.db.commit()
+        # Migrations for existing DBs.
+        for col, sql in [
+            ("forge", "ALTER TABLE repos ADD COLUMN forge TEXT NOT NULL DEFAULT 'github'"),
+            ("model", "ALTER TABLE jobs ADD COLUMN model TEXT"),
+            ("usage_delta", "ALTER TABLE jobs ADD COLUMN usage_delta REAL"),
+        ]:
+            try:
+                tbl = "repos" if col == "forge" else "jobs"
+                self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
+            except sqlite3.OperationalError:
+                self.db.execute(sql)
+                self.db.commit()
 
     # -- repos ---------------------------------------------------------
     def add_repo(
@@ -340,3 +348,53 @@ class Store:
         args.append(fid)
         self.db.execute(f"UPDATE findings SET {', '.join(sets)} WHERE id = ?", args)
         self.db.commit()
+
+    # -- stats -------------------------------------------------------------
+    def stats_by_kind(self) -> list[Row]:
+        """Aggregate job stats grouped by kind."""
+        return _rows(
+            self.db.execute(
+                "SELECT kind, COUNT(*) AS jobs,"
+                " SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) AS done,"
+                " SUM(CASE WHEN state='failed' THEN 1 ELSE 0 END) AS failed,"
+                " SUM(CASE WHEN state='killed' THEN 1 ELSE 0 END) AS killed,"
+                " SUM(CASE WHEN state='denied' THEN 1 ELSE 0 END) AS denied,"
+                " SUM(tokens_new) AS total_tokens,"
+                " SUM(calls) AS total_calls,"
+                " AVG(tokens_new) AS avg_tokens,"
+                " SUM(usage_delta) AS total_usage_delta,"
+                " GROUP_CONCAT(DISTINCT model) AS models"
+                " FROM jobs GROUP BY kind ORDER BY kind"
+            )
+        )
+
+    def stats_by_finding(self) -> list[Row]:
+        """Total tokens and job count per finding."""
+        return _rows(
+            self.db.execute(
+                "SELECT j.finding_id, f.fingerprint, f.status, f.severity,"
+                " COUNT(*) AS jobs,"
+                " SUM(j.tokens_new) AS total_tokens,"
+                " SUM(j.calls) AS total_calls,"
+                " SUM(j.usage_delta) AS total_usage_delta"
+                " FROM jobs j JOIN findings f ON f.id = j.finding_id"
+                " WHERE j.finding_id IS NOT NULL"
+                " GROUP BY j.finding_id"
+                " ORDER BY total_tokens DESC"
+            )
+        )
+
+    def stats_totals(self) -> Row:
+        """Overall totals across all jobs."""
+        rows = _rows(
+            self.db.execute(
+                "SELECT COUNT(*) AS jobs,"
+                " SUM(tokens_new) AS total_tokens,"
+                " SUM(calls) AS total_calls,"
+                " SUM(usage_delta) AS total_usage_delta,"
+                " SUM(CASE WHEN state='done' THEN 1 ELSE 0 END) AS done,"
+                " SUM(CASE WHEN state='denied' THEN 1 ELSE 0 END) AS denied"
+                " FROM jobs"
+            )
+        )
+        return rows[0] if rows else {}

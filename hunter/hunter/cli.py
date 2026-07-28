@@ -137,6 +137,57 @@ def cmd_events(store: Store, cfg: Config, args: argparse.Namespace) -> None:
         print(f"{e['at']}  [{e['kind']}]  {e['message']}")
 
 
+def cmd_stats(store: Store, cfg: Config, args: argparse.Namespace) -> None:
+    totals = store.stats_totals()
+    print("=== Totals ===")
+    print(
+        f"  jobs: {totals.get('jobs', 0)}"
+        f"  done: {totals.get('done', 0)}"
+        f"  denied: {totals.get('denied', 0)}"
+    )
+    print(f"  tokens: {totals.get('total_tokens') or 0:,}")
+    print(f"  calls:  {totals.get('total_calls') or 0:,}")
+    delta = totals.get("total_usage_delta")
+    if delta is not None:
+        print(f"  usage delta: {delta:.2%} (upper bound of weekly budget consumed)")
+
+    by_kind = store.stats_by_kind()
+    if by_kind:
+        print("\n=== By Job Type ===")
+        _fmt(
+            by_kind,
+            [
+                "kind",
+                "jobs",
+                "done",
+                "failed",
+                "killed",
+                "denied",
+                "total_tokens",
+                "avg_tokens",
+                "total_usage_delta",
+                "models",
+            ],
+        )
+
+    by_finding = store.stats_by_finding()
+    if by_finding:
+        print("\n=== By Finding ===")
+        _fmt(
+            by_finding,
+            [
+                "finding_id",
+                "fingerprint",
+                "status",
+                "severity",
+                "jobs",
+                "total_tokens",
+                "total_calls",
+                "total_usage_delta",
+            ],
+        )
+
+
 def cmd_hunt(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     from .scheduler import run_hunt
 
@@ -250,6 +301,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("jobs", help="list jobs").set_defaults(fn=cmd_jobs)
     sub.add_parser("events", help="recent events").set_defaults(fn=cmd_events)
+    sub.add_parser("stats", help="job and token stats").set_defaults(fn=cmd_stats)
 
     p = sub.add_parser("hunt", help="run a hunt for one repo")
     p.add_argument("repo")

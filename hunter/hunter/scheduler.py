@@ -20,7 +20,7 @@ from .playbooks import (
     build_recheck_prompt,
 )
 from .store import Store
-from .types import Config, Row, RunResult, now_ms
+from .types import Config, Row, RunResult, WindowState, now_ms
 from .util import run_cmd
 
 
@@ -30,7 +30,21 @@ def _job_state(rr: RunResult) -> str:
     return "done" if rr.exit_code == 0 else "failed"
 
 
-def _record_job(store: Store, job_id: int, rr: RunResult) -> str:
+def _usage_snapshot(windows: dict[str, WindowState]) -> float | None:
+    """Max used_fraction across 7d windows, or None if unavailable."""
+    fracs = [
+        w.used_fraction for k, w in windows.items() if ":7d" in k and w.used_fraction is not None
+    ]
+    return max(fracs) if fracs else None
+
+
+def _record_job(
+    store: Store,
+    job_id: int,
+    rr: RunResult,
+    model: str | None = None,
+    usage_delta: float | None = None,
+) -> str:
     state = _job_state(rr)
     store.update_job(
         job_id,
@@ -41,6 +55,8 @@ def _record_job(store: Store, job_id: int, rr: RunResult) -> str:
         exit_code=rr.exit_code,
         killed_reason=rr.killed_reason,
         session_file=rr.session_file,
+        model=model,
+        usage_delta=usage_delta,
         finished_at=now_ms(),
     )
     return state
@@ -155,16 +171,20 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         out_path,
         cfg.hunt_max_findings,
     )
+    pre_usage = _usage_snapshot(windows)
     store.update_job(job, state="running")
+    model = cfg.model_for("hunt")
     rr = runner.run_worker(
         cfg,
         rpath,
         prompt,
         dec.cap_tokens,
         cfg.hunt_max_wall_s,
-        model=cfg.model_for("hunt"),
+        model=model,
     )
-    state = _record_job(store, job, rr)
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
 
     summary: Row = {
         "kind": "hunt",
@@ -261,16 +281,20 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
     out_path = cfg.work_root / "out" / f"recheck{fid}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prompt = build_recheck_prompt(finding, repo, out_path)
+    pre_usage = _usage_snapshot(windows)
     store.update_job(job, state="running")
+    model = cfg.model_for("hunt")
     rr = runner.run_worker(
         cfg,
         rpath,
         prompt,
         dec.cap_tokens,
         cfg.hunt_max_wall_s,
-        model=cfg.model_for("hunt"),
+        model=model,
     )
-    state = _record_job(store, job, rr)
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
     summary: Row = {
         "kind": "recheck",
         "finding": fid,
@@ -457,18 +481,22 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         return {"denied": dec.reason, "job": job}
 
     job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens)
+    pre_usage = _usage_snapshot(windows)
     store.set_status(fid, "fixing")
     store.update_job(job, state="running")
     prompt = build_fix_prompt(finding, worktree, branch, repo)
+    model = cfg.model_for("fix")
     rr = runner.run_worker(
         cfg,
         worktree,
         prompt,
         dec.cap_tokens,
         cfg.fix_max_wall_s,
-        model=cfg.model_for("fix"),
+        model=model,
     )
-    state = _record_job(store, job, rr)
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
     summary: Row = {
         "kind": "fix",
         "finding": fid,
@@ -888,15 +916,19 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
         pr,
         ps.get("needs_attention") or "",
     )
+    pre_usage = _usage_snapshot(windows)
+    model = cfg.model_for("fix")
     rr = runner.run_worker(
         cfg,
         worktree,
         prompt,
         dec.cap_tokens,
         cfg.fix_max_wall_s,
-        model=cfg.model_for("fix"),
+        model=model,
     )
-    state = _record_job(store, job, rr)
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
     summary: Row = {
         "kind": "engage",
         "finding": fid,

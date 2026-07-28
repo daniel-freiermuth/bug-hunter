@@ -42,7 +42,7 @@ CREATE INDEX IF NOT EXISTS findings_repo ON findings(repo_id, status);
 
 CREATE TABLE IF NOT EXISTS jobs (
   id            INTEGER PRIMARY KEY,
-  kind          TEXT NOT NULL,             -- hunt | fix
+  kind          TEXT NOT NULL,             -- hunt | fix | engage | recheck
   repo_id       INTEGER NOT NULL REFERENCES repos(id),
   finding_id    INTEGER REFERENCES findings(id),
   state         TEXT NOT NULL DEFAULT 'queued',
@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   exit_code     INTEGER,
   killed_reason TEXT,                      -- cap | wallclock | NULL
   notes         TEXT,
+  model         TEXT,                      -- model used for this job
+  usage_delta   REAL,                      -- 7d used_fraction increase observed during job
   started_at    INTEGER,
   finished_at   INTEGER
 );
