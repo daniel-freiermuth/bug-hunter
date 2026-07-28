@@ -43,12 +43,22 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA_PATH.read_text())
         self.db.commit()
+        # Migration: add forge column for existing DBs created before v2.
+        try:
+            self.db.execute("SELECT forge FROM repos LIMIT 1")
+        except sqlite3.OperationalError:
+            self.db.execute(
+                "ALTER TABLE repos ADD COLUMN forge TEXT NOT NULL DEFAULT 'github'")
+            self.db.commit()
 
     # -- repos ---------------------------------------------------------
-    def add_repo(self, name: str, url: str, path: str, default_branch: str = "main") -> int:
+    def add_repo(self, name: str, url: str, path: str,
+                 default_branch: str = "main",
+                 forge: str = "github") -> int:
         cur = self.db.execute(
-            "INSERT INTO repos (name, url, path, default_branch, added_at) VALUES (?,?,?,?,?)",
-            (name, url, str(path), default_branch, now_ms()),
+            "INSERT INTO repos (name, url, path, forge, default_branch, added_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (name, url, str(path), forge, default_branch, now_ms()),
         )
         self.db.commit()
         return cur.lastrowid

@@ -36,14 +36,20 @@ def cmd_init(store: Store, cfg: Config, args) -> None:
 
 
 def cmd_add_repo(store: Store, cfg: Config, args) -> None:
+    from .forge import FORGE_NAMES, detect_forge
+    forge = args.forge
+    if forge is None:
+        forge = detect_forge(args.url)
+    if forge not in FORGE_NAMES:
+        sys.exit(f"error: unknown forge {forge!r} (choose from {', '.join(FORGE_NAMES)})")
     path = cfg.work_root / "repos" / args.name
-    rid = store.add_repo(args.name, args.url, str(path), args.branch)
-    print(f"repo #{rid} {args.name} -> {path}")
+    rid = store.add_repo(args.name, args.url, str(path), args.branch, forge=forge)
+    print(f"repo #{rid} {args.name} ({forge}) -> {path}")
 
 
 def cmd_repos(store: Store, cfg: Config, args) -> None:
     _fmt(store.list_repos(),
-         ["id", "name", "url", "default_branch", "last_hunt_sha", "enabled"])
+         ["id", "name", "url", "forge", "default_branch", "last_hunt_sha", "enabled"])
 
 
 def cmd_findings(store: Store, cfg: Config, args) -> None:
@@ -144,6 +150,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name")
     p.add_argument("url")
     p.add_argument("--branch", default="main")
+    p.add_argument("--forge", default=None, choices=["github", "gitlab"],
+                   help="forge type (auto-detected from URL if omitted)")
     p.set_defaults(fn=cmd_add_repo)
 
     sub.add_parser("repos", help="list repos").set_defaults(fn=cmd_repos)
@@ -184,8 +192,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repo", default=None)
     p.set_defaults(fn=cmd_cycle)
 
-    sub.add_parser("sync", help="refresh pr_state for open PRs (gh only,"
-                   " no tokens)").set_defaults(fn=cmd_sync)
+    sub.add_parser("sync", help="refresh pr_state for open PRs/MRs"
+                   " (no tokens)").set_defaults(fn=cmd_sync)
 
     p = sub.add_parser("serve", help="run the triage UI")
     p.add_argument("--port", type=int, default=None)

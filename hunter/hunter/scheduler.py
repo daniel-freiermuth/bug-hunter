@@ -4,12 +4,13 @@ run_cycle never raises (the loop that calls it must survive anything).
 from __future__ import annotations
 
 import json
-import re
 import subprocess
+import re
 from datetime import datetime
 from pathlib import Path
 
 from . import budget, runner
+from .forge import forge_for
 from .ingest import ingest_findings
 from .playbooks import build_engage_prompt, build_fix_prompt, build_hunt_prompt, build_recheck_prompt
 from .types import Config, now_ms
@@ -29,17 +30,6 @@ def _run(cmd: list[str], cwd=None, timeout: int = 300) -> tuple[int, str]:
         return 127, str(e)
 
 
-def _ssh_url(url: str) -> str:
-    """https://github.com/O/R(.git)? -> git@github.com:O/R.git (ssh passthrough)."""
-    m = re.match(r"^https://github\.com/([^/]+)/(.+?)(?:\.git)?/?$", url)
-    if m:
-        return f"git@github.com:{m.group(1)}/{m.group(2)}.git"
-    return url
-
-
-def _owner_repo(url: str) -> str | None:
-    m = re.match(r"^(?:https://github\.com/|git@github\.com:)([^/]+)/(.+?)(?:\.git)?/?$", url)
-    return f"{m.group(1)}/{m.group(2)}" if m else None
 
 
 def _job_state(rr) -> str:
@@ -337,26 +327,27 @@ def run_fix(store, cfg: Config, finding: dict) -> dict:
                             f"{db}..HEAD", "--oneline"])
     pr_desc = worktree / "PR-DESCRIPTION.md"
     if rc == 0 and commits and pr_desc.exists():
-        push_url = _ssh_url(repo["url"])
+        forge = forge_for(repo)
+        push_url = forge.ssh_url(repo["url"])
         rc, out = _run(["git", "-C", str(worktree), "push", push_url, "HEAD"],
                        timeout=600)
         if rc == 0:
             _, title = _run(["git", "-C", str(worktree), "log", "-1", "--format=%s"])
-            slug_or = _owner_repo(repo["url"])
-            cmd = ["gh", "pr", "create", "--draft", "--head", branch,
-                   "--title", title or branch, "--body-file", str(pr_desc)]
-            if slug_or:
-                cmd[3:3] = ["-R", slug_or]
-            rc, out = _run(cmd, cwd=str(worktree), timeout=300)
-            if rc == 0:
-                pr_url = out.strip().splitlines()[-1] if out else ""
-                store.set_status(fid, "pr_open", pr_url=pr_url)
-                store.log_event("ship", f"#{fid} draft PR: {pr_url}",
-                                job_id=job, finding_id=fid)
-                _drop_worktree(delete_branch=False)
-                summary.update(outcome="pr_open", pr_url=pr_url)
-                return summary
-            failure = f"gh pr create failed: {out[-300:]}"
+            slug = forge.owner_repo(repo["url"])
+            if not slug:
+                failure = f"unparseable repo url for PR: {repo['url']!r}"
+            else:
+                rc, pr_url_or_err = forge.create_pr(
+                    slug, branch, title or branch, pr_desc,
+                    cwd=str(worktree))
+                if rc == 0:
+                    store.set_status(fid, "pr_open", pr_url=pr_url_or_err)
+                    store.log_event("ship", f"#{fid} draft PR: {pr_url_or_err}",
+                                    job_id=job, finding_id=fid)
+                    _drop_worktree(delete_branch=False)
+                    summary.update(outcome="pr_open", pr_url=pr_url_or_err)
+                    return summary
+                failure = f"PR create failed: {pr_url_or_err[-300:]}"
         else:
             failure = f"push failed: {out[-300:]}"
     else:
@@ -374,14 +365,13 @@ def run_fix(store, cfg: Config, finding: dict) -> dict:
 
 # -- pr sync ----------------------------------------------------------------
 
-_PR_URL_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)")
 _FAIL_CONCLUSIONS = ("FAILURE", "TIMED_OUT", "CANCELLED")
 _REJECT_CLOSED = ("PR closed without merge — treat this bug class/location"
                   " as human-rejected")
 
 
 def _iso_ms(ts: str | None) -> int:
-    """gh ISO-8601 timestamp -> epoch ms (0 when absent/unparseable)."""
+    """ISO-8601 timestamp -> epoch ms (0 when absent/unparseable)."""
     if not ts:
         return 0
     try:
@@ -413,30 +403,29 @@ def _checks_summary(rollup: list | None) -> tuple[str | None, bool]:
 
 
 def sync_prs(store, cfg: Config) -> dict:
-    """Refresh pr_state for every pr_open finding. gh reads only — no tokens,
-    never raises; a gh failure logs an event and skips that PR."""
+    """Refresh pr_state for every pr_open finding.  Forge reads only — no
+    tokens, never raises; a forge CLI failure logs an event and skips that PR."""
     summary = {"synced": 0, "merged": 0, "closed": 0, "attention": 0, "errors": 0}
     for f in store.list_findings(status="pr_open"):
         fid, url = f["id"], f.get("pr_url") or ""
-        m = _PR_URL_RE.match(url)
-        if not m:
+        repo = store.get_repo(f["repo_id"])
+        if repo is None:
+            store.log_event("error", f"sync #{fid}: repo {f['repo_id']} missing",
+                            finding_id=fid)
+            summary["errors"] += 1
+            continue
+        forge = forge_for(repo)
+        parsed = forge.parse_pr_url(url)
+        if not parsed:
             store.log_event("error", f"sync #{fid}: unparseable pr_url {url!r}",
                             finding_id=fid)
             summary["errors"] += 1
             continue
-        slug, num = m.group(1), int(m.group(2))
-        rc, out = _run(["gh", "pr", "view", str(num), "-R", slug, "--json",
-                        "state,mergedAt,mergeable,reviewDecision,statusCheckRollup,"
-                        "comments,reviews,updatedAt,headRefName"], timeout=30)
-        if rc != 0:
-            store.log_event("error", f"sync #{fid}: gh pr view failed: {out[-300:]}",
-                            finding_id=fid)
-            summary["errors"] += 1
-            continue
-        try:
-            pr = json.loads(out)
-        except ValueError:
-            store.log_event("error", f"sync #{fid}: bad gh JSON: {out[:200]}",
+        slug, num = parsed
+        rc, pr, raw = forge.view_pr_sync(slug, num)
+        if rc != 0 or pr is None:
+            store.log_event("error",
+                            f"sync #{fid}: PR/MR view failed: {(raw or '')[-300:]}",
                             finding_id=fid)
             summary["errors"] += 1
             continue
@@ -508,7 +497,8 @@ def run_engage(store, cfg: Config, finding: dict) -> dict:
         store.log_event("error", f"engage #{fid}: no pr_state/head_ref — sync first",
                         finding_id=fid)
         return {"error": "no pr_state"}
-    slug = _owner_repo(repo["url"])
+    forge = forge_for(repo)
+    slug = forge.owner_repo(repo["url"])
     if not slug:
         store.log_event("error", f"engage #{fid}: unparseable repo url {repo['url']!r}",
                         finding_id=fid)
@@ -551,19 +541,13 @@ def run_engage(store, cfg: Config, finding: dict) -> dict:
                         finding_id=fid)
         return {"denied": dec.reason, "job": job}
 
-    rc, out = _run(["gh", "pr", "view", str(num), "-R", slug, "--json",
-                    "title,body,comments,reviews,statusCheckRollup"], timeout=30)
-    pr = None
-    if rc == 0:
-        try:
-            pr = json.loads(out)
-        except ValueError:
-            pr = None
+    rc, pr, raw = forge.view_pr_engage(slug, num)
     if pr is None:
-        store.log_event("error", f"engage #{fid}: gh pr view failed: {out[-300:]}",
+        store.log_event("error",
+                        f"engage #{fid}: PR/MR view failed: {(raw or '')[-300:]}",
                         finding_id=fid)
         _drop_worktree()
-        return {"error": "gh pr view failed"}
+        return {"error": "PR/MR view failed"}
 
     job = store.create_job("engage", repo["id"], finding_id=fid,
                            cap_tokens=dec.cap_tokens)
@@ -580,8 +564,7 @@ def run_engage(store, cfg: Config, finding: dict) -> dict:
     withdraw = worktree / "WITHDRAW.md"
     if withdraw.exists():
         reason = withdraw.read_text()
-        _run(["gh", "pr", "close", str(num), "-R", slug, "--comment", reason[:800]],
-             timeout=60)
+        forge.close_pr(slug, num, reason[:800])
         store.set_status(fid, "rejected", verdict_reason=reason[:500])
         store.upsert_pr_state(fid, state="CLOSED", needs_attention=None,
                               synced_at=now_ms())
@@ -601,7 +584,7 @@ def run_engage(store, cfg: Config, finding: dict) -> dict:
                             f"origin/{head_ref}..HEAD", "--oneline"])
         if rc == 0 and commits:
             rc, out = _run(["git", "-C", str(worktree), "push",
-                            _ssh_url(repo["url"]), f"HEAD:{head_ref}"], timeout=600)
+                            forge.ssh_url(repo["url"]), f"HEAD:{head_ref}"], timeout=600)
             if rc == 0:
                 pushed = True
             else:
@@ -609,12 +592,11 @@ def run_engage(store, cfg: Config, finding: dict) -> dict:
     if failure is None:
         reply = worktree / "PR-REPLY.md"
         if reply.exists():
-            rc, out = _run(["gh", "pr", "comment", str(num), "-R", slug,
-                            "--body-file", str(reply)], timeout=60)
+            rc, out = forge.comment_pr(slug, num, reply)
             if rc == 0:
                 replied = True
             else:
-                failure = f"gh pr comment failed: {out[-300:]}"
+                failure = f"PR comment failed: {out[-300:]}"
 
     # (c) Failure: keep the worktree and the attention flag — retry next cycle.
     if failure is not None:

@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS repos (
   name          TEXT NOT NULL UNIQUE,
   url           TEXT NOT NULL,             -- https or ssh remote
   path          TEXT NOT NULL,             -- local clone path (workRoot/repos/<name>)
+  forge          TEXT NOT NULL DEFAULT 'github', -- github | gitlab
   default_branch TEXT NOT NULL DEFAULT 'main',
   last_hunt_sha TEXT,                      -- HEAD at last completed hunt
   last_hunt_at  INTEGER,                   -- epoch ms
