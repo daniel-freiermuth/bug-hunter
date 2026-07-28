@@ -1,6 +1,11 @@
-"""Budget policy — two horizons (exp2): 5h window is the scheduling grain,
-the 7-day caps are the true budget. Reads omp's local usage mirror; treats
-stale rows as unknown and falls back to conservative caps.
+"""Budget policy — linear ramp over the 7-day window.
+
+Core rule: if fraction p of the 7-day window has elapsed, the scavenger may
+have consumed at most p × (1 − interactive_reserve) of the budget. This
+spreads spending evenly and guarantees the reserve is never touched.
+
+The 5h window is a short-horizon gate (deny when near-exhausted so the human
+isn't locked out mid-afternoon). Stale or missing data → always deny.
 """
 from __future__ import annotations
 
@@ -42,33 +47,56 @@ def read_windows() -> dict[str, WindowState]:
 
 def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDecision:
     base = cfg.hunt_cap_tokens if kind == "hunt" else cfg.fix_cap_tokens
+    now_ms = time.time() * 1000
 
     if not windows:
-        return BudgetDecision(True, "no window data — conservative cap",
-                              min(base, _CONSERVATIVE_CAP))
+        return BudgetDecision(False, "no window data — deny until fresh")
 
     fresh = {k: w for k, w in windows.items() if w.age_s <= cfg.stale_after_s}
+    if not fresh:
+        return BudgetDecision(False, "window data stale or missing — deny until fresh")
 
+    # -- 5h gate: don't lock the human out mid-session -----------------------
     w5 = fresh.get("anthropic:5h")
     if w5 is not None:
         if w5.status == "exhausted" or (w5.used_fraction or 0) >= cfg.deny_5h_above:
             return BudgetDecision(False, f"5h window at {w5.used_fraction} ({w5.status})")
 
-    scavenge_ceiling = 1.0 - cfg.interactive_reserve_7d
-    weekly_pressure = 0.0
+    # -- 7d linear ramp: spend proportionally to elapsed time ----------------
+    scavenge_ceiling = 1.0 - cfg.interactive_reserve_7d   # e.g. 0.75
+    WEEK_MS = 7 * 24 * 3600 * 1000
+
     for lid, w in fresh.items():
-        if ":7d" in lid and w.used_fraction is not None:
-            if w.used_fraction >= scavenge_ceiling:
-                return BudgetDecision(False, f"{lid} at {w.used_fraction} ≥ weekly reserve line {scavenge_ceiling:.2f}")
-            weekly_pressure = max(weekly_pressure, w.used_fraction)
+        if ":7d" not in lid or w.used_fraction is None:
+            continue
+        if w.resets_at and w.resets_at > now_ms:
+            started_ms = w.resets_at - WEEK_MS
+            elapsed_frac = min((now_ms - started_ms) / WEEK_MS, 1.0)
+        else:
+            elapsed_frac = 1.0   # can't compute → assume end-of-window
+        allowed = elapsed_frac * scavenge_ceiling
+        used = w.used_fraction
+        if used >= allowed:
+            return BudgetDecision(
+                False,
+                f"{lid}: used {used:.2f} ≥ ramp {allowed:.2f} "
+                f"(elapsed {elapsed_frac:.1%} × ceiling {scavenge_ceiling:.2f})")
+
+    # -- allowed: scale cap by remaining ramp headroom -----------------------
+    # Find the tightest 7d limit's remaining ramp room
+    min_headroom = 1.0
+    for lid, w in fresh.items():
+        if ":7d" not in lid or w.used_fraction is None or not w.resets_at:
+            continue
+        started_ms = w.resets_at - WEEK_MS
+        elapsed_frac = min((now_ms - started_ms) / WEEK_MS, 1.0)
+        allowed = elapsed_frac * scavenge_ceiling
+        headroom = (allowed - w.used_fraction) / scavenge_ceiling if scavenge_ceiling else 0
+        min_headroom = min(min_headroom, headroom)
 
     cap = base
-    reason = f"ok (weekly pressure {weekly_pressure:.2f})"
-    if weekly_pressure >= 0.8 * scavenge_ceiling:
+    if min_headroom < 0.1:
         cap = base // 2
-        reason = f"weekly pressure {weekly_pressure:.2f} near reserve — cap halved"
-
-    if not fresh:
-        return BudgetDecision(False, "window data stale or missing — deny until fresh")
-
+    reason = (f"ok (ramp headroom {min_headroom:.1%})"
+              + (", cap halved" if min_headroom < 0.1 else ""))
     return BudgetDecision(True, reason, cap)
