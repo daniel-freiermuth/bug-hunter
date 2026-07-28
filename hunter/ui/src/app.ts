@@ -618,6 +618,25 @@ async function refresh(): Promise<void> {
           .join("")
       : '<div class="empty">nothing suppressed</div>';
 
+    const notes = all.filter((f) => f.status === "note");
+    $("nNotes").textContent = `(${notes.length})`;
+    $("notes").innerHTML = notes.length
+      ? notes
+          .map(
+            (f) => `<div class="card">
+          <div class="top"><span class="badge">note</span>
+          <span class="fp">#${f.id} ${esc(f.fingerprint)}</span></div>
+          <div class="sum">${esc(f.summary)}</div>
+          <div class="loc">${esc(f.file || "")}${f.line ? ":" + f.line : ""}</div>
+          <div class="acts">
+            <button onclick="verdict(${f.id},'queued',false)">Queue fix</button>
+            <button onclick="verdict(${f.id},'rejected',true)">Reject</button>
+          </div>
+        </div>`,
+          )
+          .join("")
+      : '<div class="empty">no notes</div>';
+
     renderStats(stats.body!);
     renderJobs(jobs.body!);
     renderEvents(events.body!);
