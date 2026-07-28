@@ -281,9 +281,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class _Server(ThreadingHTTPServer):
-    allow_reuse_address = True
-    allow_reuse_port = True
-    request_queue_size = 64  # default 5 is too low for burst page loads
+    allow_reuse_address = True  # reuse addr after restart (TIME_WAIT)
+    request_queue_size = 64
 
     def handle_error(
         self,
