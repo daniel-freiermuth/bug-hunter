@@ -165,11 +165,17 @@ class Handler(BaseHTTPRequestHandler):
                 msg = f"unknown repo {repo_key!r}"
                 raise ValueError(msg)
             repo_id = repo["id"]
-        return store.list_findings(  # type: ignore[no-any-return]
+        findings: list[Row] = store.list_findings(
             status=status,
             repo_id=repo_id,
             min_severity=severity,
         )
+        # Embed per-finding event timeline.
+        fids: list[int] = [f["id"] for f in findings]
+        timelines = store.events_by_finding(fids)
+        for f in findings:
+            f["timeline"] = timelines.get(f["id"], [])
+        return findings
 
     # -- POST -------------------------------------------------------------
 

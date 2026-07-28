@@ -309,6 +309,22 @@ class Store:
     def recent_events(self, limit: int = 100) -> list[Row]:
         return _rows(self.db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)))
 
+    def events_by_finding(self, fids: list[int]) -> dict[int, list[Row]]:
+        """Return events grouped by finding_id for the given IDs."""
+        if not fids:
+            return {}
+        ph = ",".join("?" * len(fids))
+        rows = _rows(
+            self.db.execute(
+                f"SELECT * FROM events WHERE finding_id IN ({ph}) ORDER BY id",
+                fids,
+            )
+        )
+        out: dict[int, list[Row]] = {}
+        for r in rows:
+            out.setdefault(r["finding_id"], []).append(r)
+        return out
+
     def log_window(self, states: list[WindowState]) -> None:
         t = now_ms()
         for w in states:

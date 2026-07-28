@@ -31,6 +31,7 @@ interface Finding {
   pr_url: string | null;
   created_at: number;
   updated_at: number;
+  timeline: Event[];
 }
 
 interface Job {
@@ -164,6 +165,13 @@ function ts(ms: number | null): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function datetime(ms: number | null): string {
+  if (!ms) return "\u2013";
+  const d = new Date(ms);
+  return d.toLocaleDateString([], { month: "short", day: "numeric" }) +
+    " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function countdown(ms: number | null): string {
@@ -336,6 +344,17 @@ function findingCard(f: Finding, withActions: boolean): string {
   const loc = `${esc(f.file || "")}${f.line ? ":" + f.line : ""}${f.symbol ? " \u00b7 " + esc(f.symbol) : ""}`;
   const detail = (f.detail || "").trim();
   const plan = (f.evidence_plan || "").trim();
+  const tl = f.timeline || [];
+  const timeline = tl.length
+    ? `<details><summary>timeline (${tl.length})</summary>
+      <div class="timeline">${tl
+        .map(
+          (e) =>
+            `<div class="tl-entry"><span class="t">${datetime(e.at)}</span> <span class="k">${esc(e.kind)}</span> ${esc(e.message)}</div>`,
+        )
+        .join("")}</div>
+    </details>`
+    : "";
   return `<div class="card">
     <div class="top">
       <span class="badge sev-${sev}">${sev} \u00b7 ${conf}</span>
@@ -352,6 +371,7 @@ function findingCard(f: Finding, withActions: boolean): string {
     </details>`
         : ""
     }
+    ${timeline}
     ${
       withActions
         ? `<div class="acts">
