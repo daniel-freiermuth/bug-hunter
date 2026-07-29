@@ -550,7 +550,7 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         forge = forge_for(repo)
         push_url = forge.ssh_url(repo["url"])
         rc, out = run_cmd(
-            ["git", "-C", str(worktree), "push", push_url, "HEAD"],
+            ["git", "-C", str(worktree), "push", "--force", push_url, "HEAD"],
             timeout=600,
         )
         if rc == 0:
@@ -982,6 +982,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
                     "-C",
                     str(worktree),
                     "push",
+                    "--force",
                     forge.ssh_url(repo["url"]),
                     f"HEAD:{head_ref}",
                 ],
