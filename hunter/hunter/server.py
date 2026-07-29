@@ -196,6 +196,9 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/recheck":
                 self._recheck()
                 return
+            if url.path == "/api/unqueue":
+                self._unqueue()
+                return
             self._error(404, "not found")
         except (ValueError, json.JSONDecodeError) as exc:
             self._error(400, str(exc))
@@ -278,6 +281,27 @@ class Handler(BaseHTTPRequestHandler):
         store.set_status(fid, "rechecking")
         store.log_event("recheck", f"#{fid} queued for recheck", finding_id=fid)
         self._json({"queued": True, "finding": store.get_finding(fid)})
+
+    def _unqueue(self) -> None:
+        body = self._body_json()
+        fid = body.get("id")
+        if not isinstance(fid, int):
+            self._error(400, "id must be an integer")
+            return
+        store = self._store()
+        finding = store.get_finding(fid)
+        if finding is None:
+            self._error(404, f"no finding {fid}")
+            return
+        if finding["status"] != "queued":
+            self._error(
+                400,
+                f"finding #{fid} is {finding['status']!r}, not 'queued'",
+            )
+            return
+        store.set_status(fid, "new")
+        store.log_event("unqueue", f"#{fid} removed from fix queue", finding_id=fid)
+        self._json({"ok": True, "finding": store.get_finding(fid)})
 
 
 class _Server(ThreadingHTTPServer):

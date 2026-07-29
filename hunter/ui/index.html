@@ -80,13 +80,14 @@
   .acts .rc { border-color: var(--purple); color: var(--purple); background: transparent; }
 
   /* pipeline */
-  #pipeline { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  #pipeline { display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; }
   .col { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 8px; }
   .col h3 { margin: 0 0 6px; font-size: 10px; text-transform: uppercase;
             letter-spacing: .1em; color: var(--dim); font-weight: 600; }
   .col .item { border-top: 1px solid var(--line); padding: 5px 0; font-size: 12px; }
   .col .item:first-of-type { border-top: none; }
-  .col .item .m { color: var(--faint); font-size: 10.5px; }
+  .col .item .m { color: var(--faint); font-size: 10.5px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .uq { font-size: 10px; padding: 1px 6px; border-color: var(--amber); color: var(--amber); background: transparent; }
 
   /* tables / feeds */
   table { width: 100%; border-collapse: collapse; font-size: 12px; }

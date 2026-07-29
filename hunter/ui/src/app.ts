@@ -299,8 +299,29 @@ async function recheck(id: number): Promise<void> {
   refresh();
 }
 
+async function unqueue(id: number): Promise<void> {
+  const btn = document.getElementById("uq" + id) as HTMLButtonElement | null;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Removing\u2026";
+  }
+  const r = await api<{ error?: string }>("/api/unqueue", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  });
+  if (r.status !== 200) {
+    alert("unqueue failed: " + (r.body?.error || r.status));
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Unqueue";
+    }
+  }
+  refresh();
+}
+
 // Expose to onclick handlers in rendered HTML
-Object.assign(window, { verdict, recheck });
+Object.assign(window, { verdict, recheck, unqueue });
 
 // ---------------------------------------------------------------------------
 // Renderers
@@ -402,7 +423,7 @@ function renderPipeline(findings: Finding[]): void {
             .map(
               (f) => `<div class="item">
         #${f.id} ${esc(f.summary)}
-        <div class="m">${esc(f.file || "")}${f.pr_url ? ` \u00b7 <a href="${esc(f.pr_url)}" target="_blank">PR</a>` : ""}</div>
+        <div class="m">${esc(f.file || "")}${f.pr_url ? ` \u00b7 <a href="${esc(f.pr_url)}" target="_blank">PR</a>` : ""}${name === "queued" ? ` <button class="uq" id="uq${f.id}" onclick="unqueue(${f.id})">Unqueue</button>` : ""}</div>
       </div>`,
             )
             .join("")
