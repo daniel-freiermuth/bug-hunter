@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from hunter.budget import _WEEK_MS, decide
+from hunter.budget import decide
 from hunter.types import Config, WindowState
 
 # ---------------------------------------------------------------------------
@@ -13,6 +13,9 @@ from hunter.types import Config, WindowState
 # ---------------------------------------------------------------------------
 
 _NOW_MS = int(time.time() * 1000)
+_WEEK_MS = 7 * 24 * 3600 * 1000
+_5H_MS = 5 * 3600 * 1000
+_1H_MS = 1 * 3600 * 1000
 
 
 def _cfg(**overrides) -> Config:
@@ -21,7 +24,6 @@ def _cfg(**overrides) -> Config:
         "db_path": Path("/tmp/test.db"),
         "hunt_cap_tokens": 200_000,
         "fix_cap_tokens": 150_000,
-        "deny_5h_above": 0.85,
         "stale_after_s": 1800,
     }
     defaults.update(overrides)
@@ -47,10 +49,18 @@ def _ws(
     )
 
 
-def _healthy_windows() -> dict[str, WindowState]:
-    """Windows that should produce an allow decision."""
+def _healthy_windows(
+    *,
+    w5_used: float = 0.05,
+    w5_elapsed_h: float = 4.5,
+) -> dict[str, WindowState]:
+    """Windows that should produce an allow decision.
+
+    Default: 5h window halfway through the harvest hour, low usage.
+    """
+    resets_5h = _NOW_MS + int((5 - w5_elapsed_h) * 3600 * 1000)
     return {
-        "anthropic:5h": _ws("anthropic:5h", used_fraction=0.20),
+        "anthropic:5h": _ws("anthropic:5h", used_fraction=w5_used, resets_at=resets_5h),
         "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10),
         "anthropic:7d:model-class": _ws("anthropic:7d:model-class", used_fraction=0.10),
     }
@@ -79,52 +89,109 @@ def test_all_stale_windows_deny():
 
 
 # ---------------------------------------------------------------------------
-# 5h gate → deny
-# ---------------------------------------------------------------------------
-
-
-def test_5h_exhausted_deny():
-    windows = _healthy_windows()
-    windows["anthropic:5h"] = _ws("anthropic:5h", used_fraction=0.50, status="exhausted")
-    d = decide(_cfg(), "hunt", windows)
-    assert not d.allow
-    assert "5h" in d.reason
-
-
-def test_5h_above_deny_fraction():
-    windows = _healthy_windows()
-    windows["anthropic:5h"] = _ws("anthropic:5h", used_fraction=0.90)
-    d = decide(_cfg(deny_5h_above=0.85), "hunt", windows)
-    assert not d.allow
-    assert "5h" in d.reason
-
-
-def test_5h_at_exact_threshold_deny():
-    windows = _healthy_windows()
-    windows["anthropic:5h"] = _ws("anthropic:5h", used_fraction=0.85)
-    d = decide(_cfg(deny_5h_above=0.85), "hunt", windows)
-    assert not d.allow
-
-
-# ---------------------------------------------------------------------------
 # 7d ramp → deny
 # ---------------------------------------------------------------------------
 
 
 def test_7d_used_above_ramp_deny():
     """7d used_fraction exceeds linear ramp -> deny."""
-    cfg = _cfg()
-    # resets_at at midpoint -> elapsed_frac ~ 0.5, allowed ~ 0.5
-    # used = 0.55 -> clearly above ramp -> deny
-    windows = _healthy_windows()
+    # Place us 10% into the 7d window, but used_fraction = 0.30
+    resets_at = _NOW_MS + int(_WEEK_MS * 0.90)  # 10% elapsed
+    windows = _healthy_windows(w5_elapsed_h=4.5)
     windows["anthropic:7d"] = _ws(
-        "anthropic:7d",
-        used_fraction=0.55,
-        resets_at=_NOW_MS + _WEEK_MS // 2,
+        "anthropic:7d", used_fraction=0.30, resets_at=resets_at,
     )
-    d = decide(cfg, "hunt", windows)
+    d = decide(_cfg(), "hunt", windows)
     assert not d.allow
     assert "ramp" in d.reason
+
+
+def test_7d_used_below_ramp_allow():
+    """7d used_fraction below ramp -> OK (5h also ok)."""
+    resets_at = _NOW_MS + int(_WEEK_MS * 0.50)  # 50% elapsed
+    windows = _healthy_windows(w5_elapsed_h=4.5)
+    windows["anthropic:7d"] = _ws(
+        "anthropic:7d", used_fraction=0.30, resets_at=resets_at,
+    )
+    d = decide(_cfg(), "hunt", windows)
+    assert d.allow
+
+
+# ---------------------------------------------------------------------------
+# 5h last-hour ramp
+# ---------------------------------------------------------------------------
+
+
+def test_5h_first_4h_deny():
+    """Within the first 4 hours, the 5h ramp is 0 → deny."""
+    windows = _healthy_windows(w5_used=0.05, w5_elapsed_h=2.0)
+    d = decide(_cfg(), "hunt", windows)
+    assert not d.allow
+    assert "5h" in d.reason
+    assert "harvest" in d.reason
+
+
+def test_5h_at_exactly_4h_deny():
+    """At exactly 4h elapsed, ramp is 0 → any usage ≥ 0 with fraction > 0 denies."""
+    windows = _healthy_windows(w5_used=0.01, w5_elapsed_h=4.0)
+    d = decide(_cfg(), "hunt", windows)
+    assert not d.allow
+
+
+def test_5h_harvest_halfway_low_usage_allow():
+    """4.5h elapsed → ramp = 0.5; usage 0.05 < 0.5 → allow."""
+    windows = _healthy_windows(w5_used=0.05, w5_elapsed_h=4.5)
+    d = decide(_cfg(), "hunt", windows)
+    assert d.allow
+
+
+def test_5h_harvest_halfway_high_usage_deny():
+    """4.5h elapsed → ramp = 0.5; usage 0.60 ≥ 0.5 → deny."""
+    windows = _healthy_windows(w5_used=0.60, w5_elapsed_h=4.5)
+    d = decide(_cfg(), "hunt", windows)
+    assert not d.allow
+    assert "5h" in d.reason
+
+
+def test_5h_harvest_end_high_usage_allow():
+    """4.95h elapsed → ramp ≈ 0.95; usage 0.90 < 0.95 → allow."""
+    windows = _healthy_windows(w5_used=0.90, w5_elapsed_h=4.95)
+    d = decide(_cfg(), "hunt", windows)
+    assert d.allow
+
+
+def test_5h_exhausted_deny():
+    """Exhausted 5h window → deny regardless of timing."""
+    windows = _healthy_windows(w5_elapsed_h=4.5)
+    windows["anthropic:5h"] = _ws("anthropic:5h", used_fraction=1.0, status="exhausted")
+    d = decide(_cfg(), "hunt", windows)
+    assert not d.allow
+
+
+# ---------------------------------------------------------------------------
+# No active 5h window → allow (opens one)
+# ---------------------------------------------------------------------------
+
+
+def test_no_5h_window_allow():
+    """No 5h window in data → allow, gated only by 7d ramp."""
+    windows = {
+        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10),
+    }
+    d = decide(_cfg(), "hunt", windows)
+    assert d.allow
+    assert d.cap_tokens == 200_000
+
+
+def test_no_5h_window_but_7d_over_deny():
+    """No 5h window, but 7d ramp exceeded → deny."""
+    resets_at = _NOW_MS + int(_WEEK_MS * 0.95)  # 5% elapsed
+    windows = {
+        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.30, resets_at=resets_at),
+    }
+    d = decide(_cfg(), "hunt", windows)
+    assert not d.allow
+    assert "7d" in d.reason
 
 
 # ---------------------------------------------------------------------------

@@ -1,11 +1,14 @@
-"""Budget policy -- linear ramp over the 7-day window.
+"""Budget policy -- two linear ramps.
 
-Core rule: if fraction p of the 7-day window has elapsed, the scavenger may
-have consumed at most p of the total budget.  This spreads spending evenly
-across the week.
+7-day ramp:  allowed = elapsed_fraction_of_7d_window.
+             Spreads spending evenly across the week.
 
-The 5h window is a short-horizon gate (deny when near-exhausted so the human
-isn't locked out mid-afternoon). Stale or missing data -> always deny.
+5-hour ramp: allowed = max(0, (elapsed - 4h) / 1h).
+             Zero for the first 4 hours (human headroom), then 0→1 over the
+             last hour.  Anything unspent at reset is wasted capacity.
+
+No active 5h window → allow (opens one).  The 7d ramp is the outer gate.
+Stale or missing data → deny.
 """
 
 from __future__ import annotations
@@ -15,8 +18,10 @@ import time
 
 from .types import OMP_AGENT_DB, BudgetDecision, Config, WindowState
 
-_CONSERVATIVE_CAP = 120_000
 _WEEK_MS = 7 * 24 * 3600 * 1000
+_5H_MS = 5 * 3600 * 1000
+_4H_MS = 4 * 3600 * 1000
+_1H_MS = 1 * 3600 * 1000
 
 
 def read_windows() -> dict[str, WindowState]:
@@ -60,13 +65,6 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
     if not fresh:
         return BudgetDecision(False, "window data stale or missing -- deny until fresh")
 
-    # -- 5h gate: don't lock the human out mid-session -----------------------
-    w5 = fresh.get("anthropic:5h")
-    if w5 is not None and (
-        w5.status == "exhausted" or (w5.used_fraction or 0) >= cfg.deny_5h_above
-    ):
-        return BudgetDecision(False, f"5h window at {w5.used_fraction} ({w5.status})")
-
     # -- 7d linear ramp: spend proportionally to elapsed time ----------------
 
     for lid, w in fresh.items():
@@ -77,12 +75,30 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
             elapsed_frac = min((now_ms - started_ms) / _WEEK_MS, 1.0)
         else:
             elapsed_frac = 1.0  # can't compute -> assume end-of-window
-        allowed = elapsed_frac
-        used = w.used_fraction
-        if used >= allowed:
+        if w.used_fraction >= elapsed_frac:
             return BudgetDecision(
                 False,
-                f"{lid}: used {used:.2f} >= ramp {allowed:.2f} (elapsed {elapsed_frac:.1%})",
+                f"{lid}: used {w.used_fraction:.2f} >= ramp {elapsed_frac:.2f}"
+                f" (elapsed {elapsed_frac:.1%})",
             )
+
+    # -- 5h last-hour ramp ---------------------------------------------------
+    #
+    # No active 5h window → allow (this job opens one).
+    # Active window → allowed = max(0, (elapsed - 4h) / 1h).
+
+    w5 = fresh.get("anthropic:5h")
+    if w5 is not None:
+        if w5.status == "exhausted":
+            return BudgetDecision(False, f"5h window exhausted")
+        if w5.resets_at and w5.resets_at > now_ms and w5.used_fraction is not None:
+            elapsed_ms = _5H_MS - (w5.resets_at - now_ms)
+            allowed = max(0.0, (elapsed_ms - _4H_MS) / _1H_MS)
+            if w5.used_fraction >= allowed:
+                return BudgetDecision(
+                    False,
+                    f"5h: used {w5.used_fraction:.2f} >= ramp {allowed:.2f}"
+                    f" (harvest in {(w5.resets_at - _1H_MS - now_ms) / 60_000:.0f}min)",
+                )
 
     return BudgetDecision(True, "ok", base)

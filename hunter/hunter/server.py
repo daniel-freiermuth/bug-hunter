@@ -389,10 +389,18 @@ def daemon(cfg: Config) -> None:
                 ):
                     sleep_s = 60
                 elif summary.get("denied"):
+                    # Sleep until the harvest window opens (last hour of 5h)
+                    # or until a new window can be opened.
                     w5 = budget.read_windows().get("anthropic:5h")
                     if w5 and w5.resets_at:
-                        until = (w5.resets_at / 1000) - time.time() + 120
-                        sleep_s = max(60.0, min(until, 30 * 60))
+                        harvest_at = (w5.resets_at - 3600_000) / 1000
+                        until_harvest = harvest_at - time.time()
+                        if until_harvest > 0:
+                            sleep_s = max(60.0, min(until_harvest + 30, 60 * 60))
+                        else:
+                            # Already in harvest window; denied for another
+                            # reason (7d ramp) -- back off longer.
+                            sleep_s = 30 * 60
                     else:
                         sleep_s = 30 * 60
                 log.info(
