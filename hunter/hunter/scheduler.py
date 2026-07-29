@@ -575,6 +575,11 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
                     pr_desc,
                     cwd=str(worktree),
                 )
+                if rc != 0 and "already exists" in pr_url_or_err:
+                    # Prior attempt already created the PR — extract its URL.
+                    m = re.search(r"https://\S+/pull/\d+", pr_url_or_err)
+                    if m:
+                        rc, pr_url_or_err = 0, m.group()
                 if rc == 0:
                     store.set_status(fid, "pr_open", pr_url=pr_url_or_err)
                     store.log_event(
