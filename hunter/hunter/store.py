@@ -119,6 +119,21 @@ class Store:
         )
         self.db.commit()
 
+    def update_repo(self, repo_id: int, **fields: Any) -> None:
+        allowed = {"name", "url", "default_branch", "forge", "enabled"}
+        bad = set(fields) - allowed
+        if bad:
+            msg = f"invalid repo fields: {bad}"
+            raise ValueError(msg)
+        if not fields:
+            return
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self.db.execute(
+            f"UPDATE repos SET {sets} WHERE id = ?",
+            (*fields.values(), repo_id),
+        )
+        self.db.commit()
+
     # -- findings ------------------------------------------------------
     def upsert_finding(self, repo_id: int, f: Row) -> tuple[int, bool]:
         cur = self.db.execute("SELECT id FROM findings WHERE fingerprint = ?", (f["fingerprint"],))

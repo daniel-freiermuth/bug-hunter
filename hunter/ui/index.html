@@ -91,6 +91,14 @@
   .ov { font-size: 9px; padding: 1px 5px; border-radius: 3px; background: var(--amber); color: #000; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
   .ov-btn { font-size: 10px; padding: 1px 6px; border-color: var(--blue); color: var(--blue); background: transparent; }
   .attn { font-size: 9px; padding: 1px 5px; border-radius: 3px; background: var(--red); color: #fff; font-weight: 600; }
+  .repo-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+              padding: 6px 10px; border-bottom: 1px solid var(--line); font-size: 12px; }
+  .repo-row:last-child { border-bottom: none; }
+  .repo-row .name { font-weight: 600; min-width: 100px; }
+  .repo-row .url { color: var(--dim); font-size: 11px; word-break: break-all; flex: 1; min-width: 200px; }
+  .repo-row .meta { color: var(--faint); font-size: 10.5px; }
+  .repo-row .paused { color: var(--amber); font-weight: 600; }
+  #repos { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; }
 
   /* tables / feeds */
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -162,6 +170,9 @@
 
   <h2>Pipeline <button class="ov-btn" onclick="clearAllOverrides()" style="font-size:10px;vertical-align:middle">Clear all overrides</button></h2>
   <div id="pipeline"></div>
+
+  <h2>Repos</h2>
+  <div id="repos"></div>
 
   <h2>Suppressed <span class="n" id="nSupp"></span></h2>
   <details><summary>rejected / wontfix</summary><div id="suppressed"></div></details>

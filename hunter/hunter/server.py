@@ -213,6 +213,9 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/override":
                 self._override()
                 return
+            if url.path == "/api/repo":
+                self._update_repo()
+                return
             self._error(404, "not found")
         except (ValueError, json.JSONDecodeError) as exc:
             self._error(400, str(exc))
@@ -348,6 +351,34 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True, "finding": store.get_finding(fid)})
         if mode:  # setting an override -> wake the daemon loop
             _wake.set()
+
+    def _update_repo(self) -> None:
+        body = self._body_json()
+        rid = body.get("id")
+        if not isinstance(rid, int):
+            self._error(400, "id must be an integer")
+            return
+        store = self._store()
+        repo = store.get_repo(rid)
+        if repo is None:
+            self._error(404, f"no repo {rid}")
+            return
+        fields: dict[str, object] = {}
+        if "enabled" in body:
+            fields["enabled"] = 1 if body["enabled"] else 0
+        if "url" in body and isinstance(body["url"], str) and body["url"].strip():
+            fields["url"] = body["url"].strip()
+        if "default_branch" in body and isinstance(body["default_branch"], str) and body["default_branch"].strip():
+            fields["default_branch"] = body["default_branch"].strip()
+        if "forge" in body and body["forge"] in ("github", "gitlab"):
+            fields["forge"] = body["forge"]
+        if not fields:
+            self._error(400, "no valid fields to update")
+            return
+        store.update_repo(rid, **fields)
+        action = ", ".join(f"{k}={v}" for k, v in fields.items())
+        store.log_event("repo", f"updated {repo['name']}: {action}")
+        self._json({"ok": True, "repo": store.get_repo(rid)})
 
 
 class _Server(ThreadingHTTPServer):

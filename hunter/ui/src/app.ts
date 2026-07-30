@@ -60,10 +60,23 @@ interface Event {
   finding_id: number | null;
 }
 
+interface Repo {
+  id: number;
+  name: string;
+  url: string;
+  path: string;
+  forge: string;
+  default_branch: string;
+  last_hunt_sha: string | null;
+  last_hunt_at: number | null;
+  enabled: number;
+  added_at: number;
+}
+
 interface Summary {
   windows: Record<string, WindowInfo>;
   counts: Record<string, number>;
-  repos: unknown[];
+  repos: Repo[];
   last_cycle: Event | null;
   cycle_running: boolean;
 }
@@ -358,8 +371,20 @@ async function clearAllOverrides(): Promise<void> {
   refresh();
 }
 
+async function toggleRepo(id: number, enabled: boolean): Promise<void> {
+  const r = await api<{ error?: string }>("/api/repo", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, enabled }),
+  });
+  if (r.status !== 200) {
+    alert("update repo failed: " + (r.body?.error || r.status));
+  }
+  refresh();
+}
+
 // Expose to onclick handlers in rendered HTML
-Object.assign(window, { verdict, recheck, unqueue, budgetOverride, clearOverride, clearAllOverrides });
+Object.assign(window, { verdict, recheck, unqueue, budgetOverride, clearOverride, clearAllOverrides, toggleRepo });
 
 // ---------------------------------------------------------------------------
 // Renderers
@@ -486,6 +511,23 @@ function renderPipeline(findings: Finding[]): void {
         : '<div class="empty">\u2014</div>';
       return `<div class="col"><h3>${name} (${items.length})</h3>${body}</div>`;
     })
+    .join("");
+}
+
+function renderRepos(repos: Repo[]): void {
+  if (!repos.length) {
+    $("repos").innerHTML = '<div class="empty">no repos configured</div>';
+    return;
+  }
+  $("repos").innerHTML = repos
+    .map(
+      (r) => `<div class="repo-row">
+      <span class="name">${esc(r.name)}${r.enabled ? "" : ' <span class="paused">PAUSED</span>'}</span>
+      <span class="url"><a href="${esc(r.url)}" target="_blank">${esc(r.url)}</a></span>
+      <span class="meta">${esc(r.forge)} \u00b7 ${esc(r.default_branch)}${r.last_hunt_at ? " \u00b7 hunted " + ts(r.last_hunt_at) : ""}</span>
+      <button class="${r.enabled ? "uq" : "q"}" onclick="toggleRepo(${r.id},${r.enabled ? "false" : "true"})">${r.enabled ? "Pause" : "Resume"}</button>
+    </div>`,
+    )
     .join("");
 }
 
@@ -677,6 +719,7 @@ async function refresh(): Promise<void> {
         "</div>";
 
     renderPipeline(all);
+    renderRepos(s.repos || []);
 
     const supp = all.filter(
       (f) => f.status === "rejected" || f.status === "wontfix",
