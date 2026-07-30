@@ -20,7 +20,7 @@ from .playbooks import (
     build_recheck_prompt,
 )
 from .store import Store
-from .types import Config, Row, RunResult, WindowState, now_ms
+from .types import BudgetDecision, Config, Row, RunResult, WindowState, now_ms
 from .util import run_cmd
 
 
@@ -263,8 +263,12 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
             return {"error": f"{' '.join(cmd)} failed: {out[-300:]}"}
 
     # Budget gate -- recheck is investigative, like hunt.
+    override = finding.get("budget_override")
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "hunt", windows)
+    if override:
+        dec = BudgetDecision(True, f"override:{override}", cfg.hunt_cap_tokens)
+    else:
+        dec = budget.decide(cfg, "hunt", windows)
     if not dec.allow:
         job = store.create_job("recheck", repo["id"], finding_id=fid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -324,6 +328,8 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
             finding_id=fid,
         )
         summary["outcome"] = "failed"
+        if override == "once":
+            store.set_budget_override(fid, None)
         return summary
 
     v: str = verdict["verdict"]
@@ -366,8 +372,9 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
 
     summary["verdict"] = v
     summary["reason"] = reason
+    if override == "once":
+        store.set_budget_override(fid, None)
     return summary
-
 
 # -- fix --------------------------------------------------------------------
 
@@ -466,8 +473,13 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         if delete_branch:
             run_cmd(["git", "-C", rpath, "branch", "-D", branch])
 
+    override = finding.get("budget_override")
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "fix", windows)
+    if override:
+        base = cfg.fix_cap_tokens
+        dec = BudgetDecision(True, f"override:{override}", base)
+    else:
+        dec = budget.decide(cfg, "fix", windows)
     if not dec.allow:
         _drop_worktree(delete_branch=True)
         job = store.create_job("fix", repo["id"], finding_id=fid)
@@ -590,6 +602,8 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
                     )
                     _drop_worktree(delete_branch=False)
                     summary.update(outcome="pr_open", pr_url=pr_url_or_err)
+                    if override == "once":
+                        store.set_budget_override(fid, None)
                     return summary
                 failure = f"PR create failed: {pr_url_or_err[-300:]}"
         else:
@@ -611,6 +625,8 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         finding_id=fid,
     )
     summary.update(outcome="requeued", failure=failure, worktree=str(worktree))
+    if override == "once":
+        store.set_budget_override(fid, None)
     return summary
 
 
@@ -883,8 +899,12 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
             ]
         )
 
+    override = finding.get("budget_override")
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "fix", windows)
+    if override:
+        dec = BudgetDecision(True, f"override:{override}", cfg.fix_cap_tokens)
+    else:
+        dec = budget.decide(cfg, "fix", windows)
     if not dec.allow:
         _drop_worktree()
         job = store.create_job("engage", repo["id"], finding_id=fid)
@@ -1019,6 +1039,8 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
             finding_id=fid,
         )
         summary.update(outcome="retry", failure=failure, worktree=str(worktree))
+        if override == "once":
+            store.set_budget_override(fid, None)
         return summary
 
     # Watermark: activity up to the sync snapshot is handled; when we just
@@ -1040,6 +1062,8 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
     )
     _drop_worktree()
     summary.update(outcome="engaged", pushed=pushed, replied=replied)
+    if override == "once":
+        store.set_budget_override(fid, None)
     return summary
 
 

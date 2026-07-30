@@ -32,6 +32,7 @@ interface Finding {
   created_at: number;
   updated_at: number;
   timeline: Event[];
+  budget_override: string | null;
 }
 
 interface Job {
@@ -320,8 +321,44 @@ async function unqueue(id: number): Promise<void> {
   refresh();
 }
 
+async function budgetOverride(id: number, mode: "once" | "exempt"): Promise<void> {
+  const r = await api<{ error?: string }>("/api/override", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, mode }),
+  });
+  if (r.status !== 200) {
+    alert("override failed: " + (r.body?.error || r.status));
+  }
+  refresh();
+}
+
+async function clearOverride(id: number): Promise<void> {
+  const r = await api<{ error?: string }>("/api/override", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, mode: null }),
+  });
+  if (r.status !== 200) {
+    alert("clear override failed: " + (r.body?.error || r.status));
+  }
+  refresh();
+}
+
+async function clearAllOverrides(): Promise<void> {
+  const r = await api<{ error?: string }>("/api/override", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: "all", mode: null }),
+  });
+  if (r.status !== 200) {
+    alert("clear all overrides failed: " + (r.body?.error || r.status));
+  }
+  refresh();
+}
+
 // Expose to onclick handlers in rendered HTML
-Object.assign(window, { verdict, recheck, unqueue });
+Object.assign(window, { verdict, recheck, unqueue, budgetOverride, clearOverride, clearAllOverrides });
 
 // ---------------------------------------------------------------------------
 // Renderers
@@ -421,10 +458,26 @@ function renderPipeline(findings: Finding[]): void {
       const body = items.length
         ? items
             .map(
-              (f) => `<div class="item">
-        #${f.id} ${esc(f.summary)}
-        <div class="m">${esc(f.file || "")}${f.pr_url ? ` \u00b7 <a href="${esc(f.pr_url)}" target="_blank">PR</a>` : ""}${name === "queued" ? ` <button class="uq" id="uq${f.id}" onclick="unqueue(${f.id})">Unqueue</button>` : ""}</div>
-      </div>`,
+              (f) => {
+                const ov = f.budget_override;
+                const ovBadge = ov ? ` <span class="ov">${esc(ov)}</span>` : "";
+                const acts: string[] = [];
+                if (name === "queued") {
+                  acts.push(`<button class="uq" id="uq${f.id}" onclick="unqueue(${f.id})">Unqueue</button>`);
+                }
+                if (name === "queued" || name === "fixing" || name === "pr_open") {
+                  if (!ov) {
+                    acts.push(`<button class="ov-btn" onclick="budgetOverride(${f.id},'once')">Run 1</button>`);
+                    acts.push(`<button class="ov-btn" onclick="budgetOverride(${f.id},'exempt')">Exempt</button>`);
+                  } else {
+                    acts.push(`<button class="ov-btn" onclick="clearOverride(${f.id})">Clear</button>`);
+                  }
+                }
+                return `<div class="item">
+        #${f.id} ${esc(f.summary)}${ovBadge}
+        <div class="m">${esc(f.file || "")}${f.pr_url ? ` \u00b7 <a href="${esc(f.pr_url)}" target="_blank">PR</a>` : ""}${acts.length ? " " + acts.join(" ") : ""}</div>
+      </div>`;
+              },
             )
             .join("")
         : '<div class="empty">\u2014</div>';

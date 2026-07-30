@@ -199,6 +199,9 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/unqueue":
                 self._unqueue()
                 return
+            if url.path == "/api/override":
+                self._override()
+                return
             self._error(404, "not found")
         except (ValueError, json.JSONDecodeError) as exc:
             self._error(400, str(exc))
@@ -301,6 +304,36 @@ class Handler(BaseHTTPRequestHandler):
             return
         store.set_status(fid, "new")
         store.log_event("unqueue", f"#{fid} removed from fix queue", finding_id=fid)
+        self._json({"ok": True, "finding": store.get_finding(fid)})
+
+    def _override(self) -> None:
+        body = self._body_json()
+        fid = body.get("id")
+        mode = body.get("mode")  # "once" | "exempt" | None (clear)
+        if fid == "all" and mode is None:
+            store = self._store()
+            n = store.clear_all_overrides()
+            store.log_event("override", f"cleared all budget overrides ({n} findings)")
+            self._json({"ok": True, "cleared": n})
+            return
+        if not isinstance(fid, int):
+            self._error(400, "id must be an integer (or 'all' with mode=null)")
+            return
+        if mode not in ("once", "exempt", None):
+            self._error(400, "mode must be 'once', 'exempt', or null")
+            return
+        store = self._store()
+        finding = store.get_finding(fid)
+        if finding is None:
+            self._error(404, f"no finding {fid}")
+            return
+        store.set_budget_override(fid, mode)
+        label = mode or "cleared"
+        store.log_event(
+            "override",
+            f"#{fid} budget override: {label}",
+            finding_id=fid,
+        )
         self._json({"ok": True, "finding": store.get_finding(fid)})
 
 

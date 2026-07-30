@@ -73,13 +73,13 @@ class Store:
         self.db.executescript(SCHEMA_PATH.read_text())
         self.db.commit()
         # Migrations for existing DBs.
-        for col, sql in [
-            ("forge", "ALTER TABLE repos ADD COLUMN forge TEXT NOT NULL DEFAULT 'github'"),
-            ("model", "ALTER TABLE jobs ADD COLUMN model TEXT"),
-            ("usage_delta", "ALTER TABLE jobs ADD COLUMN usage_delta REAL"),
+        for col, tbl, sql in [
+            ("forge", "repos", "ALTER TABLE repos ADD COLUMN forge TEXT NOT NULL DEFAULT 'github'"),
+            ("model", "jobs", "ALTER TABLE jobs ADD COLUMN model TEXT"),
+            ("usage_delta", "jobs", "ALTER TABLE jobs ADD COLUMN usage_delta REAL"),
+            ("budget_override", "findings", "ALTER TABLE findings ADD COLUMN budget_override TEXT"),
         ]:
             try:
-                tbl = "repos" if col == "forge" else "jobs"
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
             except sqlite3.OperationalError:
                 self.db.execute(sql)
@@ -206,6 +206,27 @@ class Store:
         args.append(fid)
         self.db.execute(f"UPDATE findings SET {', '.join(sets)} WHERE id = ?", args)
         self.db.commit()
+
+    def set_budget_override(self, fid: int, mode: str | None) -> None:
+        """Set budget override: 'once', 'exempt', or None to clear."""
+        if mode not in (None, "once", "exempt"):
+            msg = f"invalid budget_override mode: {mode!r}"
+            raise ValueError(msg)
+        self.db.execute(
+            "UPDATE findings SET budget_override = ?, updated_at = ? WHERE id = ?",
+            (mode, now_ms(), fid),
+        )
+        self.db.commit()
+
+    def clear_all_overrides(self) -> int:
+        """Clear all budget overrides. Returns count of affected rows."""
+        cur = self.db.execute(
+            "UPDATE findings SET budget_override = NULL, updated_at = ?"
+            " WHERE budget_override IS NOT NULL",
+            (now_ms(),),
+        )
+        self.db.commit()
+        return cur.rowcount
 
     def suppressions(self, repo_id: int) -> list[Row]:
         ph = ",".join("?" * len(SUPPRESSED_STATUSES))

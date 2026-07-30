@@ -88,6 +88,8 @@
   .col .item:first-of-type { border-top: none; }
   .col .item .m { color: var(--faint); font-size: 10.5px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .uq { font-size: 10px; padding: 1px 6px; border-color: var(--amber); color: var(--amber); background: transparent; }
+  .ov { font-size: 9px; padding: 1px 5px; border-radius: 3px; background: var(--amber); color: #000; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; }
+  .ov-btn { font-size: 10px; padding: 1px 6px; border-color: var(--blue); color: var(--blue); background: transparent; }
 
   /* tables / feeds */
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -157,7 +159,7 @@
   </div>
   <div id="inbox"></div>
 
-  <h2>Pipeline</h2>
+  <h2>Pipeline <button class="ov-btn" onclick="clearAllOverrides()" style="font-size:10px;vertical-align:middle">Clear all overrides</button></h2>
   <div id="pipeline"></div>
 
   <h2>Suppressed <span class="n" id="nSupp"></span></h2>
