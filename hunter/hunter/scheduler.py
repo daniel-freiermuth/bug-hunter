@@ -1081,12 +1081,20 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
         rechecking = store.list_findings(status="rechecking")
         attention = store.list_attention()
         queued = store.list_findings(status="queued")
+
+        # Prioritize findings with budget overrides.
+        def _pick(items: list[Row]) -> Row:
+            for f in items:
+                if f.get("budget_override"):
+                    return f
+            return items[-1]  # default: oldest (list is DESC by id)
+
         if attention:
-            result = run_engage(store, cfg, attention[0])  # stalest sync first
+            result = run_engage(store, cfg, _pick(attention))
         elif rechecking:
-            result = run_recheck(store, cfg, rechecking[-1])  # DESC -> last = oldest
+            result = run_recheck(store, cfg, _pick(rechecking))
         elif queued:
-            result = run_fix(store, cfg, queued[-1])  # DESC -> last = oldest
+            result = run_fix(store, cfg, _pick(queued))
         else:
             repos = [r for r in store.list_repos() if r["enabled"]]
             if force_repo:

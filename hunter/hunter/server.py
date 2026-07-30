@@ -25,6 +25,8 @@ log = logging.getLogger(__name__)
 
 # One cycle at a time, across all request threads.
 _cycle_lock = threading.Lock()
+# Wakes the daemon loop early (e.g. budget override set from UI).
+_wake = threading.Event()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -344,6 +346,8 @@ class Handler(BaseHTTPRequestHandler):
             finding_id=fid,
         )
         self._json({"ok": True, "finding": store.get_finding(fid)})
+        if mode:  # setting an override -> wake the daemon loop
+            _wake.set()
 
 
 class _Server(ThreadingHTTPServer):
@@ -457,7 +461,15 @@ def daemon(cfg: Config) -> None:
                 _cycle_lock.release()
         else:
             sleep_s = 60  # a UI-triggered cycle is running
-        stop.wait(sleep_s)
+        _wake.clear()
+        # Wait for stop OR wake, whichever comes first.
+        # threading.Event can't OR two events, so poll with short intervals.
+        deadline = time.time() + sleep_s
+        while not stop.is_set() and not _wake.is_set():
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            stop.wait(min(remaining, 5.0))
 
     httpd.shutdown()
     httpd.server_close()
