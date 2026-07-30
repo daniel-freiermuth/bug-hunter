@@ -33,6 +33,7 @@ interface Finding {
   updated_at: number;
   timeline: Event[];
   budget_override: string | null;
+  needs_attention: string | null;
 }
 
 interface Job {
@@ -449,7 +450,8 @@ function renderPipeline(findings: Finding[]): void {
     ["rechecking", (f) => f.status === "rechecking"],
     ["queued", (f) => f.status === "queued"],
     ["fixing", (f) => f.status === "fixing"],
-    ["pr_open", (f) => f.status === "pr_open"],
+    ["pr_review", (f) => f.status === "pr_open" && !!f.needs_attention],
+    ["pr_open", (f) => f.status === "pr_open" && !f.needs_attention],
     ["merged", (f) => f.status === "merged"],
   ];
   $("pipeline").innerHTML = cols
@@ -465,7 +467,7 @@ function renderPipeline(findings: Finding[]): void {
                 if (name === "queued") {
                   acts.push(`<button class="uq" id="uq${f.id}" onclick="unqueue(${f.id})">Unqueue</button>`);
                 }
-                if (name === "queued" || name === "fixing" || name === "pr_open") {
+                if (name === "queued" || name === "fixing" || name === "pr_open" || name === "pr_review") {
                   if (!ov) {
                     acts.push(`<button class="ov-btn" onclick="budgetOverride(${f.id},'once')">Run 1</button>`);
                     acts.push(`<button class="ov-btn" onclick="budgetOverride(${f.id},'exempt')">Exempt</button>`);
@@ -473,8 +475,9 @@ function renderPipeline(findings: Finding[]): void {
                     acts.push(`<button class="ov-btn" onclick="clearOverride(${f.id})">Clear</button>`);
                   }
                 }
+                const attn = name === "pr_review" && f.needs_attention ? ` <span class="attn">${esc(f.needs_attention)}</span>` : "";
                 return `<div class="item">
-        #${f.id} ${esc(f.summary)}${ovBadge}
+        #${f.id} ${esc(f.summary)}${ovBadge}${attn}
         <div class="m">${esc(f.file || "")}${f.pr_url ? ` \u00b7 <a href="${esc(f.pr_url)}" target="_blank">PR</a>` : ""}${acts.length ? " " + acts.join(" ") : ""}</div>
       </div>`;
               },

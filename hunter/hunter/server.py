@@ -178,8 +178,17 @@ class Handler(BaseHTTPRequestHandler):
         # Embed per-finding event timeline.
         fids: list[int] = [f["id"] for f in findings]
         timelines = store.events_by_finding(fids)
+        # Embed pr_state.needs_attention for pr_open findings.
+        pr_fids = [f["id"] for f in findings if f["status"] == "pr_open"]
+        pr_attention: dict[int, str | None] = {}
+        for pfid in pr_fids:
+            ps = store.get_pr_state(pfid)
+            if ps:
+                pr_attention[pfid] = ps.get("needs_attention")
         for f in findings:
             f["timeline"] = timelines.get(f["id"], [])
+            if f["id"] in pr_attention:
+                f["needs_attention"] = pr_attention[f["id"]]
         return findings
 
     # -- POST -------------------------------------------------------------
