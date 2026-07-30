@@ -77,15 +77,28 @@ def test_empty_windows_deny():
     assert "no window data" in d.reason
 
 
-def test_all_stale_windows_deny():
+def test_all_stale_5h_allows_as_opener():
+    """Stale 5h data → treated as no active window → allow (7d still gates)."""
     stale_age = 3600.0  # well above default stale_after_s=1800
     windows = {
         "anthropic:5h": _ws("anthropic:5h", age_s=stale_age),
-        "anthropic:7d": _ws("anthropic:7d", age_s=stale_age),
+        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10, age_s=stale_age),
+    }
+    d = decide(_cfg(), "hunt", windows)
+    assert d.allow
+
+
+def test_stale_5h_denied_by_7d_ramp():
+    """Stale 5h but 7d over ramp → deny."""
+    stale_age = 3600.0
+    resets_at = _NOW_MS + int(_WEEK_MS * 0.95)  # 5% elapsed
+    windows = {
+        "anthropic:5h": _ws("anthropic:5h", age_s=stale_age),
+        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.30, resets_at=resets_at, age_s=stale_age),
     }
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
-    assert "stale" in d.reason
+    assert "7d" in d.reason
 
 
 # ---------------------------------------------------------------------------

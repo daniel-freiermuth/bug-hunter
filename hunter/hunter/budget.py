@@ -8,7 +8,8 @@
              last hour.  Anything unspent at reset is wasted capacity.
 
 No active 5h window → allow (opens one).  The 7d ramp is the outer gate.
-Stale or missing data → deny.
+Stale 5h data → treated as no active window (opener safe, 7d is the gate).
+Missing data entirely → deny.
 """
 
 from __future__ import annotations
@@ -61,13 +62,10 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
     if not windows:
         return BudgetDecision(False, "no window data -- deny until fresh")
 
-    fresh = {k: w for k, w in windows.items() if w.age_s <= cfg.stale_after_s}
-    if not fresh:
-        return BudgetDecision(False, "window data stale or missing -- deny until fresh")
-
     # -- 7d linear ramp: spend proportionally to elapsed time ----------------
+    # The 7d fraction moves slowly; even somewhat stale data is safe here.
 
-    for lid, w in fresh.items():
+    for lid, w in windows.items():
         if ":7d" not in lid or w.used_fraction is None:
             continue
         if w.resets_at and w.resets_at > now_ms:
@@ -84,13 +82,14 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
 
     # -- 5h last-hour ramp ---------------------------------------------------
     #
-    # No active 5h window → allow (this job opens one).
+    # Only trust fresh 5h data (the human could be actively using the window).
+    # Stale or missing 5h → treat as no active window → allow (opener).
     # Active window → allowed = max(0, (elapsed - 4h) / 1h).
 
-    w5 = fresh.get("anthropic:5h")
-    if w5 is not None:
+    w5 = windows.get("anthropic:5h")
+    if w5 is not None and w5.age_s <= cfg.stale_after_s:
         if w5.status == "exhausted":
-            return BudgetDecision(False, f"5h window exhausted")
+            return BudgetDecision(False, "5h window exhausted")
         if w5.resets_at and w5.resets_at > now_ms and w5.used_fraction is not None:
             elapsed_ms = _5H_MS - (w5.resets_at - now_ms)
             allowed = max(0.0, (elapsed_ms - _4H_MS) / _1H_MS)
@@ -100,5 +99,4 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
                     f"5h: used {w5.used_fraction:.2f} >= ramp {allowed:.2f}"
                     f" (harvest in {(w5.resets_at - _1H_MS - now_ms) / 60_000:.0f}min)",
                 )
-
     return BudgetDecision(True, "ok", base)
