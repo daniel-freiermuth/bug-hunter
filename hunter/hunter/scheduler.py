@@ -1047,9 +1047,9 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
         return summary
 
     # Watermark: activity up to the sync snapshot is handled; when we just
-    # posted our own comment, advance to now so it never re-triggers
-    # new_comments on the next sync.
-    engaged_mark = now_ms() if replied else (ps.get("last_activity_at") or now_ms())
+    # posted our own comment, advance to now + 3s to absorb clock skew
+    # between local time and GitHub's createdAt timestamp.
+    engaged_mark = (now_ms() + 3_000) if replied else (ps.get("last_activity_at") or now_ms())
     store.upsert_pr_state(
         fid,
         last_engaged_activity_at=engaged_mark,
