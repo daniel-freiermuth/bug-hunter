@@ -1082,19 +1082,30 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
         attention = store.list_attention()
         queued = store.list_findings(status="queued")
 
-        # Prioritize findings with budget overrides.
-        def _pick(items: list[Row]) -> Row:
+        # Budget-overridden findings jump the queue across all categories.
+        override_target: tuple[str, Row] | None = None
+        for kind, items in (("engage", attention), ("recheck", rechecking), ("fix", queued)):
             for f in items:
                 if f.get("budget_override"):
-                    return f
-            return items[-1]  # default: oldest (list is DESC by id)
+                    override_target = (kind, f)
+                    break
+            if override_target:
+                break
 
-        if attention:
-            result = run_engage(store, cfg, _pick(attention))
+        if override_target:
+            kind, f = override_target
+            if kind == "engage":
+                result = run_engage(store, cfg, f)
+            elif kind == "recheck":
+                result = run_recheck(store, cfg, f)
+            else:
+                result = run_fix(store, cfg, f)
+        elif attention:
+            result = run_engage(store, cfg, attention[0])  # stalest sync first
         elif rechecking:
-            result = run_recheck(store, cfg, _pick(rechecking))
+            result = run_recheck(store, cfg, rechecking[-1])  # DESC -> last = oldest
         elif queued:
-            result = run_fix(store, cfg, _pick(queued))
+            result = run_fix(store, cfg, queued[-1])  # DESC -> last = oldest
         else:
             repos = [r for r in store.list_repos() if r["enabled"]]
             if force_repo:
