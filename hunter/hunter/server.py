@@ -454,6 +454,7 @@ def daemon(cfg: Config) -> None:
     while not stop.is_set():
         sleep_s: float = 15 * 60
         if _cycle_lock.acquire(blocking=False):
+            _wake.clear()
             try:
                 store = Store(cfg)
                 summary = scheduler.run_cycle(store, cfg)
@@ -492,7 +493,6 @@ def daemon(cfg: Config) -> None:
                 _cycle_lock.release()
         else:
             sleep_s = 60  # a UI-triggered cycle is running
-        _wake.clear()
         # Wait for stop OR wake, whichever comes first.
         # threading.Event can't OR two events, so poll with short intervals.
         deadline = time.time() + sleep_s
