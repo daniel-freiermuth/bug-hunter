@@ -233,6 +233,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
             f"recheck #{fid}: repo {finding['repo_id']} missing",
             finding_id=fid,
         )
+        store.set_status(fid, "new")
         return {"error": "repo missing"}
     rpath = Path(repo["path"])
     db: str = repo["default_branch"]
@@ -247,6 +248,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
                 f"recheck #{fid}: clone failed: {out[-300:]}",
                 finding_id=fid,
             )
+            store.set_status(fid, "new")
             return {"error": f"clone failed: {out[-300:]}"}
     for cmd in (
         ["git", "fetch", "origin"],
@@ -260,6 +262,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
                 f"recheck #{fid}: {' '.join(cmd)} failed: {out[-300:]}",
                 finding_id=fid,
             )
+            store.set_status(fid, "new")
             return {"error": f"{' '.join(cmd)} failed: {out[-300:]}"}
 
     # Budget gate -- recheck is investigative, like hunt.
