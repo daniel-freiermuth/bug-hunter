@@ -493,6 +493,7 @@ def daemon(cfg: Config) -> None:
                 _cycle_lock.release()
         else:
             sleep_s = 60  # a UI-triggered cycle is running
+            _wake.clear()
         # Wait for stop OR wake, whichever comes first.
         # threading.Event can't OR two events, so poll with short intervals.
         deadline = time.time() + sleep_s
