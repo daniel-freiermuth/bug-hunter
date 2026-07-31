@@ -475,9 +475,17 @@ def daemon(cfg: Config) -> None:
                         until_harvest = harvest_at - time.time()
                         if until_harvest > 0:
                             sleep_s = max(60.0, min(until_harvest + 30, 60 * 60))
+                        elif summary["denied"].startswith("5h:"):
+                            # Still in harvest; ramp rising linearly.
+                            # Compute seconds until ramp exceeds usage.
+                            if w5.used_fraction is not None:
+                                harvest_elapsed = time.time() - harvest_at
+                                need_s = w5.used_fraction * 3600 - harvest_elapsed
+                                sleep_s = max(60.0, min(need_s + 30, 15 * 60))
+                            else:
+                                sleep_s = 3 * 60
                         else:
-                            # Already in harvest window; denied for another
-                            # reason (7d ramp) -- back off longer.
+                            # Denied for another reason (7d ramp) -- back off.
                             sleep_s = 30 * 60
                     else:
                         sleep_s = 30 * 60

@@ -35,7 +35,8 @@ loginctl enable-linger $USER   # survive logout
 ```
 
 It idles at zero token cost and wakes on a policy: after a job → 60s
-(drain the queue); budget denied → sleep to the 5h reset; idle → 15min.
+(drain the queue); budget denied → short retry if the 5h ramp is rising,
+otherwise sleep to the 5h reset; idle → 15min.
 Every wake passes the budget gate before spending anything.
 
 ## How it decides
