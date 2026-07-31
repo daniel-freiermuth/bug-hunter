@@ -72,7 +72,7 @@ class TestRunRecheckResetsStatus:
         # Path that doesn't exist yet → triggers the clone branch.
         clone_dest = str(tmp_path / "repos" / "will-fail")
         repo_id = store.add_repo(
-            "bad-clone", "https://invalid.test/no-such.git", clone_dest
+            "bad-clone", str(tmp_path / "nonexistent-source"), clone_dest
         )
         fid, _ = store.upsert_finding(repo_id, _make_finding(
             fingerprint="repo:f.py:fn:clone-fail",
