@@ -101,6 +101,8 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
 
     last: str | None = repo.get("last_hunt_sha")
     if last == head and not force:
+        # No new commits — update timestamp so scheduler rotates to next repo.
+        store.set_last_hunt(repo["id"], head)
         store.log_event(
             "hunt",
             f"{rname}: no new commits since {head[:12]} -- skipped",
