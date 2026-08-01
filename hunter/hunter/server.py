@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
+from .budget import HEADROOM_MS, _RAMP_MS
 from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
 
 log = logging.getLogger(__name__)
@@ -467,11 +468,11 @@ def daemon(cfg: Config) -> None:
                 ):
                     sleep_s = 60
                 elif summary.get("denied"):
-                    # Sleep until the harvest window opens (last hour of 5h)
+                    # Sleep until the harvest window opens (HEADROOM into 5h window)
                     # or until a new window can be opened.
                     w5 = budget.read_windows().get("anthropic:5h")
                     if w5 and w5.resets_at:
-                        harvest_at = (w5.resets_at - 3600_000) / 1000
+                        harvest_at = (w5.resets_at - _RAMP_MS) / 1000
                         until_harvest = harvest_at - time.time()
                         if until_harvest > 0:
                             sleep_s = max(60.0, min(until_harvest + 30, 60 * 60))
@@ -480,7 +481,7 @@ def daemon(cfg: Config) -> None:
                             # Compute seconds until ramp exceeds usage.
                             if w5.used_fraction is not None:
                                 harvest_elapsed = time.time() - harvest_at
-                                need_s = w5.used_fraction * 3600 - harvest_elapsed
+                                need_s = w5.used_fraction * (_RAMP_MS / 1000) - harvest_elapsed
                                 sleep_s = max(60.0, min(need_s + 30, 15 * 60))
                             else:
                                 sleep_s = 3 * 60

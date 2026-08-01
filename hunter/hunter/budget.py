@@ -3,9 +3,9 @@
 7-day ramp:  allowed = elapsed_fraction_of_7d_window.
              Spreads spending evenly across the week.
 
-5-hour ramp: allowed = max(0, (elapsed - 4h) / 1h).
-             Zero for the first 4 hours (human headroom), then 0→1 over the
-             last hour.  Anything unspent at reset is wasted capacity.
+5-hour ramp: allowed = max(0, (elapsed - HEADROOM) / (5h - HEADROOM)).
+             Zero for the first HEADROOM duration (human headroom), then 0→1
+             over the remaining time.  Anything unspent at reset is wasted capacity.
 
 No active 5h window → allow (opens one).  The 7d ramp is the outer gate.
 Stale 5h data → treated as no active window (opener safe, 7d is the gate).
@@ -19,10 +19,16 @@ import time
 
 from .types import OMP_AGENT_DB, BudgetDecision, Config, WindowState
 
+# =============================================================================
+# Configuration: To adjust when hunter can start using the 5h window,
+#                change HEADROOM_MS below (e.g., 15min, 1h, 2h).
+#                Everything else auto-computes from it.
+# =============================================================================
+HEADROOM_MS = 30 * 60 * 1000  # Human headroom before harvest window opens
+
 _WEEK_MS = 7 * 24 * 3600 * 1000
 _5H_MS = 5 * 3600 * 1000
-_4H_MS = 4 * 3600 * 1000
-_1H_MS = 1 * 3600 * 1000
+_RAMP_MS = _5H_MS - HEADROOM_MS  # Harvest window duration (4.5h at 30min headroom)
 
 
 def read_windows() -> dict[str, WindowState]:
@@ -80,11 +86,11 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
                 f" (elapsed {elapsed_frac:.1%})",
             )
 
-    # -- 5h last-hour ramp ---------------------------------------------------
+    # -- 5h ramp (configurable headroom, then linear harvest) ------------------
     #
     # Only trust fresh 5h data (the human could be actively using the window).
     # Stale or missing 5h → treat as no active window → allow (opener).
-    # Active window → allowed = max(0, (elapsed - 4h) / 1h).
+    # Active window → allowed = max(0, (elapsed - HEADROOM) / (5h - HEADROOM)).
 
     w5 = windows.get("anthropic:5h")
     if w5 is not None and w5.age_s <= cfg.stale_after_s:
@@ -92,11 +98,11 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
             return BudgetDecision(False, "5h window exhausted")
         if w5.resets_at and w5.resets_at > now_ms and w5.used_fraction is not None:
             elapsed_ms = _5H_MS - (w5.resets_at - now_ms)
-            allowed = max(0.0, (elapsed_ms - _4H_MS) / _1H_MS)
+            allowed = max(0.0, (elapsed_ms - HEADROOM_MS) / _RAMP_MS)
             if w5.used_fraction >= allowed:
                 return BudgetDecision(
                     False,
                     f"5h: used {w5.used_fraction:.2f} >= ramp {allowed:.2f}"
-                    f" (harvest in {(w5.resets_at - _1H_MS - now_ms) / 60_000:.0f}min)",
+                    f" (harvest in {(w5.resets_at - _RAMP_MS - now_ms) / 60_000:.0f}min)",
                 )
     return BudgetDecision(True, "ok", base)

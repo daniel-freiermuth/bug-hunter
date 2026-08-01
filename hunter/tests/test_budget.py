@@ -135,39 +135,38 @@ def test_7d_used_below_ramp_allow():
 # ---------------------------------------------------------------------------
 
 
-def test_5h_first_4h_deny():
-    """Within the first 4 hours, the 5h ramp is 0 → deny."""
-    windows = _healthy_windows(w5_used=0.05, w5_elapsed_h=2.0)
+def test_5h_first_30min_deny():
+    """Within the first 30 minutes, the 5h ramp is 0 → deny."""
+    windows = _healthy_windows(w5_used=0.05, w5_elapsed_h=0.25)
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
     assert "5h" in d.reason
     assert "harvest" in d.reason
 
 
-def test_5h_at_exactly_4h_deny():
-    """At exactly 4h elapsed, ramp is 0 → any usage ≥ 0 with fraction > 0 denies."""
-    windows = _healthy_windows(w5_used=0.01, w5_elapsed_h=4.0)
+def test_5h_at_exactly_30min_deny():
+    """At exactly 30min elapsed, ramp is 0 → any usage > 0 denies."""
+    windows = _healthy_windows(w5_used=0.01, w5_elapsed_h=0.5)
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
 
 
 def test_5h_harvest_halfway_low_usage_allow():
-    """4.5h elapsed → ramp = 0.5; usage 0.05 < 0.5 → allow."""
-    windows = _healthy_windows(w5_used=0.05, w5_elapsed_h=4.5)
+    """2.75h elapsed (halfway through 4.5h harvest) → ramp = 0.5; usage 0.05 < 0.5 → allow."""
+    windows = _healthy_windows(w5_used=0.05, w5_elapsed_h=2.75)
     d = decide(_cfg(), "hunt", windows)
     assert d.allow
 
-
 def test_5h_harvest_halfway_high_usage_deny():
-    """4.5h elapsed → ramp = 0.5; usage 0.60 ≥ 0.5 → deny."""
-    windows = _healthy_windows(w5_used=0.60, w5_elapsed_h=4.5)
+    """2.75h elapsed → ramp = 0.5; usage 0.60 ≥ 0.5 → deny."""
+    windows = _healthy_windows(w5_used=0.60, w5_elapsed_h=2.75)
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
     assert "5h" in d.reason
-
+    assert "harvest" in d.reason
 
 def test_5h_harvest_end_high_usage_allow():
-    """4.95h elapsed → ramp ≈ 0.95; usage 0.90 < 0.95 → allow."""
+    """4.95h elapsed → ramp ≈ 0.989; usage 0.90 < 0.989 → allow."""
     windows = _healthy_windows(w5_used=0.90, w5_elapsed_h=4.95)
     d = decide(_cfg(), "hunt", windows)
     assert d.allow
