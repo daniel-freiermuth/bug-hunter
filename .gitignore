@@ -1,3 +1,14 @@
 exp1/**
 exp2/**
 *.pyc
+hunter/data/out/*
+__pycache__/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+hunter/data/hunter.db
+hunter/data/repos/
+hunter/data/wt/
+hunter/node_modules/
+hunter/ui/app.js
+hunter/ui/app.js.map
