@@ -23,6 +23,7 @@ class TestRecordJobNotes:
     def test_failed_job_gets_notes(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
         jid = store.create_job("hunt", rid)
+        long_tail = "x" * 400 + "MARKER" + "y" * 200  # 606 chars total
         rr = RunResult(
             exit_code=1,
             killed_reason=None,
@@ -30,14 +31,17 @@ class TestRecordJobNotes:
             calls=2,
             session_file=None,
             duration_s=5.0,
-            stdout_tail="some error context here",
+            stdout_tail=long_tail,
         )
         state = _record_job(store, jid, rr)
         assert state == "failed"
         jobs = store.list_jobs()
         job = jobs[0]
-        assert job["notes"] is not None, "notes must contain stdout_tail for failed jobs"
-        assert "some error context" in job["notes"]
+        assert job["notes"] == long_tail[-500:], (
+            "notes must be the last 500 chars of stdout_tail"
+        )
+        assert "MARKER" in job["notes"]
+        assert len(job["notes"]) == 500
 
     def test_killed_job_gets_notes(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
