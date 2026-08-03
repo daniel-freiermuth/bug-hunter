@@ -46,6 +46,7 @@ def _record_job(
     usage_delta: float | None = None,
 ) -> str:
     state = _job_state(rr)
+    notes = rr.stdout_tail[-500:] if state != "done" and rr.stdout_tail else None
     store.update_job(
         job_id,
         state=state,
@@ -57,6 +58,7 @@ def _record_job(
         session_file=rr.session_file,
         model=model,
         usage_delta=usage_delta,
+        notes=notes,
         finished_at=now_ms(),
     )
     return state
