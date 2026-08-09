@@ -7,6 +7,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 hunter/data/hunter.db
+hunter/data/hunter.db-shm
+hunter/data/hunter.db-wal
 hunter/data/repos/
 hunter/data/wt/
 hunter/node_modules/
