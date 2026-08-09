@@ -47,13 +47,13 @@ def build_hunt_prompt(
 ) -> str:
     sup = (
         "\n".join(
-            f"- {s['fingerprint']} -- {s.get('verdict_reason') or '(no reason recorded)'}"
+            f"- {s['fingerprint']} -- {_escape_braces(s.get('verdict_reason') or '(no reason recorded)')}"
             for s in suppressions
         )
         or "(none yet)"
     )
     kn = (
-        "\n".join(f"- {k['fingerprint']} [{k['status']}] -- {k.get('summary', '')}" for k in known)
+        "\n".join(f"- {k['fingerprint']} [{k['status']}] -- {_escape_braces(k.get('summary', ''))}" for k in known)
         or "(none yet)"
     )
     return _render(
