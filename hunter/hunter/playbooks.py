@@ -78,7 +78,7 @@ def build_fix_prompt(finding: Row, worktree: Path, branch: str, repo: Row) -> st
         {
             "WORKTREE": worktree,
             "BRANCH": branch,
-            "FINDING_JSON": json.dumps(subset, indent=2),
+            "FINDING_JSON": _escape_braces(json.dumps(subset, indent=2)),
             "REPO_NAME": repo["name"],
         },
     )
@@ -157,7 +157,7 @@ def build_recheck_prompt(finding: Row, repo: Row, out_path: Path) -> str:
         {
             "REPO_PATH": repo["path"],
             "REPO_NAME": repo["name"],
-            "FINDING_JSON": json.dumps(subset, indent=2),
+            "FINDING_JSON": _escape_braces(json.dumps(subset, indent=2)),
             "OUT_PATH": str(out_path),
         },
     )

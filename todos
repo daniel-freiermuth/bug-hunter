@@ -1,0 +1,20 @@
+- [x] monitor and answer/adapt PRs until merged
+- recheck button
+- overview: filter by project and severify
+- bug: time not rechecked?
+- dive into run logic. not use any tokens when not running. Prioritize finishing ongoing work
+- rigorous type checking
+- linting
+- ruff
+- et al
+- SOTA logging
+- drop 25% weekly held off
+- let bughunter check itself
+
+- SOTA other
+
+- keep logs of things that should be changed, but need taking a step back
+- focus on areas without open PRs (to avoid merge conflicts) and mantain coverage
+- support gitlab.com and own-hosted gitlab
+- use docker / virsh?
+- user management

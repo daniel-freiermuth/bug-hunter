@@ -1,0 +1,6 @@
+14:00:33 start: latest 5h row = {'recorded_at': 1784801410327, 'used_fraction': 0.0, 'status': 'ok', 'resets_at': None}
+14:00:33 no future resets_at — window may already be past reset; proceeding
+14:00:33 pre-opener state: {'recorded_at': 1784801410327, 'used_fraction': 0.0, 'status': 'ok', 'resets_at': None}
+14:00:33 boundary quiet — firing opener
+14:02:10 post-opener state: {'recorded_at': 1784801410327, 'used_fraction': 0.0, 'status': 'ok', 'resets_at': None}
+14:02:10 result written: COMPLETED
