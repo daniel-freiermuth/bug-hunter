@@ -44,6 +44,7 @@ def build_hunt_prompt(
     known: list[Row],
     out_path: Path,
     max_findings: int,
+    repo_notes: str = "",
 ) -> str:
     sup = (
         "\n".join(
@@ -56,6 +57,7 @@ def build_hunt_prompt(
         "\n".join(f"- {k['fingerprint']} [{k['status']}] -- {_escape_braces(k.get('summary', ''))}" for k in known)
         or "(none yet)"
     )
+    notes = repo_notes or "(No notes yet — consider adding conventions/architecture/gotchas as you discover them)"
     return _render(
         (PLAYBOOK_DIR / "hunt.md").read_text(),
         {
@@ -67,12 +69,14 @@ def build_hunt_prompt(
             "KNOWN_FINDINGS": kn,
             "OUT_PATH": out_path,
             "MAX_FINDINGS": max_findings,
+            "REPO_NOTES": notes,
         },
     )
 
 
-def build_fix_prompt(finding: Row, worktree: Path, branch: str, repo: Row) -> str:
+def build_fix_prompt(finding: Row, worktree: Path, branch: str, repo: Row, repo_notes: str = "") -> str:
     subset = {k: finding.get(k) for k in _FINDING_PROMPT_KEYS}
+    notes = repo_notes or "(No notes yet)"
     return _render(
         (PLAYBOOK_DIR / "fix.md").read_text(),
         {
@@ -80,6 +84,7 @@ def build_fix_prompt(finding: Row, worktree: Path, branch: str, repo: Row) -> st
             "BRANCH": branch,
             "FINDING_JSON": _escape_braces(json.dumps(subset, indent=2)),
             "REPO_NAME": repo["name"],
+            "REPO_NOTES": notes,
         },
     )
 
@@ -125,15 +130,15 @@ def _checks_lines(rollup: list[Row] | None) -> str:
         f"{c.get('conclusion') or c.get('state') or 'PENDING'}"
         for c in rollup[:30]
     )
-
-
 def build_engage_prompt(
     worktree: Path,
     head_ref: str,
     repo: Row,
     pr: Row,
     attention: str,
+    repo_notes: str = "",
 ) -> str:
+    notes = repo_notes or "(No notes yet)"
     return _render(
         (PLAYBOOK_DIR / "engage.md").read_text(),
         {
@@ -146,12 +151,12 @@ def build_engage_prompt(
             "FEEDBACK": _escape_braces(_feedback_blocks(pr)),
             "CHECKS": _escape_braces(_checks_lines(pr.get("statusCheckRollup"))),
             "ATTENTION": attention or "(none recorded)",
+            "REPO_NOTES": notes,
         },
     )
-
-
-def build_recheck_prompt(finding: Row, repo: Row, out_path: Path) -> str:
+def build_recheck_prompt(finding: Row, repo: Row, out_path: Path, repo_notes: str = "") -> str:
     subset = {k: finding.get(k) for k in _FINDING_PROMPT_KEYS}
+    notes = repo_notes or "(No notes yet)"
     return _render(
         (PLAYBOOK_DIR / "recheck.md").read_text(),
         {
@@ -159,5 +164,6 @@ def build_recheck_prompt(finding: Row, repo: Row, out_path: Path) -> str:
             "REPO_NAME": repo["name"],
             "FINDING_JSON": _escape_braces(json.dumps(subset, indent=2)),
             "OUT_PATH": str(out_path),
+            "REPO_NOTES": notes,
         },
     )

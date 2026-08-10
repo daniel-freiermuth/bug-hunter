@@ -242,6 +242,22 @@ def cmd_daemon(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     daemon(cfg)
 
 
+def cmd_note(store: Store, cfg: Config, args: argparse.Namespace) -> None:
+    repo = _repo_or_die(store, args.repo)
+    store.append_repo_note(repo["id"], args.message, category=args.category)
+    print(f"✓ Note added to {repo['name']}")
+
+
+def cmd_show_notes(store: Store, cfg: Config, args: argparse.Namespace) -> None:
+    repo = _repo_or_die(store, args.repo)
+    notes = store.repo_notes(repo["id"])
+    if notes:
+        print(notes)
+    else:
+        print(f"No notes for {repo['name']} yet")
+        print(f"Create with: hunter note {repo['name']} \"your message\"")
+
+
 # -- parser ---------------------------------------------------------------
 
 
@@ -275,6 +291,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(fn=cmd_add_repo)
 
+
+    p = sub.add_parser("note", help="add a note to a repo")
+    p.add_argument("repo")
+    p.add_argument("message")
+    p.add_argument("--category", default=None, help="optional section header")
+    p.set_defaults(fn=cmd_note)
+
+    p = sub.add_parser("show-notes", help="show repo notes")
+    p.add_argument("repo")
+    p.set_defaults(fn=cmd_show_notes)
     sub.add_parser("repos", help="list repos").set_defaults(fn=cmd_repos)
 
     p = sub.add_parser("findings", help="list findings")

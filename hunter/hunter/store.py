@@ -134,6 +134,39 @@ class Store:
         )
         self.db.commit()
 
+    # -- repo notes ----------------------------------------------------
+    def repo_notes_path(self, repo_id: int) -> Path:
+        """Return path to repo's NOTES.md file."""
+        repo = self.get_repo(repo_id)
+        if not repo:
+            msg = f"repo {repo_id} not found"
+            raise ValueError(msg)
+        return self.cfg.work_root / "repos" / repo["name"] / "NOTES.md"
+
+    def repo_notes(self, repo_id: int) -> str:
+        """Read repo notes, or empty string if none exist."""
+        p = self.repo_notes_path(repo_id)
+        return p.read_text() if p.exists() else ""
+
+    def append_repo_note(self, repo_id: int, note: str, category: str | None = None) -> None:
+        """Append timestamped note to repo's NOTES.md."""
+        from datetime import datetime
+
+        p = self.repo_notes_path(repo_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        
+        # If file doesn't exist, create with header
+        if not p.exists():
+            repo = self.get_repo(repo_id)
+            p.write_text(f"# Notes: {repo['name']}\n\nLast updated: {datetime.now().date()}\n\n")
+        
+        # Append note
+        with p.open("a") as f:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            if category:
+                f.write(f"## {category}\n")
+            f.write(f"- [{ts}] {note}\n\n")
+
     # -- findings ------------------------------------------------------
     def upsert_finding(self, repo_id: int, f: Row) -> tuple[int, bool]:
         cur = self.db.execute("SELECT id FROM findings WHERE fingerprint = ?", (f["fingerprint"],))

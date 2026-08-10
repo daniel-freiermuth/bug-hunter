@@ -2,6 +2,9 @@ Fix exactly ONE verified bug in the worktree at {{WORKTREE}} (repo
 {{REPO_NAME}}, branch {{BRANCH}} — already checked out for you). Work only
 inside this worktree. NEVER push. NEVER run project-wide formatters.
 
+# Repository Context
+{{REPO_NOTES}}
+
 # The finding
 ```json
 {{FINDING_JSON}}
