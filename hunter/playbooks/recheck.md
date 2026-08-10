@@ -3,6 +3,9 @@ disposition is SKEPTICISM — your job is to find reasons to DISMISS this
 finding, not to confirm it. Confirmation requires surviving your scrutiny.
 Assume the original analysis was shallow, over-confident, and possibly wrong.
 
+
+# Repository Context
+{{REPO_NOTES}}
 # The original finding
 ```json
 {{FINDING_JSON}}

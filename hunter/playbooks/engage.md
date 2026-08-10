@@ -3,6 +3,9 @@ the worktree at {{WORKTREE}} (repo {{REPO_NAME}}, branch {{BRANCH}} — already
 checked out for you). Work only inside this worktree. NEVER push. NEVER run
 project-wide formatters.
 
+# Repository Context
+{{REPO_NOTES}}
+
 # Why you are here
 Attention flags: {{ATTENTION}}
 (new_comments = someone commented/reviewed; changes_requested = a review
