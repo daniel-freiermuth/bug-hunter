@@ -13,19 +13,32 @@ interface WindowInfo {
 }
 
 interface Finding {
+  type: string;  // 'bug' | 'dep_update' | 'test_gap' | 'refactor'
   id: number;
   repo_id: number;
   fingerprint: string;
   file: string;
   symbol: string | null;
   line: number | null;
-  bug_class: string;
+  category: string;  // bug_class | update_type | 'coverage' | smell_type
+  bug_class?: string;  // legacy field for bugs
   severity: string;
   confidence: number;
   summary: string;
   detail: string | null;
   evidence_plan: string | null;
   introduced_by: string | null;
+  // Type-specific fields
+  ecosystem?: string | null;
+  package?: string | null;
+  current_version?: string | null;
+  latest_version?: string | null;
+  update_type?: string | null;
+  security_advisory?: string | null;
+  missing_tests?: string | null;
+  smell_type?: string | null;
+  suggested_refactor?: string | null;
+  // Common status fields
   status: string;
   verdict_reason: string | null;
   pr_url: string | null;
@@ -76,6 +89,7 @@ interface Repo {
 interface Summary {
   windows: Record<string, WindowInfo>;
   counts: Record<string, number>;
+  type_counts: Record<string, number>;
   repos: Repo[];
   last_cycle: Event | null;
   cycle_running: boolean;
@@ -439,10 +453,20 @@ function findingCard(f: Finding, withActions: boolean): string {
         .join("")}</div>
     </details>`
     : "";
+  const typeLabels: Record<string, string> = {
+    bug: "🐛 Bug",
+    dep_update: "📦 Dep",
+    test_gap: "🧪 Test",
+    refactor: "♻️ Refactor",
+  };
+  const typeLabel = typeLabels[f.type] || f.type || "?";
+  const category = f.category || f.bug_class || "";
+  
   return `<div class="card">
     <div class="top">
+      <span class="badge type-${f.type || 'bug'}">${typeLabel}</span>
       <span class="badge sev-${sev}">${sev} \u00b7 ${conf}</span>
-      <span class="badge">${esc(f.bug_class || "")}</span>
+      <span class="badge">${esc(category)}</span>
       <span class="fp">#${f.id} ${esc(f.fingerprint)}</span>
     </div>
     <div class="sum">${esc(f.summary)}</div>
@@ -665,14 +689,15 @@ async function refresh(): Promise<void> {
     const repos = [
       ...new Set(all.map((f) => f.fingerprint.split(":")[0])),
     ].sort();
-    const classes = [
-      ...new Set(inbox.map((f) => f.bug_class).filter(Boolean)),
-    ].sort();
+    const classes = ([
+      ...new Set(inbox.map((f) => f.category || f.bug_class).filter(c => c != null && c !== "")),
+    ] as string[]).sort();
     populateSelect("fRepo", repos);
     populateSelect("fClass", classes);
 
     // ---- apply filters ----
     const fRepo = $select("fRepo").value;
+    const fType = $select("fType").value;
     const fClass = $select("fClass").value;
     const fSev = $select("fSev").value;
     const fConf = parseInt($input("fConf").value, 10) / 100;
@@ -681,7 +706,8 @@ async function refresh(): Promise<void> {
     let filtered = inbox.filter((f) => {
       if (fRepo && !f.fingerprint.startsWith(fRepo + ":"))
         return false;
-      if (fClass && f.bug_class !== fClass) return false;
+      if (fType && f.type !== fType) return false;
+      if (fClass && (f.category || f.bug_class) !== fClass) return false;
       if (
         fSev &&
         (SEV_RANK[f.severity] || 0) < (SEV_RANK[fSev] || 0)

@@ -1,4 +1,4 @@
--- Idle-Token Bug Hunter — store schema v1 (findings schema v1 from exp1 Q6)
+-- Idle-Token Bug Hunter — store schema v2 (unified findings table)
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
@@ -17,28 +17,54 @@ CREATE TABLE IF NOT EXISTS repos (
 
 CREATE TABLE IF NOT EXISTS findings (
   id            INTEGER PRIMARY KEY,
+  type          TEXT NOT NULL,             -- bug | dep_update | test_gap | refactor
   repo_id       INTEGER NOT NULL REFERENCES repos(id),
-  fingerprint   TEXT NOT NULL UNIQUE,      -- repo:path:symbol:bug-class
-  file          TEXT NOT NULL,
+  fingerprint   TEXT NOT NULL UNIQUE,
+  file          TEXT,
   symbol        TEXT,
   line          INTEGER,
-  bug_class     TEXT NOT NULL,             -- boundary|error-path|race|contract-drift|leak|logic
+  
+  -- Common fields (all types)
   severity      TEXT NOT NULL,             -- high|medium|low
   confidence    REAL NOT NULL,
   summary       TEXT NOT NULL,
   detail        TEXT,
-  evidence_plan TEXT,
-  rung_achieved INTEGER,                   -- 1..3 once fixed; NULL before
-  introduced_by TEXT,
   status        TEXT NOT NULL DEFAULT 'new',
     -- new | queued | fixing | pr_open | merged | rejected | wontfix | note
-  verdict_reason TEXT,                     -- REQUIRED for rejected/wontfix (suppression corpus)
   pr_url        TEXT,
   created_at    INTEGER NOT NULL,
-  updated_at    INTEGER NOT NULL
+  updated_at    INTEGER NOT NULL,
+  
+  -- Bug-specific fields (nullable for other types)
+  bug_class     TEXT,                      -- boundary|error-path|race|contract-drift|leak|logic
+  evidence_plan TEXT,
+  introduced_by TEXT,
+  rung_achieved INTEGER,                   -- 1..3 once fixed; NULL before
+  verdict_reason TEXT,                     -- REQUIRED for rejected/wontfix (suppression corpus)
+  budget_override TEXT,
+  
+  -- Dep update fields (nullable for other types)
+  ecosystem     TEXT,
+  package       TEXT,
+  current_version TEXT,
+  latest_version TEXT,
+  update_type   TEXT,                      -- major|minor|patch
+  security_advisory TEXT,
+  
+  -- Test gap fields (nullable for other types)
+  missing_tests TEXT,
+  test_file     TEXT,
+  
+  -- Refactoring fields (nullable for other types)
+  smell_type    TEXT,
+  suggested_refactor TEXT
 );
+CREATE UNIQUE INDEX IF NOT EXISTS findings_fingerprint ON findings(fingerprint);
 CREATE INDEX IF NOT EXISTS findings_status ON findings(status);
 CREATE INDEX IF NOT EXISTS findings_repo ON findings(repo_id, status);
+CREATE INDEX IF NOT EXISTS findings_type ON findings(type);
+CREATE INDEX IF NOT EXISTS findings_repo_type ON findings(repo_id, type);
+CREATE INDEX IF NOT EXISTS findings_type_status ON findings(type, status);
 
 CREATE TABLE IF NOT EXISTS jobs (
   id            INTEGER PRIMARY KEY,

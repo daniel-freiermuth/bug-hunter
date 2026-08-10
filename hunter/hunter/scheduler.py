@@ -14,10 +14,14 @@ from . import budget, runner
 from .forge import forge_for
 from .ingest import ingest_findings
 from .playbooks import (
+    build_apply_improvement_prompt,
+    build_dep_update_prompt,
     build_engage_prompt,
     build_fix_prompt,
     build_hunt_prompt,
     build_recheck_prompt,
+    build_refactor_prompt,
+    build_test_gap_prompt,
 )
 from .store import Store
 from .types import BudgetDecision, Config, Row, RunResult, WindowState, now_ms
@@ -102,24 +106,27 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         return {"error": "rev-parse HEAD failed"}
 
     # Check if full re-hunt is due (revisit old code periodically)
-    last_full = repo.get("last_full_hunt_at") or 0
+    last: str | None = repo.get("last_hunt_sha")
+    last_full = repo.get("last_full_hunt_at")
     rehunt_interval_ms = cfg.hunt_rehunt_days * 86400_000
-    rehunt_due = (now_ms() - last_full) > rehunt_interval_ms
+    # Only trigger re-hunt if we've completed at least one hunt before
+    rehunt_due = last_full and (now_ms() - last_full) > rehunt_interval_ms
+    full_rehunt_triggered = False
     
     if rehunt_due and not force:
         # Clear watermark → triggers full-history hunt below
         store.db.execute(
-            "UPDATE repos SET last_hunt_sha = NULL, last_full_hunt_at = ? WHERE id = ?",
-            (now_ms(), rid),
+            "UPDATE repos SET last_hunt_sha = NULL WHERE id = ?",
+            (rid,),
         )
         store.db.commit()
         store.log_event(
             "hunt",
             f"{rname}: full re-hunt triggered ({cfg.hunt_rehunt_days}d interval)",
         )
-        last = None  # Force full hunt below
+        last = None  # Force full hunt
+        full_rehunt_triggered = True
 
-    last: str | None = repo.get("last_hunt_sha")
     if last == head and not force:
         # No new commits — update timestamp so scheduler rotates to next repo.
         store.set_last_hunt(repo["id"], head)
@@ -240,6 +247,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         "diff_range": diff_range,
         "tokens_new": rr.tokens_new,
         "head": head,
+        "full_rehunt": full_rehunt_triggered,
     }
     if out_path.exists():
         counts = ingest_findings(store, rid, out_path)
@@ -251,21 +259,22 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
             f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
             job_id=job,
         )
-        # Mark full re-hunt complete only when output is produced
-        if state == "done" and full_rehunt_triggered:
-            store.db.execute(
-                "UPDATE repos SET last_full_hunt_at = ? WHERE id = ?",
-                (now_ms(), rid),
-            )
-            store.db.commit()
+        # Only update watermarks when output is produced
+        if state == "done":
+            store.set_last_hunt(rid, head)
+            if full_rehunt_triggered:
+                store.db.execute(
+                    "UPDATE repos SET last_full_hunt_at = ? WHERE id = ?",
+                    (now_ms(), rid),
+                )
+                store.db.commit()
     else:
         store.log_event(
             "hunt",
             f"{rname}: job {job} {state}, no findings file ({rr.tokens_new} tok)",
             job_id=job,
         )
-    if state == "done":
-        store.set_last_hunt(rid, head)
+
     return summary
 
 
@@ -432,6 +441,302 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
         store.set_budget_override(fid, None)
     return summary
 
+
+# -- test gap ---------------------------------------------------------------
+
+
+def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
+    """Hunt for test coverage gaps in a repo."""
+    rid: int = repo["id"]
+    rname: str = repo["name"]
+    rpath = Path(repo["path"])
+    
+    # Ensure repo is up-to-date (same as hunt)
+    if not rpath.exists():
+        store.log_event("error", f"test_gap {rname}: repo not cloned")
+        return {"error": "repo not cloned"}
+    
+    for cmd in (
+        ["git", "fetch", "origin"],
+        ["git", "checkout", repo["default_branch"]],
+        ["git", "pull", "--ff-only"],
+    ):
+        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+        if rc != 0:
+            store.log_event("error", f"test_gap {rname}: {' '.join(cmd)} failed: {out[-300:]}")
+            return {"error": f"{' '.join(cmd)} failed"}
+    
+    # Budget check
+    windows = budget.read_windows()
+    dec = budget.decide(cfg, "hunt", windows)  # Use hunt budget for now
+    if not dec.allow:
+        job = store.create_job("test_gap", rid)
+        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
+        store.log_event("deny", f"test_gap {rname}: {dec.reason}", job_id=job)
+        return {"denied": dec.reason, "job": job}
+    
+    job = store.create_job("test_gap", rid, cap_tokens=dec.cap_tokens)
+    out_path = cfg.work_root / "out" / f"job{job}.test_gaps.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    suppressions = store.suppressions(rid, finding_type="test_gap")
+    known = store.known_active(rid, finding_type="test_gap")
+
+    prompt = build_test_gap_prompt(
+        repo,
+        "Full repository scan for test coverage gaps.",
+        suppressions,
+        known,
+        out_path,
+        cfg.hunt_max_findings,  # Reuse hunt max for now
+        store.repo_notes(rid),
+    )
+    
+    pre_usage = _usage_snapshot(windows)
+    store.update_job(job, state="running")
+    model = cfg.model_for("hunt")
+    rr = runner.run_worker(
+        cfg,
+        rpath,
+        prompt,
+        dec.cap_tokens,
+        cfg.hunt_max_wall_s,
+        model=model,
+    )
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+    
+    summary: Row = {
+        "kind": "test_gap",
+        "repo": rname,
+        "job": job,
+        "state": state,
+        "tokens_new": rr.tokens_new,
+    }
+    
+    if out_path.exists():
+        counts = ingest_findings(store, rid, out_path, finding_type="test_gap")
+        summary["ingest"] = counts
+        store.log_event(
+            "test_gap",
+            f"{rname}: job {job} {state} -- +{counts['inserted']} new / {counts['duplicates']} dup"
+            f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+        # Only update timestamp after successful output + ingestion
+        if state == "done":
+            store.db.execute(
+                "UPDATE repos SET last_test_gap_at = ? WHERE id = ?",
+                (now_ms(), rid),
+            )
+            store.db.commit()
+    else:
+        store.log_event(
+            "test_gap",
+            f"{rname}: job {job} {state}, no gaps file ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+    return summary
+
+
+
+# -- dependency updates -----------------------------------------------------
+
+
+def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
+    """Check for outdated dependencies."""
+    rid: int = repo["id"]
+    rname: str = repo["name"]
+    rpath = Path(repo["path"])
+    
+    # Ensure repo is up-to-date
+    if not rpath.exists():
+        store.log_event("error", f"dep_update {rname}: repo not cloned")
+        return {"error": "repo not cloned"}
+    
+    for cmd in (
+        ["git", "fetch", "origin"],
+        ["git", "checkout", repo["default_branch"]],
+        ["git", "pull", "--ff-only"],
+    ):
+        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+        if rc != 0:
+            store.log_event("error", f"dep_update {rname}: {' '.join(cmd)} failed: {out[-300:]}")
+            return {"error": f"{' '.join(cmd)} failed"}
+    
+    # Budget check
+    windows = budget.read_windows()
+    dec = budget.decide(cfg, "hunt", windows)
+    if not dec.allow:
+        job = store.create_job("dep_update", rid)
+        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
+        store.log_event("deny", f"dep_update {rname}: {dec.reason}", job_id=job)
+        return {"denied": dec.reason, "job": job}
+    
+    job = store.create_job("dep_update", rid, cap_tokens=dec.cap_tokens)
+    out_path = cfg.work_root / "out" / f"job{job}.dep_updates.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    suppressions = store.suppressions(rid, finding_type="dep_update")
+    known = store.known_active(rid, finding_type="dep_update")
+
+    prompt = build_dep_update_prompt(
+        repo,
+        "Check all package manifests for outdated dependencies.",
+        suppressions,
+        known,
+        out_path,
+        cfg.hunt_max_findings,
+        store.repo_notes(rid),
+    )
+    
+    pre_usage = _usage_snapshot(windows)
+    store.update_job(job, state="running")
+    model = cfg.model_for("hunt")
+    rr = runner.run_worker(
+        cfg,
+        rpath,
+        prompt,
+        dec.cap_tokens,
+        cfg.hunt_max_wall_s,
+        model=model,
+    )
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+    
+    summary: Row = {
+        "kind": "dep_update",
+        "repo": rname,
+        "job": job,
+        "state": state,
+        "tokens_new": rr.tokens_new,
+    }
+    
+    if out_path.exists():
+        counts = ingest_findings(store, rid, out_path, finding_type="dep_update")
+        summary["ingest"] = counts
+        store.log_event(
+            "dep_update",
+            f"{rname}: job {job} {state} -- +{counts['inserted']} new / {counts['duplicates']} dup"
+            f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+        # Only update timestamp after successful output + ingestion
+        if state == "done":
+            store.db.execute(
+                "UPDATE repos SET last_dep_update_at = ? WHERE id = ?",
+                (now_ms(), rid),
+            )
+            store.db.commit()
+    else:
+        store.log_event(
+            "dep_update",
+            f"{rname}: job {job} {state}, no updates file ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+    
+    return summary
+
+
+# -- refactoring ------------------------------------------------------------
+
+
+def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
+    """Hunt for mechanical refactoring opportunities."""
+    rid: int = repo["id"]
+    rname: str = repo["name"]
+    rpath = Path(repo["path"])
+    
+    # Ensure repo is up-to-date
+    if not rpath.exists():
+        store.log_event("error", f"refactor {rname}: repo not cloned")
+        return {"error": "repo not cloned"}
+    
+    for cmd in (
+        ["git", "fetch", "origin"],
+        ["git", "checkout", repo["default_branch"]],
+        ["git", "pull", "--ff-only"],
+    ):
+        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+        if rc != 0:
+            store.log_event("error", f"refactor {rname}: {' '.join(cmd)} failed: {out[-300:]}")
+            return {"error": f"{' '.join(cmd)} failed"}
+    
+    # Budget check
+    windows = budget.read_windows()
+    dec = budget.decide(cfg, "hunt", windows)
+    if not dec.allow:
+        job = store.create_job("refactor", rid)
+        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
+        store.log_event("deny", f"refactor {rname}: {dec.reason}", job_id=job)
+        return {"denied": dec.reason, "job": job}
+    
+    job = store.create_job("refactor", rid, cap_tokens=dec.cap_tokens)
+    out_path = cfg.work_root / "out" / f"job{job}.refactorings.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    suppressions = store.suppressions(rid, finding_type="refactor")
+    known = store.known_active(rid, finding_type="refactor")
+    prompt = build_refactor_prompt(
+        repo,
+        "Scan for safe, mechanical refactoring opportunities (duplication, dead code, complexity).",
+        suppressions,
+        known,
+        out_path,
+        cfg.hunt_max_findings,
+        store.repo_notes(rid),
+    )
+    
+    pre_usage = _usage_snapshot(windows)
+    store.update_job(job, state="running")
+    model = cfg.model_for("hunt")
+    rr = runner.run_worker(
+        cfg,
+        rpath,
+        prompt,
+        dec.cap_tokens,
+        cfg.hunt_max_wall_s,
+        model=model,
+    )
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+    
+    summary: Row = {
+        "kind": "refactor",
+        "repo": rname,
+        "job": job,
+        "state": state,
+        "tokens_new": rr.tokens_new,
+    }
+    
+    if out_path.exists():
+        counts = ingest_findings(store, rid, out_path, finding_type="refactor")
+        summary["ingest"] = counts
+        store.log_event(
+            "refactor",
+            f"{rname}: job {job} {state} -- +{counts['inserted']} new / {counts['duplicates']} dup"
+            f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+        # Only update timestamp after successful output + ingestion
+        if state == "done":
+            store.db.execute(
+                "UPDATE repos SET last_refactor_at = ? WHERE id = ?",
+                (now_ms(), rid),
+            )
+            store.db.commit()
+    else:
+        store.log_event(
+            "refactor",
+            f"{rname}: job {job} {state}, no refactorings file ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+    
+    return summary
+
+
 # -- fix --------------------------------------------------------------------
 
 
@@ -452,8 +757,9 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
     rpath: str = repo["path"]
     db: str = repo["default_branch"]
 
+    is_bug = finding.get("type", "bug") == "bug"
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", finding["summary"]).lower().strip("-")[:40].rstrip("-")
-    branch = f"fix/{slug}-{fid}"
+    branch = f"{'fix' if is_bug else 'improve'}/{slug}-{fid}"
     worktree = cfg.work_root / "wt" / f"f{fid}"
     worktree.parent.mkdir(parents=True, exist_ok=True)
 
@@ -552,7 +858,8 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
     pre_usage = _usage_snapshot(windows)
     store.set_status(fid, "fixing")
     store.update_job(job, state="running")
-    prompt = build_fix_prompt(finding, worktree, branch, repo, store.repo_notes(repo["id"]))
+    build_prompt = build_fix_prompt if is_bug else build_apply_improvement_prompt
+    prompt = build_prompt(finding, worktree, branch, repo, store.repo_notes(repo["id"]))
     model = cfg.model_for("fix")
     rr = runner.run_worker(
         cfg,
@@ -574,15 +881,18 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         "tokens_new": rr.tokens_new,
     }
 
-    # (a) Worker argued innocence.
-    not_a_bug = worktree / "NOT-A-BUG.md"
-    if not_a_bug.exists():
-        reason = not_a_bug.read_text()[:500]
+    # (a) Worker declined this finding, or hit a blocker.
+    decline_file = worktree / ("NOT-A-BUG.md" if is_bug else "DECLINED.md")
+    blocked_file = worktree / "BLOCKED.md"
+    outcome_file = decline_file if decline_file.exists() else (blocked_file if blocked_file.exists() else None)
+    if outcome_file is not None:
+        reason = outcome_file.read_text()[:500]
         store.set_status(fid, "rejected", verdict_reason=reason)
         first_line = reason.splitlines()[0][:120] if reason else ""
+        verb = "rejected" if outcome_file == decline_file else "blocked"
         store.log_event(
             "fix",
-            f"#{fid} rejected by worker: {first_line}",
+            f"#{fid} {verb} by worker: {first_line}",
             job_id=job,
             finding_id=fid,
         )
@@ -1183,7 +1493,68 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
                     else None
                 )
             if target is not None:
-                result = run_hunt(store, cfg, target)
+                rpath = Path(target["path"])
+                
+                # If repo not cloned yet, run hunt first (it clones)
+                if not rpath.exists():
+                    result = run_hunt(store, cfg, target)
+                else:
+                    # Multi-job rotation: pick the most stale job type
+                    job_times = {
+                        "hunt": target.get("last_hunt_at") or 0,
+                        "test_gap": target.get("last_test_gap_at") or 0,
+                        "dep_update": target.get("last_dep_update_at") or 0,
+                        "refactor": target.get("last_refactor_at") or 0,
+                    }
+                    
+                    # Pick job type that hasn't run (0) or is most stale
+                    # Priority: never-run > oldest timestamp
+                    never_run = [k for k, v in job_times.items() if v == 0]
+                    if never_run:
+                        # Deterministic order for never-run jobs
+                        job_type = sorted(never_run)[0]
+                    else:
+                        # Pick oldest
+                        job_type = min(job_times, key=job_times.get)
+                    
+                    if job_type == "hunt":
+                        result = run_hunt(store, cfg, target)
+                    elif job_type == "test_gap":
+                        result = run_test_gap(store, cfg, target)
+                    elif job_type == "dep_update":
+                        result = run_dep_update(store, cfg, target)
+                    elif job_type == "refactor":
+                        result = run_refactor(store, cfg, target)
+                    else:
+                        result = run_hunt(store, cfg, target)  # fallback
+                    
+                    
+                    
+                    # Prevent never-run starvation: if the job was never-run and it didn't
+                    # succeed (failed, killed, or done without output), mark it attempted
+                    if job_type != "hunt":  # hunt has its own watermark logic
+                        was_never_run = job_times[job_type] == 0
+                        # Job failed if: state is not "done", OR state is "done" but no ingest occurred
+                        failed = (
+                            result.get("state") in ("killed", "failed") or
+                            result.get("error") or
+                            result.get("ingest_error") or
+                            (result.get("state") == "done" and "ingest" not in result)
+                        )
+                        if was_never_run and failed:
+                            # Job failed - mark as attempted to prevent indefinite starvation
+                            # Use conditional mapping to avoid f-string SQL injection
+                            if job_type == "test_gap":
+                                sql = "UPDATE repos SET last_test_gap_at = ? WHERE id = ?"
+                            elif job_type == "dep_update":
+                                sql = "UPDATE repos SET last_dep_update_at = ? WHERE id = ?"
+                            elif job_type == "refactor":
+                                sql = "UPDATE repos SET last_refactor_at = ? WHERE id = ?"
+                            else:
+                                sql = None
+                            if sql:
+                                store.db.execute(sql, (now_ms(), target["id"]))
+                                store.db.commit()
             else:
                 result: Row = {  # type: ignore[no-redef]
                     "idle": "no queued findings, no enabled repos",

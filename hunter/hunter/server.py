@@ -147,7 +147,10 @@ class Handler(BaseHTTPRequestHandler):
             }
         store = self._store()
         counts: dict[str, int] = dict.fromkeys(FINDING_STATUSES, 0)
-        counts.update(Counter(f["status"] for f in store.list_findings()))
+        all_findings = store.list_all_findings()
+        counts.update(Counter(f["status"] for f in all_findings))
+        # Also add type breakdown
+        type_counts = Counter(f["type"] for f in all_findings)
         last_cycle = next(
             (e for e in store.recent_events(limit=500) if e["kind"] == "cycle"),
             None,
@@ -155,6 +158,7 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "windows": windows,
             "counts": counts,
+            "type_counts": dict(type_counts),
             "repos": store.list_repos(),
             "last_cycle": last_cycle,
             "cycle_running": _cycle_lock.locked(),
@@ -165,6 +169,8 @@ class Handler(BaseHTTPRequestHandler):
         status = (qs.get("status") or [None])[0] or None  # type: ignore[list-item]
         repo_key = (qs.get("repo") or [None])[0] or None  # type: ignore[list-item]
         severity = (qs.get("severity") or [None])[0] or None  # type: ignore[list-item]
+        finding_type = (qs.get("type") or [None])[0] or None  # type: ignore[list-item]
+        unified = (qs.get("unified") or ["1"])[0] == "1"  # default true
         repo_id: int | None = None
         if repo_key is not None:
             key: int | str = int(repo_key) if repo_key.isdigit() else repo_key
@@ -173,11 +179,21 @@ class Handler(BaseHTTPRequestHandler):
                 msg = f"unknown repo {repo_key!r}"
                 raise ValueError(msg)
             repo_id = repo["id"]
-        findings: list[Row] = store.list_findings(
-            status=status,
-            repo_id=repo_id,
-            min_severity=severity,
-        )
+        
+        if unified:
+            findings: list[Row] = store.list_all_findings(
+                status=status,
+                repo_id=repo_id,
+                min_severity=severity,
+                finding_type=finding_type,
+            )
+        else:
+            # Legacy: bugs only
+            findings = store.list_findings(
+                status=status,
+                repo_id=repo_id,
+                min_severity=severity,
+            )
         # Embed per-finding event timeline.
         fids: list[int] = [f["id"] for f in findings]
         timelines = store.events_by_finding(fids)

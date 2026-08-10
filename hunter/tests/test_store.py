@@ -231,6 +231,23 @@ class TestSuppressions:
         assert len(store.known_active(r1)) == 1
         assert len(store.known_active(r2)) == 0
 
+    def test_filters_by_finding_type(self, store: Store) -> None:
+        """Bug-hunt suppression/known corpora must not leak dep_update/test_gap/
+        refactor findings sharing the same repo -- they use separate playbooks
+        and a mixed-type corpus would confuse the bug hunter."""
+        rid = store.add_repo("r", "https://r", "/r")
+        bug_fid, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-bug"), finding_type="bug")
+        dep_fid, _ = store.upsert_finding(
+            rid, {"fingerprint": "fp-dep", "package": "foo"}, finding_type="dep_update"
+        )
+        store.set_status(bug_fid, "rejected", verdict_reason="bad")
+        store.set_status(dep_fid, "rejected", verdict_reason="also bad")
+        assert [s["id"] for s in store.suppressions(rid)] == [bug_fid]
+        assert [s["id"] for s in store.suppressions(rid, finding_type="dep_update")] == [dep_fid]
+
+        other_fid, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-bug-2"), finding_type="bug")
+        assert [a["id"] for a in store.known_active(rid)] == [other_fid]
+
 
 # -- jobs ------------------------------------------------------------------
 

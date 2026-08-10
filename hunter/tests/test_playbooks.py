@@ -11,10 +11,13 @@ from hunter.playbooks import (
     _escape_braces,
     _feedback_blocks,
     _render,
+    build_dep_update_prompt,
     build_engage_prompt,
     build_fix_prompt,
     build_hunt_prompt,
     build_recheck_prompt,
+    build_refactor_prompt,
+    build_test_gap_prompt,
 )
 
 
@@ -283,3 +286,95 @@ class TestBuildRecheckPrompt:
         assert isinstance(result, str)
         assert len(result) > 0
         assert "{{" not in result
+
+
+# -- build_test_gap_prompt / build_dep_update_prompt / build_refactor_prompt --
+# All three share the suppressions+known_active contract with build_hunt_prompt:
+# suppressed (rejected/wontfix) findings surface their verdict_reason so a
+# worker can recognize a still-applicable verdict instead of re-filing.
+
+
+class TestBuildTestGapPrompt:
+    def test_suppressions_show_verdict_reason(self):
+        result = build_test_gap_prompt(
+            repo=_repo(),
+            scope_note="",
+            suppressions=[{"fingerprint": "fp-declined", "verdict_reason": "already covered by e2e suite"}],
+            known_gaps=[{"fingerprint": "fp-open", "status": "queued", "summary": "missing edge case"}],
+            out_path=Path("/tmp/gaps.json"),
+            max_gaps=5,
+        )
+        assert "fp-declined" in result
+        assert "already covered by e2e suite" in result
+        assert "fp-open" in result
+        assert "{{" not in result
+
+    def test_empty_lists_render_placeholder(self):
+        result = build_test_gap_prompt(
+            repo=_repo(),
+            scope_note="",
+            suppressions=[],
+            known_gaps=[],
+            out_path=Path("/tmp/gaps.json"),
+            max_gaps=5,
+        )
+        assert "(none yet)" in result
+
+
+class TestBuildDepUpdatePrompt:
+    def test_suppressions_show_verdict_reason(self):
+        result = build_dep_update_prompt(
+            repo=_repo(),
+            scope_note="",
+            suppressions=[
+                {
+                    "fingerprint": "test:npm:maplibre-gl:5.24.0->6.3.0",
+                    "verdict_reason": "BLOCKED: deck.gl/mapbox reads private map.transform, removed in v6",
+                }
+            ],
+            known_updates=[{"fingerprint": "test:npm:foo:1.0.0->1.1.0", "status": "new", "summary": "patch update"}],
+            out_path=Path("/tmp/updates.json"),
+            max_updates=10,
+        )
+        assert "maplibre-gl" in result
+        assert "map.transform" in result
+        assert "test:npm:foo:1.0.0->1.1.0" in result
+        assert "{{" not in result
+
+    def test_empty_lists_render_placeholder(self):
+        result = build_dep_update_prompt(
+            repo=_repo(),
+            scope_note="",
+            suppressions=[],
+            known_updates=[],
+            out_path=Path("/tmp/updates.json"),
+            max_updates=10,
+        )
+        assert "(none yet)" in result
+
+
+class TestBuildRefactorPrompt:
+    def test_suppressions_show_verdict_reason(self):
+        result = build_refactor_prompt(
+            repo=_repo(),
+            scope_note="",
+            suppressions=[{"fingerprint": "fp-declined", "verdict_reason": "intentional duplication for isolation"}],
+            known_refactors=[{"fingerprint": "fp-open", "status": "queued", "summary": "extract shared helper"}],
+            out_path=Path("/tmp/refactors.json"),
+            max_refactors=10,
+        )
+        assert "fp-declined" in result
+        assert "intentional duplication for isolation" in result
+        assert "fp-open" in result
+        assert "{{" not in result
+
+    def test_empty_lists_render_placeholder(self):
+        result = build_refactor_prompt(
+            repo=_repo(),
+            scope_note="",
+            suppressions=[],
+            known_refactors=[],
+            out_path=Path("/tmp/refactors.json"),
+            max_refactors=10,
+        )
+        assert "(none yet)" in result

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from typing import Any
 
@@ -67,6 +68,7 @@ def _rows(cur: sqlite3.Cursor) -> list[Row]:
 
 class Store:
     def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(cfg.db_path)
         self.db.row_factory = sqlite3.Row
@@ -80,6 +82,8 @@ class Store:
             ("budget_override", "findings", "ALTER TABLE findings ADD COLUMN budget_override TEXT"),
             ("last_full_hunt_at", "repos", "ALTER TABLE repos ADD COLUMN last_full_hunt_at INTEGER"),
             ("last_test_gap_at", "repos", "ALTER TABLE repos ADD COLUMN last_test_gap_at INTEGER"),
+            ("last_dep_update_at", "repos", "ALTER TABLE repos ADD COLUMN last_dep_update_at INTEGER"),
+            ("last_refactor_at", "repos", "ALTER TABLE repos ADD COLUMN last_refactor_at INTEGER"),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
@@ -138,12 +142,15 @@ class Store:
 
     # -- repo notes ----------------------------------------------------
     def repo_notes_path(self, repo_id: int) -> Path:
-        """Return path to repo's NOTES.md file."""
+        """Return path to repo's NOTES.md file (ID-based for stability)."""
+        from pathlib import Path as PathType
+        
         repo = self.get_repo(repo_id)
         if not repo:
             msg = f"repo {repo_id} not found"
             raise ValueError(msg)
-        return self.cfg.work_root / "repos" / repo["name"] / "NOTES.md"
+        # Use repo_id for path stability (survives renames)
+        return self.cfg.work_root / "repos" / f"repo-{repo_id}" / "NOTES.md"
 
     def repo_notes(self, repo_id: int) -> str:
         """Read repo notes, or empty string if none exist."""
@@ -170,30 +177,46 @@ class Store:
             f.write(f"- [{ts}] {note}\n\n")
 
     # -- findings ------------------------------------------------------
-    def upsert_finding(self, repo_id: int, f: Row) -> tuple[int, bool]:
+    def upsert_finding(self, repo_id: int, f: Row, finding_type: str = "bug") -> tuple[int, bool]:
         cur = self.db.execute("SELECT id FROM findings WHERE fingerprint = ?", (f["fingerprint"],))
         row = cur.fetchone()
         if row:
             return int(row["id"]), False
         t = now_ms()
+        missing_tests = f.get("missing_tests")
+        if isinstance(missing_tests, list):
+            missing_tests = json.dumps(missing_tests)
         cur = self.db.execute(
-            "INSERT INTO findings (repo_id, fingerprint, file, symbol, line, bug_class,"
+            "INSERT INTO findings (type, repo_id, fingerprint, file, symbol, line, bug_class,"
             " severity, confidence, summary, detail, evidence_plan, introduced_by,"
+            " ecosystem, package, current_version, latest_version, update_type, security_advisory,"
+            " missing_tests, test_file, smell_type, suggested_refactor,"
             " status, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)",
             (
+                finding_type,
                 repo_id,
                 f["fingerprint"],
                 f.get("file", ""),
                 f.get("symbol"),
                 f.get("line"),
-                f["bug_class"],
-                f["severity"],
+                f.get("bug_class"),
+                f.get("severity", "medium"),
                 float(f.get("confidence", 0.0)),
                 f.get("summary", ""),
                 f.get("detail"),
                 f.get("evidence_plan"),
                 f.get("introduced_by"),
+                f.get("ecosystem"),
+                f.get("package"),
+                f.get("current_version"),
+                f.get("latest_version"),
+                f.get("update_type"),
+                f.get("security_advisory"),
+                missing_tests,
+                f.get("test_file"),
+                f.get("smell_type"),
+                f.get("suggested_refactor"),
                 t,
                 t,
             ),
@@ -230,6 +253,50 @@ class Store:
             q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY id DESC"
         return _rows(self.db.execute(q, args))
+
+    def list_all_findings(
+        self,
+        status: str | None = None,
+        repo_id: int | None = None,
+        min_severity: str | None = None,
+        finding_type: str | None = None,
+    ) -> list[Row]:
+        """
+        Query findings across all types (bug, dep_update, test_gap, refactor).
+        Each result has a 'type' field and a computed 'category' field for UI
+        display (bug_class | update_type | 'coverage' | smell_type).
+        """
+        conds: list[str] = []
+        args: list[Any] = []
+        if status:
+            conds.append("status = ?")
+            args.append(status)
+        if repo_id:
+            conds.append("repo_id = ?")
+            args.append(repo_id)
+        if finding_type:
+            conds.append("type = ?")
+            args.append(finding_type)
+        if min_severity:
+            allowed = Severity.at_or_above(Severity.from_str(min_severity))
+            ph = ",".join("?" * len(allowed))
+            conds.append(f"severity IN ({ph})")
+            args.extend(allowed)
+        q = "SELECT * FROM findings"
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY id DESC"
+        rows = _rows(self.db.execute(q, args))
+        for r in rows:
+            if r["type"] == "bug":
+                r["category"] = r.get("bug_class")
+            elif r["type"] == "dep_update":
+                r["category"] = r.get("update_type")
+            elif r["type"] == "test_gap":
+                r["category"] = "coverage"
+            elif r["type"] == "refactor":
+                r["category"] = r.get("smell_type")
+        return rows
 
     def set_status(
         self,
@@ -278,21 +345,21 @@ class Store:
         self.db.commit()
         return cur.rowcount
 
-    def suppressions(self, repo_id: int) -> list[Row]:
+    def suppressions(self, repo_id: int, finding_type: str = "bug") -> list[Row]:
         ph = ",".join("?" * len(SUPPRESSED_STATUSES))
         return _rows(
             self.db.execute(
-                f"SELECT * FROM findings WHERE repo_id = ? AND status IN ({ph}) ORDER BY id",
-                (repo_id, *SUPPRESSED_STATUSES),
+                f"SELECT * FROM findings WHERE repo_id = ? AND type = ? AND status IN ({ph}) ORDER BY id",
+                (repo_id, finding_type, *SUPPRESSED_STATUSES),
             )
         )
 
-    def known_active(self, repo_id: int) -> list[Row]:
+    def known_active(self, repo_id: int, finding_type: str = "bug") -> list[Row]:
         ph = ",".join("?" * len(ACTIVE_STATUSES))
         return _rows(
             self.db.execute(
-                f"SELECT * FROM findings WHERE repo_id = ? AND status IN ({ph}) ORDER BY id",
-                (repo_id, *ACTIVE_STATUSES),
+                f"SELECT * FROM findings WHERE repo_id = ? AND type = ? AND status IN ({ph}) ORDER BY id",
+                (repo_id, finding_type, *ACTIVE_STATUSES),
             )
         )
 

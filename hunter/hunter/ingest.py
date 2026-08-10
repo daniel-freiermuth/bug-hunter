@@ -12,7 +12,9 @@ if TYPE_CHECKING:
     from .store import Store
 
 
-def ingest_findings(store: Store, repo_id: int, findings_path: Path) -> dict[str, int]:
+def ingest_findings(
+    store: Store, repo_id: int, findings_path: Path, finding_type: str = "bug"
+) -> dict[str, int]:
     result: dict[str, int] = {"inserted": 0, "duplicates": 0, "invalid": 0}
     try:
         entries = json.loads(Path(findings_path).read_text())
@@ -29,7 +31,7 @@ def ingest_findings(store: Store, repo_id: int, findings_path: Path) -> dict[str
         return result
 
     for i, f in enumerate(entries):
-        problem = _validate(f)
+        problem = _validate(f, finding_type)
         if problem:
             result["invalid"] += 1
             store.log_event(
@@ -39,24 +41,30 @@ def ingest_findings(store: Store, repo_id: int, findings_path: Path) -> dict[str
             continue
         row: Row = dict(f)
         row["confidence"] = max(0.0, min(1.0, float(row.get("confidence", 0.0))))
-        fid, inserted = store.upsert_finding(repo_id, row)
+        fid, inserted = store.upsert_finding(repo_id, row, finding_type=finding_type)
+        event_kind = "hunt" if finding_type == "bug" else finding_type
         if inserted:
             result["inserted"] += 1
-            store.log_event("hunt", f"new finding: {row['fingerprint']}", finding_id=fid)
+            store.log_event(event_kind, f"new {finding_type}: {row['fingerprint']}", finding_id=fid)
         else:
             result["duplicates"] += 1
     return result
 
 
-def _validate(f: Any) -> str | None:
+def _validate(f: Any, finding_type: str) -> str | None:
     if not isinstance(f, dict):
         return "not an object"
     if not f.get("fingerprint"):
         return "missing fingerprint"
-    if f.get("bug_class") not in BUG_CLASSES:
-        return f"unknown bug_class {f.get('bug_class')!r}"
-    if f.get("severity") not in SEVERITIES:
-        return f"unknown severity {f.get('severity')!r}"
+    if finding_type == "bug":
+        if f.get("bug_class") not in BUG_CLASSES:
+            return f"unknown bug_class {f.get('bug_class')!r}"
+        if f.get("severity") not in SEVERITIES:
+            return f"unknown severity {f.get('severity')!r}"
+    else:
+        sev = f.get("severity", "medium")
+        if sev not in SEVERITIES:
+            return f"unknown severity {sev!r}"
     try:
         float(f.get("confidence", 0.0))
     except (TypeError, ValueError):
