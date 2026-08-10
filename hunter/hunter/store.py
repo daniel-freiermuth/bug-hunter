@@ -78,6 +78,8 @@ class Store:
             ("model", "jobs", "ALTER TABLE jobs ADD COLUMN model TEXT"),
             ("usage_delta", "jobs", "ALTER TABLE jobs ADD COLUMN usage_delta REAL"),
             ("budget_override", "findings", "ALTER TABLE findings ADD COLUMN budget_override TEXT"),
+            ("last_full_hunt_at", "repos", "ALTER TABLE repos ADD COLUMN last_full_hunt_at INTEGER"),
+            ("last_test_gap_at", "repos", "ALTER TABLE repos ADD COLUMN last_test_gap_at INTEGER"),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")

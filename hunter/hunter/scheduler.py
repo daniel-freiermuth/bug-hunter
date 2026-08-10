@@ -101,6 +101,24 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         )
         return {"error": "rev-parse HEAD failed"}
 
+    # Check if full re-hunt is due (revisit old code periodically)
+    last_full = repo.get("last_full_hunt_at") or 0
+    rehunt_interval_ms = cfg.hunt_rehunt_days * 86400_000
+    rehunt_due = (now_ms() - last_full) > rehunt_interval_ms
+    
+    if rehunt_due and not force:
+        # Clear watermark → triggers full-history hunt below
+        store.db.execute(
+            "UPDATE repos SET last_hunt_sha = NULL, last_full_hunt_at = ? WHERE id = ?",
+            (now_ms(), rid),
+        )
+        store.db.commit()
+        store.log_event(
+            "hunt",
+            f"{rname}: full re-hunt triggered ({cfg.hunt_rehunt_days}d interval)",
+        )
+        last = None  # Force full hunt below
+
     last: str | None = repo.get("last_hunt_sha")
     if last == head and not force:
         # No new commits — update timestamp so scheduler rotates to next repo.
@@ -114,7 +132,30 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
     if last:
         diff_range = f"{last}..{head}"
         scope_note = f"Commits since the last completed hunt ({last[:12]})."
+    elif full_rehunt_triggered:
+        # Full re-hunt: scan from repository root
+        rc, roots = run_cmd(
+            [
+                "git",
+                "-C",
+                str(rpath),
+                "rev-list",
+                "--max-parents=0",
+                head,
+            ]
+        )
+        if rc != 0 or not roots:
+            store.log_event("error", f"hunt {rname}: failed to find repository root")
+            return {"error": "failed to find repository root"}
+        
+        root = roots.splitlines()[-1]
+        # Use git's empty tree to include the root commit itself
+        # The empty tree SHA is the implicit parent of all root commits
+        EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+        diff_range = f"{EMPTY_TREE}..{head}"
+        scope_note = f"Periodic full re-hunt: complete history including root {root[:12]}."
     else:
+        # First hunt: ~3 weeks or 30 commits
         rc, base = run_cmd(
             [
                 "git",
@@ -210,6 +251,13 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
             f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
             job_id=job,
         )
+        # Mark full re-hunt complete only when output is produced
+        if state == "done" and full_rehunt_triggered:
+            store.db.execute(
+                "UPDATE repos SET last_full_hunt_at = ? WHERE id = ?",
+                (now_ms(), rid),
+            )
+            store.db.commit()
     else:
         store.log_event(
             "hunt",
