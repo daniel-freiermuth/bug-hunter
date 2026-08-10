@@ -194,3 +194,57 @@ def build_test_gap_prompt(
             "REPO_NOTES": notes,
         },
     )
+
+
+def build_dep_update_prompt(
+    repo: Row,
+    scope_note: str,
+    known_updates: list[Row],
+    out_path: Path,
+    max_updates: int,
+    repo_notes: str = "",
+) -> str:
+    kn = (
+        "\n".join(f"- {u['fingerprint']} [{u['status']}] -- {_escape_braces(u.get('summary', ''))}" for u in known_updates)
+        or "(none yet)"
+    )
+    notes = repo_notes or "(No notes yet)"
+    return _render(
+        (PLAYBOOK_DIR / "dep_update.md").read_text(),
+        {
+            "REPO_PATH": repo["path"],
+            "REPO_NAME": repo["name"],
+            "SCOPE_NOTE": scope_note,
+            "KNOWN_UPDATES": kn,
+            "OUT_PATH": out_path,
+            "MAX_UPDATES": max_updates,
+            "REPO_NOTES": notes,
+        },
+    )
+
+
+def build_refactor_prompt(
+    repo: Row,
+    scope_note: str,
+    known_refactors: list[Row],
+    out_path: Path,
+    max_refactors: int,
+    repo_notes: str = "",
+) -> str:
+    kn = (
+        "\n".join(f"- {r['fingerprint']} [{r['status']}] -- {_escape_braces(r.get('summary', ''))}" for r in known_refactors)
+        or "(none yet)"
+    )
+    notes = repo_notes or "(No notes yet)"
+    return _render(
+        (PLAYBOOK_DIR / "refactor.md").read_text(),
+        {
+            "REPO_PATH": repo["path"],
+            "REPO_NAME": repo["name"],
+            "SCOPE_NOTE": scope_note,
+            "KNOWN_REFACTORS": kn,
+            "OUT_PATH": out_path,
+            "MAX_REFACTORS": max_refactors,
+            "REPO_NOTES": notes,
+        },
+    )

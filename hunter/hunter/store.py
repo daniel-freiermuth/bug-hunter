@@ -81,6 +81,8 @@ class Store:
             ("budget_override", "findings", "ALTER TABLE findings ADD COLUMN budget_override TEXT"),
             ("last_full_hunt_at", "repos", "ALTER TABLE repos ADD COLUMN last_full_hunt_at INTEGER"),
             ("last_test_gap_at", "repos", "ALTER TABLE repos ADD COLUMN last_test_gap_at INTEGER"),
+            ("last_dep_update_at", "repos", "ALTER TABLE repos ADD COLUMN last_dep_update_at INTEGER"),
+            ("last_refactor_at", "repos", "ALTER TABLE repos ADD COLUMN last_refactor_at INTEGER"),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
@@ -114,6 +116,63 @@ class Store:
                 CREATE INDEX test_gaps_status ON test_gaps(status);
                 CREATE INDEX test_gaps_repo ON test_gaps(repo_id, status);
             """)
+        
+        # Dependency updates table
+        try:
+            self.db.execute("SELECT 1 FROM dep_updates LIMIT 1")
+        except sqlite3.OperationalError:
+            self.db.executescript("""
+                CREATE TABLE dep_updates (
+                  id            INTEGER PRIMARY KEY,
+                  repo_id       INTEGER NOT NULL REFERENCES repos(id),
+                  fingerprint   TEXT NOT NULL UNIQUE,
+                  ecosystem     TEXT NOT NULL,
+                  package       TEXT NOT NULL,
+                  current_version TEXT NOT NULL,
+                  latest_version TEXT NOT NULL,
+                  update_type   TEXT NOT NULL,
+                  severity      TEXT NOT NULL,
+                  confidence    REAL NOT NULL,
+                  summary       TEXT NOT NULL,
+                  detail        TEXT,
+                  security_advisory TEXT,
+                  status        TEXT NOT NULL DEFAULT 'new',
+                  pr_url        TEXT,
+                  created_at    INTEGER NOT NULL,
+                  updated_at    INTEGER NOT NULL
+                );
+                CREATE INDEX dep_updates_status ON dep_updates(status);
+                CREATE INDEX dep_updates_repo ON dep_updates(repo_id, status);
+            """)
+            self.db.commit()
+        
+        # Refactorings table
+        try:
+            self.db.execute("SELECT 1 FROM refactorings LIMIT 1")
+        except sqlite3.OperationalError:
+            self.db.executescript("""
+                CREATE TABLE refactorings (
+                  id            INTEGER PRIMARY KEY,
+                  repo_id       INTEGER NOT NULL REFERENCES repos(id),
+                  fingerprint   TEXT NOT NULL UNIQUE,
+                  file          TEXT NOT NULL,
+                  symbol        TEXT,
+                  line          INTEGER,
+                  smell_type    TEXT NOT NULL,
+                  severity      TEXT NOT NULL,
+                  confidence    REAL NOT NULL,
+                  summary       TEXT NOT NULL,
+                  detail        TEXT,
+                  suggested_refactor TEXT,
+                  status        TEXT NOT NULL DEFAULT 'new',
+                  pr_url        TEXT,
+                  created_at    INTEGER NOT NULL,
+                  updated_at    INTEGER NOT NULL
+                );
+                CREATE INDEX refactorings_status ON refactorings(status);
+                CREATE INDEX refactorings_repo ON refactorings(repo_id, status);
+            """)
+            self.db.commit()
             self.db.commit()
 
     # -- repos ---------------------------------------------------------
