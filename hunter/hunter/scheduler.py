@@ -101,6 +101,24 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         )
         return {"error": "rev-parse HEAD failed"}
 
+    # Check if full re-hunt is due (revisit old code periodically)
+    last_full = repo.get("last_full_hunt_at") or 0
+    rehunt_interval_ms = cfg.hunt_rehunt_days * 86400_000
+    rehunt_due = (now_ms() - last_full) > rehunt_interval_ms
+    
+    if rehunt_due and not force:
+        # Clear watermark → triggers full-history hunt below
+        store.db.execute(
+            "UPDATE repos SET last_hunt_sha = NULL, last_full_hunt_at = ? WHERE id = ?",
+            (now_ms(), rid),
+        )
+        store.db.commit()
+        store.log_event(
+            "hunt",
+            f"{rname}: full re-hunt triggered ({cfg.hunt_rehunt_days}d interval)",
+        )
+        last = None  # Force full hunt below
+
     last: str | None = repo.get("last_hunt_sha")
     if last == head and not force:
         # No new commits — update timestamp so scheduler rotates to next repo.
