@@ -167,3 +167,30 @@ def build_recheck_prompt(finding: Row, repo: Row, out_path: Path, repo_notes: st
             "REPO_NOTES": notes,
         },
     )
+
+
+def build_test_gap_prompt(
+    repo: Row,
+    scope_note: str,
+    known_gaps: list[Row],
+    out_path: Path,
+    max_gaps: int,
+    repo_notes: str = "",
+) -> str:
+    kn = (
+        "\n".join(f"- {g['fingerprint']} [{g['status']}] -- {_escape_braces(g.get('summary', ''))}" for g in known_gaps)
+        or "(none yet)"
+    )
+    notes = repo_notes or "(No notes yet)"
+    return _render(
+        (PLAYBOOK_DIR / "test_gap.md").read_text(),
+        {
+            "REPO_PATH": repo["path"],
+            "REPO_NAME": repo["name"],
+            "SCOPE_NOTE": scope_note,
+            "KNOWN_GAPS": kn,
+            "OUT_PATH": out_path,
+            "MAX_GAPS": max_gaps,
+            "REPO_NOTES": notes,
+        },
+    )

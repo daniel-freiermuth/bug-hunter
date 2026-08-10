@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import sqlite3
 from datetime import datetime
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from .playbooks import (
     build_fix_prompt,
     build_hunt_prompt,
     build_recheck_prompt,
+    build_test_gap_prompt,
 )
 from .store import Store
 from .types import BudgetDecision, Config, Row, RunResult, WindowState, now_ms
@@ -401,6 +403,145 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
     if override == "once":
         store.set_budget_override(fid, None)
     return summary
+
+
+# -- test gap ---------------------------------------------------------------
+
+
+def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
+    """Hunt for test coverage gaps in a repo."""
+    rid: int = repo["id"]
+    rname: str = repo["name"]
+    rpath = Path(repo["path"])
+    
+    # Ensure repo is up-to-date (same as hunt)
+    if not rpath.exists():
+        store.log_event("error", f"test_gap {rname}: repo not cloned")
+        return {"error": "repo not cloned"}
+    
+    for cmd in (
+        ["git", "fetch", "origin"],
+        ["git", "checkout", repo["default_branch"]],
+        ["git", "pull", "--ff-only"],
+    ):
+        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+        if rc != 0:
+            store.log_event("error", f"test_gap {rname}: {' '.join(cmd)} failed: {out[-300:]}")
+            return {"error": f"{' '.join(cmd)} failed"}
+    
+    # Budget check
+    windows = budget.read_windows()
+    dec = budget.decide(cfg, "hunt", windows)  # Use hunt budget for now
+    if not dec.allow:
+        job = store.create_job("test_gap", rid)
+        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
+        store.log_event("deny", f"test_gap {rname}: {dec.reason}", job_id=job)
+        return {"denied": dec.reason, "job": job}
+    
+    job = store.create_job("test_gap", rid, cap_tokens=dec.cap_tokens)
+    out_path = cfg.work_root / "out" / f"job{job}.test_gaps.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Load known gaps
+    known_gaps = store.db.execute(
+        "SELECT * FROM test_gaps WHERE repo_id = ? AND status IN ('new', 'queued', 'pr_open')",
+        (rid,),
+    ).fetchall()
+    known = [dict(r) for r in known_gaps]
+    
+    prompt = build_test_gap_prompt(
+        repo,
+        "Full repository scan for test coverage gaps.",
+        known,
+        out_path,
+        cfg.hunt_max_findings,  # Reuse hunt max for now
+        store.repo_notes(rid),
+    )
+    
+    pre_usage = _usage_snapshot(windows)
+    store.update_job(job, state="running")
+    model = cfg.model_for("hunt")
+    rr = runner.run_worker(
+        cfg,
+        rpath,
+        prompt,
+        dec.cap_tokens,
+        cfg.hunt_max_wall_s,
+        model=model,
+    )
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+    
+    summary: Row = {
+        "kind": "test_gap",
+        "repo": rname,
+        "job": job,
+        "state": state,
+        "tokens_new": rr.tokens_new,
+    }
+    
+    if out_path.exists():
+        # Ingest test gaps
+        try:
+            gaps = json.loads(out_path.read_text())
+            inserted = duplicates = invalid = 0
+            for g in gaps:
+                if not isinstance(g, dict) or "fingerprint" not in g:
+                    invalid += 1
+                    continue
+                try:
+                    t = now_ms()
+                    store.db.execute(
+                        """INSERT INTO test_gaps 
+                           (repo_id, fingerprint, file, symbol, line, severity, confidence,
+                            summary, detail, missing_tests, test_file, status, created_at, updated_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)""",
+                        (
+                            rid,
+                            g["fingerprint"],
+                            g.get("file", ""),
+                            g.get("symbol"),
+                            g.get("line"),
+                            g.get("severity", "medium"),
+                            g.get("confidence", 0.5),
+                            g.get("summary", ""),
+                            g.get("detail"),
+                            json.dumps(g.get("missing_tests", [])),
+                            g.get("test_file"),
+                            t,
+                            t,
+                        ),
+                    )
+                    store.db.commit()
+                    inserted += 1
+                except sqlite3.IntegrityError:
+                    duplicates += 1
+            summary["ingest"] = {"inserted": inserted, "duplicates": duplicates, "invalid": invalid}
+            store.log_event(
+                "test_gap",
+                f"{rname}: job {job} {state} -- +{inserted} new / {duplicates} dup / {invalid} invalid ({rr.tokens_new} tok)",
+                job_id=job,
+            )
+        except Exception as e:
+            store.log_event("error", f"test_gap {rname}: ingest failed: {e}", job_id=job)
+            summary["ingest_error"] = str(e)
+    else:
+        store.log_event(
+            "test_gap",
+            f"{rname}: job {job} {state}, no gaps file ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+    
+    
+    if state == "done":
+        store.db.execute(
+            "UPDATE repos SET last_test_gap_at = ? WHERE id = ?",
+            (now_ms(), rid),
+        )
+        store.db.commit()
+    return summary
+
 
 # -- fix --------------------------------------------------------------------
 
@@ -1153,7 +1294,15 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
                     else None
                 )
             if target is not None:
-                result = run_hunt(store, cfg, target)
+                # Rotate between hunt and test_gap
+                last_hunt = target.get("last_hunt_at") or 0
+                last_test_gap = target.get("last_test_gap_at") or 0
+                
+                # Run test_gap if it's never run or significantly more stale than hunt
+                if last_test_gap == 0 or (last_hunt > 0 and (last_hunt - last_test_gap) > 7 * 86400_000):
+                    result = run_test_gap(store, cfg, target)
+                else:
+                    result = run_hunt(store, cfg, target)
             else:
                 result: Row = {  # type: ignore[no-redef]
                     "idle": "no queued findings, no enabled repos",
