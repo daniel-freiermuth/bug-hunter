@@ -174,6 +174,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         store.known_active(rid),
         out_path,
         cfg.hunt_max_findings,
+        store.repo_notes(rid),
     )
     pre_usage = _usage_snapshot(windows)
     store.update_job(job, state="running")
@@ -291,7 +292,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
     job = store.create_job("recheck", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"recheck{fid}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt = build_recheck_prompt(finding, repo, out_path)
+    prompt = build_recheck_prompt(finding, repo, out_path, store.repo_notes(repo["id"]))
     pre_usage = _usage_snapshot(windows)
     store.update_job(job, state="running")
     model = cfg.model_for("hunt")
@@ -503,7 +504,7 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
     pre_usage = _usage_snapshot(windows)
     store.set_status(fid, "fixing")
     store.update_job(job, state="running")
-    prompt = build_fix_prompt(finding, worktree, branch, repo)
+    prompt = build_fix_prompt(finding, worktree, branch, repo, store.repo_notes(repo["id"]))
     model = cfg.model_for("fix")
     rr = runner.run_worker(
         cfg,
@@ -947,6 +948,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
         repo,
         pr,
         ps.get("needs_attention") or "",
+        store.repo_notes(repo["id"]),
     )
     pre_usage = _usage_snapshot(windows)
     model = cfg.model_for("fix")
