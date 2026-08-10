@@ -67,6 +67,7 @@ def _rows(cur: sqlite3.Cursor) -> list[Row]:
 
 class Store:
     def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(cfg.db_path)
         self.db.row_factory = sqlite3.Row
@@ -86,6 +87,34 @@ class Store:
             except sqlite3.OperationalError:
                 self.db.execute(sql)
                 self.db.commit()
+        
+        # Table migrations
+        try:
+            self.db.execute("SELECT 1 FROM test_gaps LIMIT 1")
+        except sqlite3.OperationalError:
+            self.db.executescript("""
+                CREATE TABLE test_gaps (
+                  id            INTEGER PRIMARY KEY,
+                  repo_id       INTEGER NOT NULL REFERENCES repos(id),
+                  fingerprint   TEXT NOT NULL UNIQUE,
+                  file          TEXT NOT NULL,
+                  symbol        TEXT,
+                  line          INTEGER,
+                  severity      TEXT NOT NULL,
+                  confidence    REAL NOT NULL,
+                  summary       TEXT NOT NULL,
+                  detail        TEXT,
+                  missing_tests TEXT,
+                  test_file     TEXT,
+                  status        TEXT NOT NULL DEFAULT 'new',
+                  pr_url        TEXT,
+                  created_at    INTEGER NOT NULL,
+                  updated_at    INTEGER NOT NULL
+                );
+                CREATE INDEX test_gaps_status ON test_gaps(status);
+                CREATE INDEX test_gaps_repo ON test_gaps(repo_id, status);
+            """)
+            self.db.commit()
 
     # -- repos ---------------------------------------------------------
     def add_repo(
