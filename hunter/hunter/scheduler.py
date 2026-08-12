@@ -399,6 +399,7 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
             f"fix #{fid}: repo {finding['repo_id']} missing",
             finding_id=fid,
         )
+        store.set_status(fid, "new")
         return {"error": "repo missing"}
     rpath: str = repo["path"]
     db: str = repo["default_branch"]
@@ -463,6 +464,7 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
             f"fix #{fid}: worktree add failed: {out[-300:]}",
             finding_id=fid,
         )
+        store.set_status(fid, "new")
         return {"error": f"worktree add failed: {out[-300:]}"}
 
     def _drop_worktree(delete_branch: bool) -> None:
