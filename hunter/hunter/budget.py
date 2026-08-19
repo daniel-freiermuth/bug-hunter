@@ -61,12 +61,23 @@ def read_windows() -> dict[str, WindowState]:
     return out
 
 
-def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDecision:
+def decide(
+    cfg: Config,
+    kind: str,
+    windows: dict[str, WindowState],
+    running_jobs_cap: int = 0,
+) -> BudgetDecision:
     base = cfg.hunt_cap_tokens if kind == "hunt" else cfg.fix_cap_tokens
     now_ms = time.time() * 1000
 
     if not windows:
         return BudgetDecision(False, "no window data -- deny until fresh")
+
+    # -- Account for in-flight jobs --------------------------------------------
+    # Running jobs reserve budget but OMP hasn't recorded their usage yet.
+    # Conservatively estimate: reserve 10% of window capacity per 200k job cap.
+    # (Anthropic 5h ~= 2-5M tokens depending on model, so 200k ~= 4-10%)
+    inflight_reservation = (running_jobs_cap / 200_000) * 0.10
 
     # -- 7d linear ramp: spend proportionally to elapsed time ----------------
     # The 7d fraction moves slowly; even somewhat stale data is safe here.
@@ -79,11 +90,13 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
             elapsed_frac = min((now_ms - started_ms) / _WEEK_MS, 1.0)
         else:
             elapsed_frac = 1.0  # can't compute -> assume end-of-window
-        if w.used_fraction >= elapsed_frac:
+        # Reserve budget for running jobs
+        effective_used = w.used_fraction + inflight_reservation
+        if effective_used >= elapsed_frac:
             return BudgetDecision(
                 False,
-                f"{lid}: used {w.used_fraction:.2f} >= ramp {elapsed_frac:.2f}"
-                f" (elapsed {elapsed_frac:.1%})",
+                f"{lid}: used {w.used_fraction:.2f} + inflight {inflight_reservation:.2f}"
+                f" = {effective_used:.2f} >= ramp {elapsed_frac:.2f}",
             )
 
     # -- 5h ramp (configurable headroom, then linear harvest) ------------------
@@ -99,10 +112,11 @@ def decide(cfg: Config, kind: str, windows: dict[str, WindowState]) -> BudgetDec
         if w5.resets_at and w5.resets_at > now_ms and w5.used_fraction is not None:
             elapsed_ms = _5H_MS - (w5.resets_at - now_ms)
             allowed = max(0.0, (elapsed_ms - HEADROOM_MS) / _RAMP_MS)
-            if w5.used_fraction >= allowed:
+            effective_used = w5.used_fraction + inflight_reservation
+            if effective_used >= allowed:
                 return BudgetDecision(
                     False,
-                    f"5h: used {w5.used_fraction:.2f} >= ramp {allowed:.2f}"
-                    f" (harvest in {(w5.resets_at - _RAMP_MS - now_ms) / 60_000:.0f}min)",
+                    f"5h: used {w5.used_fraction:.2f} + inflight {inflight_reservation:.2f}"
+                    f" = {effective_used:.2f} >= ramp {allowed:.2f}",
                 )
     return BudgetDecision(True, "ok", base)

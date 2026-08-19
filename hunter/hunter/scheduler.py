@@ -28,6 +28,14 @@ from .types import BudgetDecision, Config, Row, RunResult, WindowState, now_ms
 from .util import run_cmd
 
 
+def _running_jobs_cap(store: Store) -> int:
+    """Sum of cap_tokens for all currently running jobs."""
+    result = store.db.execute(
+        "SELECT COALESCE(SUM(cap_tokens), 0) as total FROM jobs WHERE state = 'running'"
+    ).fetchone()
+    return result["total"] if result else 0
+
+
 def _job_state(rr: RunResult) -> str:
     if rr.killed_reason:
         return "killed"
@@ -204,7 +212,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         scope_note = f"First hunt for this repo: {scope} (base {base[:12]})."
 
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "hunt", windows)
+    dec = budget.decide(cfg, "hunt", windows, _running_jobs_cap(store))
     if not dec.allow:
         job = store.create_job("hunt", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -333,7 +341,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
     if override:
         dec = BudgetDecision(True, f"override:{override}", cfg.hunt_cap_tokens)
     else:
-        dec = budget.decide(cfg, "hunt", windows)
+        dec = budget.decide(cfg, "hunt", windows, _running_jobs_cap(store))
     if not dec.allow:
         job = store.create_job("recheck", repo["id"], finding_id=fid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -468,7 +476,7 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
     
     # Budget check
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "hunt", windows)  # Use hunt budget for now
+    dec = budget.decide(cfg, "hunt", windows, _running_jobs_cap(store))  # Use hunt budget for now
     if not dec.allow:
         job = store.create_job("test_gap", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -567,7 +575,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
     
     # Budget check
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "hunt", windows)
+    dec = budget.decide(cfg, "hunt", windows, _running_jobs_cap(store))
     if not dec.allow:
         job = store.create_job("dep_update", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -665,7 +673,7 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
     
     # Budget check
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "hunt", windows)
+    dec = budget.decide(cfg, "hunt", windows, _running_jobs_cap(store))
     if not dec.allow:
         job = store.create_job("refactor", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -841,7 +849,7 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         base = cfg.fix_cap_tokens
         dec = BudgetDecision(True, f"override:{override}", base)
     else:
-        dec = budget.decide(cfg, "fix", windows)
+        dec = budget.decide(cfg, "fix", windows, _running_jobs_cap(store))
     if not dec.allow:
         _drop_worktree(delete_branch=True)
         job = store.create_job("fix", repo["id"], finding_id=fid)
@@ -1270,7 +1278,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
     if override:
         dec = BudgetDecision(True, f"override:{override}", cfg.fix_cap_tokens)
     else:
-        dec = budget.decide(cfg, "fix", windows)
+        dec = budget.decide(cfg, "fix", windows, _running_jobs_cap(store))
     if not dec.allow:
         _drop_worktree()
         job = store.create_job("engage", repo["id"], finding_id=fid)
