@@ -16,7 +16,23 @@
     margin: 0; background: var(--bg); color: var(--fg);
     font: 13px/1.45 "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
   }
-  main { max-width: 1100px; margin: 0 auto; padding: 12px 16px 60px; }
+  .app { display: flex; align-items: flex-start; }
+  #nav {
+    flex: 0 0 170px; position: sticky; top: 0; height: 100vh; overflow-y: auto;
+    background: var(--panel); border-right: 1px solid var(--line);
+    padding: 16px 0;
+  }
+  #nav .nav-item {
+    padding: 9px 22px; font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+    color: var(--dim); cursor: pointer; border-left: 2px solid transparent;
+  }
+  #nav .nav-item:hover { color: var(--fg); }
+  #nav .nav-item.active {
+    color: var(--fg); border-left-color: var(--blue); background: var(--panel2);
+  }
+  main { flex: 1; max-width: 1100px; padding: 12px 16px 60px; }
+  .page { display: none; }
+  .page.active { display: block; }
   h2 {
     font-size: 11px; text-transform: uppercase; letter-spacing: .12em;
     color: var(--dim); margin: 26px 0 8px; font-weight: 600;
@@ -141,67 +157,88 @@
 </style>
 </head>
 <body>
-<main>
-  <div id="ops">
-    <div id="windows"><span class="empty">no window data</span></div>
-    <div id="opsRight">
-      <button id="runCycle">Run Cycle</button>
-      <div id="lastEvent">&nbsp;</div>
-    </div>
-  </div>
-  <div id="err"></div>
+<div class="app">
+  <nav id="nav">
+    <div class="nav-item" data-page="status">Status</div>
+    <div class="nav-item" data-page="inbox">Inbox</div>
+    <div class="nav-item" data-page="pipeline">Kanban / Pipeline</div>
+    <div class="nav-item" data-page="stats">Stats</div>
+    <div class="nav-item" data-page="log">Log</div>
+  </nav>
+  <main>
+    <div id="err"></div>
 
-  <h2>Inbox <span class="n" id="nInbox"></span></h2>
-  <div id="filters">
-    <label>repo</label><select id="fRepo"><option value="">all</option></select>
-    <div class="sep"></div>
-    <div class="sep"></div>
-    <label>type</label><select id="fType">
-      <option value="">all</option>
-      <option value="bug">🐛 Bug</option>
-      <option value="dep_update">📦 Dep</option>
-      <option value="test_gap">🧪 Test</option>
-      <option value="refactor">♻️ Refactor</option>
-    </select>
-    <label>class</label><select id="fClass"><option value="">all</option></select>
-    <div class="sep"></div>
-    <label>min severity</label><select id="fSev"><option value="">all</option>
-      <option>high</option><option>medium</option><option>low</option></select>
-    <div class="sep"></div>
-    <label>min confidence</label>
-    <input type="range" id="fConf" min="0" max="100" value="0" step="5">
-    <span id="fConfVal">0%</span>
-    <div class="sep"></div>
-    <label>sort</label><select id="fSort">
-      <option value="score">severity × confidence</option>
-      <option value="newest">newest first</option>
-      <option value="oldest">oldest first</option>
-      <option value="repo">by repo</option>
-    </select>
-  </div>
-  <div id="inbox"></div>
+    <section id="page-status" class="page">
+      <h2>Status</h2>
+      <div id="ops">
+        <div id="windows"><span class="empty">no window data</span></div>
+        <div id="opsRight">
+          <button id="runCycle">Run Cycle</button>
+          <div id="lastEvent">&nbsp;</div>
+        </div>
+      </div>
+    </section>
 
-  <h2>Pipeline <button class="ov-btn" onclick="clearAllOverrides()" style="font-size:10px;vertical-align:middle">Clear all overrides</button></h2>
-  <div id="pipeline"></div>
+    <section id="page-inbox" class="page">
+      <h2>Inbox <span class="n" id="nInbox"></span></h2>
+      <div id="filters">
+        <label>repo</label><select id="fRepo"><option value="">all</option></select>
+        <div class="sep"></div>
+        <div class="sep"></div>
+        <label>type</label><select id="fType">
+          <option value="">all</option>
+          <option value="bug">🐛 Bug</option>
+          <option value="dep_update">📦 Dep</option>
+          <option value="test_gap">🧪 Test</option>
+          <option value="refactor">♻️ Refactor</option>
+        </select>
+        <label>class</label><select id="fClass"><option value="">all</option></select>
+        <div class="sep"></div>
+        <label>min severity</label><select id="fSev"><option value="">all</option>
+          <option>high</option><option>medium</option><option>low</option></select>
+        <div class="sep"></div>
+        <label>min confidence</label>
+        <input type="range" id="fConf" min="0" max="100" value="0" step="5">
+        <span id="fConfVal">0%</span>
+        <div class="sep"></div>
+        <label>sort</label><select id="fSort">
+          <option value="score">severity × confidence</option>
+          <option value="newest">newest first</option>
+          <option value="oldest">oldest first</option>
+          <option value="repo">by repo</option>
+        </select>
+      </div>
+      <div id="inbox"></div>
+    </section>
 
-  <h2>Repos</h2>
-  <div id="repos"></div>
+    <section id="page-pipeline" class="page">
+      <h2>Pipeline <button class="ov-btn" onclick="clearAllOverrides()" style="font-size:10px;vertical-align:middle">Clear all overrides</button></h2>
+      <div id="pipeline"></div>
 
-  <h2>Suppressed <span class="n" id="nSupp"></span></h2>
-  <details><summary>rejected / wontfix</summary><div id="suppressed"></div></details>
+      <h2>Repos</h2>
+      <div id="repos"></div>
 
-  <h2>Notes <span class="n" id="nNotes"></span></h2>
-  <details><summary>informational findings</summary><div id="notes"></div></details>
+      <h2>Suppressed <span class="n" id="nSupp"></span></h2>
+      <details><summary>rejected / wontfix</summary><div id="suppressed"></div></details>
 
-  <h2>Stats</h2>
-  <details><summary>token usage and job metrics</summary><div id="stats"></div></details>
+      <h2>Notes <span class="n" id="nNotes"></span></h2>
+      <details><summary>informational findings</summary><div id="notes"></div></details>
+    </section>
 
-  <h2>Jobs</h2>
-  <div id="jobs"></div>
+    <section id="page-stats" class="page">
+      <h2>Stats</h2>
+      <div id="stats"></div>
+    </section>
 
-  <h2>Events</h2>
-  <div id="events"></div>
-</main>
+    <section id="page-log" class="page">
+      <h2>Jobs</h2>
+      <div id="jobs"></div>
+
+      <h2>Events</h2>
+      <div id="events"></div>
+    </section>
+  </main>
+</div>
 
 <script src="app.js"></script>
 </body>

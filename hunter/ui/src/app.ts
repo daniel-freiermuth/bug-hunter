@@ -810,6 +810,29 @@ async function refresh(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Left nav / page routing
+// ---------------------------------------------------------------------------
+
+const NAV_PAGES = ["status", "inbox", "pipeline", "stats", "log"];
+
+function showPage(name: string): void {
+  const page = NAV_PAGES.includes(name) ? name : "inbox";
+  for (const el of document.querySelectorAll<HTMLElement>(".page")) {
+    el.classList.toggle("active", el.id === `page-${page}`);
+  }
+  for (const el of document.querySelectorAll<HTMLElement>("#nav .nav-item")) {
+    el.classList.toggle("active", el.dataset.page === page);
+  }
+  if (location.hash.slice(1) !== page) location.hash = page;
+}
+
+for (const el of document.querySelectorAll<HTMLElement>("#nav .nav-item")) {
+  el.onclick = () => showPage(el.dataset.page ?? "inbox");
+}
+window.addEventListener("hashchange", () => showPage(location.hash.slice(1)));
+showPage(location.hash.slice(1));
+
+// ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 
