@@ -446,10 +446,12 @@ def daemon(cfg: Config) -> None:
     cycles never overlap. Idling costs zero tokens -- every wake goes through
     the budget gate, which is where all spending decisions live.
 
-    Wake policy:
-      - a job ran            -> 60s   (drain the queue quickly)
-      - budget denied        -> until the 5h reset (+2min), capped at 30min
-      - idle / no new work   -> 15min (upstream may push commits)
+    Wake policy (smart sleep - only when necessary):
+      - queue has fixes      -> 0s    (drain immediately)
+      - just found bugs      -> 5s    (keep momentum)
+      - repos exist, no work -> 60s   (periodic check)
+      - budget denied        -> until reset, capped at 30min
+      - truly idle (no repos)-> 15min
       - error                -> 5min
     """
     import signal as _signal
@@ -482,7 +484,32 @@ def daemon(cfg: Config) -> None:
                     "killed",
                     "failed",
                 ):
-                    sleep_s = 60
+                    # Smart sleep: ONLY sleep when necessary
+                    # Check for queued work (fixes awaiting budget)
+                    queued_fixes = store.db.execute(
+                        "SELECT COUNT(*) FROM findings WHERE status = 'queued'"
+                    ).fetchone()[0]
+                    
+                    # Check if we just produced new findings (likely more analysis work to do)
+                    job_produced_findings = summary.get("ingest", {}).get("inserted", 0) > 0
+                    
+                    # Check if any enabled repos exist (potential hunt/analysis targets)
+                    enabled_repos = store.db.execute(
+                        "SELECT COUNT(*) FROM repos WHERE enabled = 1"
+                    ).fetchone()[0]
+                    
+                    if queued_fixes > 0:
+                        # Priority: drain fix queue with ZERO delay
+                        sleep_s = 0
+                    elif job_produced_findings:
+                        # Just found bugs, keep momentum - minimal delay
+                        sleep_s = 5
+                    elif enabled_repos > 0:
+                        # Repos exist but nothing queued - check periodically
+                        sleep_s = 60
+                    else:
+                        # Truly idle (no repos) - back off
+                        sleep_s = 15 * 60
                 elif summary.get("denied"):
                     # Sleep until the harvest window opens (HEADROOM into 5h window)
                     # or until a new window can be opened.
