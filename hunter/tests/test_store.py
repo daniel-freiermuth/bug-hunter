@@ -80,6 +80,28 @@ class TestRepos:
         assert row["last_hunt_sha"] == "deadbeef"
         assert row["last_hunt_at"] is not None
 
+    def test_delete_repo_with_no_history(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.delete_repo(rid)
+        assert store.get_repo(rid) is None
+
+    def test_delete_repo_refuses_with_findings(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.upsert_finding(rid, _make_finding())
+        with pytest.raises(ValueError, match="finding"):
+            store.delete_repo(rid)
+        assert store.get_repo(rid) is not None
+
+    def test_delete_repo_refuses_with_jobs(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.create_job("hunt", rid)
+        with pytest.raises(ValueError, match="job"):
+            store.delete_repo(rid)
+        assert store.get_repo(rid) is not None
+
+    def test_delete_repo_missing_is_noop(self, store: Store) -> None:
+        store.delete_repo(999)  # no rows affected, does not raise
+
 
 # -- findings --------------------------------------------------------------
 

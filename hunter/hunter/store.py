@@ -140,6 +140,23 @@ class Store:
         )
         self.db.commit()
 
+    def delete_repo(self, repo_id: int) -> None:
+        """Remove a repo record. Refuses if findings or jobs still reference
+        it -- delete their history first, or use update_repo(enabled=False)
+        to pause scheduling without losing data."""
+        n_findings = self.db.execute(
+            "SELECT COUNT(*) AS n FROM findings WHERE repo_id = ?", (repo_id,)
+        ).fetchone()["n"]
+        n_jobs = self.db.execute("SELECT COUNT(*) AS n FROM jobs WHERE repo_id = ?", (repo_id,)).fetchone()["n"]
+        if n_findings or n_jobs:
+            msg = (
+                f"repo {repo_id} has {n_findings} finding(s) and {n_jobs} job(s) -- "
+                "cannot delete without losing history; pause it instead"
+            )
+            raise ValueError(msg)
+        self.db.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
+        self.db.commit()
+
     # -- repo notes ----------------------------------------------------
     def repo_notes_path(self, repo_id: int) -> Path:
         """Return path to repo's NOTES.md file (ID-based for stability)."""

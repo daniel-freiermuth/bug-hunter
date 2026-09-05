@@ -233,6 +233,12 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/repo":
                 self._update_repo()
                 return
+            if url.path == "/api/repos":
+                self._add_repo()
+                return
+            if url.path == "/api/repo/delete":
+                self._delete_repo()
+                return
             self._error(404, "not found")
         except (ValueError, json.JSONDecodeError) as exc:
             self._error(400, str(exc))
@@ -396,6 +402,47 @@ class Handler(BaseHTTPRequestHandler):
         action = ", ".join(f"{k}={v}" for k, v in fields.items())
         store.log_event("repo", f"updated {repo['name']}: {action}")
         self._json({"ok": True, "repo": store.get_repo(rid)})
+
+    def _add_repo(self) -> None:
+        from .forge import FORGE_NAMES, detect_forge
+
+        body = self._body_json()
+        name = (body.get("name") or "").strip() if isinstance(body.get("name"), str) else ""
+        url = (body.get("url") or "").strip() if isinstance(body.get("url"), str) else ""
+        if not name or not url:
+            self._error(400, "name and url are required")
+            return
+        branch = body.get("branch")
+        branch = branch.strip() if isinstance(branch, str) and branch.strip() else "main"
+        forge = body.get("forge") or None
+        if forge is None:
+            forge = detect_forge(url)
+        if forge not in FORGE_NAMES:
+            self._error(400, f"unknown forge {forge!r} (choose from {', '.join(FORGE_NAMES)})")
+            return
+        store = self._store()
+        if store.get_repo(name) is not None:
+            self._error(409, f"repo {name!r} already exists")
+            return
+        path = self.cfg.work_root / "repos" / name
+        rid = store.add_repo(name, url, str(path), branch, forge=forge)
+        store.log_event("repo", f"added {name} ({forge}) -> {path}")
+        self._json({"ok": True, "repo": store.get_repo(rid)}, 201)
+
+    def _delete_repo(self) -> None:
+        body = self._body_json()
+        rid = body.get("id")
+        if not isinstance(rid, int):
+            self._error(400, "id must be an integer")
+            return
+        store = self._store()
+        repo = store.get_repo(rid)
+        if repo is None:
+            self._error(404, f"no repo {rid}")
+            return
+        store.delete_repo(rid)
+        store.log_event("repo", f"deleted {repo['name']} (#{rid})")
+        self._json({"ok": True})
 
 
 class _Server(ThreadingHTTPServer):

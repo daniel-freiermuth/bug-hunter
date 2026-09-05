@@ -154,6 +154,17 @@
   }
   #filters label { color: var(--dim); font-size: 11px; }
   #filters .sep { border-left: 1px solid var(--line); height: 20px; }
+
+  /* add repo form */
+  #addRepo {
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  #addRepo input, #addRepo select {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 3px; font: inherit; font-size: 12px; padding: 3px 8px;
+  }
+  #addRepo input[id=arUrl] { min-width: 240px; flex: 1; }
 </style>
 </head>
 <body>
@@ -225,6 +236,17 @@
 
     <section id="page-repos" class="page">
       <h2>Repos</h2>
+      <div id="addRepo">
+        <input type="text" id="arName" placeholder="name">
+        <input type="text" id="arUrl" placeholder="https://github.com/org/repo">
+        <input type="text" id="arBranch" placeholder="branch" value="main">
+        <select id="arForge">
+          <option value="">auto-detect forge</option>
+          <option value="github">github</option>
+          <option value="gitlab">gitlab</option>
+        </select>
+        <button onclick="addRepo()">Add Repo</button>
+      </div>
       <div id="repos"></div>
     </section>
 

@@ -397,8 +397,59 @@ async function toggleRepo(id: number, enabled: boolean): Promise<void> {
   refresh();
 }
 
+async function addRepo(): Promise<void> {
+  const name = $input("arName").value.trim();
+  const url = $input("arUrl").value.trim();
+  const branch = $input("arBranch").value.trim() || "main";
+  const forge = $select("arForge").value || undefined;
+  if (!name || !url) {
+    alert("name and url are required");
+    return;
+  }
+  const r = await api<{ error?: string }>("/api/repos", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, url, branch, forge }),
+  });
+  if (r.status !== 201) {
+    alert("add repo failed: " + (r.body?.error || r.status));
+    return;
+  }
+  $input("arName").value = "";
+  $input("arUrl").value = "";
+  $input("arBranch").value = "main";
+  $select("arForge").value = "";
+  refresh();
+}
+
+async function removeRepo(id: number, name: string): Promise<void> {
+  if (!confirm(`Remove repo "${name}"? Only works if it has no findings or jobs yet.`)) {
+    return;
+  }
+  const r = await api<{ error?: string }>("/api/repo/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  });
+  if (r.status !== 200) {
+    alert("remove repo failed: " + (r.body?.error || r.status));
+    return;
+  }
+  refresh();
+}
+
 // Expose to onclick handlers in rendered HTML
-Object.assign(window, { verdict, recheck, unqueue, budgetOverride, clearOverride, clearAllOverrides, toggleRepo });
+Object.assign(window, {
+  verdict,
+  recheck,
+  unqueue,
+  budgetOverride,
+  clearOverride,
+  clearAllOverrides,
+  toggleRepo,
+  addRepo,
+  removeRepo,
+});
 
 // ---------------------------------------------------------------------------
 // Renderers
@@ -550,6 +601,7 @@ function renderRepos(repos: Repo[]): void {
       <span class="url"><a href="${esc(r.url)}" target="_blank">${esc(r.url)}</a></span>
       <span class="meta">${esc(r.forge)} \u00b7 ${esc(r.default_branch)}${r.last_hunt_at ? " \u00b7 hunted " + ts(r.last_hunt_at) : ""}</span>
       <button class="${r.enabled ? "uq" : "q"}" onclick="toggleRepo(${r.id},${r.enabled ? "false" : "true"})">${r.enabled ? "Pause" : "Resume"}</button>
+      <button class="r" data-name="${esc(r.name)}" onclick="removeRepo(${r.id},this.dataset.name)">Remove</button>
     </div>`,
     )
     .join("");
