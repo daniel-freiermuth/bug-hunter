@@ -813,7 +813,7 @@ async function refresh(): Promise<void> {
 // Left nav / page routing
 // ---------------------------------------------------------------------------
 
-const NAV_PAGES = ["status", "inbox", "pipeline", "stats", "log"];
+const NAV_PAGES = ["status", "inbox", "pipeline", "repos", "stats", "log"];
 
 function showPage(name: string): void {
   const page = NAV_PAGES.includes(name) ? name : "inbox";
