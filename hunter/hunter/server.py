@@ -115,6 +115,9 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/repos":
                 self._json(self._store().list_repos())
                 return
+            if url.path == "/api/repo/notes":
+                self._repo_notes(qs)
+                return
             if url.path == "/api/events":
                 self._json(self._store().recent_events(limit=100))
                 return
@@ -163,6 +166,18 @@ class Handler(BaseHTTPRequestHandler):
             "last_cycle": last_cycle,
             "cycle_running": _cycle_lock.locked(),
         }
+
+    def _repo_notes(self, qs: dict[str, list[str]]) -> None:
+        rid_str = (qs.get("id") or [None])[0]  # type: ignore[list-item]
+        if not rid_str or not rid_str.isdigit():
+            self._error(400, "id query param must be an integer")
+            return
+        store = self._store()
+        repo = store.get_repo(int(rid_str))
+        if repo is None:
+            self._error(404, f"no repo {rid_str}")
+            return
+        self._json({"notes": store.repo_notes(repo["id"])})
 
     def _findings(self, qs: dict[str, list[str]]) -> list[Row]:
         store = self._store()
@@ -232,6 +247,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if url.path == "/api/repo":
                 self._update_repo()
+                return
+            if url.path == "/api/repos":
+                self._add_repo()
+                return
+            if url.path == "/api/repo/delete":
+                self._delete_repo()
+                return
+            if url.path == "/api/repo/notes":
+                self._add_repo_note()
                 return
             self._error(404, "not found")
         except (ValueError, json.JSONDecodeError) as exc:
@@ -396,6 +420,71 @@ class Handler(BaseHTTPRequestHandler):
         action = ", ".join(f"{k}={v}" for k, v in fields.items())
         store.log_event("repo", f"updated {repo['name']}: {action}")
         self._json({"ok": True, "repo": store.get_repo(rid)})
+
+    def _add_repo(self) -> None:
+        from .forge import FORGE_NAMES, detect_forge
+
+        body = self._body_json()
+        name = (body.get("name") or "").strip() if isinstance(body.get("name"), str) else ""
+        url = (body.get("url") or "").strip() if isinstance(body.get("url"), str) else ""
+        if not name or not url:
+            self._error(400, "name and url are required")
+            return
+        branch = body.get("branch")
+        branch = branch.strip() if isinstance(branch, str) and branch.strip() else "main"
+        forge = body.get("forge") or None
+        if forge is None:
+            forge = detect_forge(url)
+        if forge not in FORGE_NAMES:
+            self._error(400, f"unknown forge {forge!r} (choose from {', '.join(FORGE_NAMES)})")
+            return
+        store = self._store()
+        if store.get_repo(name) is not None:
+            self._error(409, f"repo {name!r} already exists")
+            return
+        path = self.cfg.work_root / "repos" / name
+        rid = store.add_repo(name, url, str(path), branch, forge=forge)
+        store.log_event("repo", f"added {name} ({forge}) -> {path}")
+        self._json({"ok": True, "repo": store.get_repo(rid)}, 201)
+
+    def _delete_repo(self) -> None:
+        body = self._body_json()
+        rid = body.get("id")
+        if not isinstance(rid, int):
+            self._error(400, "id must be an integer")
+            return
+        store = self._store()
+        repo = store.get_repo(rid)
+        if repo is None:
+            self._error(404, f"no repo {rid}")
+            return
+        store.delete_repo(rid)
+        store.log_event("repo", f"deleted {repo['name']} (#{rid})")
+        self._json({"ok": True})
+
+    def _add_repo_note(self) -> None:
+        body = self._body_json()
+        rid = body.get("id")
+        note = body.get("note")
+        category = body.get("category")
+        if not isinstance(rid, int):
+            self._error(400, "id must be an integer")
+            return
+        if not isinstance(note, str) or not note.strip():
+            self._error(400, "note must be a non-empty string")
+            return
+        if category is not None and not isinstance(category, str):
+            self._error(400, "category must be a string")
+            return
+        store = self._store()
+        repo = store.get_repo(rid)
+        if repo is None:
+            self._error(404, f"no repo {rid}")
+            return
+        category = category.strip() or None if category else None
+        store.append_repo_note(rid, note.strip(), category=category)
+        store.log_event("repo", f"note added to {repo['name']}" + (f" [{category}]" if category else ""))
+        self._json({"ok": True, "notes": store.repo_notes(rid)}, 201)
 
 
 class _Server(ThreadingHTTPServer):
