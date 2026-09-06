@@ -616,8 +616,23 @@ function renderActivity(s: Summary): void {
       `<div class="row"><b class="${esc(ss.state)}">\u23f8 ${esc(ss.state)}</b> ${esc(ss.detail)}</div>`,
     );
     if (ss.next_wake_at) {
+      const nc0 = s.next_candidate;
+      // "next check" only means "the daemon loop wakes up again" -- with
+      // sync_prs running (nearly) every cycle to never delay noticing PR
+      // feedback, that wake is often just a cheap heartbeat, not a real
+      // chance to start a job while the budget gate is still shut. Once
+      // we already know (from the SAME pick_next/decide the real cycle
+      // will use) that it'll deny again, say so plainly instead of
+      // implying an imminent check that visually contradicts "budget
+      // available ~1h" a few lines below.
+      const heartbeatOnly =
+        nc0?.budget_state === "denied" &&
+        nc0.budget_retry_at != null &&
+        ss.next_wake_at < nc0.budget_retry_at;
+      const label = heartbeatOnly ? "next sync check" : "next check";
+      const note = heartbeatOnly ? " \u2014 budget still closed" : "";
       rows.push(
-        `<div class="row dim">next check ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})</div>`,
+        `<div class="row dim">${label} ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})${note}</div>`,
       );
     }
   } else {

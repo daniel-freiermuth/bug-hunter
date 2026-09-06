@@ -28,8 +28,16 @@ _cycle_lock = threading.Lock()
 # Wakes the daemon loop early (e.g. budget override set from UI).
 _wake = threading.Event()
 # PR comments/reviews/merge state cost nothing to check (gh reads only) --
-# never let a token-budget backoff also delay noticing PR feedback.
-PR_SYNC_INTERVAL_S = 60.0
+# never let a token-budget backoff also delay noticing PR feedback for
+# HOURS. 60s was needlessly tight: sync_prs itself routinely takes
+# 30-40s (network calls across every pr_open finding, occasionally
+# hitting TLS handshake timeouts), so a 60s cap meant the daemon spent
+# most of its time mid-sync and looped a full budget-gated cycle every
+# ~90-100s continuously for the entire length of a denial -- for a
+# multi-hour backoff, that's dozens of GitHub API sweeps and "denied"
+# log lines that taught us nothing new. 5 minutes still satisfies
+# "never delayed for hours" while cutting that churn ~5x.
+PR_SYNC_INTERVAL_S = 5 * 60.0
 
 
 def _reconcile_and_log(store: Any) -> None:
