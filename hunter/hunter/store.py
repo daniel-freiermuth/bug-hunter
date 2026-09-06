@@ -537,6 +537,21 @@ class Store:
             )
         )
 
+    def jobs_by_finding(self, fid: int) -> list[Row]:
+        """Every job ever run against this finding, newest first -- unlike
+        list_jobs()'s recent-50 window, this is the complete history for
+        one finding (a finding fixed weeks ago can have jobs long since
+        pushed off that global feed). Powers the /api/finding detail
+        view's "all measurements" panel."""
+        return _rows(
+            self.db.execute(
+                "SELECT j.*, r.name AS repo_name FROM jobs j"
+                " JOIN repos r ON r.id = j.repo_id"
+                " WHERE j.finding_id = ? ORDER BY j.id DESC",
+                (fid,),
+            )
+        )
+
     def current_job(self) -> JobDict | None:
         """The job currently in flight, if any -- at most one, given
         _cycle_lock serializes the daemon loop and POST /api/cycle."""

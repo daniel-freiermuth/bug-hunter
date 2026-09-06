@@ -91,6 +91,29 @@ const EventSchema = z.object({
 });
 type Event = z.infer<typeof EventSchema>;
 
+// pr_state table row -- see schema.sql. Only ever fetched on demand via
+// /api/finding (toggleFindingDetail below), never part of the 5s poll.
+interface PrState {
+  pr_number: number | null;
+  state: string | null;
+  mergeable: string | null;
+  checks: string | null;
+  head_ref: string | null;
+  last_activity_at: number | null;
+  last_engaged_activity_at: number | null;
+  needs_attention: string | null;
+  synced_at: number | null;
+}
+
+// /api/finding?id=<id> response: everything about one finding NOT
+// already on its list-view card -- see hunter.server._finding_detail's
+// docstring for why (list_jobs()'s /api/jobs feed is capped at 50 and
+// list_findings() only ever embeds needs_attention for pr_open).
+interface FindingDetail {
+  jobs: Job[];
+  pr_state: PrState | null;
+}
+
 const RepoSchema = z.object({
   id: z.number(),
   name: z.string(),
@@ -329,6 +352,91 @@ function populateSelect(id: string, values: string[]): void {
     if (!wanted.has(o.value)) o.remove();
   }
   el.value = wanted.has(prev) ? prev : "";
+}
+
+// Same filter bar, three places (Inbox, Pipeline, All Findings) -- one
+// generator + one apply function, parametrized by a DOM-id prefix, so
+// the three pages can never drift into subtly different filter sets.
+// Inbox uses prefix "f" (reproducing its original ids byte-for-byte,
+// so nothing else referencing e.g. $select("fRepo") needed to change);
+// Pipeline uses "pf"; All Findings uses "af" and additionally gets a
+// status dropdown (includeStatus), since unlike Inbox (implicitly
+// status=new) and Pipeline (columns ARE the status breakdown), this
+// page's whole purpose is picking which status to look at.
+const STATUS_OPTIONS = [
+  "new", "rechecking", "queued", "fixing", "pr_open",
+  "merged", "rejected", "wontfix", "note",
+];
+
+function filterBarHtml(p: string, includeStatus: boolean): string {
+  const statusHtml = includeStatus
+    ? `<label>status</label><select id="${p}Status"><option value="">all</option>
+        ${STATUS_OPTIONS.map((s) => `<option value="${s}">${s}</option>`).join("")}
+      </select>
+      <div class="sep"></div>`
+    : "";
+  return `${statusHtml}
+    <label>repo</label><select id="${p}Repo"><option value="">all</option></select>
+    <div class="sep"></div>
+    <label>type</label><select id="${p}Type">
+      <option value="">all</option>
+      <option value="bug">\ud83d\udc1b Bug</option>
+      <option value="dep_update">\ud83d\udce6 Dep</option>
+      <option value="test_gap">\ud83e\uddea Test</option>
+      <option value="refactor">\u267b\ufe0f Refactor</option>
+      <option value="modernization">\ud83d\udd2c Modern</option>
+    </select>
+    <label>class</label><select id="${p}Class"><option value="">all</option></select>
+    <div class="sep"></div>
+    <label>min severity</label><select id="${p}Sev"><option value="">all</option>
+      <option>high</option><option>medium</option><option>low</option></select>
+    <div class="sep"></div>
+    <label>min confidence</label>
+    <input type="range" id="${p}Conf" min="0" max="100" value="0" step="5">
+    <span id="${p}ConfVal">0%</span>
+    <div class="sep"></div>
+    <label>sort</label><select id="${p}Sort">
+      <option value="score">severity \u00d7 confidence</option>
+      <option value="newest">newest first</option>
+      <option value="oldest">oldest first</option>
+      <option value="repo">by repo</option>
+    </select>`;
+}
+
+function applyFindingFilters(findings: Finding[], p: string): Finding[] {
+  const statusEl = document.getElementById(`${p}Status`) as HTMLSelectElement | null;
+  const fStatus = statusEl?.value || "";
+  const fRepo = $select(`${p}Repo`).value;
+  const fType = $select(`${p}Type`).value;
+  const fClass = $select(`${p}Class`).value;
+  const fSev = $select(`${p}Sev`).value;
+  const fConf = parseInt($input(`${p}Conf`).value, 10) / 100;
+  const fSort = $select(`${p}Sort`).value;
+
+  const filtered = findings.filter((f) => {
+    if (fStatus && f.status !== fStatus) return false;
+    if (fRepo && !f.fingerprint.startsWith(fRepo + ":")) return false;
+    if (fType && f.type !== fType) return false;
+    if (fClass && (f.category || f.bug_class) !== fClass) return false;
+    if (fSev && (SEV_RANK[f.severity] || 0) < (SEV_RANK[fSev] || 0)) return false;
+    if ((f.confidence || 0) < fConf) return false;
+    return true;
+  });
+
+  if (fSort === "score") {
+    filtered.sort(
+      (a, b) =>
+        (SEV_RANK[b.severity] || 0) * (b.confidence || 0) -
+        (SEV_RANK[a.severity] || 0) * (a.confidence || 0),
+    );
+  } else if (fSort === "newest") {
+    filtered.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  } else if (fSort === "oldest") {
+    filtered.sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+  } else if (fSort === "repo") {
+    filtered.sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
+  }
+  return filtered;
 }
 
 // ---------------------------------------------------------------------------
@@ -601,6 +709,73 @@ async function addRepoNote(id: number): Promise<void> {
   toast("note added", false);
 }
 
+// ---------------------------------------------------------------------------
+// Finding detail -- a <details> per card (findingCard below), lazily
+// fetching /api/finding on first open. Same caching pattern as repo
+// notes above: fetched content lives in a module-level map, not the
+// DOM, so the 5s refresh() rebuild of #inbox/#allFindings never loses
+// it or re-fetches it.
+// ---------------------------------------------------------------------------
+
+const findingDetailCache = new Map<number, FindingDetail | "loading" | "error">();
+
+async function toggleFindingDetail(id: number, opened: boolean): Promise<void> {
+  if (!opened) return;
+  if (!findingDetailCache.has(id)) {
+    findingDetailCache.set(id, "loading");
+    renderFindingDetailBody(id);
+    const r = await api<FindingDetail>(`/api/finding?id=${id}`);
+    findingDetailCache.set(id, r.status === 200 && r.body ? r.body : "error");
+  }
+  renderFindingDetailBody(id);
+}
+
+function renderFindingDetailBody(id: number): void {
+  const el = document.getElementById(`fd-body-${id}`);
+  if (!el) return;
+  const state = findingDetailCache.get(id);
+  if (state === "loading" || state === undefined) {
+    el.innerHTML = '<div class="empty">loading\u2026</div>';
+    return;
+  }
+  if (state === "error") {
+    el.innerHTML = '<div class="empty">failed to load</div>';
+    return;
+  }
+  const { jobs, pr_state } = state;
+  const jobsHtml = jobs.length
+    ? `<table>
+        <tr><th>id</th><th>kind</th><th>state</th><th class="num">tokens</th>
+            <th class="num">calls</th><th class="num">dur</th><th>killed</th><th>when</th></tr>
+        ${jobs
+          .map(
+            (j) => `<tr>
+          <td>${j.id}</td><td>${esc(j.kind)}</td>
+          <td class="state-${esc(j.state)}">${esc(j.state)}</td>
+          <td class="num">${ktok(j.tokens_new)}</td>
+          <td class="num">${j.calls ?? "\u2013"}</td>
+          <td class="num">${dur(j)}</td>
+          <td>${esc(j.killed_reason || "")}</td>
+          <td>${datetime(j.started_at)}</td>
+        </tr>`,
+          )
+          .join("")}
+      </table>`
+    : '<div class="empty">no jobs recorded for this finding</div>';
+  const prHtml = pr_state
+    ? `<div class="loc">PR #${pr_state.pr_number ?? "?"} \u00b7 ${esc(pr_state.state || "?")}` +
+      `${pr_state.mergeable ? " \u00b7 " + esc(pr_state.mergeable) : ""}` +
+      `${pr_state.checks ? " \u00b7 " + esc(pr_state.checks) : ""}` +
+      `${pr_state.head_ref ? " \u00b7 " + esc(pr_state.head_ref) : ""}</div>
+       <div class="loc">last activity ${datetime(pr_state.last_activity_at)} \u00b7 ` +
+      `we engaged ${datetime(pr_state.last_engaged_activity_at)} \u00b7 ` +
+      `synced ${datetime(pr_state.synced_at)}` +
+      `${pr_state.needs_attention ? " \u00b7 \u26a0 " + esc(pr_state.needs_attention) : ""}</div>`
+    : '<div class="empty">no PR opened yet</div>';
+  el.innerHTML = `<div class="fd-section"><b>Jobs (${jobs.length})</b>${jobsHtml}</div>
+    <div class="fd-section"><b>PR state</b>${prHtml}</div>`;
+}
+
 // Expose to onclick handlers in rendered HTML
 Object.assign(window, {
   verdict,
@@ -614,6 +789,7 @@ Object.assign(window, {
   removeRepo,
   toggleRepoNotes,
   addRepoNote,
+  toggleFindingDetail,
 });
 
 // ---------------------------------------------------------------------------
@@ -766,6 +942,10 @@ function findingCard(f: Finding, withActions: boolean): string {
   const detail = (f.detail || "").trim();
   const plan = (f.evidence_plan || "").trim();
   const tl = f.timeline || [];
+  const detailBlock = `<details ontoggle="toggleFindingDetail(${f.id}, this.open)">
+    <summary>full history (jobs \u00b7 PR)</summary>
+    <div id="fd-body-${f.id}"></div>
+  </details>`;
   const timeline = tl.length
     ? `<details><summary>timeline (${tl.length})</summary>
       <div class="timeline">${tl
@@ -795,6 +975,7 @@ function findingCard(f: Finding, withActions: boolean): string {
       <span class="badge type-${f.type || 'bug'}">${typeLabel}</span>
       <span class="badge sev-${sev}">${sev} \u00b7 ${conf}</span>
       <span class="badge">${esc(category)}</span>
+      <span class="badge status-${esc(f.status)}">${esc(f.status)}</span>
       <span class="fp">#${f.id} ${esc(f.fingerprint)}</span>
     </div>
     <div class="sum">${esc(f.summary)}</div>
@@ -809,6 +990,7 @@ function findingCard(f: Finding, withActions: boolean): string {
         : ""
     }
     ${timeline}
+    ${detailBlock}
     ${
       withActions
         ? `<div class="acts">
@@ -865,6 +1047,15 @@ function renderPipeline(findings: Finding[]): void {
       return `<div class="col"><h3>${name} (${items.length})</h3>${body}</div>`;
     })
     .join("");
+}
+
+function renderAllFindings(all: Finding[], filtered: Finding[]): void {
+  $("nFindings").textContent = `(${filtered.length}/${all.length})`;
+  $("allFindings").innerHTML = filtered.length
+    ? filtered.map((f) => findingCard(f, false)).join("")
+    : '<div class="empty">' +
+      (all.length ? "all filtered out" : "no findings yet") +
+      "</div>";
 }
 
 function renderRepos(repos: Repo[]): void {
@@ -1031,54 +1222,21 @@ async function refresh(): Promise<void> {
     const repos = [
       ...new Set(all.map((f) => f.fingerprint.split(":")[0])),
     ].sort();
-    const classes = ([
+    const inboxClasses = ([
       ...new Set(inbox.map((f) => f.category || f.bug_class).filter(c => c != null && c !== "")),
     ] as string[]).sort();
+    const allClasses = ([
+      ...new Set(all.map((f) => f.category || f.bug_class).filter(c => c != null && c !== "")),
+    ] as string[]).sort();
     populateSelect("fRepo", repos);
-    populateSelect("fClass", classes);
+    populateSelect("fClass", inboxClasses);
+    populateSelect("pfRepo", repos);
+    populateSelect("pfClass", allClasses);
+    populateSelect("afRepo", repos);
+    populateSelect("afClass", allClasses);
 
-    // ---- apply filters ----
-    const fRepo = $select("fRepo").value;
-    const fType = $select("fType").value;
-    const fClass = $select("fClass").value;
-    const fSev = $select("fSev").value;
-    const fConf = parseInt($input("fConf").value, 10) / 100;
-    const fSort = $select("fSort").value;
-
-    let filtered = inbox.filter((f) => {
-      if (fRepo && !f.fingerprint.startsWith(fRepo + ":"))
-        return false;
-      if (fType && f.type !== fType) return false;
-      if (fClass && (f.category || f.bug_class) !== fClass) return false;
-      if (
-        fSev &&
-        (SEV_RANK[f.severity] || 0) < (SEV_RANK[fSev] || 0)
-      )
-        return false;
-      if ((f.confidence || 0) < fConf) return false;
-      return true;
-    });
-
-    if (fSort === "score") {
-      filtered.sort(
-        (a, b) =>
-          (SEV_RANK[b.severity] || 0) * (b.confidence || 0) -
-          (SEV_RANK[a.severity] || 0) * (a.confidence || 0),
-      );
-    } else if (fSort === "newest") {
-      filtered.sort(
-        (a, b) => (b.created_at || 0) - (a.created_at || 0),
-      );
-    } else if (fSort === "oldest") {
-      filtered.sort(
-        (a, b) => (a.created_at || 0) - (b.created_at || 0),
-      );
-    } else if (fSort === "repo") {
-      filtered.sort((a, b) =>
-        a.fingerprint.localeCompare(b.fingerprint),
-      );
-    }
-
+    // ---- apply filters (same filter bar, three independent instances) ----
+    const filtered = applyFindingFilters(inbox, "f");
     $("nInbox").textContent = `(${filtered.length}/${inbox.length})`;
     $("inbox").innerHTML = filtered.length
       ? filtered.map((f) => findingCard(f, true)).join("")
@@ -1086,7 +1244,8 @@ async function refresh(): Promise<void> {
         (inbox.length ? "all filtered out" : "inbox zero") +
         "</div>";
 
-    renderPipeline(all);
+    renderPipeline(applyFindingFilters(all, "pf"));
+    renderAllFindings(all, applyFindingFilters(all, "af"));
     renderRepos(s.repos || []);
 
     const supp = all.filter(
@@ -1155,7 +1314,7 @@ async function refresh(): Promise<void> {
 // Left nav / page routing
 // ---------------------------------------------------------------------------
 
-const NAV_PAGES = ["status", "inbox", "pipeline", "repos", "stats", "log"];
+const NAV_PAGES = ["status", "inbox", "pipeline", "findings", "repos", "stats", "log"];
 
 function showPage(name: string): void {
   const page = NAV_PAGES.includes(name) ? name : "inbox";
@@ -1180,14 +1339,27 @@ showPage(location.hash.slice(1));
 
 $button("runCycle").addEventListener("click", runCycle);
 
-for (const id of ["fRepo", "fClass", "fSev", "fSort"]) {
-  $(id).onchange = refresh;
+// Mount the three filter bars (Inbox reproduces its original "f" ids
+// byte-for-byte -- see filterBarHtml's comment), then wire every
+// select/range in each to trigger a refresh on change.
+$("filters-inbox").innerHTML = filterBarHtml("f", false);
+$("filters-pipeline").innerHTML = filterBarHtml("pf", false);
+$("filters-findings").innerHTML = filterBarHtml("af", true);
+
+for (const p of ["f", "pf", "af"]) {
+  for (const suffix of ["Status", "Repo", "Type", "Class", "Sev", "Sort"]) {
+    const el = document.getElementById(`${p}${suffix}`);
+    if (el) (el as HTMLSelectElement).onchange = refresh;
+  }
+  const confInput = document.getElementById(`${p}Conf`) as HTMLInputElement | null;
+  if (confInput) {
+    confInput.oninput = () => {
+      const label = document.getElementById(`${p}ConfVal`);
+      if (label) label.textContent = confInput.value + "%";
+      refresh();
+    };
+  }
 }
-const confInput = $input("fConf");
-confInput.oninput = () => {
-  $("fConfVal").textContent = confInput.value + "%";
-  refresh();
-};
 
 refresh();
 setInterval(refresh, 5000);
