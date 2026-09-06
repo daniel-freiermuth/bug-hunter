@@ -14,14 +14,14 @@ interface WindowInfo {
 }
 
 interface Finding {
-  type: string;  // 'bug' | 'dep_update' | 'test_gap' | 'refactor'
+  type: string;  // 'bug' | 'dep_update' | 'test_gap' | 'refactor' | 'modernization'
   id: number;
   repo_id: number;
   fingerprint: string;
   file: string;
   symbol: string | null;
   line: number | null;
-  category: string;  // bug_class | update_type | 'coverage' | smell_type
+  category: string;  // bug_class | update_type | 'coverage' | smell_type | modernization_class
   bug_class?: string;  // legacy field for bugs
   severity: string;
   confidence: number;
@@ -39,6 +39,9 @@ interface Finding {
   missing_tests?: string | null;
   smell_type?: string | null;
   suggested_refactor?: string | null;
+  modernization_class?: string | null;
+  current_approach?: string | null;
+  proposed_approach?: string | null;
   // Common status fields
   status: string;
   verdict_reason: string | null;
@@ -662,10 +665,15 @@ function findingCard(f: Finding, withActions: boolean): string {
     dep_update: "📦 Dep",
     test_gap: "🧪 Test",
     refactor: "♻️ Refactor",
+    modernization: "🔬 Modern",
   };
   const typeLabel = typeLabels[f.type] || f.type || "?";
   const category = f.category || f.bug_class || "";
-  
+  const approach =
+    f.current_approach || f.proposed_approach
+      ? `<div class="loc">${esc(f.current_approach || "?")} \u2192 ${esc(f.proposed_approach || "?")}</div>`
+      : "";
+
   return `<div class="card">
     <div class="top">
       <span class="badge type-${f.type || 'bug'}">${typeLabel}</span>
@@ -675,6 +683,7 @@ function findingCard(f: Finding, withActions: boolean): string {
     </div>
     <div class="sum">${esc(f.summary)}</div>
     <div class="loc">${loc}${f.introduced_by ? " \u00b7 introduced by " + esc(f.introduced_by) : ""}</div>
+    ${approach}
     ${
       detail || plan
         ? `<details><summary>detail + evidence plan</summary>

@@ -13,7 +13,7 @@ import pytest
 
 from hunter.scheduler import pick_next
 from hunter.store import Store
-from hunter.types import Config
+from hunter.types import Config, now_ms
 
 
 @pytest.fixture
@@ -147,8 +147,8 @@ class TestPickNextRepoRotation:
         rid = store.add_repo("r", "https://r", str(repo_path))
         store.db.execute(
             "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
-            " last_dep_update_at=?, last_refactor_at=? WHERE id=?",
-            (500, 400, 300, 100, rid),  # refactor is oldest (100)
+            " last_dep_update_at=?, last_refactor_at=?, last_modernization_at=? WHERE id=?",
+            (500, 400, 300, 100, 600, rid),  # refactor is oldest (100)
         )
         store.db.commit()
 
@@ -175,3 +175,66 @@ class TestPickNextRepoRotation:
     def test_force_repo_unknown_raises(self, store: Store, cfg: Config) -> None:
         with pytest.raises(ValueError, match="unknown repo"):
             pick_next(store, cfg, force_repo="nonexistent-repo-name")
+
+
+class TestPickNextModernizationGate:
+    """modernization is a periodic strategic check (default 30-day interval),
+    not a tight-loop scan -- it must not compete for scan slots against
+    hunt/test_gap/dep_update/refactor every single cycle."""
+
+    def test_never_run_modernization_is_eligible_immediately(
+        self, store: Store, cfg: Config, tmp_path: Path
+    ) -> None:
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        rid = store.add_repo("r", "https://r", str(repo_path))
+        # Other four have all run; only modernization is never-run.
+        store.db.execute(
+            "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
+            " last_dep_update_at=?, last_refactor_at=? WHERE id=?",
+            (500, 400, 300, 100, rid),
+        )
+        store.db.commit()
+
+        kind, _target = pick_next(store, cfg)
+        assert kind == "modernization"
+
+    def test_gated_out_within_interval_even_if_otherwise_stalest(
+        self, store: Store, cfg: Config, tmp_path: Path
+    ) -> None:
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        rid = store.add_repo("r", "https://r", str(repo_path))
+        recent = now_ms()
+        # modernization ran a moment ago (well inside the 30-day interval);
+        # the other four ran long before that -- would lose to modernization
+        # on staleness alone if the gate didn't exempt it.
+        store.db.execute(
+            "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
+            " last_dep_update_at=?, last_refactor_at=?, last_modernization_at=? WHERE id=?",
+            (100, 200, 300, 400, recent, rid),
+        )
+        store.db.commit()
+
+        kind, _target = pick_next(store, cfg)
+        assert kind == "hunt"  # oldest of the four; modernization gated out
+
+    def test_eligible_again_once_interval_has_elapsed(
+        self, store: Store, cfg: Config, tmp_path: Path
+    ) -> None:
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        rid = store.add_repo("r", "https://r", str(repo_path))
+        interval_ms = cfg.modernization_interval_days * 86_400_000
+        long_ago = now_ms() - interval_ms - 1000
+        # modernization last ran just over the interval ago -- it's the
+        # stalest job now, and the gate no longer excludes it.
+        store.db.execute(
+            "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
+            " last_dep_update_at=?, last_refactor_at=?, last_modernization_at=? WHERE id=?",
+            (now_ms(), now_ms(), now_ms(), now_ms(), long_ago, rid),
+        )
+        store.db.commit()
+
+        kind, _target = pick_next(store, cfg)
+        assert kind == "modernization"

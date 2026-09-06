@@ -85,6 +85,10 @@ class Store:
             ("last_test_gap_at", "repos", "ALTER TABLE repos ADD COLUMN last_test_gap_at INTEGER"),
             ("last_dep_update_at", "repos", "ALTER TABLE repos ADD COLUMN last_dep_update_at INTEGER"),
             ("last_refactor_at", "repos", "ALTER TABLE repos ADD COLUMN last_refactor_at INTEGER"),
+            ("last_modernization_at", "repos", "ALTER TABLE repos ADD COLUMN last_modernization_at INTEGER"),
+            ("modernization_class", "findings", "ALTER TABLE findings ADD COLUMN modernization_class TEXT"),
+            ("current_approach", "findings", "ALTER TABLE findings ADD COLUMN current_approach TEXT"),
+            ("proposed_approach", "findings", "ALTER TABLE findings ADD COLUMN proposed_approach TEXT"),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
@@ -209,8 +213,9 @@ class Store:
             " severity, confidence, summary, detail, evidence_plan, introduced_by,"
             " ecosystem, package, current_version, latest_version, update_type, security_advisory,"
             " missing_tests, test_file, smell_type, suggested_refactor,"
+            " modernization_class, current_approach, proposed_approach,"
             " status, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)",
             (
                 finding_type,
                 repo_id,
@@ -235,6 +240,9 @@ class Store:
                 f.get("test_file"),
                 f.get("smell_type"),
                 f.get("suggested_refactor"),
+                f.get("modernization_class"),
+                f.get("current_approach"),
+                f.get("proposed_approach"),
                 t,
                 t,
             ),
@@ -314,6 +322,8 @@ class Store:
                 r["category"] = "coverage"
             elif r["type"] == "refactor":
                 r["category"] = r.get("smell_type")
+            elif r["type"] == "modernization":
+                r["category"] = r.get("modernization_class")
         return rows
 
     def set_status(

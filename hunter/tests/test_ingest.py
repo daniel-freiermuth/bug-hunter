@@ -283,6 +283,44 @@ def test_refactor_ingested_with_type_columns(env: tuple[Store, int, Path]) -> No
     assert rows[0]["suggested_refactor"] == "extract shared helper"
 
 
+def test_modernization_ingested_with_type_columns(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:tiles:format-or-protocol-shift",
+            "file": "src/tiles.py",
+            "modernization_class": "format-or-protocol-shift",
+            "severity": "medium",
+            "confidence": 0.7,
+            "summary": "MVT is stale, MLT is now the SOTA vector tile format",
+            "current_approach": "MVT (Mapbox Vector Tile)",
+            "proposed_approach": "MLT (Mapbox Vector Tile, v2)",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+    rows = store.list_all_findings(finding_type="modernization")
+    assert rows[0]["type"] == "modernization"
+    assert rows[0]["category"] == "format-or-protocol-shift"
+    assert rows[0]["current_approach"] == "MVT (Mapbox Vector Tile)"
+    assert rows[0]["proposed_approach"] == "MLT (Mapbox Vector Tile, v2)"
+    # bug_class must stay unset for non-bug findings
+    assert rows[0]["bug_class"] is None
+
+
+def test_modernization_missing_class_is_not_invalid(env: tuple[Store, int, Path]) -> None:
+    """modernization findings never carry bug_class -- only a generic
+    severity/confidence check applies, same as dep_update/test_gap/refactor."""
+    store, repo_id, fdir = env
+    entries = [{"fingerprint": "repo:x", "severity": "low", "confidence": 0.5, "summary": "x"}]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+
+
 def test_different_types_do_not_leak_into_each_others_known_list(
     env: tuple[Store, int, Path],
 ) -> None:
