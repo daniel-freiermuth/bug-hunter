@@ -163,14 +163,22 @@ class Handler(BaseHTTPRequestHandler):
     def _summary(self) -> Row:
         from . import budget
 
+        now_ms = time.time() * 1000
         windows: Row = {}
         for limit_id, w in budget.read_windows().items():
+            if ":5h" in limit_id:
+                ramp = budget.ramp_5h(w.resets_at, now_ms)
+            elif ":7d" in limit_id:
+                ramp = budget.ramp_7d(w.resets_at, now_ms)
+            else:
+                ramp = None
             windows[limit_id] = {
                 "used_fraction": w.used_fraction,
                 "status": w.status,
                 "resets_at": w.resets_at,
                 "age_s": w.age_s,
                 "stale": w.stale,
+                "ramp": ramp,
             }
         store = self._store()
         counts: dict[str, int] = dict.fromkeys(FINDING_STATUSES, 0)
