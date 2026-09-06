@@ -27,6 +27,9 @@ log = logging.getLogger(__name__)
 _cycle_lock = threading.Lock()
 # Wakes the daemon loop early (e.g. budget override set from UI).
 _wake = threading.Event()
+# PR comments/reviews/merge state cost nothing to check (gh reads only) --
+# never let a token-budget backoff also delay noticing PR feedback.
+PR_SYNC_INTERVAL_S = 60.0
 
 
 def _reconcile_and_log(store: Any) -> None:
@@ -630,6 +633,65 @@ def _describe_cycle(summary: Row) -> tuple[str, str]:
         return "idle", f"last: {bits}"
     return "idle", "cycle produced no actionable outcome"
 
+def _compute_sleep_s(store: Any, summary: Row) -> float:
+    """How long the daemon loop should sleep after this cycle attempt --
+    extracted from the loop body so it's directly testable rather than
+    only observable by running the real infinite loop.
+
+    Wake policy (smart sleep -- only when necessary):
+      - queue has fixes      -> 0s    (drain immediately)
+      - just found bugs      -> 5s    (keep momentum)
+      - repos exist, no work -> 60s   (periodic check)
+      - budget denied        -> dec.retry_at-derived, capped at 60min
+      - truly idle (no repos)-> 15min
+      - error                -> 5min
+      - unrecognized summary shape (e.g. {"idle": ...}, {"skipped": ...})
+        -> 15min, the same default the caller started with
+
+    Then, regardless of the above: if a PR sync happened this cycle
+    ("sync" in summary), cap at PR_SYNC_INTERVAL_S. sync_prs is free (gh
+    reads only, no tokens), so a long token-budget backoff must never
+    also delay noticing PR feedback.
+    """
+    sleep_s: float
+    if "error" in summary:
+        sleep_s = 5 * 60
+    elif summary.get("state") in ("done", "killed", "failed"):
+        queued_fixes = store.db.execute(
+            "SELECT COUNT(*) FROM findings WHERE status = 'queued'"
+        ).fetchone()[0]
+        job_produced_findings = summary.get("ingest", {}).get("inserted", 0) > 0
+        enabled_repos = store.db.execute(
+            "SELECT COUNT(*) FROM repos WHERE enabled = 1"
+        ).fetchone()[0]
+        if queued_fixes > 0:
+            sleep_s = 0
+        elif job_produced_findings:
+            sleep_s = 5
+        elif enabled_repos > 0:
+            sleep_s = 60
+        else:
+            sleep_s = 15 * 60
+    elif summary.get("denied"):
+        # dec.retry_at (threaded through every "denied" return in
+        # scheduler.py) is computed at the source, directly from the
+        # WindowState that caused the denial -- an exact answer to
+        # "when would this specific denial resolve", not re-derived
+        # here from the reason string. None means no informed estimate
+        # exists (e.g. missing resets_at); fall back to a generic
+        # backoff rather than a value that looks precise but isn't.
+        retry_at = summary.get("retry_at")
+        if retry_at:
+            until_retry = retry_at / 1000 - time.time()
+            sleep_s = max(60.0, min(until_retry + 30, 60 * 60))
+        else:
+            sleep_s = 30 * 60
+    else:
+        sleep_s = 15 * 60
+    if "sync" in summary:
+        sleep_s = min(sleep_s, PR_SYNC_INTERVAL_S)
+    return sleep_s
+
 
 def daemon(cfg: Config) -> None:
     """Run forever: UI server + scheduler loop in one process.
@@ -638,13 +700,7 @@ def daemon(cfg: Config) -> None:
     cycles never overlap. Idling costs zero tokens -- every wake goes through
     the budget gate, which is where all spending decisions live.
 
-    Wake policy (smart sleep - only when necessary):
-      - queue has fixes      -> 0s    (drain immediately)
-      - just found bugs      -> 5s    (keep momentum)
-      - repos exist, no work -> 60s   (periodic check)
-      - budget denied        -> until reset, capped at 30min
-      - truly idle (no repos)-> 15min
-      - error                -> 5min
+    Wake policy: see _compute_sleep_s.
     """
     import signal as _signal
 
@@ -659,7 +715,7 @@ def daemon(cfg: Config) -> None:
     for sig in (_signal.SIGTERM, _signal.SIGINT):
         _signal.signal(sig, lambda *_args: stop.set())
 
-    from . import budget, scheduler
+    from . import scheduler
     from .store import Store
 
     while not stop.is_set():
@@ -670,55 +726,7 @@ def daemon(cfg: Config) -> None:
                 store = Store(cfg)
                 _reconcile_and_log(store)
                 summary = scheduler.run_cycle(store, cfg)
-                if "error" in summary:
-                    sleep_s = 5 * 60
-                elif summary.get("state") in (
-                    "done",
-                    "killed",
-                    "failed",
-                ):
-                    # Smart sleep: ONLY sleep when necessary
-                    # Check for queued work (fixes awaiting budget)
-                    queued_fixes = store.db.execute(
-                        "SELECT COUNT(*) FROM findings WHERE status = 'queued'"
-                    ).fetchone()[0]
-                    
-                    # Check if we just produced new findings (likely more analysis work to do)
-                    job_produced_findings = summary.get("ingest", {}).get("inserted", 0) > 0
-                    
-                    # Check if any enabled repos exist (potential hunt/analysis targets)
-                    enabled_repos = store.db.execute(
-                        "SELECT COUNT(*) FROM repos WHERE enabled = 1"
-                    ).fetchone()[0]
-                    
-                    if queued_fixes > 0:
-                        # Priority: drain fix queue with ZERO delay
-                        sleep_s = 0
-                    elif job_produced_findings:
-                        # Just found bugs, keep momentum - minimal delay
-                        sleep_s = 5
-                    elif enabled_repos > 0:
-                        # Repos exist but nothing queued - check periodically
-                        sleep_s = 60
-                    else:
-                        # Truly idle (no repos) - back off
-                        sleep_s = 15 * 60
-                elif summary.get("denied"):
-                    # dec.retry_at (threaded through every "denied" return
-                    # in scheduler.py) is computed at the source, directly
-                    # from the WindowState that caused the denial -- an
-                    # exact answer to "when would this specific denial
-                    # resolve", not re-derived here from the reason
-                    # string. None means no informed estimate exists
-                    # (e.g. missing resets_at); fall back to a generic
-                    # backoff rather than a value that looks precise but
-                    # isn't.
-                    retry_at = summary.get("retry_at")
-                    if retry_at:
-                        until_retry = retry_at / 1000 - time.time()
-                        sleep_s = max(60.0, min(until_retry + 30, 60 * 60))
-                    else:
-                        sleep_s = 30 * 60
+                sleep_s = _compute_sleep_s(store, summary)
                 state_label, detail = _describe_cycle(summary)
                 with contextlib.suppress(Exception):
                     store.set_scheduler_state(
