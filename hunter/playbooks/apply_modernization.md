@@ -51,6 +51,30 @@ disclosed, not discovered later.
 Same commit-per-step, test-as-you-go discipline as any other fix. Breaking changes are allowed
 here — call them out explicitly in the PR description; do not downplay them.
 
+### CI/CD gaps specifically: usually (c), not (a)
+
+A `ci-cd-gap` finding is a different shape from a code migration -- adding or wiring up a
+workflow file is normally additive and isolated from application code, not a multi-file
+rewrite with unclear rollback. Default to (c) full implementation for wiring up
+lint/test/build gates; do NOT drop to an RFC plan document just because "modernization
+findings often do." The exceptions:
+- **Release/publish automation is the higher-risk part of this class** — it touches external
+  registries, app stores, or secrets you don't have and shouldn't invent. For that piece
+  specifically, prefer (a) a plan document (what secrets/environment a human needs to
+  provision) or (b) a dry-run-only spike (build the release artifact, do not attempt to
+  actually publish it) — never fabricate credentials or assume a secret already exists.
+- Mirror the project's OWN existing tooling. Before writing a single line of workflow YAML,
+  find how this repo already builds/tests/lints/releases by hand (Makefile, justfile,
+  `package.json` scripts, README/CONTRIBUTING instructions) and wire up exactly those
+  commands — do not introduce a generic template pipeline with commands the project doesn't
+  actually use.
+- **Verify every command locally before it goes in the workflow file.** Run the exact
+  lint/test/build/release-dry-run commands you're about to add, in this worktree, right now,
+  and quote the results. A new workflow file typically will not execute until this PR is
+  merged (GitHub/GitLab do not run brand-new pipeline definitions against the PR that adds
+  them the same way they run existing ones) — your local run is the only verification
+  evidence that will exist before merge, so it is not optional.
+
 Whichever you pick, COMMIT PER STEP: you may be killed at any moment, and committed work
 survives while anything only in your head does not. Every path — including (a) — ends with at
 least one commit; a PR needs a diff to open.

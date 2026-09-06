@@ -41,10 +41,31 @@ currently broken.
 ### Platform EOL (class: platform-eol)
 - Targeting a language/runtime/OS version whose support window has ended or is ending soon
 
+### CI/CD gap (class: ci-cd-gap)
+- No CI configured at all for the forge this repo actually uses (no `.github/workflows/`,
+  `.gitlab-ci.yml`, `.circleci/config.yml`, `Jenkinsfile`, `azure-pipelines.yml`) despite the
+  project having a real test suite, lint config, or build step a human currently runs by hand
+- CI exists but is thin: it doesn't invoke tooling the project has ALREADY configured for
+  itself (an `.eslintrc`/`ruff`/`clippy.toml`/`rustfmt.toml`/`pyproject.toml [tool.*]` exists
+  but no CI job runs it), doesn't run the actual test suite, or never builds/typechecks
+- No release/delivery automation for a project whose own metadata signals it's meant to be
+  published (a `Cargo.toml` with `publish` not set to `false` plus real `description`/
+  `repository` fields, a non-private `package.json`, `fastlane`/App Store/Play Store config
+  present) but releases are still cut by hand
+- **Look around FIRST, before proposing anything.** A Makefile, justfile, `package.json`
+  scripts block, README "Development"/"Building" section, or CONTRIBUTING.md usually already
+  documents the normal way to build/test/lint/release THIS specific project. The gap is
+  almost always that none of it runs unattended on push/PR/tag -- not that the commands don't
+  exist. Propose wiring up what's already there; do not invent a generic starter-template
+  pipeline that ignores the project's own conventions
+
 ## What does NOT count
 - A routine "newer version available" with no qualitative reason -- that is dep_update's job
 - A local code smell fixable by extracting a function -- that is refactor's job
 - Speculative "X is trendier" opinions with no maintenance, capability, or security rationale
+- Branch-protection / required-status-check settings on the forge itself -- that needs forge
+  API access this hunt/fix pair doesn't have, and isn't something a local worktree checkout
+  can meaningfully verify or change
 
 # Verification is mandatory, not optional
 Every claim in this domain is exactly the kind of thing that goes stale in training data.
@@ -55,6 +76,15 @@ Before filing:
 - "EOL" -> cite the actual published support-end date
 - "X is now mature / production-ready" -> cite adoption evidence (real projects using it,
   a release history showing stability), not a hunch
+- "no CI" -> confirm by actually listing the relevant directories/files for the forge this
+  repo actually uses (`.github/workflows/`, `.gitlab-ci.yml`, etc.) -- don't assume from the
+  project's language or from a README badge alone
+- "CI doesn't run lint/tests/build" -> read the actual CI config file(s) and quote which
+  commands they invoke; don't infer from a missing badge or an assumption about what a
+  project "usually" does
+- Any command you plan to propose adding to CI -> actually run it in the repo right now and
+  quote the result; proposing a pipeline step that would immediately fail is worse than no
+  finding at all
 
 # Known non-candidates (suppression corpus — do NOT re-file these or variants)
 {{SUPPRESSIONS}}
@@ -72,7 +102,7 @@ entries. Each entry:
 {
   "fingerprint": "{{REPO_NAME}}:area:modernization-class",
   "file": "path/file.ext or directory/area",
-  "modernization_class": "deprecated-dependency|unmaintained-library|language-feature-gap|format-or-protocol-shift|major-version-debt|platform-eol",
+  "modernization_class": "deprecated-dependency|unmaintained-library|language-feature-gap|format-or-protocol-shift|major-version-debt|platform-eol|ci-cd-gap",
   "current_approach": "what's used today, concretely",
   "proposed_approach": "what to move to, concretely",
   "severity": "high|medium|low",
