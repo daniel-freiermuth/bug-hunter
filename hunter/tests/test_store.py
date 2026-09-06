@@ -567,3 +567,59 @@ class TestReconcileOrphanedJobs:
 
         assert result == {"findings": [], "jobs": []}
         assert store.list_jobs()[0]["state"] == "done"
+
+
+# -- current_job / scheduler_state -------------------------------------------
+
+
+class TestCurrentJob:
+    def test_none_when_nothing_running(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.create_job("hunt", rid)  # queued, not running
+        assert store.current_job() is None
+
+    def test_returns_the_running_job_with_repo_and_finding_context(
+        self, store: Store
+    ) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        fid, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-1"))
+        jid = store.create_job("fix", rid, finding_id=fid, cap_tokens=150_000)
+        store.update_job(jid, state="running")
+        job = store.current_job()
+        assert job is not None
+        assert job["id"] == jid
+        assert job["repo_name"] == "r"
+        assert job["finding_fingerprint"] == "fp-1"
+        assert job["finding_summary"] == "Bug found"
+
+    def test_only_the_most_recent_running_job_is_returned(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        j1 = store.create_job("hunt", rid)
+        store.update_job(j1, state="done")
+        j2 = store.create_job("hunt", rid)
+        store.update_job(j2, state="running")
+        job = store.current_job()
+        assert job is not None
+        assert job["id"] == j2
+
+
+class TestSchedulerState:
+    def test_none_before_ever_set(self, store: Store) -> None:
+        assert store.get_scheduler_state() is None
+
+    def test_set_and_get_roundtrip(self, store: Store) -> None:
+        store.set_scheduler_state("idle", "no work", 12345)
+        state = store.get_scheduler_state()
+        assert state is not None
+        assert state["state"] == "idle"
+        assert state["detail"] == "no work"
+        assert state["next_wake_at"] == 12345
+
+    def test_set_overwrites_previous_value(self, store: Store) -> None:
+        store.set_scheduler_state("idle", "no work", 100)
+        store.set_scheduler_state("denied", "5h ramp", 200)
+        state = store.get_scheduler_state()
+        assert state is not None
+        assert state["state"] == "denied"
+        assert state["detail"] == "5h ramp"
+        assert state["next_wake_at"] == 200

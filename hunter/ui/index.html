@@ -206,6 +206,18 @@
     border-radius: 3px; font: inherit; font-size: 12px; padding: 4px 8px;
   }
   .rn-form textarea { flex: 1; min-width: 220px; resize: vertical; }
+
+  /* activity panel */
+  #activity { margin: 10px 0 14px; display: flex; flex-direction: column; gap: 4px; }
+  #activity .row { font-size: 12px; }
+  #activity .dim { color: var(--dim); }
+  #activity .running { color: var(--green); font-weight: 600; }
+  #activity .denied { color: var(--amber); font-weight: 600; }
+  #activity .error { color: var(--red); font-weight: 600; }
+  #activity .idle { color: var(--dim); font-weight: 600; }
+  #activity .b-denied { color: var(--red); }
+  #activity .b-allowed { color: var(--green); }
+  #activity .b-exempt { color: var(--blue); }
 </style>
 </head>
 <body>
@@ -231,6 +243,7 @@
           <div id="lastEvent">&nbsp;</div>
         </div>
       </div>
+      <div id="activity"></div>
     </section>
 
     <section id="page-inbox" class="page">

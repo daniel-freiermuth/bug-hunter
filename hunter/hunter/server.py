@@ -161,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
             self._error(500, "internal error")
 
     def _summary(self) -> Row:
-        from . import budget
+        from . import budget, scheduler
 
         now_ms = time.time() * 1000
         windows: Row = {}
@@ -190,6 +190,43 @@ class Handler(BaseHTTPRequestHandler):
             (e for e in store.recent_events(limit=500) if e["kind"] == "cycle"),
             None,
         )
+
+        # "What's happening" panel: what's running now, why nothing is
+        # (if not), and what's next -- all derived from the SAME
+        # functions the scheduler itself uses (pick_next, budget.decide),
+        # never a separate guess that could drift from reality.
+        current_job = store.current_job()
+        next_candidate: Row | None = None
+        if current_job is None:
+            try:
+                picked = scheduler.pick_next(store, self.cfg)
+            except Exception:
+                picked = None
+            if picked is not None:
+                kind, target = picked
+                is_finding = kind in ("engage", "recheck", "fix")
+                budget_kind = "fix" if kind in ("engage", "fix") else "hunt"
+                override = target.get("budget_override") if is_finding else None
+                if override:
+                    budget_state, budget_reason = "exempt", f"override: {override}"
+                else:
+                    dec = budget.decide(
+                        cfg=self.cfg,
+                        kind=budget_kind,
+                        windows=budget.read_windows(),
+                        running_jobs_cap=scheduler._running_jobs_cap(store),  # noqa: SLF001
+                    )
+                    budget_state = "allowed" if dec.allow else "denied"
+                    budget_reason = dec.reason
+                next_candidate = {
+                    "kind": kind,
+                    "id": target["id"],
+                    "label": target.get("summary") or target.get("name") or target.get("fingerprint"),
+                    "is_finding": is_finding,
+                    "budget_state": budget_state,
+                    "budget_reason": budget_reason,
+                }
+
         return {
             "windows": windows,
             "counts": counts,
@@ -197,6 +234,9 @@ class Handler(BaseHTTPRequestHandler):
             "repos": store.list_repos(),
             "last_cycle": last_cycle,
             "cycle_running": _cycle_lock.locked(),
+            "current_job": current_job,
+            "next_candidate": next_candidate,
+            "scheduler_state": store.get_scheduler_state(),
         }
 
     def _repo_notes(self, qs: dict[str, list[str]]) -> None:
@@ -561,6 +601,35 @@ def serve(cfg: Config) -> None:
         httpd.server_close()
 
 
+def _describe_cycle(summary: Row) -> tuple[str, str]:
+    """(state, detail) for the Status page's "what's happening" panel --
+    classifies run_cycle's return shape the same way daemon()'s own
+    sleep computation below does, so the displayed reason always matches
+    the sleep decision it explains rather than a second, driftable
+    interpretation of the same data."""
+    if "error" in summary:
+        return "error", str(summary["error"])[:200]
+    if summary.get("idle"):
+        return "idle", str(summary["idle"])
+    if summary.get("skipped"):
+        return "idle", str(summary["skipped"])
+    if summary.get("denied"):
+        return "denied", str(summary["denied"])
+    state = summary.get("state")
+    kind = summary.get("kind")
+    if state in ("done", "killed", "failed") and kind:
+        who = summary.get("finding")
+        target_desc = f"#{who}" if who is not None else f"({summary.get('repo')})"
+        outcome = summary.get("outcome")
+        bits = f"{kind} {target_desc}"
+        if outcome:
+            bits += f" -> {outcome}"
+        elif state != "done":
+            bits += f" {state}"
+        return "idle", f"last: {bits}"
+    return "idle", "cycle produced no actionable outcome"
+
+
 def daemon(cfg: Config) -> None:
     """Run forever: UI server + scheduler loop in one process.
 
@@ -656,14 +725,26 @@ def daemon(cfg: Config) -> None:
                             sleep_s = 30 * 60
                     else:
                         sleep_s = 30 * 60
+                state_label, detail = _describe_cycle(summary)
+                with contextlib.suppress(Exception):
+                    store.set_scheduler_state(
+                        state_label, detail, int((time.time() + sleep_s) * 1000)
+                    )
                 log.info(
                     "cycle: %s -> sleep %ds",
                     json.dumps(summary)[:200],
                     sleep_s,
                 )
-            except Exception:
+            except Exception as e:
                 log.exception("cycle crashed")
                 sleep_s = 5 * 60
+                if "store" in locals():
+                    with contextlib.suppress(Exception):
+                        store.set_scheduler_state(
+                            "error",
+                            f"daemon loop crashed: {e}"[:200],
+                            int((time.time() + sleep_s) * 1000),
+                        )
             finally:
                 _cycle_lock.release()
         else:
