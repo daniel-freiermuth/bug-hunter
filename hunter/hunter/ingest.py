@@ -12,9 +12,16 @@ if TYPE_CHECKING:
     from .store import Store
 
 
+_KNOWN_FINDING_TYPES = ("bug", "dep_update", "test_gap", "refactor", "modernization")
+
+
 def ingest_findings(
-    store: Store, repo_id: int, findings_path: Path, finding_type: str = "bug"
+    store: Store, repo_id: int, findings_path: Path, finding_type: str | None = "bug"
 ) -> dict[str, int]:
+    """finding_type=None means every entry in the file declares its own
+    "type" (used for FOLLOW-UPS.json, which can propose any kind of
+    follow-up, not just one fixed type per file -- see
+    hunter.scheduler's ingestion call sites)."""
     result: dict[str, int] = {"inserted": 0, "duplicates": 0, "invalid": 0}
     try:
         entries = json.loads(Path(findings_path).read_text())
@@ -31,7 +38,17 @@ def ingest_findings(
         return result
 
     for i, f in enumerate(entries):
-        problem = _validate(f, finding_type)
+        entry_type = finding_type if finding_type is not None else (
+            f.get("type") if isinstance(f, dict) else None
+        )
+        if entry_type not in _KNOWN_FINDING_TYPES:
+            result["invalid"] += 1
+            store.log_event(
+                "error",
+                f"ingest: entry {i} has unknown/missing type {entry_type!r}: {json.dumps(f)[:300]}",
+            )
+            continue
+        problem = _validate(f, entry_type)
         if problem:
             result["invalid"] += 1
             store.log_event(
@@ -41,11 +58,11 @@ def ingest_findings(
             continue
         row: Row = dict(f)
         row["confidence"] = max(0.0, min(1.0, float(row.get("confidence", 0.0))))
-        fid, inserted = store.upsert_finding(repo_id, row, finding_type=finding_type)
-        event_kind = "hunt" if finding_type == "bug" else finding_type
+        fid, inserted = store.upsert_finding(repo_id, row, finding_type=entry_type)
+        event_kind = "hunt" if entry_type == "bug" else entry_type
         if inserted:
             result["inserted"] += 1
-            store.log_event(event_kind, f"new {finding_type}: {row['fingerprint']}", finding_id=fid)
+            store.log_event(event_kind, f"new {entry_type}: {row['fingerprint']}", finding_id=fid)
         else:
             result["duplicates"] += 1
     return result

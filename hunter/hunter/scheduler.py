@@ -138,6 +138,30 @@ def _record_job(
     return state
 
 
+def _ingest_followups(store: Store, repo_id: int, worktree: Path, fid: int, job: int) -> None:
+    """Read worktree/FOLLOW-UPS.json (if the worker wrote one) and file its
+    entries as real findings -- each entry declares its own "type", since
+    a follow-up can be anything (a deferred migration, a dep bump that's
+    now achievable again, a test gap noticed along the way). Without this,
+    a worker's "this is worth doing later" note lives only as prose in a
+    PR/comment that stops being read the moment the PR closes or merges --
+    see apply_improvement.md step 5 and engage.md's superseded-PR guidance
+    for the two places a worker is told to write this file. Call BEFORE
+    the caller drops the worktree."""
+    followups_path = worktree / "FOLLOW-UPS.json"
+    if not followups_path.exists():
+        return
+    counts = ingest_findings(store, repo_id, followups_path, finding_type=None)
+    if counts["inserted"]:
+        store.log_event(
+            "modernization",
+            f"#{fid}: +{counts['inserted']} follow-up(s) filed from deferred/superseded work"
+            f" ({counts['duplicates']} dup / {counts['invalid']} invalid)",
+            job_id=job,
+            finding_id=fid,
+        )
+
+
 # -- hunt -------------------------------------------------------------------
 
 
@@ -1159,6 +1183,8 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
                             job_id=job,
                             finding_id=fid,
                         )
+                        # Read before _drop_worktree below removes the file.
+                        _ingest_followups(store, repo["id"], worktree, fid, job)
                         _drop_worktree(delete_branch=False)
                         summary.update(outcome="pr_open", pr_url=pr_url_or_err)
                         if override == "once":
@@ -1559,6 +1585,12 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
             job_id=job,
             finding_id=fid,
         )
+        # A withdrawal often means something else moved first (e.g. a
+        # sibling dep bump landed and changed what's achievable) -- worth
+        # distinguishing "fully done, nothing left" from "the goal is now
+        # MORE reachable, not less" (see engage.md's superseded-PR
+        # guidance). Read before _drop_worktree below removes the file.
+        _ingest_followups(store, repo["id"], worktree, fid, job)
         _drop_worktree()
         summary["outcome"] = "withdrawn"
         return summary

@@ -41,6 +41,20 @@ Title: {{PR_TITLE}}
 3. Merge conflict -> bring {{BRANCH}} up to date with
    `origin/{{DEFAULT_BRANCH}}` (merge or rebase, your choice — a rebase
    is fine here too) and resolve.
+
+   If resolving reveals your diff is now a no-op or strictly behind what
+   {{DEFAULT_BRANCH}} already ships (something else landed the same or a
+   related change first) — do NOT just conclude "nothing left, withdraw"
+   without one more check: WHY was this PR's original target capped below
+   the finding's actual goal in the first place? If that was a real
+   technical constraint (e.g. "can't reach 2.60.1 yet, needs a coordinated
+   Kotlin/KSP bump") and whatever superseded you just resolved exactly that
+   constraint, the goal may now be MORE achievable than when you started,
+   not moot. Re-verify against the current state of {{DEFAULT_BRANCH}}
+   (same evidence discipline as forming the original PR — real commands,
+   not memory) and, if a real further step is now open, propose it via
+   FOLLOW-UPS.json (see Deliverables) before withdrawing. Only skip this if
+   what landed already fully achieves or exceeds the original goal.
 4. Failing checks -> reproduce locally where possible, fix minimally,
    commit. If the failure is unrelated flake, say so in PR-REPLY.md instead.
 
@@ -50,6 +64,17 @@ Title: {{PR_TITLE}}
   a PR comment): concise — what you changed and why, or the answers to the
   questions, or why a suggestion was declined. No filler, no restating the
   PR description.
-- If the feedback shows the fix is fundamentally wrong and should be
-  abandoned: write WITHDRAW.md at the worktree root with the technical
+- If the feedback shows the fix is fundamentally wrong, or this PR is
+  superseded/obsolete and step 3's re-check found nothing further to
+  propose: write WITHDRAW.md at the worktree root with the technical
   reasoning instead of PR-REPLY.md, and commit nothing new.
+- FOLLOW-UPS.json at the worktree root, NOT COMMITTED, OPTIONAL — write
+  ALONGSIDE WITHDRAW.md when step 3's re-check found the underlying goal is
+  now MORE achievable (not just "something changed"). Same schema as
+  apply_improvement.md's FOLLOW-UPS.json (a JSON array; each entry sets its
+  own "type" — usually "dep_update" here, since this is typically "the
+  same package could now go further", with ecosystem/package/
+  current_version/latest_version fields rather than modernization's
+  current_approach/proposed_approach). The scheduler ingests it into the
+  finding queue right after withdrawing, so the opportunity becomes a
+  fresh, triage-able finding instead of a closed PR nobody re-reads.

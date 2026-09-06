@@ -58,7 +58,12 @@ blocking claim.
 ### For `type = 'dep_update'`:
 
 a. **Check for local patches** in patches/, .patch files, or vendored code
-b. **Upgrade the dependency** to the target version
+b. **Upgrade the dependency** to the target version -- or to the highest
+   version you can safely reach this pass if the full target isn't
+   achievable (a peer-dependency/toolchain constraint, needs a coordinated
+   bump elsewhere). If you settle for anything below the finding's own
+   `latest_version`, treat that gap as real, mandatory work for step 5
+   below -- see there for why this is easy to miss.
 c. **Handle patches**:
    - If patches exist, try to rebase/update them for the new version
    - If patches conflict or fail, document in BLOCKED.md
@@ -98,6 +103,36 @@ All green, or the improvement does not ship.
 COMMIT AFTER EVERY STEP with descriptive messages. You may be killed at any
 moment — committed work survives, uncommitted work dies.
 
+## 5. Flag anything you deferred
+
+Two distinct triggers below. Both are real deferred work; neither is optional
+when it applies.
+
+- **You didn't reach the finding's own target.** The single most common case,
+  and the easiest to miss precisely because it feels like "I already did the
+  work": for `type = 'dep_update'`, if you shipped anything below the
+  finding's `latest_version` (stopped short at an intermediate version due to
+  a peer-dependency/toolchain constraint), the gap between what you shipped
+  and that original target is NOT closed -- it is deferred work, every time,
+  unless the constraint is structural and permanent (the package genuinely
+  stopped publishing further versions, or the target version doesn't exist).
+  "Requires a coordinated bump I didn't attempt this pass" is NOT permanent --
+  file the remainder (your-shipped-version -> the finding's original
+  latest_version) in FOLLOW-UPS.json. This is exactly the failure mode that
+  motivated FOLLOW-UPS.json existing at all: a real PR once explained in
+  careful prose exactly why it stopped short of its target and by how much,
+  and that reasoning was never picked up again because nothing captured it
+  structurally.
+- **Something else is now clearly worth doing.** E.g. a dep upgrade lands but
+  a bigger DSL/API migration it enables is deliberately left for later, a
+  flag is left off pending a follow-up, a patch is dropped but its underlying
+  issue still needs a real fix upstream.
+
+Either way: do NOT just mention this in PR-DESCRIPTION.md prose. A merged PR
+closes out and stops being watched; a note buried in its body is never read
+again. File it as a real, queryable follow-up instead: see FOLLOW-UPS.json
+below.
+
 # Deliverables
 
 - **Commits on {{BRANCH}}** (upgrade/test/refactor commits)
@@ -107,6 +142,32 @@ moment — committed work survives, uncommitted work dies.
   - What changed (version bump + patch rebase, new test cases, simplified code)
   - Verification performed with observed results
   - What you deliberately did NOT change
+- **FOLLOW-UPS.json** at the worktree root, NOT COMMITTED, OPTIONAL — only if
+  step 5 identified real deferred work. A JSON array; the scheduler ingests
+  it into the finding queue right after the PR ships, so it becomes a
+  normal, triage-able finding instead of prose no one re-reads. Empty array
+  or omit the file entirely if there is nothing to flag — do NOT file
+  speculative or trivial items just to produce output. Each entry MUST set
+  `"type"` to whichever shape actually fits (usually `"modernization"` for
+  an architectural migration you deferred; `"dep_update"` if the deferred
+  work is really just "this same package could go further later" with its
+  own ecosystem/package/current_version/latest_version fields instead of
+  modernization_class/current_approach/proposed_approach):
+  ```json
+  {
+    "type": "modernization",
+    "fingerprint": "{{REPO_NAME}}:area:short-slug",
+    "file": "path/file.ext or directory/area",
+    "modernization_class": "deferred-followup",
+    "current_approach": "what this PR left in place, concretely",
+    "proposed_approach": "what the follow-up should do instead, concretely",
+    "severity": "high|medium|low",
+    "confidence": 0.0,
+    "summary": "one sentence",
+    "detail": "why this was deferred now, what the follow-up entails, scope/risk",
+    "introduced_by": "deferred while applying <this finding's type and fingerprint, from the JSON above>"
+  }
+  ```
 
 OR if not actionable:
 
