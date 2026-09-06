@@ -303,7 +303,6 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
             f"recheck #{fid}: repo {finding['repo_id']} missing",
             finding_id=fid,
         )
-        store.set_status(fid, "new")
         return {"error": "repo missing"}
     rpath = Path(repo["path"])
     db: str = repo["default_branch"]
@@ -318,7 +317,6 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
                 f"recheck #{fid}: clone failed: {out[-300:]}",
                 finding_id=fid,
             )
-            store.set_status(fid, "new")
             return {"error": f"clone failed: {out[-300:]}"}
     for cmd in (
         ["git", "fetch", "origin"],
@@ -332,7 +330,6 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
                 f"recheck #{fid}: {' '.join(cmd)} failed: {out[-300:]}",
                 finding_id=fid,
             )
-            store.set_status(fid, "new")
             return {"error": f"{' '.join(cmd)} failed: {out[-300:]}"}
 
     # Budget gate -- recheck is investigative, like hunt.
@@ -345,7 +342,6 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
     if not dec.allow:
         job = store.create_job("recheck", repo["id"], finding_id=fid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.set_status(fid, "new")  # un-queue so the button reappears
         store.log_event(
             "deny",
             f"recheck #{fid}: {dec.reason}",
@@ -393,14 +389,17 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
         "stale",
         "invalid",
     ):
-        store.set_status(fid, "new")  # restore -- recheck inconclusive
+        # Leave status at 'rechecking' (don't reset to 'new') -- killed/failed/
+        # inconclusive attempts must not look identical to "still relevant",
+        # and the next cycle's priority scan naturally retries 'rechecking'
+        # findings, same as a killed fix stays 'queued'.
         store.log_event(
             "recheck",
-            f"#{fid}: job {job} {state}, verdict file missing/unparseable",
+            f"#{fid}: job {job} {state}, verdict file missing/unparseable -- will retry",
             job_id=job,
             finding_id=fid,
         )
-        summary["outcome"] = "failed"
+        summary["outcome"] = "requeued"
         if override == "once":
             store.set_budget_override(fid, None)
         return summary
