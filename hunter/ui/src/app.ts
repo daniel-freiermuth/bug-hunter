@@ -113,6 +113,17 @@ interface SchedulerState {
   updated_at: number;
 }
 
+// The single, canonical answer to "what is hunter doing right now" --
+// computed once server-side (see hunter.server._activity_status) so this
+// panel and the manual-run button can never independently disagree about
+// it again.
+interface ActivityStatus {
+  kind: "running" | "working" | "error" | "paused" | "ready" | "idle" | "warming_up";
+  job: CurrentJob | null;
+  candidate: NextCandidate | null;
+  detail: string | null;
+}
+
 interface Summary {
   windows: Record<string, WindowInfo>;
   counts: Record<string, number>;
@@ -123,6 +134,7 @@ interface Summary {
   current_job: CurrentJob | null;
   next_candidate: NextCandidate | null;
   scheduler_state: SchedulerState | null;
+  activity_status: ActivityStatus;
 }
 
 interface ApiResult<T> {
@@ -605,86 +617,90 @@ function renderWindows(windows: Record<string, WindowInfo>): void {
 }
 
 function renderActivity(s: Summary): void {
-  const cj = s.current_job;
-  const nc = s.next_candidate;
+  const a = s.activity_status;
   const ss = s.scheduler_state;
   const rows: string[] = [];
 
-  // Primary status: what's happening RIGHT NOW, derived live from
-  // current_job/next_candidate -- never from scheduler_state.state, which
-  // only reflects whichever cycle last completed and can sit unchanged
-  // for the whole sleep interval while these live signals have already
-  // moved on. Showing that stale outcome with equal visual weight next
-  // to a pause icon is what read as "paused, but also allowed?" --
-  // it's two different points in time, not a contradiction.
-  if (cj) {
-    const label =
-      cj.finding_id != null
-        ? `#${cj.finding_id} ${esc(cj.finding_summary || cj.finding_fingerprint || "")}`
-        : esc(cj.repo_name);
-    rows.push(
-      `<div class="row"><b class="running">\u25b6 running</b> ${esc(cj.kind)}: ${label}` +
-        ` <span class="dim">(${dur(cj)}, job #${cj.id})</span></div>`,
-    );
-  } else if (s.cycle_running) {
-    // _cycle_lock is held for the WHOLE cycle -- including sync_prs,
-    // which alone can take up to ~40s -- well before a job is ever
-    // created (or the decision to deny one is even made). Without this
-    // check, next_candidate below is a fresh but INDEPENDENT
-    // pick_next/decide preview that doesn't know a real cycle is
-    // already mid-flight, so it can show "ready" (or "paused") right
-    // next to the manual-run button correctly saying "cycle running...".
-    // Once we know a cycle is actually in progress, that's the more
-    // current truth than any hypothetical preview of what it might do.
-    rows.push('<div class="row"><b class="running">\u25b6 running</b> cycle in progress\u2026</div>');
-  } else if (ss?.state === "error") {
-    rows.push(`<div class="row"><b class="error">\u26a0 error</b> ${esc(ss.detail)}</div>`);
-  } else if (nc?.budget_state === "denied") {
-    const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
-    rows.push(
-      `<div class="row"><b class="paused">\u23f8 paused</b> next up: ${esc(nc.kind)} ${label}` +
-        ` \u00b7 budget: <span class="b-denied">denied</span> (${esc(nc.budget_reason)})</div>`,
-    );
-    if (nc.budget_retry_at) {
+  // Every branch below renders a.kind, computed once server-side by
+  // hunter.server._activity_status and covered by its own test suite --
+  // this function does formatting only, never re-derives "what's
+  // happening" from current_job/next_candidate/cycle_running itself.
+  // See _activity_status's docstring for why that split matters.
+  switch (a.kind) {
+    case "running": {
+      const cj = a.job!;
+      const label =
+        cj.finding_id != null
+          ? `#${cj.finding_id} ${esc(cj.finding_summary || cj.finding_fingerprint || "")}`
+          : esc(cj.repo_name);
       rows.push(
-        `<div class="row dim">budget available ~${countdown(nc.budget_retry_at)} (${ts(nc.budget_retry_at)})</div>`,
+        `<div class="row"><b class="running">\u25b6 running</b> ${esc(cj.kind)}: ${label}` +
+          ` <span class="dim">(${dur(cj)}, job #${cj.id})</span></div>`,
       );
+      break;
     }
-  } else if (nc) {
-    // budget_state is "allowed" or "exempt" here (the "denied" case is
-    // handled above) -- the very next cycle attempt will dispatch this,
-    // not "idle" in any sense a reader would recognize: nothing is
-    // blocking it, it just hasn't been picked up by the daemon's own
-    // wake timer yet.
-    const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
-    rows.push(
-      `<div class="row"><b class="ready">\u25b7 ready</b> next up: ${esc(nc.kind)} ${label}` +
-        ` \u00b7 budget: <span class="b-${esc(nc.budget_state)}">${esc(nc.budget_state)}</span></div>`,
-    );
-  } else if (ss) {
-    rows.push('<div class="row"><b class="idle">\u25cf idle</b> nothing to do</div>');
-  } else {
-    rows.push('<div class="row dim">warming up \u2014 no cycle has run yet</div>');
-  }
-
-  // Next scheduler wake -- only meaningful while nothing is actively
-  // running or in progress (once dispatched or already cycling, "next
-  // wake" doesn't apply until this one ends).
-  if (!cj && !s.cycle_running && ss?.next_wake_at) {
-    // "next check" only means "the daemon loop wakes up again" -- with
-    // sync_prs running (nearly) every cycle to never delay noticing PR
-    // feedback, that wake is often just a cheap heartbeat, not a real
-    // chance to start a job while the budget gate is still shut. While
-    // ready, there's no such ambiguity -- the next wake IS the start.
-    const heartbeatOnly =
-      nc?.budget_state === "denied" &&
-      nc.budget_retry_at != null &&
-      ss.next_wake_at < nc.budget_retry_at;
-    const label = nc && nc.budget_state !== "denied" ? "starting" : heartbeatOnly ? "next sync check" : "next check";
-    const note = heartbeatOnly ? " \u2014 budget still closed" : "";
-    rows.push(
-      `<div class="row dim">${label} ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})${note}</div>`,
-    );
+    case "working":
+      rows.push(
+        '<div class="row"><b class="running">\u25b6 running</b> cycle in progress\u2026</div>',
+      );
+      break;
+    case "error":
+      rows.push(`<div class="row"><b class="error">\u26a0 error</b> ${esc(a.detail || "")}</div>`);
+      break;
+    case "paused": {
+      const nc = a.candidate!;
+      const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
+      rows.push(
+        `<div class="row"><b class="paused">\u23f8 paused</b> next up: ${esc(nc.kind)} ${label}` +
+          ` \u00b7 budget: <span class="b-denied">denied</span> (${esc(nc.budget_reason)})</div>`,
+      );
+      if (nc.budget_retry_at) {
+        rows.push(
+          `<div class="row dim">budget available ~${countdown(nc.budget_retry_at)} (${ts(nc.budget_retry_at)})</div>`,
+        );
+      }
+      if (ss?.next_wake_at) {
+        // "next check" only means "the daemon loop wakes up again" --
+        // with sync_prs running nearly every cycle to never delay
+        // noticing PR feedback, that wake is often just a cheap
+        // heartbeat, not a real chance to start a job while the budget
+        // gate is still shut.
+        const heartbeatOnly = nc.budget_retry_at != null && ss.next_wake_at < nc.budget_retry_at;
+        const label2 = heartbeatOnly ? "next sync check" : "next check";
+        const note = heartbeatOnly ? " \u2014 budget still closed" : "";
+        rows.push(
+          `<div class="row dim">${label2} ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})${note}</div>`,
+        );
+      }
+      break;
+    }
+    case "ready": {
+      const nc = a.candidate!;
+      const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
+      rows.push(
+        `<div class="row"><b class="ready">\u25b7 ready</b> next up: ${esc(nc.kind)} ${label}` +
+          ` \u00b7 budget: <span class="b-${esc(nc.budget_state)}">${esc(nc.budget_state)}</span></div>`,
+      );
+      if (ss?.next_wake_at) {
+        // No heartbeat-vs-real-check ambiguity here -- budget already
+        // allows it, so the next wake IS the start.
+        rows.push(
+          `<div class="row dim">starting ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})</div>`,
+        );
+      }
+      break;
+    }
+    case "idle":
+      rows.push('<div class="row"><b class="idle">\u25cf idle</b> nothing to do</div>');
+      if (ss?.next_wake_at) {
+        rows.push(
+          `<div class="row dim">next check ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})</div>`,
+        );
+      }
+      break;
+    case "warming_up":
+      rows.push('<div class="row dim">warming up \u2014 no cycle has run yet</div>');
+      break;
   }
 
   // Last log -- what the most recently COMPLETED cycle actually did.
