@@ -33,6 +33,10 @@ _FINDING_PROMPT_KEYS = (
     # refactor fields
     "smell_type",
     "suggested_refactor",
+    # modernization fields
+    "modernization_class",
+    "current_approach",
+    "proposed_approach",
 )
 
 
@@ -125,6 +129,23 @@ def build_apply_improvement_prompt(
     notes = _escape_braces(repo_notes) if repo_notes else "(No notes yet)"
     return _render(
         (PLAYBOOK_DIR / "apply_improvement.md").read_text(),
+        {
+            "WORKTREE": worktree,
+            "BRANCH": branch,
+            "FINDING_JSON": _escape_braces(json.dumps(subset, indent=2)),
+            "REPO_NAME": repo["name"],
+            "REPO_NOTES": notes,
+        },
+    )
+
+
+def build_apply_modernization_prompt(
+    finding: Row, worktree: Path, branch: str, repo: Row, repo_notes: str = ""
+) -> str:
+    subset = _finding_subset(finding)
+    notes = _escape_braces(repo_notes) if repo_notes else "(No notes yet)"
+    return _render(
+        (PLAYBOOK_DIR / "apply_modernization.md").read_text(),
         {
             "WORKTREE": worktree,
             "BRANCH": branch,
@@ -285,6 +306,31 @@ def build_refactor_prompt(
             "KNOWN_REFACTORS": _known_block(known_refactors),
             "OUT_PATH": out_path,
             "MAX_REFACTORS": max_refactors,
+            "REPO_NOTES": notes,
+        },
+    )
+
+
+def build_modernization_prompt(
+    repo: Row,
+    scope_note: str,
+    suppressions: list[Row],
+    known_modernizations: list[Row],
+    out_path: Path,
+    max_modernizations: int,
+    repo_notes: str = "",
+) -> str:
+    notes = _escape_braces(repo_notes) if repo_notes else "(No notes yet)"
+    return _render(
+        (PLAYBOOK_DIR / "modernization.md").read_text(),
+        {
+            "REPO_PATH": repo["path"],
+            "REPO_NAME": repo["name"],
+            "SCOPE_NOTE": scope_note,
+            "SUPPRESSIONS": _suppressions_block(suppressions),
+            "KNOWN_MODERNIZATIONS": _known_block(known_modernizations),
+            "OUT_PATH": out_path,
+            "MAX_MODERNIZATIONS": max_modernizations,
             "REPO_NOTES": notes,
         },
     )

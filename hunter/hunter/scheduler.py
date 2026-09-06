@@ -16,10 +16,12 @@ from .forge import forge_for
 from .ingest import ingest_findings
 from .playbooks import (
     build_apply_improvement_prompt,
+    build_apply_modernization_prompt,
     build_dep_update_prompt,
     build_engage_prompt,
     build_fix_prompt,
     build_hunt_prompt,
+    build_modernization_prompt,
     build_recheck_prompt,
     build_refactor_prompt,
     build_test_gap_prompt,
@@ -745,6 +747,108 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
     return summary
 
 
+# -- modernization ------------------------------------------------------------
+
+
+def run_modernize(store: Store, cfg: Config, repo: Row) -> Row:
+    """Hunt for SOTA-drift modernization opportunities -- deprecated or
+    unmaintained dependencies, language-feature gaps, format/protocol
+    shifts, major version debt, platform EOL. Explicitly NOT bounded to
+    safe/mechanical changes like refactor/dep_update; see modernization.md."""
+    rid: int = repo["id"]
+    rname: str = repo["name"]
+    rpath = Path(repo["path"])
+
+    # Ensure repo is up-to-date
+    if not rpath.exists():
+        store.log_event("error", f"modernize {rname}: repo not cloned")
+        return {"error": "repo not cloned"}
+
+    for cmd in (
+        ["git", "fetch", "origin"],
+        ["git", "checkout", repo["default_branch"]],
+        ["git", "pull", "--ff-only"],
+    ):
+        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+        if rc != 0:
+            store.log_event("error", f"modernize {rname}: {' '.join(cmd)} failed: {out[-300:]}")
+            return {"error": f"{' '.join(cmd)} failed"}
+
+    # Budget check
+    windows = budget.read_windows()
+    dec = budget.decide(cfg, "hunt", windows, _running_jobs_cap(store))
+    if not dec.allow:
+        job = store.create_job("modernization", rid)
+        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
+        store.log_event("deny", f"modernize {rname}: {dec.reason}", job_id=job)
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
+
+    job = store.create_job("modernization", rid, cap_tokens=dec.cap_tokens)
+    out_path = cfg.work_root / "out" / f"job{job}.modernizations.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    suppressions = store.suppressions(rid, finding_type="modernization")
+    known = store.known_active(rid, finding_type="modernization")
+    prompt = build_modernization_prompt(
+        repo,
+        "Scan for SOTA-drift modernization opportunities (deprecated/unmaintained deps,"
+        " language-feature gaps, format/protocol shifts, major version debt, platform EOL).",
+        suppressions,
+        known,
+        out_path,
+        cfg.hunt_max_findings,
+        store.repo_notes(rid),
+    )
+
+    pre_usage = _usage_snapshot(windows)
+    store.update_job(job, state="running")
+    model = cfg.model_for("hunt")
+    rr = runner.run_worker(
+        cfg,
+        rpath,
+        prompt,
+        dec.cap_tokens,
+        cfg.hunt_max_wall_s,
+        model=model,
+    )
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+
+    summary: Row = {
+        "kind": "modernization",
+        "repo": rname,
+        "job": job,
+        "state": state,
+        "tokens_new": rr.tokens_new,
+    }
+
+    if out_path.exists():
+        counts = ingest_findings(store, rid, out_path, finding_type="modernization")
+        summary["ingest"] = counts
+        store.log_event(
+            "modernization",
+            f"{rname}: job {job} {state} -- +{counts['inserted']} new / {counts['duplicates']} dup"
+            f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+        # Only update timestamp after successful output + ingestion
+        if state == "done":
+            store.db.execute(
+                "UPDATE repos SET last_modernization_at = ? WHERE id = ?",
+                (now_ms(), rid),
+            )
+            store.db.commit()
+    else:
+        store.log_event(
+            "modernization",
+            f"{rname}: job {job} {state}, no modernizations file ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+
+    return summary
+
+
 # -- fix --------------------------------------------------------------------
 
 
@@ -765,9 +869,12 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
     rpath: str = repo["path"]
     db: str = repo["default_branch"]
 
-    is_bug = finding.get("type", "bug") == "bug"
+    finding_type = finding.get("type", "bug")
+    is_bug = finding_type == "bug"
+    is_modernization = finding_type == "modernization"
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", finding["summary"]).lower().strip("-")[:40].rstrip("-")
-    branch = f"{'fix' if is_bug else 'improve'}/{slug}-{fid}"
+    branch_prefix = "fix" if is_bug else ("modernize" if is_modernization else "improve")
+    branch = f"{branch_prefix}/{slug}-{fid}"
     worktree = cfg.work_root / "wt" / f"f{fid}"
     worktree.parent.mkdir(parents=True, exist_ok=True)
 
@@ -866,7 +973,13 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
     pre_usage = _usage_snapshot(windows)
     with store.in_progress(fid, "fixing", fallback="queued"):
         store.update_job(job, state="running")
-        build_prompt = build_fix_prompt if is_bug else build_apply_improvement_prompt
+        build_prompt = (
+            build_fix_prompt
+            if is_bug
+            else build_apply_modernization_prompt
+            if is_modernization
+            else build_apply_improvement_prompt
+        )
         prompt = build_prompt(finding, worktree, branch, repo, store.repo_notes(repo["id"]))
         model = cfg.model_for("fix")
         rr = runner.run_worker(
@@ -1472,12 +1585,17 @@ def pick_next(
     queue -> flagged PR (stalest sync first) -> oldest rechecking ->
     oldest queued fix -> the most stale-of-rotation job type for the
     least-recently-hunted enabled repo (hunt if never cloned, else
-    whichever of hunt/test_gap/dep_update/refactor is oldest/never-run).
+    whichever of hunt/test_gap/dep_update/refactor is oldest/never-run;
+    modernization joins that pool too, but only once
+    cfg.modernization_interval_days have passed since it last ran for
+    this repo -- it's a periodic strategic check, not a tight-loop scan,
+    so it must not compete for scan slots against the other four every
+    single cycle).
 
     Returns (kind, target): target is a finding row for
-    engage/recheck/fix, a repo row for hunt/test_gap/dep_update/refactor.
-    None means nothing to do (no queued/attention/rechecking work and no
-    enabled repos).
+    engage/recheck/fix, a repo row for
+    hunt/test_gap/dep_update/refactor/modernization. None means nothing
+    to do (no queued/attention/rechecking work and no enabled repos).
     """
     rechecking = store.list_findings(status="rechecking")
     attention = store.list_attention()
@@ -1523,6 +1641,10 @@ def pick_next(
         "dep_update": target.get("last_dep_update_at") or 0,
         "refactor": target.get("last_refactor_at") or 0,
     }
+    last_modernization = target.get("last_modernization_at") or 0
+    interval_ms = cfg.modernization_interval_days * 86_400_000
+    if last_modernization == 0 or (now_ms() - last_modernization) >= interval_ms:
+        job_times["modernization"] = last_modernization
     never_run = [k for k, v in job_times.items() if v == 0]
     job_type = sorted(never_run)[0] if never_run else min(job_times, key=job_times.get)
     return job_type, target
@@ -1536,6 +1658,7 @@ _RUNNERS: dict[str, Callable[[Store, Config, Row], Row]] = {
     "test_gap": run_test_gap,
     "dep_update": run_dep_update,
     "refactor": run_refactor,
+    "modernization": run_modernize,
 }
 
 
@@ -1563,7 +1686,7 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
         # killed, or done without output), mark it attempted so it stops
         # winning "never run" priority every single cycle. hunt has its
         # own watermark logic (set_last_hunt) and is exempt.
-        if kind in ("test_gap", "dep_update", "refactor"):
+        if kind in ("test_gap", "dep_update", "refactor", "modernization"):
             was_never_run = (target.get(f"last_{kind}_at") or 0) == 0
             failed = (
                 result.get("state") in ("killed", "failed")

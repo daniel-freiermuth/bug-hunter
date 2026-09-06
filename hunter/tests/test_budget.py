@@ -148,7 +148,7 @@ def test_5h_first_30min_deny():
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
     assert "5h" in d.reason
-    assert "harvest" in d.reason
+    assert "ramp" in d.reason
 
 
 def test_5h_at_exactly_30min_deny():
@@ -170,7 +170,7 @@ def test_5h_harvest_halfway_high_usage_deny():
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
     assert "5h" in d.reason
-    assert "harvest" in d.reason
+    assert "ramp" in d.reason
     # retry_at: ramp reaches 0.60 at 0.45h from now (window started 2.75h
     # ago; 0.60 of the 4.5h harvest ramp, plus the 0.5h headroom, is 3.2h
     # after window start = 0.45h from now).

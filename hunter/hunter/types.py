@@ -106,6 +106,7 @@ class Config:
     hunt_max_wall_s: int = 1800
     hunt_max_findings: int = 8
     hunt_rehunt_days: int = 90  # Full re-hunt interval
+    modernization_interval_days: int = 30  # min days between modernization scans per repo
     fix_cap_tokens: int = 150_000
     fix_max_wall_s: int = 2700
     stale_after_s: int = 1800
@@ -138,6 +139,7 @@ class Config:
             hunt_max_wall_s=raw.get("hunt", {}).get("maxWallS", 1800),
             hunt_max_findings=raw.get("hunt", {}).get("maxFindings", 8),
             hunt_rehunt_days=raw.get("hunt", {}).get("rehuntDays", 90),
+            modernization_interval_days=raw.get("modernization", {}).get("intervalDays", 30),
             fix_cap_tokens=raw.get("fix", {}).get("capNewTokens", 150_000),
             fix_max_wall_s=raw.get("fix", {}).get("maxWallS", 2700),
             stale_after_s=raw.get("budget", {}).get("staleAfterS", 1800),
