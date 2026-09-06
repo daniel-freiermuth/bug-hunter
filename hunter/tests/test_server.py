@@ -1,5 +1,5 @@
-"""Tests for hunter.server._describe_cycle, _compute_sleep_s, and
-_activity_status.
+"""Tests for hunter.server._describe_cycle, _compute_sleep_s,
+_activity_status, and _validate_summary.
 
 _describe_cycle classifies run_cycle's return shape into (state, detail)
 for the Status page's "last log" line. _compute_sleep_s decides how long
@@ -8,10 +8,14 @@ single canonical answer to "what is hunter doing right now" -- every
 rendering surface (the activity panel, the manual-run button) must
 derive its text from this and nothing else; see its docstring for the
 four real incidents in one session that came from computing it more
-than once, independently, in different places. All three are extracted
-from the daemon loop / summary endpoint specifically so this logic is
-provable by test rather than only observable by running the real
-infinite loop or clicking around the UI.
+than once, independently, in different places. _validate_summary is the
+runtime (pydantic) re-check of the whole /api/summary payload against
+SummaryDict, right before serialization -- the network-boundary half of
+the guarantee TypedDicts + mypy provide on the Python-internal half
+(see SummaryDict's docstring). All four are extracted from the daemon
+loop / summary endpoint specifically so this logic is provable by test
+rather than only observable by running the real infinite loop or
+clicking around the UI.
 """
 
 from __future__ import annotations
@@ -19,8 +23,15 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from hunter.server import PR_SYNC_INTERVAL_S, _activity_status, _compute_sleep_s, _describe_cycle
+from hunter.server import (
+    PR_SYNC_INTERVAL_S,
+    _activity_status,
+    _compute_sleep_s,
+    _describe_cycle,
+    _validate_summary,
+)
 from hunter.store import Store
 from hunter.types import Config
 
@@ -171,8 +182,14 @@ _DENIED = {
     "budget_state": "denied", "budget_reason": "5h: used 0.5 >= ramp 0.4",
     "budget_retry_at": 999,
 }
-_ERROR_STATE = {"id": 1, "state": "error", "detail": "daemon loop crashed: boom", "next_wake_at": None, "updated_at": 0}
-_IDLE_STATE = {"id": 1, "state": "idle", "detail": "last: nothing to do", "next_wake_at": None, "updated_at": 0}
+_ERROR_STATE = {
+    "id": 1, "state": "error", "detail": "daemon loop crashed: boom",
+    "next_wake_at": None, "updated_at": 0,
+}
+_IDLE_STATE = {
+    "id": 1, "state": "idle", "detail": "last: nothing to do",
+    "next_wake_at": None, "updated_at": 0,
+}
 
 
 class TestActivityStatus:
@@ -227,3 +244,75 @@ class TestActivityStatus:
     def test_nothing_at_all_is_warming_up(self) -> None:
         result = _activity_status(None, False, None, None)
         assert result["kind"] == "warming_up"
+
+
+# ---------------------------------------------------------------------------
+# _validate_summary: the runtime re-check at the network boundary
+# ---------------------------------------------------------------------------
+
+
+def _valid_summary() -> dict:
+    """A minimal, fully-valid SummaryDict-shaped payload. Every test
+    below starts from this and breaks exactly one thing, so a failure
+    always isolates to the field under test."""
+    return {
+        "windows": {
+            "anthropic:5h": {
+                "used_fraction": 0.3, "status": "ok", "resets_at": 999,
+                "age_s": 1.0, "stale": False, "ramp": 0.4, "available_tokens": None,
+            },
+        },
+        "counts": {"new": 1},
+        "type_counts": {"bug": 1},
+        "repos": [
+            {
+                "id": 1, "name": "r", "url": "https://r", "path": "/r", "forge": "github",
+                "default_branch": "main", "last_hunt_sha": None, "last_hunt_at": None,
+                "enabled": 1, "added_at": 0,
+            },
+        ],
+        "last_cycle": None,
+        "cycle_running": False,
+        "current_job": None,
+        "next_candidate": None,
+        "scheduler_state": None,
+        "activity_status": {"kind": "idle"},
+    }
+
+
+class TestValidateSummary:
+    def test_valid_payload_passes_through_unchanged(self) -> None:
+        payload = _valid_summary()
+        assert _validate_summary(payload) == payload
+
+    def test_wrong_type_is_rejected(self) -> None:
+        """The exact class of bug this closes: Row = dict[str, Any] would
+        have accepted this silently and shipped it over the wire."""
+        payload = _valid_summary()
+        payload["cycle_running"] = "not-a-bool"
+        with pytest.raises(ValidationError, match="cycle_running"):
+            _validate_summary(payload)
+
+    def test_missing_required_key_is_rejected(self) -> None:
+        payload = _valid_summary()
+        del payload["counts"]
+        with pytest.raises(ValidationError, match="counts"):
+            _validate_summary(payload)
+
+    def test_nested_shape_violation_is_rejected(self) -> None:
+        """A malformed repo entry -- e.g. from a future code path that
+        builds the repos list differently -- is caught even though it's
+        nested three levels deep in the payload."""
+        payload = _valid_summary()
+        del payload["repos"][0]["url"]
+        with pytest.raises(ValidationError, match="url"):
+            _validate_summary(payload)
+
+    def test_unknown_activity_status_kind_is_rejected(self) -> None:
+        """The discriminated union's Literal tags are enforced here too --
+        a typo'd or since-removed kind fails loudly instead of shipping
+        a shape the frontend's exhaustiveness check has never seen."""
+        payload = _valid_summary()
+        payload["activity_status"] = {"kind": "bogus"}
+        with pytest.raises(ValidationError):
+            _validate_summary(payload)

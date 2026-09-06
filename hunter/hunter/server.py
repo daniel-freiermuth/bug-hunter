@@ -16,10 +16,33 @@ import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, ClassVar, Literal, TypedDict
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
 
-from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
+from pydantic import TypeAdapter
+
+from .types import (
+    FINDING_STATUSES,
+    REASON_REQUIRED,
+    UI_DIR,
+    VERDICT_STATUSES,
+    Config,
+    EventDict,
+    JobDict,
+    RepoDict,
+    Row,
+    SchedulerStateDict,
+)
+
+if TYPE_CHECKING:
+    # Type-only: store/budget/scheduler stay runtime-lazy-imported inside
+    # handlers (see module docstring) so this module keeps importing
+    # cleanly while siblings build; this import never executes (PEP 563
+    # postponed evaluation via `from __future__ import annotations` above
+    # means annotations referencing Store are never evaluated at runtime
+    # either), so it can't reintroduce that problem -- it only lets mypy
+    # replace the Any that used to stand in for Store's real shape below.
+    from .store import Store
 
 log = logging.getLogger(__name__)
 
@@ -40,7 +63,7 @@ _wake = threading.Event()
 PR_SYNC_INTERVAL_S = 5 * 60.0
 
 
-def _reconcile_and_log(store: Any) -> None:
+def _reconcile_and_log(store: Store) -> None:
     """Recover jobs/findings orphaned by a previous process dying mid-job
     (crash, systemctl restart, host reboot, or an in-process exception
     run_cycle's own catch-all swallowed). Safe to call at the top of every
@@ -78,7 +101,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_error(self, format: str, *args: Any) -> None:  # noqa: A002
         log.warning(format, *args)
 
-    def _store(self) -> Any:
+    def _store(self) -> Store:
         from .store import Store
 
         return Store(self.cfg)
@@ -138,7 +161,7 @@ class Handler(BaseHTTPRequestHandler):
                         self._send(200, asset.read_bytes(), ctype)
                         return
             if url.path == "/api/summary":
-                self._json(self._summary())
+                self._json(_validate_summary(self._summary()))
                 return
             if url.path == "/api/findings":
                 self._json(self._findings(qs))
@@ -170,12 +193,12 @@ class Handler(BaseHTTPRequestHandler):
             log.exception("GET %s", self.path)
             self._error(500, "internal error")
 
-    def _summary(self) -> Row:
+    def _summary(self) -> SummaryDict:
         from . import budget, scheduler
 
         store = self._store()
         now_ms = time.time() * 1000
-        windows: Row = {}
+        windows: dict[str, WindowInfoDict] = {}
         for limit_id, w in budget.read_windows().items():
             if ":5h" in limit_id:
                 ramp = budget.ramp_5h(w.resets_at, now_ms)
@@ -213,7 +236,7 @@ class Handler(BaseHTTPRequestHandler):
         # functions the scheduler itself uses (pick_next, budget.decide),
         # never a separate guess that could drift from reality.
         current_job = store.current_job()
-        next_candidate: Row | None = None
+        next_candidate: NextCandidateDict | None = None
         if current_job is None:
             try:
                 picked = scheduler.pick_next(store, self.cfg)
@@ -257,7 +280,15 @@ class Handler(BaseHTTPRequestHandler):
             "windows": windows,
             "counts": counts,
             "type_counts": dict(type_counts),
-            "repos": store.list_repos(),
+            # store.list_repos() stays Row-typed -- its many OTHER callers
+            # (scheduler.py) need the permissive dict[str, Any] shape a
+            # RepoDict return type would break. cast(), not
+            # _require_keys(), is enough here specifically because
+            # _validate_summary (below, at the actual call site) already
+            # re-verifies this exact field against RepoDict at runtime,
+            # right before serialization -- this cast only needs to
+            # satisfy mypy's static view of THIS one field.
+            "repos": cast("list[RepoDict]", store.list_repos()),
             "last_cycle": last_cycle,
             "cycle_running": cycle_running,
             "current_job": current_job,
@@ -506,7 +537,7 @@ class Handler(BaseHTTPRequestHandler):
         if repo is None:
             self._error(404, f"no repo {rid}")
             return
-        fields: dict[str, object] = {}
+        fields: dict[str, str | int] = {}
         if "enabled" in body:
             fields["enabled"] = 1 if body["enabled"] else 0
         if "url" in body and isinstance(body["url"], str) and body["url"].strip():
@@ -666,9 +697,34 @@ def _describe_cycle(summary: Row) -> tuple[str, str]:
     return "idle", "cycle produced no actionable outcome"
 
 
+class NextCandidateDict(TypedDict):
+    """What pick_next()/budget.decide() would do right now, if run --
+    the "what's next" preview built fresh in _summary(), never a raw DB
+    row (no SQL boundary here, so no runtime check needed: mypy alone
+    is sufficient since the construction code below is fully typed)."""
+
+    kind: str
+    id: int
+    label: str | None
+    is_finding: bool
+    budget_state: str
+    budget_reason: str
+    budget_retry_at: float | None
+
+
+class WindowInfoDict(TypedDict):
+    used_fraction: float | None
+    status: str | None
+    resets_at: int | None
+    age_s: float
+    stale: bool
+    ramp: float | None
+    available_tokens: float | None
+
+
 class _RunningStatus(TypedDict):
     kind: Literal["running"]
-    job: Row
+    job: JobDict
 
 
 class _WorkingStatus(TypedDict):
@@ -682,12 +738,12 @@ class _ErrorStatus(TypedDict):
 
 class _PausedStatus(TypedDict):
     kind: Literal["paused"]
-    candidate: Row
+    candidate: NextCandidateDict
 
 
 class _ReadyStatus(TypedDict):
     kind: Literal["ready"]
-    candidate: Row
+    candidate: NextCandidateDict
 
 
 class _IdleStatus(TypedDict):
@@ -709,11 +765,52 @@ ActivityStatus = (
 )
 
 
+class SummaryDict(TypedDict):
+    """The complete /api/summary response shape. mypy --strict checks
+    every construction site against this (and its nested TypedDicts)
+    the same way it does everywhere else in this module -- but that
+    only proves the PYTHON CODE THAT BUILDS the dict is internally
+    consistent. It says nothing about the actual bytes that leave the
+    process: a stale cached client, a manual curl/test hitting this
+    route with a monkeypatched Store, or a future bug that slips past
+    mypy (a bare Any leaking in somewhere) would all still produce
+    whatever shape the code happens to build, unchecked, all the way to
+    the wire. _validate_summary is the one place that actually re-
+    verifies the real dict against this schema at runtime, at the last
+    possible moment before serialization -- the network-boundary half
+    of the guarantee _require_keys provides on the SQL-row half."""
+
+    windows: dict[str, WindowInfoDict]
+    counts: dict[str, int]
+    type_counts: dict[str, int]
+    repos: list[RepoDict]
+    last_cycle: EventDict | None
+    cycle_running: bool
+    current_job: JobDict | None
+    next_candidate: NextCandidateDict | None
+    scheduler_state: SchedulerStateDict | None
+    activity_status: ActivityStatus
+
+
+_SUMMARY_ADAPTER = TypeAdapter(SummaryDict)
+
+
+def _validate_summary(payload: SummaryDict) -> SummaryDict:
+    """Re-verify the built payload against SummaryDict at runtime,
+    right before it's serialized -- see SummaryDict's docstring for
+    why mypy alone can't provide this guarantee. Raises pydantic's
+    ValidationError (caught by do_GET's existing except Exception,
+    returning a 500 with the real cause logged) rather than silently
+    shipping a malformed payload a client would misinterpret with no
+    error at all."""
+    return _SUMMARY_ADAPTER.validate_python(payload)
+
+
 def _activity_status(
-    current_job: Row | None,
+    current_job: JobDict | None,
     cycle_running: bool,
-    next_candidate: Row | None,
-    scheduler_state: Row | None,
+    next_candidate: NextCandidateDict | None,
+    scheduler_state: SchedulerStateDict | None,
 ) -> ActivityStatus:
     """The single, canonical answer to "what is hunter doing right now" --
     every rendering surface (the Status page's activity panel AND the
@@ -780,7 +877,7 @@ def _activity_status(
     return {"kind": "warming_up"}
 
 
-def _compute_sleep_s(store: Any, summary: Row) -> float:
+def _compute_sleep_s(store: Store, summary: Row) -> float:
     """How long the daemon loop should sleep after this cycle attempt --
     extracted from the loop body so it's directly testable rather than
     only observable by running the real infinite loop.

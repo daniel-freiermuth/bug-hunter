@@ -774,3 +774,56 @@ class TestSchedulerState:
         assert state["state"] == "denied"
         assert state["detail"] == "5h ramp"
         assert state["next_wake_at"] == 200
+
+
+# ---------------------------------------------------------------------------
+# _require_keys: the one runtime check at the SQL-row-to-TypedDict seam
+# ---------------------------------------------------------------------------
+
+
+class TestRequireKeys:
+    """No static type checker can verify a SQL query's actual result
+    columns match a declared TypedDict -- that's a runtime fact about
+    the database, not something mypy parses. _require_keys is the one
+    deliberate runtime check standing at that exact seam, so a
+    schema/query drift fails immediately and clearly, in the store
+    layer where the row was actually built, rather than as a confusing
+    KeyError far downstream in unrelated consuming code."""
+
+    def test_passes_through_when_all_keys_present(self) -> None:
+        from hunter.store import _require_keys
+        from hunter.types import SchedulerStateDict
+
+        row = {"id": 1, "state": "idle", "detail": "d", "next_wake_at": None, "updated_at": 0}
+        result = _require_keys(
+            row, "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
+        )
+        assert result == row
+
+    def test_raises_with_exact_missing_keys_and_actual_shape(self) -> None:
+        from hunter.store import _require_keys
+        from hunter.types import SchedulerStateDict
+
+        row = {"id": 1, "state": "error"}  # simulates a schema/query drift
+        with pytest.raises(ValueError, match=r"detail.*next_wake_at.*updated_at") as exc_info:
+            _require_keys(
+                row, "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
+            )
+        assert "SchedulerStateDict" in str(exc_info.value)
+        assert "['id', 'state']" in str(exc_info.value), "must name what WAS present, not just what's missing"
+
+    def test_extra_unexpected_keys_do_not_fail(self) -> None:
+        """Not every column needs a home in the TypedDict -- current_job()
+        deliberately carries DB columns the frontend never reads. Only
+        missing REQUIRED keys are an error."""
+        from hunter.store import _require_keys
+        from hunter.types import SchedulerStateDict
+
+        row = {
+            "id": 1, "state": "idle", "detail": "d", "next_wake_at": None,
+            "updated_at": 0, "some_future_column": "unexpected but harmless",
+        }
+        result = _require_keys(
+            row, "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
+        )
+        assert result["some_future_column"] == "unexpected but harmless"  # type: ignore[typeddict-item]

@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
 from pathlib import Path
-from typing import Any
+from typing import Any, NotRequired, TypedDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # .../hunter
 SCHEMA_PATH = PROJECT_ROOT / "schema.sql"
@@ -95,6 +95,80 @@ def now_ms() -> int:
 
 # Type alias for rows returned from SQLite (dict with str keys).
 Row = dict[str, Any]
+
+
+# Precise shapes for the two SQL-backed rows that cross the /api/summary
+# HTTP boundary (see server.py's _activity_status). Everything else in
+# this codebase still uses the loose Row alias above -- these two exist
+# specifically because untyped access to them (scheduler_state["detail"])
+# produced a real, demonstrated bug: mypy --strict cannot catch a missing
+# or misspelled key on dict[str, Any], by design, no matter how strict
+# the rest of the config is. Store.get_scheduler_state()/current_job()
+# verify these shapes at runtime (the one place a SQL/schema drift could
+# actually violate them) before asserting the type -- see
+# store._require_keys. Everything downstream of that one checked
+# boundary gets full mypy coverage instead of Any all the way through.
+class SchedulerStateDict(TypedDict):
+    id: int
+    state: str
+    detail: str
+    next_wake_at: int | None
+    updated_at: int
+
+
+class JobDict(TypedDict):
+    id: int
+    kind: str
+    repo_id: int
+    repo_name: str
+    finding_id: int | None
+    state: str
+    pid: int | None
+    session_file: str | None
+    cap_tokens: int | None
+    tokens_new: int | None
+    calls: int | None
+    exit_code: int | None
+    killed_reason: str | None
+    notes: str | None
+    started_at: int | None
+    finished_at: int | None
+    model: str | None
+    usage_delta: float | None
+    # Only present when finding_id is set (current_job() looks the
+    # finding up separately) -- NotRequired, not "| None", because the
+    # key is genuinely absent rather than present-with-null in that case.
+    finding_summary: NotRequired[str | None]
+    finding_fingerprint: NotRequired[str | None]
+
+
+class RepoDict(TypedDict):
+    """SELECT * FROM repos -- see schema.sql. Store.list_repos()/get_repo()
+    stay Row-typed (their other callers need dict[str, Any]); this exists
+    for the /api/summary boundary specifically, where server.py casts to
+    it and SummaryDict's pydantic validation re-verifies it at runtime."""
+
+    id: int
+    name: str
+    url: str
+    path: str
+    forge: str
+    default_branch: str
+    last_hunt_sha: str | None
+    last_hunt_at: int | None
+    enabled: int
+    added_at: int
+
+
+class EventDict(TypedDict):
+    """SELECT * FROM events -- see schema.sql."""
+
+    id: int
+    at: int
+    kind: str
+    message: str
+    job_id: int | None
+    finding_id: int | None
 
 
 @dataclass

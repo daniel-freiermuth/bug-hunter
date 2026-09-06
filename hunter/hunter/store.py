@@ -5,7 +5,10 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, ClassVar, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from .types import (
     ACTIVE_STATUSES,
@@ -13,11 +16,23 @@ from .types import (
     SCHEMA_PATH,
     SUPPRESSED_STATUSES,
     Config,
+    EventDict,
+    JobDict,
     Row,
+    SchedulerStateDict,
     Severity,
     WindowState,
     now_ms,
 )
+
+# The value types SQLite actually stores for every column these dynamic
+# setters (update_repo/update_job/upsert_pr_state) and query-parameter
+# builders (list_findings/list_all_findings/set_status/
+# update_finding_analysis) touch -- str/int/float per schema.sql, plus
+# None for nullable columns. Precise enough to catch a real type error
+# (e.g. passing a dict or a list by mistake) while still fitting every
+# legitimate column value, without Any's "stop checking entirely."
+SqlParam = str | int | float | None
 
 _JOB_COLUMNS = {
     "state",
@@ -65,6 +80,25 @@ _FINDING_KEYS = (
 
 def _rows(cur: sqlite3.Cursor) -> list[Row]:
     return [dict(r) for r in cur.fetchall()]
+
+
+def _require_keys[T](row: Row, *required: str, shape: type[T]) -> T:
+    """Verify a raw SQLite row has every key a TypedDict declares before
+    asserting that type onto it. This is the one runtime check standing
+    between "the SQL query's actual columns" (a fact only the database
+    knows) and "the Python type system's belief about that shape" (a
+    fact only the TypedDict declares) -- the seam neither mypy nor any
+    static checker can verify on its own, since a query's result shape
+    isn't visible to the type checker. A schema/query drift now fails
+    loudly, here, with the exact missing key and what was actually
+    present, on the very first call that hits it -- not as a KeyError
+    deep inside unrelated code far from the real defect.
+    """
+    missing = [k for k in required if k not in row]
+    if missing:
+        msg = f"row missing required keys {missing} for {shape.__name__}: got {sorted(row)}"
+        raise ValueError(msg)
+    return cast("T", row)
 
 
 class Store:
@@ -130,7 +164,7 @@ class Store:
         )
         self.db.commit()
 
-    def update_repo(self, repo_id: int, **fields: Any) -> None:
+    def update_repo(self, repo_id: int, **fields: str | int) -> None:
         allowed = {"name", "url", "default_branch", "forge", "enabled"}
         bad = set(fields) - allowed
         if bad:
@@ -262,7 +296,7 @@ class Store:
         min_severity: str | None = None,
     ) -> list[Row]:
         q = "SELECT * FROM findings"
-        args: list[Any] = []
+        args: list[SqlParam] = []
         conds: list[str] = []
         if status:
             conds.append("status = ?")
@@ -293,7 +327,7 @@ class Store:
         display (bug_class | update_type | 'coverage' | smell_type).
         """
         conds: list[str] = []
-        args: list[Any] = []
+        args: list[SqlParam] = []
         if status:
             conds.append("status = ?")
             args.append(status)
@@ -338,7 +372,7 @@ class Store:
             msg = f"invalid status: {status}"
             raise ValueError(msg)
         sets: list[str] = ["status = ?", "updated_at = ?"]
-        args: list[Any] = [status, now_ms()]
+        args: list[SqlParam] = [status, now_ms()]
         if verdict_reason is not None:
             sets.append("verdict_reason = ?")
             args.append(verdict_reason)
@@ -429,7 +463,7 @@ class Store:
         r = self.db.execute("SELECT * FROM pr_state WHERE finding_id = ?", (fid,)).fetchone()
         return dict(r) if r else None
 
-    def upsert_pr_state(self, fid: int, **fields: Any) -> None:
+    def upsert_pr_state(self, fid: int, **fields: SqlParam) -> None:
         bad = set(fields) - _PR_STATE_COLUMNS
         if bad:
             msg = f"invalid pr_state fields: {bad}"
@@ -484,7 +518,7 @@ class Store:
         assert cur.lastrowid is not None
         return cur.lastrowid
 
-    def update_job(self, job_id: int, **fields: Any) -> None:
+    def update_job(self, job_id: int, **fields: SqlParam) -> None:
         bad = set(fields) - _JOB_COLUMNS
         if bad:
             msg = f"invalid job fields: {bad}"
@@ -503,7 +537,7 @@ class Store:
             )
         )
 
-    def current_job(self) -> Row | None:
+    def current_job(self) -> JobDict | None:
         """The job currently in flight, if any -- at most one, given
         _cycle_lock serializes the daemon loop and POST /api/cycle."""
         r = self.db.execute(
@@ -519,7 +553,13 @@ class Store:
             if f is not None:
                 row["finding_summary"] = f.get("summary")
                 row["finding_fingerprint"] = f.get("fingerprint")
-        return row
+        return _require_keys(
+            row,
+            "id", "kind", "repo_id", "repo_name", "finding_id", "state", "pid",
+            "session_file", "cap_tokens", "tokens_new", "calls", "exit_code",
+            "killed_reason", "notes", "started_at", "finished_at", "model", "usage_delta",
+            shape=JobDict,
+        )
 
     def set_scheduler_state(self, state: str, detail: str, next_wake_at: int | None) -> None:
         """Persist the daemon loop's own read of "what am I doing and
@@ -534,9 +574,13 @@ class Store:
         )
         self.db.commit()
 
-    def get_scheduler_state(self) -> Row | None:
+    def get_scheduler_state(self) -> SchedulerStateDict | None:
         r = self.db.execute("SELECT * FROM scheduler_state WHERE id = 1").fetchone()
-        return dict(r) if r else None
+        if r is None:
+            return None
+        return _require_keys(
+            dict(r), "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
+        )
 
     def reconcile_orphaned_jobs(self) -> dict[str, list[Row]]:
         """Last-resort net for total process death (crash, systemctl
@@ -607,8 +651,14 @@ class Store:
         )
         self.db.commit()
 
-    def recent_events(self, limit: int = 100) -> list[Row]:
-        return _rows(self.db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)))
+    def recent_events(self, limit: int = 100) -> list[EventDict]:
+        rows = _rows(
+            self.db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))
+        )
+        return [
+            _require_keys(r, "id", "at", "kind", "message", "job_id", "finding_id", shape=EventDict)
+            for r in rows
+        ]
 
     def events_by_finding(self, fids: list[int]) -> dict[int, list[Row]]:
         """Return events grouped by finding_id for the given IDs."""
@@ -626,7 +676,7 @@ class Store:
             out.setdefault(r["finding_id"], []).append(r)
         return out
 
-    _CALIBRATION_DURATIONS_MS = {
+    _CALIBRATION_DURATIONS_MS: ClassVar[dict[str, int]] = {
         "5h": 5 * 3600 * 1000,
         "7d": 7 * 24 * 3600 * 1000,
     }
@@ -640,7 +690,9 @@ class Store:
         schema.sql for what this is (and isn't) good for."""
         t = now_ms()
         for w in states:
-            horizon = next((h for h in self._CALIBRATION_DURATIONS_MS if f":{h}" in w.limit_id), None)
+            horizon = next(
+                (h for h in self._CALIBRATION_DURATIONS_MS if f":{h}" in w.limit_id), None
+            )
             if horizon and w.resets_at and w.used_fraction is not None:
                 prev = self.db.execute(
                     "SELECT observed_at, used_fraction FROM window_log"
@@ -662,9 +714,13 @@ class Store:
                     if tok > 0:
                         self.db.execute(
                             "INSERT INTO calibration_samples"
-                            " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
+                            " (observed_at, limit_id, window_resets_at,"
+                            " used_fraction_delta, hunter_tokens)"
                             " VALUES (?,?,?,?,?)",
-                            (t, w.limit_id, w.resets_at, w.used_fraction - prev["used_fraction"], tok),
+                            (
+                                t, w.limit_id, w.resets_at,
+                                w.used_fraction - prev["used_fraction"], tok,
+                            ),
                         )
             self.db.execute(
                 "INSERT INTO window_log (observed_at, limit_id, used_fraction,"
@@ -714,7 +770,7 @@ class Store:
         Never touches status or verdict_reason.
         """
         sets: list[str] = ["updated_at = ?"]
-        args: list[Any] = [now_ms()]
+        args: list[SqlParam] = [now_ms()]
         if summary is not None:
             sets.append("summary = ?")
             args.append(summary)
