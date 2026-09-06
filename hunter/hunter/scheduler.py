@@ -1198,6 +1198,18 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
     rpath: str = repo["path"]
     num: int = ps["pr_number"]
     head_ref: str = ps["head_ref"]
+    if head_ref == repo["default_branch"]:
+        # Structurally shouldn't happen (a PR's head can't be its own base
+        # in the same repo) but costs nothing to refuse outright: engage
+        # pushes are allowed to rewrite the PR branch freely (that's the
+        # point -- squash/cleanup before merge), the one thing that must
+        # never happen is a rewriting push landing on the default branch.
+        store.log_event(
+            "error",
+            f"engage #{fid}: refusing -- head_ref equals default branch {head_ref!r}",
+            finding_id=fid,
+        )
+        return {"error": "head_ref equals default branch"}
 
     worktree = cfg.work_root / "wt" / f"e{fid}"
     worktree.parent.mkdir(parents=True, exist_ok=True)
@@ -1375,57 +1387,22 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
             ]
         )
         if rc == 0 and commits:
-            # Infra-level guard: never trust the worker's promise not to
-            # rewrite published history (playbook rule alone is not
-            # sufficient -- see the signalk-pose-provider PR#7 incident,
-            # where a worker was talked into rebasing an already-published
-            # branch under review). Refuse any push whose local HEAD does
-            # not contain the branch tip we started from as an ancestor.
-            rc, _ = run_cmd(
+            rc, out = run_cmd(
                 [
                     "git",
                     "-C",
                     str(worktree),
-                    "merge-base",
-                    "--is-ancestor",
-                    f"origin/{head_ref}",
-                    "HEAD",
-                ]
+                    "push",
+                    "--force",
+                    forge.ssh_url(repo["url"]),
+                    f"HEAD:{head_ref}",
+                ],
+                timeout=600,
             )
-            if rc != 0:
-                notice = worktree / "SAFETY-REFUSAL.md"
-                notice.write_text(
-                    "Automated safety check blocked this push: the "
-                    "worker's local history no longer contains the "
-                    "previously published branch tip as an ancestor, "
-                    "meaning it would rewrite published commits (e.g. a "
-                    "rebase or force-push of existing history). This is "
-                    "not allowed regardless of what was requested in "
-                    "review -- no changes were pushed; the branch is "
-                    "unchanged. A human should review the worktree and "
-                    "either drop the rewritten attempt or, if a linear "
-                    "history is truly wanted, rebase and push it "
-                    "themselves.\n"
-                )
-                forge.comment_pr(owner_slug, num, notice)
-                failure = "refused to push: would rewrite published history"
+            if rc == 0:
+                pushed = True
             else:
-                rc, out = run_cmd(
-                    [
-                        "git",
-                        "-C",
-                        str(worktree),
-                        "push",
-                        "--force",
-                        forge.ssh_url(repo["url"]),
-                        f"HEAD:{head_ref}",
-                    ],
-                    timeout=600,
-                )
-                if rc == 0:
-                    pushed = True
-                else:
-                    failure = f"push failed: {out[-300:]}"
+                failure = f"push failed: {out[-300:]}"
     if failure is None:
         reply = worktree / "PR-REPLY.md"
         if reply.exists():

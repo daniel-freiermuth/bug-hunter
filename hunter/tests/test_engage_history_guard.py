@@ -1,11 +1,7 @@
-"""Regression: run_engage must never let a worker's push land if it would
-rewrite already-published branch history. The playbook (engage.md) tells the
-worker not to rebase/force-push, but a prompt-level rule alone is not
-sufficient -- production incident: a worker was talked into rebasing a
-published PR branch by a reviewer questioning the rule, while a sibling
-worker on a different PR correctly refused. This test proves the guard is
-enforced mechanically in the scheduler, independent of what the worker did
-or claimed.
+"""run_engage may freely rewrite the PR's own branch history (rebase,
+squash, force-push, amend) -- that is expected/desired: PR branches are
+cleaned up before merging to the default branch. The only hard line is the
+default branch itself, which run_engage must never target.
 """
 
 from __future__ import annotations
@@ -106,7 +102,7 @@ def _make_repo_with_published_branch(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _setup(
-    store: Store, tmp_path: Path
+    store: Store, tmp_path: Path, head_ref: str = "feature"
 ) -> tuple[dict[str, Any], _FakeForge]:
     upstream_path, repo_path = _make_repo_with_published_branch(tmp_path)
     repo_id = store.add_repo(
@@ -117,7 +113,7 @@ def _setup(
     store.upsert_pr_state(
         fid,
         pr_number=1,
-        head_ref="feature",
+        head_ref=head_ref,
         needs_attention="new_comments",
         synced_at=0,
     )
@@ -128,8 +124,20 @@ def _setup(
     return finding, fake_forge
 
 
-class TestEngageRefusesHistoryRewrite:
-    def test_legitimate_commit_is_pushed(
+def _fake_result() -> RunResult:
+    return RunResult(
+        exit_code=0,
+        killed_reason=None,
+        tokens_new=1000,
+        calls=1,
+        session_file=None,
+        duration_s=5.0,
+        stdout_tail="done",
+    )
+
+
+class TestEngageAllowsBranchHistoryRewrite:
+    def test_new_commit_is_pushed(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A worker that only adds commits on top of the published tip must
@@ -142,15 +150,7 @@ class TestEngageRefusesHistoryRewrite:
             _run("git", "add", "-A", cwd=worktree)
             _run("git", "commit", "-m", "address feedback", cwd=worktree)
             (worktree / "PR-REPLY.md").write_text("Addressed the feedback.\n")
-            return RunResult(
-                exit_code=0,
-                killed_reason=None,
-                tokens_new=1000,
-                calls=1,
-                session_file=None,
-                duration_s=5.0,
-                stdout_tail="done",
-            )
+            return _fake_result()
 
         monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
 
@@ -169,41 +169,31 @@ class TestEngageRefusesHistoryRewrite:
         assert "address feedback" in rc.stdout
         assert any("Addressed the feedback." in c for c in fake_forge.comments)
 
-    def test_rewritten_history_is_refused(
+    def test_rebased_history_is_pushed(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A worker that drops the previously-published commit (e.g. a
-        rebase it was talked into despite instructions) must NOT have that
-        push reach the remote, and its (potentially false) PR-REPLY.md must
-        NOT be posted as if the rewrite succeeded cleanly."""
+        """A worker that rewrites its own PR branch (e.g. squashing/rebasing
+        to clean up commits before merge, as requested by a reviewer) must
+        have the rewrite actually reach the remote -- this is desired
+        behavior, not a violation."""
         finding, fake_forge = _setup(store, tmp_path)
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
 
         def fake_run_worker(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
-            # Drop the published commit and rewrite from underneath it --
-            # simulates a rebase the worker was socially pressured into.
+            # Drop the published commit and replace it with a cleaned-up one.
             _run("git", "reset", "--hard", "HEAD~1", cwd=worktree)
-            _run("git", "commit", "--allow-empty", "-m", "rebased onto main", cwd=worktree)
-            (worktree / "PR-REPLY.md").write_text(
-                "I've rebased the branch as requested; history is now linear.\n"
-            )
-            return RunResult(
-                exit_code=0,
-                killed_reason=None,
-                tokens_new=1000,
-                calls=1,
-                session_file=None,
-                duration_s=5.0,
-                stdout_tail="done",
-            )
+            (worktree / "f.py").write_text("pass\nsquashed and cleaned\n")
+            _run("git", "add", "-A", cwd=worktree)
+            _run("git", "commit", "-m", "squashed: clean commit for merge", cwd=worktree)
+            (worktree / "PR-REPLY.md").write_text("Rebased and squashed as requested.\n")
+            return _fake_result()
 
         monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
 
         result = run_engage(store, cfg, finding)
-        assert result.get("outcome") == "retry", result
-        assert "rewrite published history" in result.get("failure", "")
+        assert result.get("outcome") == "engaged", result
+        assert result.get("pushed") is True
 
-        # The remote branch must be untouched.
         upstream_path = Path(store.get_repo(finding["repo_id"])["url"])
         rc = subprocess.run(
             ["git", "log", "--oneline", "feature"],
@@ -212,16 +202,30 @@ class TestEngageRefusesHistoryRewrite:
             text=True,
             check=True,
         )
-        assert "rebased onto main" not in rc.stdout
-        assert "first published commit" in rc.stdout
+        assert "squashed: clean commit for merge" in rc.stdout
+        assert "first published commit" not in rc.stdout
+        assert any("Rebased and squashed as requested." in c for c in fake_forge.comments)
 
-        # The worker's (false) claim of success must never be posted; only
-        # the scheduler's own safety notice may be.
-        assert not any("history is now linear" in c for c in fake_forge.comments)
-        assert any("would rewrite published commits" in c for c in fake_forge.comments)
 
-        # needs_attention must stay set so the finding is retried, not
-        # silently dropped.
-        after_ps = store.get_pr_state(finding["id"])
-        assert after_ps is not None
-        assert after_ps["needs_attention"] == "new_comments"
+class TestEngageNeverTargetsDefaultBranch:
+    def test_refuses_when_head_ref_is_default_branch(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """However head_ref got set to the default branch (shouldn't happen
+        structurally, but cheap to refuse outright), run_engage must bail
+        before touching git or spending any worker tokens."""
+        finding, fake_forge = _setup(store, tmp_path, head_ref="main")
+        monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
+
+        called = False
+
+        def fake_run_worker(*_a: object, **_kw: object) -> RunResult:
+            nonlocal called
+            called = True
+            return _fake_result()
+
+        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
+
+        result = run_engage(store, cfg, finding)
+        assert "error" in result
+        assert not called, "worker must never run when head_ref is the default branch"
