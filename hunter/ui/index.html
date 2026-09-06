@@ -155,34 +155,56 @@
   #filters label { color: var(--dim); font-size: 11px; }
   #filters .sep { border-left: 1px solid var(--line); height: 20px; }
 
-  /* add repo form */
-  #addRepo {
-    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
-    margin-bottom: 10px;
+  /* add-repo dialog */
+  dialog {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 16px 18px; min-width: 320px;
   }
-  #addRepo input, #addRepo select {
-    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
-    border-radius: 3px; font: inherit; font-size: 12px; padding: 3px 8px;
+  dialog::backdrop { background: rgba(0, 0, 0, .6); }
+  dialog h3 { margin: 0 0 12px; font-size: 13px; }
+  .dlg-form { display: flex; flex-direction: column; gap: 8px; }
+  .dlg-form label {
+    display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--dim);
   }
-  #addRepo input[id=arUrl] { min-width: 240px; flex: 1; }
-
-  /* repo notes panel */
-  #repoNotesPanel {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
-    padding: 10px 12px; margin-top: 12px;
-  }
-  #repoNotesPanel h3 { margin: 0 0 8px; font-size: 12px; color: var(--fg); }
-  #repoNotesPanel pre {
-    white-space: pre-wrap; background: var(--panel2); border: 1px solid var(--line);
-    border-radius: 3px; padding: 8px 10px; font-size: 11.5px; color: var(--fg);
-    max-height: 300px; overflow-y: auto; margin: 0 0 10px;
-  }
-  #rnpForm { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
-  #rnpForm input, #rnpForm textarea {
+  .dlg-form input, .dlg-form select {
     background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
     border-radius: 3px; font: inherit; font-size: 12px; padding: 4px 8px;
   }
-  #rnpForm textarea { flex: 1; min-width: 260px; resize: vertical; }
+  .dlg-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+
+  /* toast */
+  #toast {
+    position: fixed; bottom: 16px; right: 16px; max-width: 360px; z-index: 100;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  #toast .msg {
+    background: var(--panel2); border: 1px solid var(--line); border-left: 3px solid var(--blue);
+    border-radius: 3px; padding: 8px 12px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.4);
+    animation: toast-in .15s ease-out;
+  }
+  #toast .msg.err { border-left-color: var(--red); }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* inline repo notes */
+  .repo-notes { flex-basis: 100%; margin-top: 4px; }
+  .repo-notes summary {
+    cursor: pointer; color: var(--dim); font-size: 11px; list-style: none;
+  }
+  .repo-notes summary::-webkit-details-marker { display: none; }
+  .repo-notes summary::before { content: "\25b8  "; }
+  .repo-notes[open] summary::before { content: "\25be  "; }
+  .repo-notes-body { margin: 8px 0 4px 14px; }
+  .repo-notes-body pre {
+    white-space: pre-wrap; background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 3px; padding: 8px 10px; font-size: 11.5px; color: var(--fg);
+    max-height: 240px; overflow-y: auto; margin: 0 0 8px;
+  }
+  .rn-form { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+  .rn-form input, .rn-form textarea {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 3px; font: inherit; font-size: 12px; padding: 4px 8px;
+  }
+  .rn-form textarea { flex: 1; min-width: 220px; resize: vertical; }
 </style>
 </head>
 <body>
@@ -197,6 +219,7 @@
   </nav>
   <main>
     <div id="err"></div>
+    <div id="toast"></div>
 
     <section id="page-status" class="page">
       <h2>Status</h2>
@@ -253,33 +276,27 @@
     </section>
 
     <section id="page-repos" class="page">
-      <h2>Repos</h2>
-      <div id="addRepo">
-        <input type="text" id="arName" placeholder="name">
-        <input type="text" id="arUrl" placeholder="https://github.com/org/repo">
-        <input type="text" id="arBranch" placeholder="branch" value="main">
-        <select id="arForge">
-          <option value="">auto-detect forge</option>
+      <h2>Repos <button class="ov-btn" onclick="document.getElementById('addRepoDialog').showModal()">+ Add Repo</button></h2>
+      <div id="repos"></div>
+    </section>
+
+    <dialog id="addRepoDialog">
+      <h3>Add Repo</h3>
+      <div class="dlg-form">
+        <label>name<input type="text" id="arName" placeholder="my-repo"></label>
+        <label>url<input type="text" id="arUrl" placeholder="https://github.com/org/repo"></label>
+        <label>branch<input type="text" id="arBranch" placeholder="main" value="main"></label>
+        <label>forge<select id="arForge">
+          <option value="">auto-detect</option>
           <option value="github">github</option>
           <option value="gitlab">gitlab</option>
-        </select>
-        <button onclick="addRepo()">Add Repo</button>
+        </select></label>
       </div>
-      <div id="repos"></div>
-
-      <div id="repoNotesPanel" style="display:none">
-        <h3 id="rnpTitle"></h3>
-        <pre id="rnpContent"></pre>
-        <div id="rnpForm">
-          <input type="text" id="rnpCategory" placeholder="category (optional)">
-          <textarea id="rnpNote" rows="3" placeholder="note text"></textarea>
-          <div>
-            <button onclick="addRepoNote()">Add Note</button>
-            <button onclick="closeRepoNotes()">Close</button>
-          </div>
-        </div>
+      <div class="dlg-actions">
+        <button class="q" onclick="addRepo()">Add</button>
+        <button onclick="document.getElementById('addRepoDialog').close()">Cancel</button>
       </div>
-    </section>
+    </dialog>
 
     <section id="page-stats" class="page">
       <h2>Stats</h2>

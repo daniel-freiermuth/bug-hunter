@@ -397,13 +397,21 @@ async function toggleRepo(id: number, enabled: boolean): Promise<void> {
   refresh();
 }
 
+function toast(message: string, isError = true): void {
+  const el = document.createElement("div");
+  el.className = "msg" + (isError ? " err" : "");
+  el.textContent = message;
+  $("toast").appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
 async function addRepo(): Promise<void> {
   const name = $input("arName").value.trim();
   const url = $input("arUrl").value.trim();
   const branch = $input("arBranch").value.trim() || "main";
   const forge = $select("arForge").value || undefined;
   if (!name || !url) {
-    alert("name and url are required");
+    toast("name and url are required");
     return;
   }
   const r = await api<{ error?: string }>("/api/repos", {
@@ -412,13 +420,15 @@ async function addRepo(): Promise<void> {
     body: JSON.stringify({ name, url, branch, forge }),
   });
   if (r.status !== 201) {
-    alert("add repo failed: " + (r.body?.error || r.status));
+    toast("add repo failed: " + (r.body?.error || r.status));
     return;
   }
   $input("arName").value = "";
   $input("arUrl").value = "";
   $input("arBranch").value = "main";
   $select("arForge").value = "";
+  ($("addRepoDialog") as HTMLDialogElement).close();
+  toast(`repo "${name}" added`, false);
   refresh();
 }
 
@@ -432,54 +442,75 @@ async function removeRepo(id: number, name: string): Promise<void> {
     body: JSON.stringify({ id }),
   });
   if (r.status !== 200) {
-    alert("remove repo failed: " + (r.body?.error || r.status));
+    toast("remove repo failed: " + (r.body?.error || r.status));
     return;
   }
+  toast(`repo "${name}" removed`, false);
   refresh();
 }
 
-let notesRepoId: number | null = null;
+// ---------------------------------------------------------------------------
+// Inline repo notes -- a <details> per row. Fetched content and in-progress
+// draft text live in module-level maps (not the DOM) so the 5s refresh()
+// rebuild of #repos never loses them; see the ontoggle/restore wiring below.
+// ---------------------------------------------------------------------------
 
-async function openRepoNotes(id: number, name: string): Promise<void> {
-  const r = await api<{ notes: string; error?: string }>(`/api/repo/notes?id=${id}`);
-  if (r.status !== 200) {
-    alert("load notes failed: " + (r.body?.error || r.status));
-    return;
+const repoNotesCache = new Map<number, string>();
+const repoNotesDraft = new Map<number, { category: string; note: string }>();
+
+async function toggleRepoNotes(id: number, opened: boolean): Promise<void> {
+  if (!opened) return;
+  if (!repoNotesCache.has(id)) {
+    const r = await api<{ notes: string; error?: string }>(`/api/repo/notes?id=${id}`);
+    if (r.status !== 200) {
+      toast("load notes failed: " + (r.body?.error || r.status));
+      return;
+    }
+    repoNotesCache.set(id, r.body?.notes || "");
   }
-  notesRepoId = id;
-  $("rnpTitle").textContent = `Notes \u2014 ${name}`;
-  $("rnpContent").textContent = r.body?.notes || "(no notes yet)";
-  $input("rnpCategory").value = "";
-  ($("rnpNote") as HTMLTextAreaElement).value = "";
-  $("repoNotesPanel").style.display = "block";
-  $("repoNotesPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  renderRepoNotesBody(id);
 }
 
-function closeRepoNotes(): void {
-  notesRepoId = null;
-  $("repoNotesPanel").style.display = "none";
+function renderRepoNotesBody(id: number): void {
+  const body = document.getElementById(`rn-body-${id}`);
+  if (!body) return;
+  const content = repoNotesCache.get(id) || "";
+  const draft = repoNotesDraft.get(id);
+  body.innerHTML = `
+    <pre>${esc(content) || "(no notes yet)"}</pre>
+    <div class="rn-form">
+      <input type="text" class="rn-category" placeholder="category (optional)" value="${esc(draft?.category || "")}">
+      <textarea class="rn-note" rows="2" placeholder="note text">${esc(draft?.note || "")}</textarea>
+      <button onclick="addRepoNote(${id})">Add Note</button>
+    </div>`;
+  const catInput = body.querySelector<HTMLInputElement>(".rn-category")!;
+  const noteInput = body.querySelector<HTMLTextAreaElement>(".rn-note")!;
+  const saveDraft = () => repoNotesDraft.set(id, { category: catInput.value, note: noteInput.value });
+  catInput.oninput = saveDraft;
+  noteInput.oninput = saveDraft;
 }
 
-async function addRepoNote(): Promise<void> {
-  if (notesRepoId == null) return;
-  const note = ($("rnpNote") as HTMLTextAreaElement).value.trim();
-  const category = $input("rnpCategory").value.trim() || undefined;
+async function addRepoNote(id: number): Promise<void> {
+  const body = document.getElementById(`rn-body-${id}`);
+  const note = body?.querySelector<HTMLTextAreaElement>(".rn-note")?.value.trim() || "";
+  const category = body?.querySelector<HTMLInputElement>(".rn-category")?.value.trim() || undefined;
   if (!note) {
-    alert("note text is required");
+    toast("note text is required");
     return;
   }
   const r = await api<{ notes: string; error?: string }>("/api/repo/notes", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id: notesRepoId, note, category }),
+    body: JSON.stringify({ id, note, category }),
   });
   if (r.status !== 201) {
-    alert("add note failed: " + (r.body?.error || r.status));
+    toast("add note failed: " + (r.body?.error || r.status));
     return;
   }
-  $("rnpContent").textContent = r.body?.notes || "";
-  $input("rnpCategory").value = "";
-  ($("rnpNote") as HTMLTextAreaElement).value = "";
+  repoNotesCache.set(id, r.body?.notes || "");
+  repoNotesDraft.delete(id);
+  renderRepoNotesBody(id);
+  toast("note added", false);
 }
 
 // Expose to onclick handlers in rendered HTML
@@ -493,8 +524,7 @@ Object.assign(window, {
   toggleRepo,
   addRepo,
   removeRepo,
-  openRepoNotes,
-  closeRepoNotes,
+  toggleRepoNotes,
   addRepoNote,
 });
 
@@ -648,8 +678,11 @@ function renderRepos(repos: Repo[]): void {
       <span class="url"><a href="${esc(r.url)}" target="_blank">${esc(r.url)}</a></span>
       <span class="meta">${esc(r.forge)} \u00b7 ${esc(r.default_branch)}${r.last_hunt_at ? " \u00b7 hunted " + ts(r.last_hunt_at) : ""}</span>
       <button class="${r.enabled ? "uq" : "q"}" onclick="toggleRepo(${r.id},${r.enabled ? "false" : "true"})">${r.enabled ? "Pause" : "Resume"}</button>
-      <button class="rc" data-name="${esc(r.name)}" onclick="openRepoNotes(${r.id},this.dataset.name)">Notes</button>
       <button class="r" data-name="${esc(r.name)}" onclick="removeRepo(${r.id},this.dataset.name)">Remove</button>
+      <details class="repo-notes" id="rn-${r.id}" ontoggle="toggleRepoNotes(${r.id},this.open)">
+        <summary>Notes</summary>
+        <div class="repo-notes-body" id="rn-body-${r.id}"></div>
+      </details>
     </div>`,
     )
     .join("");
@@ -777,7 +810,7 @@ async function refresh(): Promise<void> {
     // Snapshot open <details> elements before DOM rebuild.
     const openDetails = new Set<string>();
     for (const d of document.querySelectorAll("details[open]")) {
-      const card = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.parentElement?.id ?? "";
+      const card = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.id ?? d.parentElement?.id ?? "";
       const label = d.querySelector("summary")?.textContent ?? "";
       if (card) openDetails.add(card + "|" + label);
     }
@@ -889,7 +922,7 @@ async function refresh(): Promise<void> {
 
     // Restore open <details> elements after DOM rebuild.
     for (const d of document.querySelectorAll("details")) {
-      const card = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.parentElement?.id ?? "";
+      const card = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.id ?? d.parentElement?.id ?? "";
       const label = d.querySelector("summary")?.textContent ?? "";
       if (card && openDetails.has(card + "|" + label)) d.open = true;
     }
