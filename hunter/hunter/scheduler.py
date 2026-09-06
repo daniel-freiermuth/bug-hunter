@@ -1679,6 +1679,20 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
 # -- cycle ------------------------------------------------------------------
 
 
+# Deterministic priority among ties in pick_next's never-run job-type set,
+# NOT alphabetical sorting's accident (which put dep_update ahead of hunt
+# purely because 'd' < 'h' -- a denied hunt attempt leaves last_hunt_at at
+# 0, so this set is exactly what a denial produces. Without an explicit
+# order, a freshly-denied hunt lost every tie to dep_update instead of
+# being retried -- observed in production: repo `recentIP`'s hunt was
+# denied for budget, and the very next cycle ran dep_update instead of
+# retrying hunt, purely because of string sort order). Order matches
+# pick_next's own docstring: hunt first (discovers what everything else
+# would act on), then the three routine maintenance scans, modernization
+# last (it's already the slow, periodic one).
+_JOB_TYPE_PRIORITY = ("hunt", "test_gap", "dep_update", "refactor", "modernization")
+
+
 def pick_next(
     store: Store, cfg: Config, force_repo: str | None = None  # noqa: ARG001
 ) -> tuple[str, Row] | None:
@@ -1755,7 +1769,11 @@ def pick_next(
     if last_modernization == 0 or (now_ms() - last_modernization) >= interval_ms:
         job_times["modernization"] = last_modernization
     never_run = [k for k, v in job_times.items() if v == 0]
-    job_type = sorted(never_run)[0] if never_run else min(job_times, key=job_times.get)
+    job_type = (
+        next(k for k in _JOB_TYPE_PRIORITY if k in never_run)
+        if never_run
+        else min(job_times, key=job_times.get)
+    )
     return job_type, target
 
 
