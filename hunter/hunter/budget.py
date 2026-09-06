@@ -7,8 +7,19 @@
              Zero for the first HEADROOM duration (human headroom), then 0→1
              over the remaining time.  Anything unspent at reset is wasted capacity.
 
+Both horizons reduce to one comparison: allowed = ramp(...) > effective_used.
+"exhausted" is folded into effective_used (clamped to exactly 1.0, see
+_effective_used) rather than special-cased -- since both ramps are
+themselves capped at 1.0 (reached only exactly at resets_at), an exhausted
+window denies for its whole remaining duration for free, with no
+ramp-catchup-before-reset risk.
+
 No active 5h window → allow (opens one).  The 7d ramp is the outer gate.
-Stale 5h data → treated as no active window (opener safe, 7d is the gate).
+Stale 5h ramp data (status "ok") → treated as no active window (opener
+safe, 7d is the gate).  Stale 5h "exhausted" is NOT treated as no window:
+it is a hard cap that only lifts at resets_at, unaffected by probe
+staleness -- it can only be confirmed *more* exhausted between probes,
+never less.
 Missing data entirely → deny.
 """
 
@@ -117,6 +128,21 @@ def retry_at_5h(resets_at: int | None, effective_used: float) -> float | None:
     return window_start_ms + HEADROOM_MS + effective_used * _RAMP_MS
 
 
+def _effective_used(w: WindowState, inflight_reservation: float) -> float:
+    """used_fraction, adjusted for in-flight spend the probe can't see yet.
+
+    "exhausted" is clamped to exactly 1.0 rather than trusting the raw
+    reported fraction: it's Anthropic's hard-stop signal, not a pacing
+    number, and its literal value isn't reliable across limit types
+    (observed as high as 1.57 for a non-Anthropic limit in this same
+    usage_history table). Trusting it verbatim could let a fraction just
+    under 1.0 be second-guessed by ramp catch-up before the window is
+    actually over, or push a ramp-derived retry_at past the real reset.
+    """
+    used = 1.0 if w.status == "exhausted" else w.used_fraction
+    return used + inflight_reservation
+
+
 def decide(
     cfg: Config,
     kind: str,
@@ -135,11 +161,15 @@ def decide(
     # (Anthropic 5h ~= 2-5M tokens depending on model, so 200k ~= 4-10%)
     inflight_reservation = (running_jobs_cap / 200_000) * 0.10
 
-    # -- 7d linear ramp: spend proportionally to elapsed time ----------------
-    # The 7d fraction moves slowly; even somewhat stale data is safe here.
+    # -- 7d linear ramp: spend proportionally to elapsed time -----------------
+    # allowed_by_7d = ramp_7d(...) > effective_used. The 7d fraction moves
+    # slowly; even somewhat stale data is safe here. "exhausted" needs no
+    # separate branch: _effective_used clamps it to 1.0, and ramp_7d is
+    # itself capped at 1.0 (reached only exactly at resets_at), so an
+    # exhausted window denies for its entire remaining duration for free.
 
     for lid, w in windows.items():
-        if ":7d" not in lid or w.used_fraction is None:
+        if ":7d" not in lid or (w.status != "exhausted" and w.used_fraction is None):
             continue
         if w.resets_at and w.resets_at <= now_ms:
             # This window's own cycle has already ended -- the recorded
@@ -153,36 +183,49 @@ def decide(
             # stale, not just imprecise.
             continue
         elapsed_frac = ramp_7d(w.resets_at, now_ms)
-        # Reserve budget for running jobs
-        effective_used = w.used_fraction + inflight_reservation
+        effective_used = _effective_used(w, inflight_reservation)
         if effective_used >= elapsed_frac:
+            # Hard exhaustion resolves exactly at reset -- not at whatever
+            # point retry_at_7d's ramp-catchup math would compute from a
+            # clamped/reservation-inflated effective_used.
+            retry_at = w.resets_at if w.status == "exhausted" else retry_at_7d(w.resets_at, effective_used)
             return BudgetDecision(
                 False,
-                f"{lid}: used {w.used_fraction:.2f} + inflight {inflight_reservation:.2f}"
+                f"{lid}: used {effective_used - inflight_reservation:.2f} + inflight {inflight_reservation:.2f}"
                 f" = {effective_used:.2f} >= ramp {elapsed_frac:.2f}",
-                retry_at=retry_at_7d(w.resets_at, effective_used),
+                retry_at=retry_at,
             )
 
-    # -- 5h ramp (configurable headroom, then linear harvest) ------------------
+    # -- 5h ramp (configurable headroom, then linear harvest) -----------------
+    # Same shape as the 7d check above: allowed_by_5h = ramp_5h(...) >
+    # effective_used, with "exhausted" clamped into effective_used rather
+    # than special-cased.
     #
-    # Only trust fresh 5h data (the human could be actively using the window).
-    # Stale or missing 5h → treat as no active window → allow (opener).
-    # Active window → allowed = max(0, (elapsed - HEADROOM) / (5h - HEADROOM)).
+    # The one asymmetry: an "ok" reading needs freshness (the human could
+    # be actively using the window, so an old fraction may understate
+    # current spend) -- stale "ok" data is treated as no active window ->
+    # allow (this job becomes the opener that produces a fresh probe for
+    # the next decision). "exhausted" needs no such freshness check: it
+    # can only ever be confirmed *more* exhausted between probes, never
+    # less, so staleness cannot un-exhaust it. Gating exhausted on age_s
+    # let a 30+min-old exhausted reading silently flip to "allow" minutes
+    # before the real reset (observed in production: a fix job kept
+    # denying for ~20 cycles on a fresh exhausted probe, then the very
+    # next cycle allowed it 4 minutes before resets_at, purely because the
+    # probe had just crossed the staleAfterS threshold mid-cycle).
 
     w5 = windows.get("anthropic:5h")
-    if w5 is not None and w5.age_s <= cfg.stale_after_s:
-        if w5.status == "exhausted":
-            # A hard cap, not a ramp -- resolves exactly at reset, not at
-            # some computed ramp-catchup point.
-            return BudgetDecision(False, "5h window exhausted", retry_at=w5.resets_at)
+    if w5 is not None and (w5.status == "exhausted" or w5.used_fraction is not None):
+        trustworthy = w5.status == "exhausted" or w5.age_s <= cfg.stale_after_s
         allowed = ramp_5h(w5.resets_at, now_ms)
-        if allowed is not None and w5.used_fraction is not None:
-            effective_used = w5.used_fraction + inflight_reservation
+        if trustworthy and allowed is not None:
+            effective_used = _effective_used(w5, inflight_reservation)
             if effective_used >= allowed:
+                retry_at = w5.resets_at if w5.status == "exhausted" else retry_at_5h(w5.resets_at, effective_used)
                 return BudgetDecision(
                     False,
-                    f"5h: used {w5.used_fraction:.2f} + inflight {inflight_reservation:.2f}"
+                    f"5h: used {effective_used - inflight_reservation:.2f} + inflight {inflight_reservation:.2f}"
                     f" = {effective_used:.2f} >= ramp {allowed:.2f}",
-                    retry_at=retry_at_5h(w5.resets_at, effective_used),
+                    retry_at=retry_at,
                 )
     return BudgetDecision(True, "ok", base)
