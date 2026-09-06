@@ -99,6 +99,25 @@ CREATE TABLE IF NOT EXISTS window_log (
   source_age_s  INTEGER                    -- staleness of the usage_history row we read
 );
 
+-- Empirical (hunter_tokens spent -> used_fraction moved) correlations,
+-- recorded incrementally each time a FRESH probe lands (used_fraction
+-- actually changed since the last row for this resets_at). Lets budget
+-- estimate real remaining tokens instead of the fixed "200k ~= 10% of
+-- 5h window" guess -- informational only, never gates a decision: the
+-- estimate is confounded by (a) any concurrent non-hunter account
+-- activity, whose share of the delta hunter can't see, and (b)
+-- Anthropic's used_fraction very likely being a cost-weighted metric,
+-- not a linear token count, so the true ratio depends on each job's
+-- input/output/cache mix and isn't a single universal constant.
+CREATE TABLE IF NOT EXISTS calibration_samples (
+  id                  INTEGER PRIMARY KEY,
+  observed_at         INTEGER NOT NULL,
+  limit_id            TEXT NOT NULL,       -- anthropic:5h | anthropic:7d
+  window_resets_at    INTEGER,             -- which window instance this belongs to
+  used_fraction_delta REAL NOT NULL,       -- Anthropic-reported change since the prior probe
+  hunter_tokens       INTEGER NOT NULL     -- hunter's own tokens_new spent in that gap
+);
+
 CREATE TABLE IF NOT EXISTS events (
   id            INTEGER PRIMARY KEY,
   at            INTEGER NOT NULL,

@@ -11,6 +11,7 @@ interface WindowInfo {
   age_s: number;
   stale: boolean;
   ramp: number | null;
+  available_tokens: number | null;
 }
 
 interface Finding {
@@ -240,6 +241,12 @@ function countdown(ms: number | null): string {
   const h = Math.floor(d / 3600);
   const m = Math.floor((d % 3600) / 60);
   return sign + (h ? h + "h" + String(m).padStart(2, "0") + "m" : m + "m");
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 1_000) return Math.round(n / 1_000) + "k";
+  return String(Math.round(n));
 }
 
 function dur(j: Job): string {
@@ -591,7 +598,7 @@ function renderWindows(windows: Record<string, WindowInfo>): void {
       return `<div class="win">
       <div class="lab"><b>${esc(label)}</b><span>${pct == null ? "?" : pct + "% used"}${avail}${w.stale ? " \u26a0stale" : ""}</span></div>
       <div class="bar"><i class="${cls}" style="width:${pct ?? 0}%"></i>${marker}</div>
-      <div class="sub">resets ${ts(w.resets_at)}${w.resets_at ? " (" + countdown(w.resets_at) + ")" : ""} \u00b7 probed ${Math.round(w.age_s / 60)}m ago</div>
+      <div class="sub">resets ${ts(w.resets_at)}${w.resets_at ? " (" + countdown(w.resets_at) + ")" : ""} \u00b7 probed ${Math.round(w.age_s / 60)}m ago${w.available_tokens == null ? "" : ` \u00b7 ~${fmtTokens(w.available_tokens)} tok avail (est.)`}</div>
     </div>`;
     })
     .join("");

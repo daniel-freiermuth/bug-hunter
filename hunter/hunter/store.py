@@ -614,15 +614,80 @@ class Store:
             out.setdefault(r["finding_id"], []).append(r)
         return out
 
+    _CALIBRATION_DURATIONS_MS = {
+        "5h": 5 * 3600 * 1000,
+        "7d": 7 * 24 * 3600 * 1000,
+    }
+
     def log_window(self, states: list[WindowState]) -> None:
+        """Record each window observation, and -- whenever this is a
+        FRESH probe (used_fraction actually moved since the last row for
+        this exact window instance) -- also record a calibration sample
+        correlating hunter's own token spend in that gap with how much
+        Anthropic's used_fraction moved. See calibration_samples in
+        schema.sql for what this is (and isn't) good for."""
         t = now_ms()
         for w in states:
+            horizon = next((h for h in self._CALIBRATION_DURATIONS_MS if f":{h}" in w.limit_id), None)
+            if horizon and w.resets_at and w.used_fraction is not None:
+                prev = self.db.execute(
+                    "SELECT observed_at, used_fraction FROM window_log"
+                    " WHERE limit_id = ? AND resets_at BETWEEN ? AND ?"
+                    " ORDER BY observed_at DESC LIMIT 1",
+                    (w.limit_id, w.resets_at - 5000, w.resets_at + 5000),
+                ).fetchone()
+                if (
+                    prev is not None
+                    and prev["used_fraction"] is not None
+                    and w.used_fraction > prev["used_fraction"]
+                    and (t - prev["observed_at"]) <= self._CALIBRATION_DURATIONS_MS[horizon]
+                ):
+                    tok = self.db.execute(
+                        "SELECT COALESCE(SUM(tokens_new), 0) AS t FROM jobs"
+                        " WHERE state != 'running' AND finished_at > ? AND finished_at <= ?",
+                        (prev["observed_at"], t),
+                    ).fetchone()["t"]
+                    if tok > 0:
+                        self.db.execute(
+                            "INSERT INTO calibration_samples"
+                            " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
+                            " VALUES (?,?,?,?,?)",
+                            (t, w.limit_id, w.resets_at, w.used_fraction - prev["used_fraction"], tok),
+                        )
             self.db.execute(
                 "INSERT INTO window_log (observed_at, limit_id, used_fraction,"
                 " status, resets_at, source_age_s) VALUES (?,?,?,?,?,?)",
                 (t, w.limit_id, w.used_fraction, w.status, w.resets_at, int(w.age_s)),
             )
         self.db.commit()
+
+    def estimate_capacity(
+        self, limit_id: str, min_delta: float = 0.02, sample_limit: int = 200
+    ) -> float | None:
+        """Empirical estimate of this window's total token capacity, from
+        accumulated calibration_samples -- tokens hunter itself spent
+        divided by how much used_fraction moved in that same gap.
+
+        Informational only (see calibration_samples in schema.sql): any
+        concurrent non-hunter account activity inflates the observed
+        used_fraction move without showing up in hunter_tokens, which can
+        only push a sample's implied capacity DOWN, never up -- so the
+        75th percentile across samples is a better estimate of the true
+        capacity than the median, which is dragged down by however many
+        samples happened to overlap other activity. min_delta discards
+        tiny deltas dominated by Anthropic's own ~1%-quantized reporting.
+        None if there isn't enough data yet to say anything.
+        """
+        rows = self.db.execute(
+            "SELECT used_fraction_delta, hunter_tokens FROM calibration_samples"
+            " WHERE limit_id = ? AND used_fraction_delta >= ?"
+            " ORDER BY observed_at DESC LIMIT ?",
+            (limit_id, min_delta, sample_limit),
+        ).fetchall()
+        ratios = sorted(float(r["hunter_tokens"]) / float(r["used_fraction_delta"]) for r in rows)
+        if not ratios:
+            return None
+        return ratios[min(int(len(ratios) * 0.75), len(ratios) - 1)]
 
     def update_finding_analysis(
         self,
