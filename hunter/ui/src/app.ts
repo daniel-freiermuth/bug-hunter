@@ -606,59 +606,77 @@ function renderWindows(windows: Record<string, WindowInfo>): void {
 
 function renderActivity(s: Summary): void {
   const cj = s.current_job;
+  const nc = s.next_candidate;
+  const ss = s.scheduler_state;
+  const rows: string[] = [];
+
+  // Primary status: what's happening RIGHT NOW, derived live from
+  // current_job/next_candidate -- never from scheduler_state.state, which
+  // only reflects whichever cycle last completed and can sit unchanged
+  // for the whole sleep interval while these live signals have already
+  // moved on. Showing that stale outcome with equal visual weight next
+  // to a pause icon is what read as "paused, but also allowed?" --
+  // it's two different points in time, not a contradiction.
   if (cj) {
     const label =
       cj.finding_id != null
         ? `#${cj.finding_id} ${esc(cj.finding_summary || cj.finding_fingerprint || "")}`
         : esc(cj.repo_name);
-    $("activity").innerHTML =
+    rows.push(
       `<div class="row"><b class="running">\u25b6 running</b> ${esc(cj.kind)}: ${label}` +
-      ` <span class="dim">(${dur(cj)}, job #${cj.id})</span></div>`;
-    return;
-  }
-  const rows: string[] = [];
-  const ss = s.scheduler_state;
-  if (ss) {
-    rows.push(
-      `<div class="row"><b class="${esc(ss.state)}">\u23f8 ${esc(ss.state)}</b> ${esc(ss.detail)}</div>`,
+        ` <span class="dim">(${dur(cj)}, job #${cj.id})</span></div>`,
     );
-    if (ss.next_wake_at) {
-      const nc0 = s.next_candidate;
-      // "next check" only means "the daemon loop wakes up again" -- with
-      // sync_prs running (nearly) every cycle to never delay noticing PR
-      // feedback, that wake is often just a cheap heartbeat, not a real
-      // chance to start a job while the budget gate is still shut. Once
-      // we already know (from the SAME pick_next/decide the real cycle
-      // will use) that it'll deny again, say so plainly instead of
-      // implying an imminent check that visually contradicts "budget
-      // available ~1h" a few lines below.
-      const heartbeatOnly =
-        nc0?.budget_state === "denied" &&
-        nc0.budget_retry_at != null &&
-        ss.next_wake_at < nc0.budget_retry_at;
-      const label = heartbeatOnly ? "next sync check" : "next check";
-      const note = heartbeatOnly ? " \u2014 budget still closed" : "";
-      rows.push(
-        `<div class="row dim">${label} ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})${note}</div>`,
-      );
-    }
-  } else {
-    rows.push('<div class="row dim">warming up \u2014 no cycle has run yet</div>');
-  }
-  const nc = s.next_candidate;
-  if (nc) {
+  } else if (ss?.state === "error") {
+    rows.push(`<div class="row"><b class="error">\u26a0 error</b> ${esc(ss.detail)}</div>`);
+  } else if (nc?.budget_state === "denied") {
     const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
-    const reason = nc.budget_state === "denied" ? ` (${esc(nc.budget_reason)})` : "";
     rows.push(
-      `<div class="row dim">next up: ${esc(nc.kind)} ${label}` +
-        ` \u00b7 budget: <span class="b-${esc(nc.budget_state)}">${esc(nc.budget_state)}</span>${reason}</div>`,
+      `<div class="row"><b class="paused">\u23f8 paused</b> next up: ${esc(nc.kind)} ${label}` +
+        ` \u00b7 budget: <span class="b-denied">denied</span> (${esc(nc.budget_reason)})</div>`,
     );
-    if (nc.budget_state === "denied" && nc.budget_retry_at) {
+    if (nc.budget_retry_at) {
       rows.push(
         `<div class="row dim">budget available ~${countdown(nc.budget_retry_at)} (${ts(nc.budget_retry_at)})</div>`,
       );
     }
+  } else if (nc) {
+    const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
+    rows.push(
+      `<div class="row"><b class="idle">\u25cf idle</b> next up: ${esc(nc.kind)} ${label}` +
+        ` \u00b7 budget: <span class="b-${esc(nc.budget_state)}">${esc(nc.budget_state)}</span></div>`,
+    );
+  } else if (ss) {
+    rows.push('<div class="row"><b class="idle">\u25cf idle</b> nothing to do</div>');
+  } else {
+    rows.push('<div class="row dim">warming up \u2014 no cycle has run yet</div>');
   }
+
+  // Next scheduler wake -- only meaningful while nothing is actively
+  // running (once dispatched, "next wake" doesn't apply until it ends).
+  if (!cj && ss?.next_wake_at) {
+    // "next check" only means "the daemon loop wakes up again" -- with
+    // sync_prs running (nearly) every cycle to never delay noticing PR
+    // feedback, that wake is often just a cheap heartbeat, not a real
+    // chance to start a job while the budget gate is still shut.
+    const heartbeatOnly =
+      nc?.budget_state === "denied" &&
+      nc.budget_retry_at != null &&
+      ss.next_wake_at < nc.budget_retry_at;
+    const label = heartbeatOnly ? "next sync check" : "next check";
+    const note = heartbeatOnly ? " \u2014 budget still closed" : "";
+    rows.push(
+      `<div class="row dim">${label} ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})${note}</div>`,
+    );
+  }
+
+  // Last log -- what the most recently COMPLETED cycle actually did.
+  // Occasionally interesting, but it's history, not current state --
+  // kept visually secondary (small, faint) and last, below everything
+  // that describes right now.
+  if (ss) {
+    rows.push(`<div class="row last-log">${esc(ss.detail)}</div>`);
+  }
+
   $("activity").innerHTML = rows.join("");
 }
 
