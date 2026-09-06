@@ -472,3 +472,72 @@ class TestPrState:
         # Stalest sync first
         assert attn[0]["id"] == fid2
         assert attn[1]["id"] == fid1
+
+
+# -- reconcile_orphaned_jobs -------------------------------------------------
+
+
+class TestReconcileOrphanedJobs:
+    """Regression: a daemon that dies mid-run_fix (crash, systemctl
+    restart, or an in-process exception run_cycle's catch-all swallowed)
+    must not leave a job stuck 'running' forever and its finding stuck
+    'fixing' forever -- 'fixing' is never scanned by the normal work
+    queue, so without reconciliation it vanishes indefinitely (observed
+    in production: a job sat 'running' for a month after an old crash)."""
+
+    def test_orphaned_fix_job_resets_finding_to_queued(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        fid, _ = store.upsert_finding(rid, _make_finding())
+        store.set_status(fid, "fixing")
+        jid = store.create_job("fix", rid, finding_id=fid, cap_tokens=150_000)
+        store.update_job(jid, state="running")
+
+        reconciled = store.reconcile_orphaned_jobs()
+
+        assert len(reconciled) == 1
+        assert reconciled[0]["id"] == jid
+        job = store.list_jobs()[0]
+        assert job["state"] == "killed"
+        assert job["killed_reason"] == "orphaned"
+        finding = store.get_finding(fid)
+        assert finding is not None
+        assert finding["status"] == "queued"
+
+    def test_orphaned_non_fix_job_does_not_touch_finding_status(self, store: Store) -> None:
+        """A stuck 'hunt' job has no finding-status side effect to fix --
+        only the job row itself needs cleaning up."""
+        rid = store.add_repo("r", "https://r", "/r")
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="running")
+
+        reconciled = store.reconcile_orphaned_jobs()
+
+        assert len(reconciled) == 1
+        job = store.list_jobs()[0]
+        assert job["state"] == "killed"
+
+    def test_finding_already_resolved_is_left_alone(self, store: Store) -> None:
+        """If the finding moved on (e.g. resolved via a later, separate
+        job) before the orphaned row was cleaned up, reconciliation must
+        not clobber its current status back to 'queued'."""
+        rid = store.add_repo("r", "https://r", "/r")
+        fid, _ = store.upsert_finding(rid, _make_finding())
+        jid = store.create_job("fix", rid, finding_id=fid, cap_tokens=150_000)
+        store.update_job(jid, state="running")
+        store.set_status(fid, "merged")  # resolved independently in the meantime
+
+        store.reconcile_orphaned_jobs()
+
+        finding = store.get_finding(fid)
+        assert finding is not None
+        assert finding["status"] == "merged"
+
+    def test_no_running_jobs_is_a_noop(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done")
+
+        reconciled = store.reconcile_orphaned_jobs()
+
+        assert reconciled == []
+        assert store.list_jobs()[0]["state"] == "done"

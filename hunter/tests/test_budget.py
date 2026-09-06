@@ -207,6 +207,42 @@ def test_no_5h_window_but_7d_over_deny():
 
 
 # ---------------------------------------------------------------------------
+# Expired-cycle 7d windows (e.g. a per-model-class window nobody has
+# probed since the config stopped using that model) must not gate on
+# ancient data from an already-completed week.
+# ---------------------------------------------------------------------------
+
+
+def test_expired_model_class_window_ignored():
+    """A :7d:<model> window whose resets_at is weeks in the past (model no
+    longer in use, never re-probed) must be excluded from gating -- its
+    used_fraction describes a bygone cycle, not now."""
+    stale_age = 26 * 86400.0  # ~26 days, matching the observed production case
+    windows = _healthy_windows(w5_elapsed_h=4.5)
+    windows["anthropic:7d:abandoned-model"] = _ws(
+        "anthropic:7d:abandoned-model",
+        used_fraction=0.99,  # would deny everything if it were honored
+        resets_at=_NOW_MS - int(3 * _WEEK_MS),
+        age_s=stale_age,
+    )
+    d = decide(_cfg(), "hunt", windows)
+    assert d.allow, d.reason
+
+
+def test_active_model_class_window_still_gates():
+    """A :7d:<model> window that IS current (resets_at in the future) must
+    still gate normally -- the fix only excludes expired cycles, not every
+    per-model-class window."""
+    resets_at = _NOW_MS + int(_WEEK_MS * 0.95)  # 5% elapsed
+    windows = _healthy_windows(w5_elapsed_h=4.5)
+    windows["anthropic:7d:active-model"] = _ws(
+        "anthropic:7d:active-model", used_fraction=0.30, resets_at=resets_at,
+    )
+    d = decide(_cfg(), "hunt", windows)
+    assert not d.allow
+    assert "7d" in d.reason
+
+# ---------------------------------------------------------------------------
 # Healthy → allow, correct cap
 # ---------------------------------------------------------------------------
 

@@ -447,6 +447,42 @@ class Store:
             )
         )
 
+    def reconcile_orphaned_jobs(self) -> list[Row]:
+        """Recover from a daemon crash/restart that happened mid-job.
+
+        A single daemon process owns the job lifecycle exclusively (the
+        systemd unit runs exactly one `hunter daemon`), so any job row
+        still marked 'running' when THIS process starts up cannot
+        actually be running -- the process that set it 'running' died
+        before it could record a terminal outcome. Mark those jobs
+        'killed' so they stop inflating _running_jobs_cap's inflight sum
+        forever, and for 'fix' jobs, reset the finding out of the
+        transient 'fixing' status back to 'queued' -- that status is
+        never scanned by the normal work queue, so without this it would
+        sit invisible and unretried indefinitely (observed in production:
+        finding #57's job sat 'running' for a month after an old crash).
+        Returns the reconciled job rows.
+        """
+        rows = _rows(
+            self.db.execute(
+                "SELECT * FROM jobs WHERE state = 'running'"
+            )
+        )
+        for r in rows:
+            self.update_job(
+                r["id"],
+                state="killed",
+                killed_reason="orphaned",
+                finished_at=now_ms(),
+                notes="reconciled at daemon startup -- prior process died mid-job",
+            )
+            fid = r.get("finding_id")
+            if r["kind"] == "fix" and fid is not None:
+                finding = self.get_finding(fid)
+                if finding is not None and finding["status"] == "fixing":
+                    self.set_status(fid, "queued")
+        return rows
+
     # -- events / window log -------------------------------------------
     def log_event(
         self,

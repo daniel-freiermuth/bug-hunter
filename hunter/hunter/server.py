@@ -30,6 +30,24 @@ _cycle_lock = threading.Lock()
 _wake = threading.Event()
 
 
+def _reconcile_and_log(store: Any) -> None:
+    """Recover jobs/findings orphaned by a previous process dying mid-job
+    (crash, systemctl restart, host reboot, or an in-process exception
+    run_cycle's own catch-all swallowed). Safe to call at the top of every
+    cycle attempt: _cycle_lock guarantees this daemon process is never
+    itself mid-run_cycle when this runs, so any 'running' row found here
+    cannot belong to still-live work."""
+    orphaned = store.reconcile_orphaned_jobs()
+    for r in orphaned:
+        store.log_event(
+            "error",
+            f"reconciled orphaned {r['kind']} job #{r['id']} "
+            f"(finding {r.get('finding_id')}) -- prior process died mid-job",
+            job_id=r["id"],
+            finding_id=r.get("finding_id"),
+        )
+
+
 class Handler(BaseHTTPRequestHandler):
     cfg: Config  # set by make_server()
     server_version = "hunter/1"
@@ -307,6 +325,7 @@ class Handler(BaseHTTPRequestHandler):
                 from .store import Store
 
                 store = Store(cfg)
+                _reconcile_and_log(store)
                 try:
                     scheduler.run_cycle(store, cfg)
                 except Exception:
@@ -565,6 +584,7 @@ def daemon(cfg: Config) -> None:
             _wake.clear()
             try:
                 store = Store(cfg)
+                _reconcile_and_log(store)
                 summary = scheduler.run_cycle(store, cfg)
                 if "error" in summary:
                     sleep_s = 5 * 60
