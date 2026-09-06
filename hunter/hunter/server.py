@@ -16,7 +16,7 @@ import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, TypedDict
 from urllib.parse import parse_qs, urlparse
 
 from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
@@ -251,16 +251,21 @@ class Handler(BaseHTTPRequestHandler):
                     "budget_retry_at": budget_retry_at,
                 }
 
+        scheduler_state = store.get_scheduler_state()
+        cycle_running = _cycle_lock.locked()
         return {
             "windows": windows,
             "counts": counts,
             "type_counts": dict(type_counts),
             "repos": store.list_repos(),
             "last_cycle": last_cycle,
-            "cycle_running": _cycle_lock.locked(),
+            "cycle_running": cycle_running,
             "current_job": current_job,
             "next_candidate": next_candidate,
-            "scheduler_state": store.get_scheduler_state(),
+            "scheduler_state": scheduler_state,
+            "activity_status": _activity_status(
+                current_job, cycle_running, next_candidate, scheduler_state
+            ),
         }
 
     def _repo_notes(self, qs: dict[str, list[str]]) -> None:
@@ -638,7 +643,14 @@ def _describe_cycle(summary: Row) -> tuple[str, str]:
     if summary.get("skipped"):
         return "idle", str(summary["skipped"])
     if summary.get("denied"):
-        return "denied", str(summary["denied"])
+        # Unlike the other branches, this has no "last:" qualifier by
+        # default -- reading naturally as "the state right now" next to
+        # the pause icon, when it's actually the outcome of whichever
+        # cycle last ran (this state can sit unchanged for the whole
+        # sleep interval while a fresh preview elsewhere on the page
+        # already shows something different, e.g. once the ramp has
+        # since caught up). Match the "last: ..." phrasing used below.
+        return "denied", f"last: {summary['denied']}"
     state = summary.get("state")
     kind = summary.get("kind")
     if state in ("done", "killed", "failed") and kind:
@@ -652,6 +664,121 @@ def _describe_cycle(summary: Row) -> tuple[str, str]:
             bits += f" {state}"
         return "idle", f"last: {bits}"
     return "idle", "cycle produced no actionable outcome"
+
+
+class _RunningStatus(TypedDict):
+    kind: Literal["running"]
+    job: Row
+
+
+class _WorkingStatus(TypedDict):
+    kind: Literal["working"]
+
+
+class _ErrorStatus(TypedDict):
+    kind: Literal["error"]
+    detail: str
+
+
+class _PausedStatus(TypedDict):
+    kind: Literal["paused"]
+    candidate: Row
+
+
+class _ReadyStatus(TypedDict):
+    kind: Literal["ready"]
+    candidate: Row
+
+
+class _IdleStatus(TypedDict):
+    kind: Literal["idle"]
+
+
+class _WarmingUpStatus(TypedDict):
+    kind: Literal["warming_up"]
+
+
+ActivityStatus = (
+    _RunningStatus
+    | _WorkingStatus
+    | _ErrorStatus
+    | _PausedStatus
+    | _ReadyStatus
+    | _IdleStatus
+    | _WarmingUpStatus
+)
+
+
+def _activity_status(
+    current_job: Row | None,
+    cycle_running: bool,
+    next_candidate: Row | None,
+    scheduler_state: Row | None,
+) -> ActivityStatus:
+    """The single, canonical answer to "what is hunter doing right now" --
+    every rendering surface (the Status page's activity panel AND the
+    manual-run button) must derive its text from this function's output
+    and nothing else, computed once, server-side, unit-tested.
+
+    Four real incidents in one session came from exactly the opposite
+    approach -- each rendering surface independently re-deriving "is
+    something happening" from a different subset of the live signals,
+    at a different point in time, with no single arbiter: (1) a stale
+    "denied" reason shown with no temporal marker, reading as current
+    state; (2) a race between _cycle_lock (held immediately) and a job
+    row only marked 'running' after real prep-work I/O, so the manual-
+    run button and the main panel briefly disagreed; (3) "idle" shown
+    for a candidate the budget had already approved; (4) the same
+    cycle_running-vs-independent-preview race recurring through the
+    new ready/paused states once (3) was fixed. Every fix converged on
+    the same lesson: stop computing "what's happening" more than once.
+    This function is that one computation, and it's covered by tests
+    the way the client-side version it replaced never was.
+
+    ActivityStatus is a discriminated union (Literal "kind" tag, one
+    TypedDict per variant carrying only the fields that variant actually
+    has -- no "job: None" on a status that was never running) rather
+    than one shape with always-present nullable fields: mypy checks each
+    return statement against its variant's exact shape, so "attach a job
+    to the paused variant" is a type error here, not just a convention.
+    The consuming switch in ui/src/app.ts has the equivalent TypeScript
+    discriminated union plus an exhaustiveness check, so adding a new
+    variant here without updating that switch is a compile error on
+    both ends -- the guarantee this whole function exists to provide.
+
+    Priority, highest first -- each check answers "do we know something
+    more current than the next one down":
+      1. current_job -> "running": we know exactly what's executing.
+      2. cycle_running -> "working": _cycle_lock is held (a real cycle
+         is picking/deciding/syncing) but no job exists yet -- any
+         next_candidate computed independently of that in-flight
+         decision is a hypothetical about to be superseded, not fact.
+      3. scheduler_state.state == "error" -> "error": worth surfacing
+         over a stale/independent candidate preview, but not over
+         actually-live current_job/cycle_running above.
+      4. next_candidate with budget_state == "denied" -> "paused".
+      5. next_candidate otherwise ("allowed" or "exempt") -> "ready":
+         nothing is blocking it, it just hasn't been picked up by the
+         daemon's wake timer yet -- never "idle", which reads as
+         nothing about to happen.
+      6. scheduler_state present, nothing above -> "idle": genuinely
+         nothing to do.
+      7. nothing at all -> "warming_up": no cycle has ever run.
+    """
+    if current_job is not None:
+        return {"kind": "running", "job": current_job}
+    if cycle_running:
+        return {"kind": "working"}
+    if scheduler_state is not None and scheduler_state.get("state") == "error":
+        return {"kind": "error", "detail": scheduler_state["detail"]}
+    if next_candidate is not None and next_candidate.get("budget_state") == "denied":
+        return {"kind": "paused", "candidate": next_candidate}
+    if next_candidate is not None:
+        return {"kind": "ready", "candidate": next_candidate}
+    if scheduler_state is not None:
+        return {"kind": "idle"}
+    return {"kind": "warming_up"}
+
 
 def _compute_sleep_s(store: Any, summary: Row) -> float:
     """How long the daemon loop should sleep after this cycle attempt --

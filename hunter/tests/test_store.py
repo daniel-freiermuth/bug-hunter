@@ -711,6 +711,24 @@ class TestCurrentJob:
         store.create_job("hunt", rid)  # queued, not running
         assert store.current_job() is None
 
+    def test_create_job_with_state_running_is_visible_immediately(
+        self, store: Store
+    ) -> None:
+        """Regression: run_* functions used to create a job at the
+        'queued' default, do real prep work (prompt building, git
+        operations), and only THEN call update_job(state="running").
+        During that gap, _cycle_lock was already held (the UI's "cycle
+        running" indicator) but current_job() found nothing, showing
+        stale last-cycle text at the same time as a "running" badge.
+        Passing state="running" to create_job closes the gap entirely --
+        no separate update_job call needed, and never a window."""
+        rid = store.add_repo("r", "https://r", "/r")
+        jid = store.create_job("hunt", rid, cap_tokens=200_000, state="running")
+        job = store.current_job()
+        assert job is not None
+        assert job["id"] == jid
+        assert job["state"] == "running"
+
     def test_returns_the_running_job_with_repo_and_finding_context(
         self, store: Store
     ) -> None:

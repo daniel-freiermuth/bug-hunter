@@ -113,6 +113,25 @@ interface SchedulerState {
   updated_at: number;
 }
 
+// The single, canonical answer to "what is hunter doing right now" --
+// computed once server-side (see hunter.server._activity_status, whose
+// docstring names the four incidents this replaced) so this panel and
+// the manual-run button can never independently disagree about it
+// again. A real discriminated union, mirroring the Python TypedDict
+// union exactly (one variant per kind, only the fields that kind
+// actually has -- no "job: null" on a variant that was never running):
+// renderActivity's switch below is checked exhaustively against this
+// by assertNever, so adding a kind here without a case there is a
+// compile error, not a silent gap.
+type ActivityStatus =
+  | { kind: "running"; job: CurrentJob }
+  | { kind: "working" }
+  | { kind: "error"; detail: string }
+  | { kind: "paused"; candidate: NextCandidate }
+  | { kind: "ready"; candidate: NextCandidate }
+  | { kind: "idle" }
+  | { kind: "warming_up" };
+
 interface Summary {
   windows: Record<string, WindowInfo>;
   counts: Record<string, number>;
@@ -123,6 +142,7 @@ interface Summary {
   current_job: CurrentJob | null;
   next_candidate: NextCandidate | null;
   scheduler_state: SchedulerState | null;
+  activity_status: ActivityStatus;
 }
 
 interface ApiResult<T> {
@@ -206,6 +226,16 @@ const ESC_MAP: Record<string, string> = {
 
 function esc(s: unknown): string {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ESC_MAP[c] ?? c);
+}
+
+// Exhaustiveness check for discriminated unions (the TS analog of
+// Rust's "match must cover every enum variant, or it's a compile
+// error") -- calling this with a value TypeScript hasn't already
+// narrowed to `never` is itself a compile error, so a switch that
+// forgets a case fails to build instead of silently falling through
+// at runtime.
+function assertNever(x: never): never {
+  throw new Error(`unreachable: unhandled variant ${JSON.stringify(x)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -605,60 +635,102 @@ function renderWindows(windows: Record<string, WindowInfo>): void {
 }
 
 function renderActivity(s: Summary): void {
-  const cj = s.current_job;
-  if (cj) {
-    const label =
-      cj.finding_id != null
-        ? `#${cj.finding_id} ${esc(cj.finding_summary || cj.finding_fingerprint || "")}`
-        : esc(cj.repo_name);
-    $("activity").innerHTML =
-      `<div class="row"><b class="running">\u25b6 running</b> ${esc(cj.kind)}: ${label}` +
-      ` <span class="dim">(${dur(cj)}, job #${cj.id})</span></div>`;
-    return;
-  }
-  const rows: string[] = [];
+  const a = s.activity_status;
   const ss = s.scheduler_state;
+  const rows: string[] = [];
+
+  // Every branch below renders a.kind, computed once server-side by
+  // hunter.server._activity_status and covered by its own test suite --
+  // this function does formatting only, never re-derives "what's
+  // happening" from current_job/next_candidate/cycle_running itself.
+  // See _activity_status's docstring for why that split matters.
+  switch (a.kind) {
+    case "running": {
+      const cj = a.job;
+      const label =
+        cj.finding_id != null
+          ? `#${cj.finding_id} ${esc(cj.finding_summary || cj.finding_fingerprint || "")}`
+          : esc(cj.repo_name);
+      rows.push(
+        `<div class="row"><b class="running">\u25b6 running</b> ${esc(cj.kind)}: ${label}` +
+          ` <span class="dim">(${dur(cj)}, job #${cj.id})</span></div>`,
+      );
+      break;
+    }
+    case "working":
+      rows.push(
+        '<div class="row"><b class="running">\u25b6 running</b> cycle in progress\u2026</div>',
+      );
+      break;
+    case "error":
+      rows.push(`<div class="row"><b class="error">\u26a0 error</b> ${esc(a.detail)}</div>`);
+      break;
+    case "paused": {
+      const nc = a.candidate;
+      const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
+      rows.push(
+        `<div class="row"><b class="paused">\u23f8 paused</b> next up: ${esc(nc.kind)} ${label}` +
+          ` \u00b7 budget: <span class="b-denied">denied</span> (${esc(nc.budget_reason)})</div>`,
+      );
+      if (nc.budget_retry_at) {
+        rows.push(
+          `<div class="row dim">budget available ~${countdown(nc.budget_retry_at)} (${ts(nc.budget_retry_at)})</div>`,
+        );
+      }
+      if (ss?.next_wake_at) {
+        // "next check" only means "the daemon loop wakes up again" --
+        // with sync_prs running nearly every cycle to never delay
+        // noticing PR feedback, that wake is often just a cheap
+        // heartbeat, not a real chance to start a job while the budget
+        // gate is still shut.
+        const heartbeatOnly = nc.budget_retry_at != null && ss.next_wake_at < nc.budget_retry_at;
+        const label2 = heartbeatOnly ? "next sync check" : "next check";
+        const note = heartbeatOnly ? " \u2014 budget still closed" : "";
+        rows.push(
+          `<div class="row dim">${label2} ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})${note}</div>`,
+        );
+      }
+      break;
+    }
+    case "ready": {
+      const nc = a.candidate;
+      const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
+      rows.push(
+        `<div class="row"><b class="ready">\u25b7 ready</b> next up: ${esc(nc.kind)} ${label}` +
+          ` \u00b7 budget: <span class="b-${esc(nc.budget_state)}">${esc(nc.budget_state)}</span></div>`,
+      );
+      if (ss?.next_wake_at) {
+        // No heartbeat-vs-real-check ambiguity here -- budget already
+        // allows it, so the next wake IS the start.
+        rows.push(
+          `<div class="row dim">starting ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})</div>`,
+        );
+      }
+      break;
+    }
+    case "idle":
+      rows.push('<div class="row"><b class="idle">\u25cf idle</b> nothing to do</div>');
+      if (ss?.next_wake_at) {
+        rows.push(
+          `<div class="row dim">next check ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})</div>`,
+        );
+      }
+      break;
+    case "warming_up":
+      rows.push('<div class="row dim">warming up \u2014 no cycle has run yet</div>');
+      break;
+    default:
+      assertNever(a);
+  }
+
+  // Last log -- what the most recently COMPLETED cycle actually did.
+  // Occasionally interesting, but it's history, not current state --
+  // kept visually secondary (small, faint) and last, below everything
+  // that describes right now.
   if (ss) {
-    rows.push(
-      `<div class="row"><b class="${esc(ss.state)}">\u23f8 ${esc(ss.state)}</b> ${esc(ss.detail)}</div>`,
-    );
-    if (ss.next_wake_at) {
-      const nc0 = s.next_candidate;
-      // "next check" only means "the daemon loop wakes up again" -- with
-      // sync_prs running (nearly) every cycle to never delay noticing PR
-      // feedback, that wake is often just a cheap heartbeat, not a real
-      // chance to start a job while the budget gate is still shut. Once
-      // we already know (from the SAME pick_next/decide the real cycle
-      // will use) that it'll deny again, say so plainly instead of
-      // implying an imminent check that visually contradicts "budget
-      // available ~1h" a few lines below.
-      const heartbeatOnly =
-        nc0?.budget_state === "denied" &&
-        nc0.budget_retry_at != null &&
-        ss.next_wake_at < nc0.budget_retry_at;
-      const label = heartbeatOnly ? "next sync check" : "next check";
-      const note = heartbeatOnly ? " \u2014 budget still closed" : "";
-      rows.push(
-        `<div class="row dim">${label} ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})${note}</div>`,
-      );
-    }
-  } else {
-    rows.push('<div class="row dim">warming up \u2014 no cycle has run yet</div>');
+    rows.push(`<div class="row last-log">${esc(ss.detail)}</div>`);
   }
-  const nc = s.next_candidate;
-  if (nc) {
-    const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
-    const reason = nc.budget_state === "denied" ? ` (${esc(nc.budget_reason)})` : "";
-    rows.push(
-      `<div class="row dim">next up: ${esc(nc.kind)} ${label}` +
-        ` \u00b7 budget: <span class="b-${esc(nc.budget_state)}">${esc(nc.budget_state)}</span>${reason}</div>`,
-    );
-    if (nc.budget_state === "denied" && nc.budget_retry_at) {
-      rows.push(
-        `<div class="row dim">budget available ~${countdown(nc.budget_retry_at)} (${ts(nc.budget_retry_at)})</div>`,
-      );
-    }
-  }
+
   $("activity").innerHTML = rows.join("");
 }
 

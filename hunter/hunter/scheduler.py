@@ -283,7 +283,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         store.log_event("deny", f"hunt {rname}: {dec.reason}", job_id=job)
         return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
-    job = store.create_job("hunt", rid, cap_tokens=dec.cap_tokens)
+    job = store.create_job("hunt", rid, cap_tokens=dec.cap_tokens, state="running")
     out_path = cfg.work_root / "out" / f"job{job}.findings.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prompt = build_hunt_prompt(
@@ -297,7 +297,6 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         store.repo_notes(rid),
     )
     pre_usage = _usage_snapshot(windows)
-    store.update_job(job, state="running")
     model = cfg.model_for("hunt")
     rr = runner.run_worker(
         cfg,
@@ -419,12 +418,11 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
         )
         return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
-    job = store.create_job("recheck", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens)
+    job = store.create_job("recheck", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens, state="running")
     out_path = cfg.work_root / "out" / f"recheck{fid}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prompt = build_recheck_prompt(finding, repo, out_path, store.repo_notes(repo["id"]))
     pre_usage = _usage_snapshot(windows)
-    store.update_job(job, state="running")
     model = cfg.model_for("hunt")
     rr = runner.run_worker(
         cfg,
@@ -553,7 +551,7 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
         store.log_event("deny", f"test_gap {rname}: {dec.reason}", job_id=job)
         return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
     
-    job = store.create_job("test_gap", rid, cap_tokens=dec.cap_tokens)
+    job = store.create_job("test_gap", rid, cap_tokens=dec.cap_tokens, state="running")
     out_path = cfg.work_root / "out" / f"job{job}.test_gaps.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -571,7 +569,6 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
     )
     
     pre_usage = _usage_snapshot(windows)
-    store.update_job(job, state="running")
     model = cfg.model_for("hunt")
     rr = runner.run_worker(
         cfg,
@@ -654,7 +651,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
         store.log_event("deny", f"dep_update {rname}: {dec.reason}", job_id=job)
         return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
     
-    job = store.create_job("dep_update", rid, cap_tokens=dec.cap_tokens)
+    job = store.create_job("dep_update", rid, cap_tokens=dec.cap_tokens, state="running")
     out_path = cfg.work_root / "out" / f"job{job}.dep_updates.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     suppressions = store.suppressions(rid, finding_type="dep_update")
@@ -671,7 +668,6 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
     )
     
     pre_usage = _usage_snapshot(windows)
-    store.update_job(job, state="running")
     model = cfg.model_for("hunt")
     rr = runner.run_worker(
         cfg,
@@ -754,7 +750,7 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
         store.log_event("deny", f"refactor {rname}: {dec.reason}", job_id=job)
         return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
     
-    job = store.create_job("refactor", rid, cap_tokens=dec.cap_tokens)
+    job = store.create_job("refactor", rid, cap_tokens=dec.cap_tokens, state="running")
     out_path = cfg.work_root / "out" / f"job{job}.refactorings.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -771,7 +767,6 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
     )
     
     pre_usage = _usage_snapshot(windows)
-    store.update_job(job, state="running")
     model = cfg.model_for("hunt")
     rr = runner.run_worker(
         cfg,
@@ -860,7 +855,7 @@ def run_modernize(store: Store, cfg: Config, repo: Row) -> Row:
         store.log_event("deny", f"modernize {rname}: {dec.reason}", job_id=job)
         return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
-    job = store.create_job("modernization", rid, cap_tokens=dec.cap_tokens)
+    job = store.create_job("modernization", rid, cap_tokens=dec.cap_tokens, state="running")
     out_path = cfg.work_root / "out" / f"job{job}.modernizations.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -878,7 +873,6 @@ def run_modernize(store: Store, cfg: Config, repo: Row) -> Row:
     )
 
     pre_usage = _usage_snapshot(windows)
-    store.update_job(job, state="running")
     model = cfg.model_for("hunt")
     rr = runner.run_worker(
         cfg,
@@ -1048,10 +1042,9 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         )
         return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
-    job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens)
+    job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens, state="running")
     pre_usage = _usage_snapshot(windows)
     with store.in_progress(fid, "fixing", fallback="queued"):
-        store.update_job(job, state="running")
         build_prompt = (
             build_fix_prompt
             if is_bug
@@ -1515,8 +1508,8 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
         repo["id"],
         finding_id=fid,
         cap_tokens=dec.cap_tokens,
+        state="running",
     )
-    store.update_job(job, state="running")
     prompt = build_engage_prompt(
         worktree,
         head_ref,
