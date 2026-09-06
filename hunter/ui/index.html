@@ -165,6 +165,24 @@
     border-radius: 3px; font: inherit; font-size: 12px; padding: 3px 8px;
   }
   #addRepo input[id=arUrl] { min-width: 240px; flex: 1; }
+
+  /* repo notes panel */
+  #repoNotesPanel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
+    padding: 10px 12px; margin-top: 12px;
+  }
+  #repoNotesPanel h3 { margin: 0 0 8px; font-size: 12px; color: var(--fg); }
+  #repoNotesPanel pre {
+    white-space: pre-wrap; background: var(--panel2); border: 1px solid var(--line);
+    border-radius: 3px; padding: 8px 10px; font-size: 11.5px; color: var(--fg);
+    max-height: 300px; overflow-y: auto; margin: 0 0 10px;
+  }
+  #rnpForm { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start; }
+  #rnpForm input, #rnpForm textarea {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 3px; font: inherit; font-size: 12px; padding: 4px 8px;
+  }
+  #rnpForm textarea { flex: 1; min-width: 260px; resize: vertical; }
 </style>
 </head>
 <body>
@@ -248,6 +266,19 @@
         <button onclick="addRepo()">Add Repo</button>
       </div>
       <div id="repos"></div>
+
+      <div id="repoNotesPanel" style="display:none">
+        <h3 id="rnpTitle"></h3>
+        <pre id="rnpContent"></pre>
+        <div id="rnpForm">
+          <input type="text" id="rnpCategory" placeholder="category (optional)">
+          <textarea id="rnpNote" rows="3" placeholder="note text"></textarea>
+          <div>
+            <button onclick="addRepoNote()">Add Note</button>
+            <button onclick="closeRepoNotes()">Close</button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section id="page-stats" class="page">

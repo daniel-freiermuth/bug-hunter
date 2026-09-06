@@ -438,6 +438,50 @@ async function removeRepo(id: number, name: string): Promise<void> {
   refresh();
 }
 
+let notesRepoId: number | null = null;
+
+async function openRepoNotes(id: number, name: string): Promise<void> {
+  const r = await api<{ notes: string; error?: string }>(`/api/repo/notes?id=${id}`);
+  if (r.status !== 200) {
+    alert("load notes failed: " + (r.body?.error || r.status));
+    return;
+  }
+  notesRepoId = id;
+  $("rnpTitle").textContent = `Notes \u2014 ${name}`;
+  $("rnpContent").textContent = r.body?.notes || "(no notes yet)";
+  $input("rnpCategory").value = "";
+  ($("rnpNote") as HTMLTextAreaElement).value = "";
+  $("repoNotesPanel").style.display = "block";
+  $("repoNotesPanel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+function closeRepoNotes(): void {
+  notesRepoId = null;
+  $("repoNotesPanel").style.display = "none";
+}
+
+async function addRepoNote(): Promise<void> {
+  if (notesRepoId == null) return;
+  const note = ($("rnpNote") as HTMLTextAreaElement).value.trim();
+  const category = $input("rnpCategory").value.trim() || undefined;
+  if (!note) {
+    alert("note text is required");
+    return;
+  }
+  const r = await api<{ notes: string; error?: string }>("/api/repo/notes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: notesRepoId, note, category }),
+  });
+  if (r.status !== 201) {
+    alert("add note failed: " + (r.body?.error || r.status));
+    return;
+  }
+  $("rnpContent").textContent = r.body?.notes || "";
+  $input("rnpCategory").value = "";
+  ($("rnpNote") as HTMLTextAreaElement).value = "";
+}
+
 // Expose to onclick handlers in rendered HTML
 Object.assign(window, {
   verdict,
@@ -449,6 +493,9 @@ Object.assign(window, {
   toggleRepo,
   addRepo,
   removeRepo,
+  openRepoNotes,
+  closeRepoNotes,
+  addRepoNote,
 });
 
 // ---------------------------------------------------------------------------
@@ -601,6 +648,7 @@ function renderRepos(repos: Repo[]): void {
       <span class="url"><a href="${esc(r.url)}" target="_blank">${esc(r.url)}</a></span>
       <span class="meta">${esc(r.forge)} \u00b7 ${esc(r.default_branch)}${r.last_hunt_at ? " \u00b7 hunted " + ts(r.last_hunt_at) : ""}</span>
       <button class="${r.enabled ? "uq" : "q"}" onclick="toggleRepo(${r.id},${r.enabled ? "false" : "true"})">${r.enabled ? "Pause" : "Resume"}</button>
+      <button class="rc" data-name="${esc(r.name)}" onclick="openRepoNotes(${r.id},this.dataset.name)">Notes</button>
       <button class="r" data-name="${esc(r.name)}" onclick="removeRepo(${r.id},this.dataset.name)">Remove</button>
     </div>`,
     )
