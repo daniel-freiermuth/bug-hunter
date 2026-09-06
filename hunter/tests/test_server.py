@@ -35,9 +35,12 @@ class TestDescribeCycle:
         assert "not queued" in detail
 
     def test_denied(self) -> None:
+        """"last:" makes clear this describes the last completed cycle,
+        not the current instant -- it can sit unchanged for the whole
+        sleep interval while a fresh preview elsewhere already differs."""
         state, detail = _describe_cycle({"denied": "5h window exhausted", "job": 3})
         assert state == "denied"
-        assert detail == "5h window exhausted"
+        assert detail == "last: 5h window exhausted"
 
     def test_finding_outcome(self) -> None:
         state, detail = _describe_cycle(

@@ -462,11 +462,23 @@ class Store:
         repo_id: int,
         finding_id: int | None = None,
         cap_tokens: int | None = None,
+        state: str = "queued",
     ) -> int:
+        """'queued' is a transient default a caller immediately overwrites
+        (via update_job) with the real outcome -- nothing ever reads a job
+        row while it's actually 'queued'. Pass state="running" directly
+        for jobs that are about to run: current_job() (the Status page's
+        "what's happening" panel) filters on state='running', and leaving
+        a row at the 'queued' default during the real prep work between
+        create_job and the old separate update_job(state="running") call
+        (prompt building, git operations, worktree setup) opened a real
+        window where _cycle_lock was already held (the UI's "cycle
+        running" indicator) but current_job() found nothing yet, showing
+        stale last-cycle text instead."""
         cur = self.db.execute(
             "INSERT INTO jobs (kind, repo_id, finding_id, cap_tokens, state, started_at)"
-            " VALUES (?,?,?,?, 'queued', ?)",
-            (kind, repo_id, finding_id, cap_tokens, now_ms()),
+            " VALUES (?,?,?,?,?,?)",
+            (kind, repo_id, finding_id, cap_tokens, state, now_ms()),
         )
         self.db.commit()
         assert cur.lastrowid is not None

@@ -638,7 +638,14 @@ def _describe_cycle(summary: Row) -> tuple[str, str]:
     if summary.get("skipped"):
         return "idle", str(summary["skipped"])
     if summary.get("denied"):
-        return "denied", str(summary["denied"])
+        # Unlike the other branches, this has no "last:" qualifier by
+        # default -- reading naturally as "the state right now" next to
+        # the pause icon, when it's actually the outcome of whichever
+        # cycle last ran (this state can sit unchanged for the whole
+        # sleep interval while a fresh preview elsewhere on the page
+        # already shows something different, e.g. once the ramp has
+        # since caught up). Match the "last: ..." phrasing used below.
+        return "denied", f"last: {summary['denied']}"
     state = summary.get("state")
     kind = summary.get("kind")
     if state in ("done", "killed", "failed") and kind:
