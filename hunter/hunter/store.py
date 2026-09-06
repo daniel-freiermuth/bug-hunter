@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
-from typing import Any, Iterator
+from typing import Any, Iterator, TypeVar, cast
 
 from .types import (
     ACTIVE_STATUSES,
@@ -13,7 +13,9 @@ from .types import (
     SCHEMA_PATH,
     SUPPRESSED_STATUSES,
     Config,
+    JobDict,
     Row,
+    SchedulerStateDict,
     Severity,
     WindowState,
     now_ms,
@@ -65,6 +67,28 @@ _FINDING_KEYS = (
 
 def _rows(cur: sqlite3.Cursor) -> list[Row]:
     return [dict(r) for r in cur.fetchall()]
+
+
+_T = TypeVar("_T")
+
+
+def _require_keys(row: Row, *required: str, shape: type[_T]) -> _T:
+    """Verify a raw SQLite row has every key a TypedDict declares before
+    asserting that type onto it. This is the one runtime check standing
+    between "the SQL query's actual columns" (a fact only the database
+    knows) and "the Python type system's belief about that shape" (a
+    fact only the TypedDict declares) -- the seam neither mypy nor any
+    static checker can verify on its own, since a query's result shape
+    isn't visible to the type checker. A schema/query drift now fails
+    loudly, here, with the exact missing key and what was actually
+    present, on the very first call that hits it -- not as a KeyError
+    deep inside unrelated code far from the real defect.
+    """
+    missing = [k for k in required if k not in row]
+    if missing:
+        msg = f"row missing required keys {missing} for {shape.__name__}: got {sorted(row)}"
+        raise ValueError(msg)
+    return cast(_T, row)
 
 
 class Store:
@@ -503,7 +527,7 @@ class Store:
             )
         )
 
-    def current_job(self) -> Row | None:
+    def current_job(self) -> JobDict | None:
         """The job currently in flight, if any -- at most one, given
         _cycle_lock serializes the daemon loop and POST /api/cycle."""
         r = self.db.execute(
@@ -519,7 +543,13 @@ class Store:
             if f is not None:
                 row["finding_summary"] = f.get("summary")
                 row["finding_fingerprint"] = f.get("fingerprint")
-        return row
+        return _require_keys(
+            row,
+            "id", "kind", "repo_id", "repo_name", "finding_id", "state", "pid",
+            "session_file", "cap_tokens", "tokens_new", "calls", "exit_code",
+            "killed_reason", "notes", "started_at", "finished_at", "model", "usage_delta",
+            shape=JobDict,
+        )
 
     def set_scheduler_state(self, state: str, detail: str, next_wake_at: int | None) -> None:
         """Persist the daemon loop's own read of "what am I doing and
@@ -534,9 +564,13 @@ class Store:
         )
         self.db.commit()
 
-    def get_scheduler_state(self) -> Row | None:
+    def get_scheduler_state(self) -> SchedulerStateDict | None:
         r = self.db.execute("SELECT * FROM scheduler_state WHERE id = 1").fetchone()
-        return dict(r) if r else None
+        if r is None:
+            return None
+        return _require_keys(
+            dict(r), "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
+        )
 
     def reconcile_orphaned_jobs(self) -> dict[str, list[Row]]:
         """Last-resort net for total process death (crash, systemctl

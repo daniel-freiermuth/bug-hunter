@@ -19,7 +19,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar, Literal, TypedDict
 from urllib.parse import parse_qs, urlparse
 
-from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
+from .types import (
+    FINDING_STATUSES,
+    REASON_REQUIRED,
+    UI_DIR,
+    VERDICT_STATUSES,
+    Config,
+    JobDict,
+    Row,
+    SchedulerStateDict,
+)
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +184,7 @@ class Handler(BaseHTTPRequestHandler):
 
         store = self._store()
         now_ms = time.time() * 1000
-        windows: Row = {}
+        windows: dict[str, WindowInfoDict] = {}
         for limit_id, w in budget.read_windows().items():
             if ":5h" in limit_id:
                 ramp = budget.ramp_5h(w.resets_at, now_ms)
@@ -213,7 +222,7 @@ class Handler(BaseHTTPRequestHandler):
         # functions the scheduler itself uses (pick_next, budget.decide),
         # never a separate guess that could drift from reality.
         current_job = store.current_job()
-        next_candidate: Row | None = None
+        next_candidate: NextCandidateDict | None = None
         if current_job is None:
             try:
                 picked = scheduler.pick_next(store, self.cfg)
@@ -666,9 +675,34 @@ def _describe_cycle(summary: Row) -> tuple[str, str]:
     return "idle", "cycle produced no actionable outcome"
 
 
+class NextCandidateDict(TypedDict):
+    """What pick_next()/budget.decide() would do right now, if run --
+    the "what's next" preview built fresh in _summary(), never a raw DB
+    row (no SQL boundary here, so no runtime check needed: mypy alone
+    is sufficient since the construction code below is fully typed)."""
+
+    kind: str
+    id: int
+    label: str | None
+    is_finding: bool
+    budget_state: str
+    budget_reason: str
+    budget_retry_at: float | None
+
+
+class WindowInfoDict(TypedDict):
+    used_fraction: float | None
+    status: str | None
+    resets_at: int | None
+    age_s: float
+    stale: bool
+    ramp: float | None
+    available_tokens: float | None
+
+
 class _RunningStatus(TypedDict):
     kind: Literal["running"]
-    job: Row
+    job: JobDict
 
 
 class _WorkingStatus(TypedDict):
@@ -682,12 +716,12 @@ class _ErrorStatus(TypedDict):
 
 class _PausedStatus(TypedDict):
     kind: Literal["paused"]
-    candidate: Row
+    candidate: NextCandidateDict
 
 
 class _ReadyStatus(TypedDict):
     kind: Literal["ready"]
-    candidate: Row
+    candidate: NextCandidateDict
 
 
 class _IdleStatus(TypedDict):
@@ -710,10 +744,10 @@ ActivityStatus = (
 
 
 def _activity_status(
-    current_job: Row | None,
+    current_job: JobDict | None,
     cycle_running: bool,
-    next_candidate: Row | None,
-    scheduler_state: Row | None,
+    next_candidate: NextCandidateDict | None,
+    scheduler_state: SchedulerStateDict | None,
 ) -> ActivityStatus:
     """The single, canonical answer to "what is hunter doing right now" --
     every rendering surface (the Status page's activity panel AND the
