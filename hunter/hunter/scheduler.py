@@ -1159,6 +1159,26 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
                             job_id=job,
                             finding_id=fid,
                         )
+                        # Deferred work the worker flagged in apply_improvement.md's
+                        # step 5 (e.g. "migration deferred, safe for now") would
+                        # otherwise live only as prose in a PR that closes out and
+                        # stops being watched the moment it merges -- ingest it as
+                        # a real, triage-able finding instead. Read before
+                        # _drop_worktree below removes the file.
+                        followups_path = worktree / "FOLLOW-UPS.json"
+                        if followups_path.exists():
+                            counts = ingest_findings(
+                                store, repo["id"], followups_path, finding_type="modernization"
+                            )
+                            if counts["inserted"]:
+                                store.log_event(
+                                    "modernization",
+                                    f"#{fid}: +{counts['inserted']} follow-up(s) filed from"
+                                    f" deferred work ({counts['duplicates']} dup"
+                                    f" / {counts['invalid']} invalid)",
+                                    job_id=job,
+                                    finding_id=fid,
+                                )
                         _drop_worktree(delete_branch=False)
                         summary.update(outcome="pr_open", pr_url=pr_url_or_err)
                         if override == "once":

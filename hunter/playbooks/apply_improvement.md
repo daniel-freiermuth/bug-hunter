@@ -98,6 +98,16 @@ All green, or the improvement does not ship.
 COMMIT AFTER EVERY STEP with descriptive messages. You may be killed at any
 moment — committed work survives, uncommitted work dies.
 
+## 5. Flag anything you deferred
+
+If applying this improvement means NOT doing something else that's now clearly
+worth doing (e.g. a dep upgrade lands but a bigger DSL/API migration it enables
+is deliberately left for later, a flag is left off pending a follow-up, a
+patch is dropped but its underlying issue still needs a real fix upstream) —
+do NOT just mention this in PR-DESCRIPTION.md prose. A merged PR closes out
+and stops being watched; a note buried in its body is never read again. File
+it as a real, queryable follow-up instead: see FOLLOW-UPS.json below.
+
 # Deliverables
 
 - **Commits on {{BRANCH}}** (upgrade/test/refactor commits)
@@ -107,6 +117,27 @@ moment — committed work survives, uncommitted work dies.
   - What changed (version bump + patch rebase, new test cases, simplified code)
   - Verification performed with observed results
   - What you deliberately did NOT change
+- **FOLLOW-UPS.json** at the worktree root, NOT COMMITTED, OPTIONAL — only if
+  step 5 identified real deferred work. A JSON array; the scheduler ingests
+  it into the finding queue (as `type: "modernization"`) right after the PR
+  ships, so it becomes a normal, triage-able finding instead of prose no one
+  re-reads. Empty array or omit the file entirely if there is nothing to flag
+  — do NOT file speculative or trivial items just to produce output. Each
+  entry:
+  ```json
+  {
+    "fingerprint": "{{REPO_NAME}}:area:short-slug",
+    "file": "path/file.ext or directory/area",
+    "modernization_class": "deferred-followup",
+    "current_approach": "what this PR left in place, concretely",
+    "proposed_approach": "what the follow-up should do instead, concretely",
+    "severity": "high|medium|low",
+    "confidence": 0.0,
+    "summary": "one sentence",
+    "detail": "why this was deferred now, what the follow-up entails, scope/risk",
+    "introduced_by": "deferred while applying <this finding's type and fingerprint, from the JSON above>"
+  }
+  ```
 
 OR if not actionable:
 
