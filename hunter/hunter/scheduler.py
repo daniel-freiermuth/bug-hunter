@@ -1198,6 +1198,18 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
     rpath: str = repo["path"]
     num: int = ps["pr_number"]
     head_ref: str = ps["head_ref"]
+    if head_ref == repo["default_branch"]:
+        # Structurally shouldn't happen (a PR's head can't be its own base
+        # in the same repo) but costs nothing to refuse outright: engage
+        # pushes are allowed to rewrite the PR branch freely (that's the
+        # point -- squash/cleanup before merge), the one thing that must
+        # never happen is a rewriting push landing on the default branch.
+        store.log_event(
+            "error",
+            f"engage #{fid}: refusing -- head_ref equals default branch {head_ref!r}",
+            finding_id=fid,
+        )
+        return {"error": "head_ref equals default branch"}
 
     worktree = cfg.work_root / "wt" / f"e{fid}"
     worktree.parent.mkdir(parents=True, exist_ok=True)

@@ -3,6 +3,13 @@ the worktree at {{WORKTREE}} (repo {{REPO_NAME}}, branch {{BRANCH}} — already
 checked out for you). Work only inside this worktree. NEVER push. NEVER run
 project-wide formatters.
 
+# Branch history
+{{BRANCH}} is your own PR branch — rebase it, squash it, force-push it,
+`commit --amend` it, whatever keeps the history clean before it lands on
+{{DEFAULT_BRANCH}}. If a reviewer asks for a rebase or a tidier commit
+log, just do it. The one hard line: never push to, merge into, or
+otherwise touch {{DEFAULT_BRANCH}} itself — only ever push {{BRANCH}}.
+
 # Repository Context
 {{REPO_NOTES}}
 
@@ -31,9 +38,9 @@ Title: {{PR_TITLE}}
    COMMIT PER STEP (you may be killed at any moment; committed work
    survives). If a suggestion is wrong, do not implement it — decline it in
    PR-REPLY.md with a technical argument.
-3. Merge conflict -> `git merge origin/{{DEFAULT_BRANCH}}` into {{BRANCH}}
-   and resolve. A plain merge commit is fine. NEVER rewrite published
-   history (no rebase of pushed commits, no force-push semantics).
+3. Merge conflict -> bring {{BRANCH}} up to date with
+   `origin/{{DEFAULT_BRANCH}}` (merge or rebase, your choice — a rebase
+   is fine here too) and resolve.
 4. Failing checks -> reproduce locally where possible, fix minimally,
    commit. If the failure is unrelated flake, say so in PR-REPLY.md instead.
 
