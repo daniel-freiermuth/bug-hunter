@@ -1,11 +1,13 @@
-"""Tests for hunter.budget.decide()."""
+"""Tests for hunter.budget.decide() and hunter.budget.read_windows()."""
 
 from __future__ import annotations
 
+import sqlite3
 import time
 from pathlib import Path
 
-from hunter.budget import decide
+import hunter.budget as budget_module
+from hunter.budget import decide, read_windows
 from hunter.types import Config, WindowState
 
 # ---------------------------------------------------------------------------
@@ -265,3 +267,70 @@ def test_kind_selects_base_cap():
     df = decide(cfg, "fix", _healthy_windows())
     assert dh.cap_tokens == 300_000
     assert df.cap_tokens == 100_000
+
+
+# ---------------------------------------------------------------------------
+# read_windows(): expired-cycle windows must not even be surfaced
+# ---------------------------------------------------------------------------
+
+
+def _make_agent_db(path: Path, rows: list[tuple[str, float, str, int, int]]) -> None:
+    """rows: (limit_id, used_fraction, status, resets_at, recorded_at)."""
+    db = sqlite3.connect(path)
+    db.execute(
+        """CREATE TABLE usage_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recorded_at INTEGER NOT NULL,
+            provider TEXT NOT NULL,
+            account_key TEXT NOT NULL,
+            limit_id TEXT NOT NULL,
+            label TEXT NOT NULL,
+            used_fraction REAL,
+            status TEXT,
+            resets_at INTEGER
+        )"""
+    )
+    for limit_id, used_fraction, status, resets_at, recorded_at in rows:
+        db.execute(
+            "INSERT INTO usage_history"
+            " (recorded_at, provider, account_key, limit_id, label, used_fraction, status, resets_at)"
+            " VALUES (?, 'anthropic', 'acct', ?, ?, ?, ?, ?)",
+            (recorded_at, limit_id, limit_id, used_fraction, status, resets_at),
+        )
+    db.commit()
+    db.close()
+
+
+def test_read_windows_drops_expired_cycle_window(tmp_path, monkeypatch):
+    """A window whose resets_at has already passed (e.g. anthropic:7d:fable,
+    abandoned since hunter's config stopped routing to that model class)
+    must not be surfaced at all -- not to decide(), not to the UI."""
+    db_path = tmp_path / "agent.db"
+    now = int(time.time() * 1000)
+    _make_agent_db(
+        db_path,
+        [
+            ("anthropic:7d", 0.3, "ok", now + _WEEK_MS // 2, now - 60_000),
+            ("anthropic:7d:fable", 0.56, "ok", now - 26 * 86400_000, now - 26 * 86400_000),
+        ],
+    )
+    monkeypatch.setattr(budget_module, "OMP_AGENT_DB", db_path)
+
+    windows = read_windows()
+
+    assert set(windows) == {"anthropic:7d"}
+
+
+def test_read_windows_keeps_active_window(tmp_path, monkeypatch):
+    db_path = tmp_path / "agent.db"
+    now = int(time.time() * 1000)
+    _make_agent_db(
+        db_path,
+        [("anthropic:7d", 0.3, "ok", now + _WEEK_MS // 2, now - 60_000)],
+    )
+    monkeypatch.setattr(budget_module, "OMP_AGENT_DB", db_path)
+
+    windows = read_windows()
+
+    assert set(windows) == {"anthropic:7d"}
+    assert windows["anthropic:7d"].used_fraction == 0.3
