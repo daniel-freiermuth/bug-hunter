@@ -213,11 +213,15 @@ class Handler(BaseHTTPRequestHandler):
                     budget_state, budget_reason, budget_retry_at = "exempt", f"override: {override}", None
                 else:
                     raw_windows = budget.read_windows()
+                    repo_id = target["repo_id"] if is_finding else target["id"]
                     dec = budget.decide(
                         cfg=self.cfg,
                         kind=budget_kind,
                         windows=raw_windows,
-                        unaccounted_tokens=scheduler._unaccounted_tokens(store, raw_windows),  # noqa: SLF001
+                        unaccounted_tokens=(
+                            scheduler._unaccounted_tokens(store, raw_windows)  # noqa: SLF001
+                            + scheduler._anticipated_tokens(store, repo_id, kind)  # noqa: SLF001
+                        ),
                     )
                     budget_state = "allowed" if dec.allow else "denied"
                     budget_reason = dec.reason

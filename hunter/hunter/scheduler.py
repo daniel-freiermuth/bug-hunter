@@ -56,6 +56,48 @@ def _unaccounted_tokens(store: Store, windows: dict[str, WindowState]) -> int:
     return running + finished_since_probe
 
 
+_CACHE_TTL_MS = 3600 * 1000  # Anthropic's observed ephemeral-cache lifetime
+
+
+def _anticipated_tokens(store: Store, repo_id: int, kind: str) -> int:
+    """Realistic anticipated cost of the job about to be decided on -- not
+    its nominal cap_tokens. A cold prompt-cache first call for a given
+    (repo, kind) pair can cost 2-5x cap_tokens in one atomic LLM call the
+    runner's watchdog cannot interrupt mid-flight (see runner.py): sizing
+    the pre-start reservation on cap_tokens systematically under-estimates
+    exactly the jobs most likely to blow through it (observed in
+    production: dep_update/refactor jobs cold-starting at 2-4x their
+    200k cap while the scheduler's own accounting still assumed 200k).
+
+    If this exact (repo, kind) pair has finished within the last hour
+    (Anthropic's observed cache TTL), its prompt cache is probably still
+    warm -- anticipate this kind's historical median cost. Otherwise
+    anticipate its historical p90: a cold cache-write is likely, and a
+    handful of jobs having been merely cheap doesn't mean this one will be.
+    No history for this kind yet -> nothing to anticipate beyond whatever
+    cap_tokens/inflight accounting already covers.
+    """
+    warm = (
+        store.db.execute(
+            "SELECT 1 FROM jobs WHERE repo_id = ? AND kind = ? AND finished_at > ? LIMIT 1",
+            (repo_id, kind, now_ms() - _CACHE_TTL_MS),
+        ).fetchone()
+        is not None
+    )
+    history = [
+        r["tokens_new"]
+        for r in store.db.execute(
+            "SELECT tokens_new FROM jobs WHERE kind = ? AND tokens_new IS NOT NULL"
+            " ORDER BY tokens_new",
+            (kind,),
+        ).fetchall()
+    ]
+    if not history:
+        return 0
+    idx = min(int(len(history) * (0.5 if warm else 0.9)), len(history) - 1)
+    return history[idx]
+
+
 def _job_state(rr: RunResult) -> str:
     if rr.killed_reason:
         return "killed"
@@ -232,7 +274,9 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         scope_note = f"First hunt for this repo: {scope} (base {base[:12]})."
 
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "hunt", windows, _unaccounted_tokens(store, windows))
+    dec = budget.decide(
+        cfg, "hunt", windows, _unaccounted_tokens(store, windows) + _anticipated_tokens(store, rid, "hunt")
+    )
     if not dec.allow:
         job = store.create_job("hunt", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -358,7 +402,12 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
     if override:
         dec = BudgetDecision(True, f"override:{override}", cfg.hunt_cap_tokens)
     else:
-        dec = budget.decide(cfg, "hunt", windows, _unaccounted_tokens(store, windows))
+        dec = budget.decide(
+            cfg,
+            "hunt",
+            windows,
+            _unaccounted_tokens(store, windows) + _anticipated_tokens(store, repo["id"], "recheck"),
+        )
     if not dec.allow:
         job = store.create_job("recheck", repo["id"], finding_id=fid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -495,7 +544,9 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
     
     # Budget check
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "hunt", windows, _unaccounted_tokens(store, windows))  # Use hunt budget for now
+    dec = budget.decide(
+        cfg, "hunt", windows, _unaccounted_tokens(store, windows) + _anticipated_tokens(store, rid, "test_gap")
+    )  # Use hunt budget for now
     if not dec.allow:
         job = store.create_job("test_gap", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -594,7 +645,9 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
     
     # Budget check
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "hunt", windows, _unaccounted_tokens(store, windows))
+    dec = budget.decide(
+        cfg, "hunt", windows, _unaccounted_tokens(store, windows) + _anticipated_tokens(store, rid, "dep_update")
+    )
     if not dec.allow:
         job = store.create_job("dep_update", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -692,7 +745,9 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
     
     # Budget check
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "hunt", windows, _unaccounted_tokens(store, windows))
+    dec = budget.decide(
+        cfg, "hunt", windows, _unaccounted_tokens(store, windows) + _anticipated_tokens(store, rid, "refactor")
+    )
     if not dec.allow:
         job = store.create_job("refactor", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -793,7 +848,12 @@ def run_modernize(store: Store, cfg: Config, repo: Row) -> Row:
 
     # Budget check
     windows = budget.read_windows()
-    dec = budget.decide(cfg, "hunt", windows, _unaccounted_tokens(store, windows))
+    dec = budget.decide(
+        cfg,
+        "hunt",
+        windows,
+        _unaccounted_tokens(store, windows) + _anticipated_tokens(store, rid, "modernization"),
+    )
     if not dec.allow:
         job = store.create_job("modernization", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
@@ -973,7 +1033,9 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         base = cfg.fix_cap_tokens
         dec = BudgetDecision(True, f"override:{override}", base)
     else:
-        dec = budget.decide(cfg, "fix", windows, _unaccounted_tokens(store, windows))
+        dec = budget.decide(
+            cfg, "fix", windows, _unaccounted_tokens(store, windows) + _anticipated_tokens(store, repo["id"], "fix")
+        )
     if not dec.allow:
         _drop_worktree(delete_branch=True)
         job = store.create_job("fix", repo["id"], finding_id=fid)
@@ -1420,7 +1482,12 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
     if override:
         dec = BudgetDecision(True, f"override:{override}", cfg.fix_cap_tokens)
     else:
-        dec = budget.decide(cfg, "fix", windows, _unaccounted_tokens(store, windows))
+        dec = budget.decide(
+            cfg,
+            "fix",
+            windows,
+            _unaccounted_tokens(store, windows) + _anticipated_tokens(store, repo["id"], "engage"),
+        )
     if not dec.allow:
         _drop_worktree()
         job = store.create_job("engage", repo["id"], finding_id=fid)
