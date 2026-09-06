@@ -1,10 +1,12 @@
-"""Deferred-work follow-ups: apply_improvement.md workers can defer a bigger
-migration (e.g. "dep upgraded but the DSL migration it enables is left for
-later") -- that used to live only as prose in a PR that closes out and stops
-being watched the moment it merges. run_fix now ingests an optional
-FOLLOW-UPS.json the worker writes alongside PR-DESCRIPTION.md into the finding
-queue (as type="modernization") right after a successful ship, so deferred
-work becomes a normal, triage-able finding instead of a note no one re-reads.
+"""Deferred-work follow-ups: a worker (apply_improvement.md's fix path, or
+engage.md's withdraw path) can discover real follow-up work -- "dep upgraded
+but the DSL migration it enables is left for later", or "the PR I'm closing
+is superseded, but that also means the original target is now MORE
+achievable, not less" -- that used to live only as prose in a PR/comment
+that stops being watched the moment it merges or closes. Both run_fix (on
+ship) and run_engage (on withdraw) now ingest an optional FOLLOW-UPS.json
+the worker writes into the finding queue, so deferred/reopened work becomes
+a normal, triage-able finding instead of a note no one re-reads.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from typing import Any
 import pytest
 
 from hunter import scheduler
-from hunter.scheduler import run_fix
+from hunter.scheduler import run_engage, run_fix
 from hunter.store import Store
 from hunter.types import Config, RunResult
 
@@ -126,6 +128,7 @@ class TestFollowUpIngestion:
         finding = _setup(store, tmp_path)
         followups = [
             {
+                "type": "modernization",
                 "fingerprint": "repo:android-dsl:new-dsl-migration",
                 "file": "build.gradle.kts",
                 "modernization_class": "deferred-followup",
@@ -185,3 +188,166 @@ class TestFollowUpIngestion:
         assert after["status"] == "pr_open"
         all_findings = store.list_all_findings()
         assert all(f["type"] != "modernization" for f in all_findings)
+
+
+def _make_repo_with_published_branch(tmp_path: Path) -> tuple[Path, Path]:
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _run("git", "init", "-b", "main", cwd=seed)
+    _run("git", "config", "user.email", "t@t.com", cwd=seed)
+    _run("git", "config", "user.name", "t", cwd=seed)
+    (seed / "build.gradle.kts").write_text("android {}\n")
+    _run("git", "add", ".", cwd=seed)
+    _run("git", "commit", "-m", "init", cwd=seed)
+    _run("git", "checkout", "-b", "feature", cwd=seed)
+    (seed / "build.gradle.kts").write_text("hilt = '2.55'\n")
+    _run("git", "add", ".", cwd=seed)
+    _run("git", "commit", "-m", "deps: bump hilt to 2.55", cwd=seed)
+    _run("git", "checkout", "main", cwd=seed)
+
+    upstream_path = tmp_path / "upstream.git"
+    _run("git", "clone", "--bare", str(seed), str(upstream_path), cwd=tmp_path)
+    repo_path = tmp_path / "repo"
+    _run("git", "clone", str(upstream_path), str(repo_path), cwd=tmp_path)
+    _run("git", "config", "user.email", "t@t.com", cwd=repo_path)
+    _run("git", "config", "user.name", "t", cwd=repo_path)
+    return upstream_path, repo_path
+
+
+class _EngageFakeForge:
+    def __init__(self) -> None:
+        self.closed: list[tuple[int, str]] = []
+
+    def owner_repo(self, url: str) -> str:
+        return "owner/repo"
+
+    def ssh_url(self, https_url: str) -> str:
+        return https_url
+
+    def view_pr_engage(self, slug: str, number: int, timeout: int = 30) -> Any:
+        return 0, {"title": "deps: upgrade hilt to 2.55", "body": "b"}, ""
+
+    def close_pr(self, slug: str, number: int, comment: str, timeout: int = 60) -> tuple[int, str]:
+        self.closed.append((number, comment))
+        return 0, ""
+
+
+def _setup_engage(store: Store, tmp_path: Path, **finding_overrides: Any) -> dict[str, Any]:
+    upstream_path, repo_path = _make_repo_with_published_branch(tmp_path)
+    repo_id = store.add_repo("repo", str(upstream_path), str(repo_path), default_branch="main")
+    fid, _ = store.upsert_finding(
+        repo_id,
+        _make_finding(
+            fingerprint="repo:gradle:com.google.dagger:hilt-android:2.48->2.60.1",
+            **finding_overrides,
+        ),
+        finding_type="dep_update",
+    )
+    store.set_status(fid, "pr_open")
+    store.upsert_pr_state(
+        fid,
+        pr_number=1,
+        head_ref="feature",
+        needs_attention="conflict",
+        synced_at=0,
+    )
+    finding = store.get_finding(fid)
+    assert finding is not None
+    finding["budget_override"] = "exempt"
+    return finding
+
+
+def _engage_worker_with_followups(followups: list[dict[str, Any]] | None) -> Any:
+    def worker(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
+        (worktree / "WITHDRAW.md").write_text(
+            "This PR is superseded. origin/main already upgraded Hilt to 2.56.2"
+            " as part of a coordinated Kotlin/KSP bump; our target of 2.55 is"
+            " strictly behind. But 2.60.1 -- the original goal -- is now"
+            " achievable since the Kotlin/KSP blocker is resolved.\n"
+        )
+        if followups is not None:
+            (worktree / "FOLLOW-UPS.json").write_text(json.dumps(followups))
+        return RunResult(
+            exit_code=0,
+            killed_reason=None,
+            tokens_new=500,
+            calls=1,
+            session_file=None,
+            duration_s=2.0,
+            stdout_tail="done",
+        )
+
+    return worker
+
+
+class TestEngageWithdrawFollowUpIngestion:
+    def test_superseded_withdraw_files_dep_update_followup(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exact glosdalen Hilt/Kotlin scenario: a PR capped at 2.55 gets
+        superseded by a coordinated bump to 2.56.2 -- but that same bump
+        resolves the constraint that capped the original PR, so 2.60.1 (the
+        finding's actual original target) is achievable again. Withdrawing
+        must not silently drop that -- it must re-propose 2.60.1 as a fresh
+        finding."""
+        finding = _setup_engage(store, tmp_path)
+        followups = [
+            {
+                "type": "dep_update",
+                "fingerprint": "repo:gradle:com.google.dagger:hilt-android:2.56.2->2.60.1",
+                "ecosystem": "gradle",
+                "package": "com.google.dagger:hilt-android",
+                "current_version": "2.56.2",
+                "latest_version": "2.60.1",
+                "update_type": "minor",
+                "severity": "medium",
+                "confidence": 0.8,
+                "summary": "Hilt 2.60.1 now achievable now that Kotlin/KSP moved",
+                "detail": "The original PR capped at 2.55 due to a KSP/Kotlin"
+                " mismatch; that mismatch is now resolved by the coordinated"
+                " bump on main, so the original 2.60.1 target is open again.",
+                "introduced_by": f"reopened while withdrawing {finding['fingerprint']}",
+            }
+        ]
+        monkeypatch.setattr(
+            scheduler.runner, "run_worker", _engage_worker_with_followups(followups)
+        )
+        fake_forge = _EngageFakeForge()
+        monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
+
+        result = run_engage(store, cfg, finding)
+
+        assert result.get("outcome") == "withdrawn", result
+        assert fake_forge.closed, "close_pr must have been called"
+        after = store.get_finding(finding["id"])
+        assert after is not None
+        assert after["status"] == "rejected"
+
+        all_findings = store.list_all_findings()
+        dep_updates = [
+            f for f in all_findings if f["type"] == "dep_update" and f["id"] != finding["id"]
+        ]
+        assert len(dep_updates) == 1, all_findings
+        assert dep_updates[0]["fingerprint"] == (
+            "repo:gradle:com.google.dagger:hilt-android:2.56.2->2.60.1"
+        )
+        assert dep_updates[0]["status"] == "new"
+
+    def test_withdraw_without_followups_is_unaffected(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A genuinely fully-superseded withdrawal (nothing further to
+        propose) must behave exactly as before -- opt-in, no new findings."""
+        finding = _setup_engage(store, tmp_path)
+        monkeypatch.setattr(scheduler.runner, "run_worker", _engage_worker_with_followups(None))
+        fake_forge = _EngageFakeForge()
+        monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
+
+        result = run_engage(store, cfg, finding)
+
+        assert result.get("outcome") == "withdrawn", result
+        after = store.get_finding(finding["id"])
+        assert after is not None
+        assert after["status"] == "rejected"
+        all_findings = store.list_all_findings()
+        assert len(all_findings) == 1  # only the original finding, nothing new

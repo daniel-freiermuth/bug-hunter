@@ -119,13 +119,18 @@ it as a real, queryable follow-up instead: see FOLLOW-UPS.json below.
   - What you deliberately did NOT change
 - **FOLLOW-UPS.json** at the worktree root, NOT COMMITTED, OPTIONAL — only if
   step 5 identified real deferred work. A JSON array; the scheduler ingests
-  it into the finding queue (as `type: "modernization"`) right after the PR
-  ships, so it becomes a normal, triage-able finding instead of prose no one
-  re-reads. Empty array or omit the file entirely if there is nothing to flag
-  — do NOT file speculative or trivial items just to produce output. Each
-  entry:
+  it into the finding queue right after the PR ships, so it becomes a
+  normal, triage-able finding instead of prose no one re-reads. Empty array
+  or omit the file entirely if there is nothing to flag — do NOT file
+  speculative or trivial items just to produce output. Each entry MUST set
+  `"type"` to whichever shape actually fits (usually `"modernization"` for
+  an architectural migration you deferred; `"dep_update"` if the deferred
+  work is really just "this same package could go further later" with its
+  own ecosystem/package/current_version/latest_version fields instead of
+  modernization_class/current_approach/proposed_approach):
   ```json
   {
+    "type": "modernization",
     "fingerprint": "{{REPO_NAME}}:area:short-slug",
     "file": "path/file.ext or directory/area",
     "modernization_class": "deferred-followup",
