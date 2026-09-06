@@ -10,6 +10,7 @@ interface WindowInfo {
   resets_at: number | null;
   age_s: number;
   stale: boolean;
+  ramp: number | null;
 }
 
 interface Finding {
@@ -546,15 +547,22 @@ function renderWindows(windows: Record<string, WindowInfo>): void {
         w.used_fraction == null
           ? null
           : Math.min(100, Math.round(w.used_fraction * 100));
+      const rampPct =
+        w.ramp == null ? null : Math.min(100, Math.round(w.ramp * 100));
+      const availPct =
+        pct == null || rampPct == null ? null : Math.max(0, rampPct - pct);
       const cls = w.stale
         ? "stale"
         : w.status === "exhausted" || (pct !== null && pct >= 100)
           ? "bad"
           : "ok";
       const label = k.replace(/^anthropic:/, "");
+      const avail = availPct == null ? "" : ` \u00b7 ${availPct}% avail`;
+      const marker =
+        rampPct == null ? "" : `<i class="ramp" style="left:${rampPct}%"></i>`;
       return `<div class="win">
-      <div class="lab"><b>${esc(label)}</b><span>${pct == null ? "?" : pct + "%"}${w.stale ? " \u26a0stale" : ""}</span></div>
-      <div class="bar"><i class="${cls}" style="width:${pct ?? 0}%"></i></div>
+      <div class="lab"><b>${esc(label)}</b><span>${pct == null ? "?" : pct + "% used"}${avail}${w.stale ? " \u26a0stale" : ""}</span></div>
+      <div class="bar"><i class="${cls}" style="width:${pct ?? 0}%"></i>${marker}</div>
       <div class="sub">resets ${ts(w.resets_at)}${w.resets_at ? " (" + countdown(w.resets_at) + ")" : ""} \u00b7 probed ${Math.round(w.age_s / 60)}m ago</div>
     </div>`;
     })

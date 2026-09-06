@@ -6,8 +6,10 @@ import sqlite3
 import time
 from pathlib import Path
 
+import pytest
+
 import hunter.budget as budget_module
-from hunter.budget import decide, read_windows
+from hunter.budget import decide, ramp_5h, ramp_7d, read_windows
 from hunter.types import Config, WindowState
 
 # ---------------------------------------------------------------------------
@@ -334,3 +336,52 @@ def test_read_windows_keeps_active_window(tmp_path, monkeypatch):
 
     assert set(windows) == {"anthropic:7d"}
     assert windows["anthropic:7d"].used_fraction == 0.3
+
+
+# ---------------------------------------------------------------------------
+# ramp_7d / ramp_5h: pure functions, now reused by both decide() (gating)
+# and server._summary() (the "available budget" the UI displays).
+# ---------------------------------------------------------------------------
+
+
+class TestRamp7d:
+    def test_no_resets_at_assumes_end_of_window(self):
+        assert ramp_7d(None, _NOW_MS) == 1.0
+
+    def test_expired_resets_at_assumes_end_of_window(self):
+        assert ramp_7d(_NOW_MS - 1000, _NOW_MS) == 1.0
+
+    def test_halfway_through_window(self):
+        resets_at = _NOW_MS + _WEEK_MS // 2  # started WEEK_MS/2 ago
+        assert ramp_7d(resets_at, _NOW_MS) == pytest.approx(0.5, abs=1e-6)
+
+    def test_just_started(self):
+        resets_at = _NOW_MS + _WEEK_MS  # reset a full week out -> just started
+        assert ramp_7d(resets_at, _NOW_MS) == pytest.approx(0.0, abs=1e-6)
+
+    def test_clamped_to_one(self):
+        # resets_at implies the window "started" in the future (bad data) --
+        # must never exceed 1.0.
+        resets_at = _NOW_MS + _WEEK_MS * 2
+        assert ramp_7d(resets_at, _NOW_MS) <= 1.0
+
+
+class TestRamp5h:
+    def test_no_resets_at_returns_none(self):
+        assert ramp_5h(None, _NOW_MS) is None
+
+    def test_expired_resets_at_returns_none(self):
+        assert ramp_5h(_NOW_MS - 1000, _NOW_MS) is None
+
+    def test_within_headroom_is_zero(self):
+        resets_at = _NOW_MS + (_5H_MS - int(15 * 60 * 1000))  # 15min elapsed
+        assert ramp_5h(resets_at, _NOW_MS) == 0.0
+
+    def test_halfway_through_harvest_ramp(self):
+        # 2.75h elapsed of a 5h window (30min headroom -> 4.5h harvest) -> 50%
+        resets_at = _NOW_MS + (_5H_MS - int(2.75 * 3600 * 1000))
+        assert ramp_5h(resets_at, _NOW_MS) == pytest.approx(0.5, abs=1e-6)
+
+    def test_never_negative(self):
+        resets_at = _NOW_MS + _5H_MS  # just started -> before headroom ends
+        assert ramp_5h(resets_at, _NOW_MS) == 0.0

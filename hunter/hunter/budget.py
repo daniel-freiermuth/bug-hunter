@@ -71,6 +71,31 @@ def read_windows() -> dict[str, WindowState]:
     return out
 
 
+def ramp_7d(resets_at: int | None, now_ms: float) -> float:
+    """Fraction of the 7-day linear ramp elapsed so far (0..1) -- this is
+    the currently-allowed spend ceiling for a :7d window, the same
+    quantity decide() compares used_fraction against. Unknown or already-
+    expired resets_at -> 1.0 (assume end-of-window; matches decide()'s
+    existing permissive fallback for missing data, and read_windows()
+    already drops genuinely-expired rows before this could be called
+    with stale data)."""
+    if not resets_at or resets_at <= now_ms:
+        return 1.0
+    started_ms = resets_at - _WEEK_MS
+    return min((now_ms - started_ms) / _WEEK_MS, 1.0)
+
+
+def ramp_5h(resets_at: int | None, now_ms: float) -> float | None:
+    """Fraction of the 5h harvest ramp elapsed so far (0..1): 0 for the
+    first HEADROOM_MS, then linear to 1.0 at reset. None means there is
+    no active window to compute a ramp against (decide() then treats the
+    window as an opener -- always-allow)."""
+    if not resets_at or resets_at <= now_ms:
+        return None
+    elapsed_ms = _5H_MS - (resets_at - now_ms)
+    return max(0.0, (elapsed_ms - HEADROOM_MS) / _RAMP_MS)
+
+
 def decide(
     cfg: Config,
     kind: str,
@@ -106,11 +131,7 @@ def decide(
             # resets_at case below, we know for certain this reading is
             # stale, not just imprecise.
             continue
-        if w.resets_at:
-            started_ms = w.resets_at - _WEEK_MS
-            elapsed_frac = min((now_ms - started_ms) / _WEEK_MS, 1.0)
-        else:
-            elapsed_frac = 1.0  # can't compute -> assume end-of-window
+        elapsed_frac = ramp_7d(w.resets_at, now_ms)
         # Reserve budget for running jobs
         effective_used = w.used_fraction + inflight_reservation
         if effective_used >= elapsed_frac:
@@ -130,9 +151,8 @@ def decide(
     if w5 is not None and w5.age_s <= cfg.stale_after_s:
         if w5.status == "exhausted":
             return BudgetDecision(False, "5h window exhausted")
-        if w5.resets_at and w5.resets_at > now_ms and w5.used_fraction is not None:
-            elapsed_ms = _5H_MS - (w5.resets_at - now_ms)
-            allowed = max(0.0, (elapsed_ms - HEADROOM_MS) / _RAMP_MS)
+        allowed = ramp_5h(w5.resets_at, now_ms)
+        if allowed is not None and w5.used_fraction is not None:
             effective_used = w5.used_fraction + inflight_reservation
             if effective_used >= allowed:
                 return BudgetDecision(

@@ -58,8 +58,9 @@
   .win { min-width: 190px; }
   .win .lab { display: flex; justify-content: space-between; font-size: 11px; color: var(--dim); }
   .win .lab b { color: var(--fg); font-weight: 600; }
-  .bar { height: 6px; background: #0b0d0e; border-radius: 3px; margin: 4px 0 3px; overflow: hidden; }
+  .bar { height: 6px; background: #0b0d0e; border-radius: 3px; margin: 4px 0 3px; overflow: hidden; position: relative; }
   .bar i { display: block; height: 100%; border-radius: 3px; }
+  .bar i.ramp { position: absolute; top: 0; width: 2px; background: var(--fg); opacity: .55; border-radius: 0; }
   .win .sub { font-size: 11px; color: var(--faint); }
   .ok    { background: var(--green); }
   .bad   { background: var(--red); }
