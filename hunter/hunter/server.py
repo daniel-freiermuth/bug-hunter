@@ -166,6 +166,13 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/findings":
                 self._json(self._findings(qs))
                 return
+            if url.path == "/api/finding":
+                detail = self._finding_detail(qs)
+                if detail is None:
+                    self._error(404, "no such finding")
+                    return
+                self._json(detail)
+                return
             if url.path == "/api/jobs":
                 self._json(self._store().list_jobs(limit=50))
                 return
@@ -356,6 +363,27 @@ class Handler(BaseHTTPRequestHandler):
             if f["id"] in pr_attention:
                 f["needs_attention"] = pr_attention[f["id"]]
         return findings
+
+    def _finding_detail(self, qs: dict[str, list[str]]) -> Row | None:
+        """Everything about one finding NOT already on its list-view card:
+        the full job history (list_jobs()'s /api/jobs feed is capped at
+        the most recent 50 across ALL findings, so an older finding's
+        jobs can already be gone from it) and PR state (list_findings()
+        only ever embeds needs_attention, and only for pr_open -- this
+        returns the whole row, for any status a PR could still exist
+        under, e.g. merged/rejected). Returns None if id is missing or
+        invalid; caller maps that to 400/404."""
+        fid_str = (qs.get("id") or [None])[0]  # type: ignore[list-item]
+        if not fid_str or not fid_str.isdigit():
+            return None
+        store = self._store()
+        fid = int(fid_str)
+        if store.get_finding(fid) is None:
+            return None
+        return {
+            "jobs": store.jobs_by_finding(fid),
+            "pr_state": store.get_pr_state(fid),
+        }
 
     # -- POST -------------------------------------------------------------
 
