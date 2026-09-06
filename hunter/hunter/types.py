@@ -142,6 +142,35 @@ class JobDict(TypedDict):
     finding_fingerprint: NotRequired[str | None]
 
 
+class RepoDict(TypedDict):
+    """SELECT * FROM repos -- see schema.sql. Store.list_repos()/get_repo()
+    stay Row-typed (their other callers need dict[str, Any]); this exists
+    for the /api/summary boundary specifically, where server.py casts to
+    it and SummaryDict's pydantic validation re-verifies it at runtime."""
+
+    id: int
+    name: str
+    url: str
+    path: str
+    forge: str
+    default_branch: str
+    last_hunt_sha: str | None
+    last_hunt_at: int | None
+    enabled: int
+    added_at: int
+
+
+class EventDict(TypedDict):
+    """SELECT * FROM events -- see schema.sql."""
+
+    id: int
+    at: int
+    kind: str
+    message: str
+    job_id: int | None
+    finding_id: int | None
+
+
 @dataclass
 class Config:
     work_root: Path

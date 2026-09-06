@@ -16,8 +16,10 @@ import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, ClassVar, Literal, TypedDict
+from typing import Any, ClassVar, Literal, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
+
+from pydantic import TypeAdapter
 
 from .types import (
     FINDING_STATUSES,
@@ -25,7 +27,9 @@ from .types import (
     UI_DIR,
     VERDICT_STATUSES,
     Config,
+    EventDict,
     JobDict,
+    RepoDict,
     Row,
     SchedulerStateDict,
 )
@@ -147,7 +151,7 @@ class Handler(BaseHTTPRequestHandler):
                         self._send(200, asset.read_bytes(), ctype)
                         return
             if url.path == "/api/summary":
-                self._json(self._summary())
+                self._json(_validate_summary(self._summary()))
                 return
             if url.path == "/api/findings":
                 self._json(self._findings(qs))
@@ -179,7 +183,7 @@ class Handler(BaseHTTPRequestHandler):
             log.exception("GET %s", self.path)
             self._error(500, "internal error")
 
-    def _summary(self) -> Row:
+    def _summary(self) -> SummaryDict:
         from . import budget, scheduler
 
         store = self._store()
@@ -266,7 +270,15 @@ class Handler(BaseHTTPRequestHandler):
             "windows": windows,
             "counts": counts,
             "type_counts": dict(type_counts),
-            "repos": store.list_repos(),
+            # store.list_repos() stays Row-typed -- its many OTHER callers
+            # (scheduler.py) need the permissive dict[str, Any] shape a
+            # RepoDict return type would break. cast(), not
+            # _require_keys(), is enough here specifically because
+            # _validate_summary (below, at the actual call site) already
+            # re-verifies this exact field against RepoDict at runtime,
+            # right before serialization -- this cast only needs to
+            # satisfy mypy's static view of THIS one field.
+            "repos": cast("list[RepoDict]", store.list_repos()),
             "last_cycle": last_cycle,
             "cycle_running": cycle_running,
             "current_job": current_job,
@@ -741,6 +753,47 @@ ActivityStatus = (
     | _IdleStatus
     | _WarmingUpStatus
 )
+
+
+class SummaryDict(TypedDict):
+    """The complete /api/summary response shape. mypy --strict checks
+    every construction site against this (and its nested TypedDicts)
+    the same way it does everywhere else in this module -- but that
+    only proves the PYTHON CODE THAT BUILDS the dict is internally
+    consistent. It says nothing about the actual bytes that leave the
+    process: a stale cached client, a manual curl/test hitting this
+    route with a monkeypatched Store, or a future bug that slips past
+    mypy (a bare Any leaking in somewhere) would all still produce
+    whatever shape the code happens to build, unchecked, all the way to
+    the wire. _validate_summary is the one place that actually re-
+    verifies the real dict against this schema at runtime, at the last
+    possible moment before serialization -- the network-boundary half
+    of the guarantee _require_keys provides on the SQL-row half."""
+
+    windows: dict[str, WindowInfoDict]
+    counts: dict[str, int]
+    type_counts: dict[str, int]
+    repos: list[RepoDict]
+    last_cycle: EventDict | None
+    cycle_running: bool
+    current_job: JobDict | None
+    next_candidate: NextCandidateDict | None
+    scheduler_state: SchedulerStateDict | None
+    activity_status: ActivityStatus
+
+
+_SUMMARY_ADAPTER = TypeAdapter(SummaryDict)
+
+
+def _validate_summary(payload: SummaryDict) -> SummaryDict:
+    """Re-verify the built payload against SummaryDict at runtime,
+    right before it's serialized -- see SummaryDict's docstring for
+    why mypy alone can't provide this guarantee. Raises pydantic's
+    ValidationError (caught by do_GET's existing except Exception,
+    returning a 500 with the real cause logged) rather than silently
+    shipping a malformed payload a client would misinterpret with no
+    error at all."""
+    return _SUMMARY_ADAPTER.validate_python(payload)
 
 
 def _activity_status(

@@ -5,7 +5,10 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
-from typing import Any, Iterator, TypeVar, cast
+from typing import TYPE_CHECKING, Any, ClassVar, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from .types import (
     ACTIVE_STATUSES,
@@ -13,6 +16,7 @@ from .types import (
     SCHEMA_PATH,
     SUPPRESSED_STATUSES,
     Config,
+    EventDict,
     JobDict,
     Row,
     SchedulerStateDict,
@@ -69,10 +73,7 @@ def _rows(cur: sqlite3.Cursor) -> list[Row]:
     return [dict(r) for r in cur.fetchall()]
 
 
-_T = TypeVar("_T")
-
-
-def _require_keys(row: Row, *required: str, shape: type[_T]) -> _T:
+def _require_keys[T](row: Row, *required: str, shape: type[T]) -> T:
     """Verify a raw SQLite row has every key a TypedDict declares before
     asserting that type onto it. This is the one runtime check standing
     between "the SQL query's actual columns" (a fact only the database
@@ -88,7 +89,7 @@ def _require_keys(row: Row, *required: str, shape: type[_T]) -> _T:
     if missing:
         msg = f"row missing required keys {missing} for {shape.__name__}: got {sorted(row)}"
         raise ValueError(msg)
-    return cast(_T, row)
+    return cast("T", row)
 
 
 class Store:
@@ -641,8 +642,14 @@ class Store:
         )
         self.db.commit()
 
-    def recent_events(self, limit: int = 100) -> list[Row]:
-        return _rows(self.db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)))
+    def recent_events(self, limit: int = 100) -> list[EventDict]:
+        rows = _rows(
+            self.db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))
+        )
+        return [
+            _require_keys(r, "id", "at", "kind", "message", "job_id", "finding_id", shape=EventDict)
+            for r in rows
+        ]
 
     def events_by_finding(self, fids: list[int]) -> dict[int, list[Row]]:
         """Return events grouped by finding_id for the given IDs."""
@@ -660,7 +667,7 @@ class Store:
             out.setdefault(r["finding_id"], []).append(r)
         return out
 
-    _CALIBRATION_DURATIONS_MS = {
+    _CALIBRATION_DURATIONS_MS: ClassVar[dict[str, int]] = {
         "5h": 5 * 3600 * 1000,
         "7d": 7 * 24 * 3600 * 1000,
     }
@@ -674,7 +681,9 @@ class Store:
         schema.sql for what this is (and isn't) good for."""
         t = now_ms()
         for w in states:
-            horizon = next((h for h in self._CALIBRATION_DURATIONS_MS if f":{h}" in w.limit_id), None)
+            horizon = next(
+                (h for h in self._CALIBRATION_DURATIONS_MS if f":{h}" in w.limit_id), None
+            )
             if horizon and w.resets_at and w.used_fraction is not None:
                 prev = self.db.execute(
                     "SELECT observed_at, used_fraction FROM window_log"
@@ -696,9 +705,13 @@ class Store:
                     if tok > 0:
                         self.db.execute(
                             "INSERT INTO calibration_samples"
-                            " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
+                            " (observed_at, limit_id, window_resets_at,"
+                            " used_fraction_delta, hunter_tokens)"
                             " VALUES (?,?,?,?,?)",
-                            (t, w.limit_id, w.resets_at, w.used_fraction - prev["used_fraction"], tok),
+                            (
+                                t, w.limit_id, w.resets_at,
+                                w.used_fraction - prev["used_fraction"], tok,
+                            ),
                         )
             self.db.execute(
                 "INSERT INTO window_log (observed_at, limit_id, used_fraction,"
