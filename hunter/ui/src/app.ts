@@ -87,6 +87,28 @@ interface Repo {
   added_at: number;
 }
 
+interface CurrentJob extends Job {
+  finding_summary?: string | null;
+  finding_fingerprint?: string | null;
+}
+
+interface NextCandidate {
+  kind: string;
+  id: number;
+  label: string | null;
+  is_finding: boolean;
+  budget_state: string; // "allowed" | "denied" | "exempt"
+  budget_reason: string;
+  budget_retry_at: number | null;
+}
+
+interface SchedulerState {
+  state: string; // "idle" | "denied" | "error"
+  detail: string;
+  next_wake_at: number | null;
+  updated_at: number;
+}
+
 interface Summary {
   windows: Record<string, WindowInfo>;
   counts: Record<string, number>;
@@ -94,6 +116,9 @@ interface Summary {
   repos: Repo[];
   last_cycle: Event | null;
   cycle_running: boolean;
+  current_job: CurrentJob | null;
+  next_candidate: NextCandidate | null;
+  scheduler_state: SchedulerState | null;
 }
 
 interface ApiResult<T> {
@@ -569,6 +594,49 @@ function renderWindows(windows: Record<string, WindowInfo>): void {
     .join("");
 }
 
+function renderActivity(s: Summary): void {
+  const cj = s.current_job;
+  if (cj) {
+    const label =
+      cj.finding_id != null
+        ? `#${cj.finding_id} ${esc(cj.finding_summary || cj.finding_fingerprint || "")}`
+        : esc(cj.repo_name);
+    $("activity").innerHTML =
+      `<div class="row"><b class="running">\u25b6 running</b> ${esc(cj.kind)}: ${label}` +
+      ` <span class="dim">(${dur(cj)}, job #${cj.id})</span></div>`;
+    return;
+  }
+  const rows: string[] = [];
+  const ss = s.scheduler_state;
+  if (ss) {
+    rows.push(
+      `<div class="row"><b class="${esc(ss.state)}">\u23f8 ${esc(ss.state)}</b> ${esc(ss.detail)}</div>`,
+    );
+    if (ss.next_wake_at) {
+      rows.push(
+        `<div class="row dim">next check ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})</div>`,
+      );
+    }
+  } else {
+    rows.push('<div class="row dim">warming up \u2014 no cycle has run yet</div>');
+  }
+  const nc = s.next_candidate;
+  if (nc) {
+    const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
+    const reason = nc.budget_state === "denied" ? ` (${esc(nc.budget_reason)})` : "";
+    rows.push(
+      `<div class="row dim">next up: ${esc(nc.kind)} ${label}` +
+        ` \u00b7 budget: <span class="b-${esc(nc.budget_state)}">${esc(nc.budget_state)}</span>${reason}</div>`,
+    );
+    if (nc.budget_state === "denied" && nc.budget_retry_at) {
+      rows.push(
+        `<div class="row dim">budget available ~${countdown(nc.budget_retry_at)} (${ts(nc.budget_retry_at)})</div>`,
+      );
+    }
+  }
+  $("activity").innerHTML = rows.join("");
+}
+
 function findingCard(f: Finding, withActions: boolean): string {
   const sev = esc(f.severity || "?");
   const conf =
@@ -824,6 +892,7 @@ async function refresh(): Promise<void> {
     }
 
     renderWindows(s.windows || {});
+    renderActivity(s);
 
     // ---- populate filter dropdowns (preserve selection) ----
     const inbox = all.filter((f) => f.status === "new");

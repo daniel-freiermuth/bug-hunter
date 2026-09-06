@@ -481,6 +481,41 @@ class Store:
             )
         )
 
+    def current_job(self) -> Row | None:
+        """The job currently in flight, if any -- at most one, given
+        _cycle_lock serializes the daemon loop and POST /api/cycle."""
+        r = self.db.execute(
+            "SELECT j.*, r.name AS repo_name FROM jobs j"
+            " JOIN repos r ON r.id = j.repo_id"
+            " WHERE j.state = 'running' ORDER BY j.id DESC LIMIT 1"
+        ).fetchone()
+        if r is None:
+            return None
+        row = dict(r)
+        if row.get("finding_id"):
+            f = self.get_finding(row["finding_id"])
+            if f is not None:
+                row["finding_summary"] = f.get("summary")
+                row["finding_fingerprint"] = f.get("fingerprint")
+        return row
+
+    def set_scheduler_state(self, state: str, detail: str, next_wake_at: int | None) -> None:
+        """Persist the daemon loop's own read of "what am I doing and
+        why" -- see schema.sql's scheduler_state comment. Informational
+        only; never consulted by any scheduling decision."""
+        self.db.execute(
+            "INSERT INTO scheduler_state (id, state, detail, next_wake_at, updated_at)"
+            " VALUES (1, ?, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET state=excluded.state, detail=excluded.detail,"
+            " next_wake_at=excluded.next_wake_at, updated_at=excluded.updated_at",
+            (state, detail, next_wake_at, now_ms()),
+        )
+        self.db.commit()
+
+    def get_scheduler_state(self) -> Row | None:
+        r = self.db.execute("SELECT * FROM scheduler_state WHERE id = 1").fetchone()
+        return dict(r) if r else None
+
     def reconcile_orphaned_jobs(self) -> dict[str, list[Row]]:
         """Last-resort net for total process death (crash, systemctl
         restart, host reboot -- SIGKILL, or any signal that doesn't let

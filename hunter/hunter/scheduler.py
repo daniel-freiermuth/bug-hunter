@@ -7,6 +7,7 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -217,7 +218,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         job = store.create_job("hunt", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"hunt {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
     job = store.create_job("hunt", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.findings.json"
@@ -348,7 +349,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
             job_id=job,
             finding_id=fid,
         )
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
     job = store.create_job("recheck", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"recheck{fid}.json"
@@ -480,7 +481,7 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
         job = store.create_job("test_gap", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"test_gap {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
     
     job = store.create_job("test_gap", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.test_gaps.json"
@@ -579,7 +580,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
         job = store.create_job("dep_update", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"dep_update {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
     
     job = store.create_job("dep_update", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.dep_updates.json"
@@ -677,7 +678,7 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
         job = store.create_job("refactor", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"refactor {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
     
     job = store.create_job("refactor", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.refactorings.json"
@@ -859,7 +860,7 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
             job_id=job,
             finding_id=fid,
         )
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
     job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens)
     pre_usage = _usage_snapshot(windows)
@@ -1300,7 +1301,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
             job_id=job,
             finding_id=fid,
         )
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
     rc, pr, raw = forge.view_pr_engage(owner_slug, num)
     if pr is None:
@@ -1456,6 +1457,88 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
 # -- cycle ------------------------------------------------------------------
 
 
+def pick_next(
+    store: Store, cfg: Config, force_repo: str | None = None  # noqa: ARG001
+) -> tuple[str, Row] | None:
+    """Pure selection: what run_cycle would act on right now, if invoked --
+    no side effects, no budget check (each run_* function evaluates its
+    own budget when actually executed; this only answers "what", not
+    "would it currently be allowed"). This is the single place the
+    priority order is expressed; run_cycle and the Status page's
+    "what's next" preview both call it, so the preview can never drift
+    from what actually runs.
+
+    Priority: a budget-overridden finding (any category) jumps the
+    queue -> flagged PR (stalest sync first) -> oldest rechecking ->
+    oldest queued fix -> the most stale-of-rotation job type for the
+    least-recently-hunted enabled repo (hunt if never cloned, else
+    whichever of hunt/test_gap/dep_update/refactor is oldest/never-run).
+
+    Returns (kind, target): target is a finding row for
+    engage/recheck/fix, a repo row for hunt/test_gap/dep_update/refactor.
+    None means nothing to do (no queued/attention/rechecking work and no
+    enabled repos).
+    """
+    rechecking = store.list_findings(status="rechecking")
+    attention = store.list_attention()
+    queued = store.list_findings(status="queued")
+
+    for kind, items in (("engage", attention), ("recheck", rechecking), ("fix", queued)):
+        for f in items:
+            if f.get("budget_override"):
+                return kind, f
+
+    if attention:
+        return "engage", attention[0]  # stalest sync first
+    if rechecking:
+        return "recheck", rechecking[-1]  # DESC -> last = oldest
+    if queued:
+        return "fix", queued[-1]  # DESC -> last = oldest
+
+    repos = [r for r in store.list_repos() if r["enabled"]]
+    if force_repo:
+        target = store.get_repo(force_repo)
+        if target is None:
+            msg = f"unknown repo {force_repo!r}"
+            raise ValueError(msg)
+    else:
+        target = (
+            min(
+                repos,
+                key=lambda r: (r["last_hunt_at"] is not None, r["last_hunt_at"] or 0),
+            )
+            if repos
+            else None
+        )
+    if target is None:
+        return None
+
+    rpath = Path(target["path"])
+    if not rpath.exists():
+        return "hunt", target  # not cloned yet -> hunt does the clone
+
+    job_times = {
+        "hunt": target.get("last_hunt_at") or 0,
+        "test_gap": target.get("last_test_gap_at") or 0,
+        "dep_update": target.get("last_dep_update_at") or 0,
+        "refactor": target.get("last_refactor_at") or 0,
+    }
+    never_run = [k for k, v in job_times.items() if v == 0]
+    job_type = sorted(never_run)[0] if never_run else min(job_times, key=job_times.get)
+    return job_type, target
+
+
+_RUNNERS: dict[str, Callable[[Store, Config, Row], Row]] = {
+    "engage": run_engage,
+    "recheck": run_recheck,
+    "fix": run_fix,
+    "hunt": run_hunt,
+    "test_gap": run_test_gap,
+    "dep_update": run_dep_update,
+    "refactor": run_refactor,
+}
+
+
 def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
     try:
         windows = budget.read_windows()
@@ -1464,124 +1547,34 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
         # (0) Cheap PR sync -- gh reads only, no tokens.
         sync: Row | None = sync_prs(store, cfg) if store.list_findings(status="pr_open") else None
 
-        rechecking = store.list_findings(status="rechecking")
-        attention = store.list_attention()
-        queued = store.list_findings(status="queued")
+        picked = pick_next(store, cfg, force_repo)
+        if picked is None:
+            result: Row = {"idle": "no queued findings, no enabled repos"}
+            if sync is not None:
+                result["sync"] = sync
+            store.log_event("cycle", "idle: nothing to do")
+            return result
 
-        # Budget-overridden findings jump the queue across all categories.
-        override_target: tuple[str, Row] | None = None
-        for kind, items in (("engage", attention), ("recheck", rechecking), ("fix", queued)):
-            for f in items:
-                if f.get("budget_override"):
-                    override_target = (kind, f)
-                    break
-            if override_target:
-                break
+        kind, target = picked
+        result = _RUNNERS[kind](store, cfg, target)
 
-        if override_target:
-            kind, f = override_target
-            if kind == "engage":
-                result = run_engage(store, cfg, f)
-            elif kind == "recheck":
-                result = run_recheck(store, cfg, f)
-            else:
-                result = run_fix(store, cfg, f)
-        elif attention:
-            result = run_engage(store, cfg, attention[0])  # stalest sync first
-        elif rechecking:
-            result = run_recheck(store, cfg, rechecking[-1])  # DESC -> last = oldest
-        elif queued:
-            result = run_fix(store, cfg, queued[-1])  # DESC -> last = oldest
-        else:
-            repos = [r for r in store.list_repos() if r["enabled"]]
-            if force_repo:
-                target = store.get_repo(force_repo)
-                if target is None:
-                    msg = f"unknown repo {force_repo!r}"
-                    raise ValueError(msg)
-            else:
-                target = (
-                    min(
-                        repos,
-                        key=lambda r: (
-                            r["last_hunt_at"] is not None,
-                            r["last_hunt_at"] or 0,
-                        ),
-                    )
-                    if repos
-                    else None
-                )
-            if target is not None:
-                rpath = Path(target["path"])
-                
-                # If repo not cloned yet, run hunt first (it clones)
-                if not rpath.exists():
-                    result = run_hunt(store, cfg, target)
-                else:
-                    # Multi-job rotation: pick the most stale job type
-                    job_times = {
-                        "hunt": target.get("last_hunt_at") or 0,
-                        "test_gap": target.get("last_test_gap_at") or 0,
-                        "dep_update": target.get("last_dep_update_at") or 0,
-                        "refactor": target.get("last_refactor_at") or 0,
-                    }
-                    
-                    # Pick job type that hasn't run (0) or is most stale
-                    # Priority: never-run > oldest timestamp
-                    never_run = [k for k, v in job_times.items() if v == 0]
-                    if never_run:
-                        # Deterministic order for never-run jobs
-                        job_type = sorted(never_run)[0]
-                    else:
-                        # Pick oldest
-                        job_type = min(job_times, key=job_times.get)
-                    
-                    if job_type == "hunt":
-                        result = run_hunt(store, cfg, target)
-                    elif job_type == "test_gap":
-                        result = run_test_gap(store, cfg, target)
-                    elif job_type == "dep_update":
-                        result = run_dep_update(store, cfg, target)
-                    elif job_type == "refactor":
-                        result = run_refactor(store, cfg, target)
-                    else:
-                        result = run_hunt(store, cfg, target)  # fallback
-                    
-                    
-                    
-                    # Prevent never-run starvation: if the job was never-run and it didn't
-                    # succeed (failed, killed, or done without output), mark it attempted
-                    if job_type != "hunt":  # hunt has its own watermark logic
-                        was_never_run = job_times[job_type] == 0
-                        # Job failed if: state is not "done", OR state is "done" but no ingest occurred
-                        failed = (
-                            result.get("state") in ("killed", "failed") or
-                            result.get("error") or
-                            result.get("ingest_error") or
-                            (result.get("state") == "done" and "ingest" not in result)
-                        )
-                        if was_never_run and failed:
-                            # Job failed - mark as attempted to prevent indefinite starvation
-                            # Use conditional mapping to avoid f-string SQL injection
-                            if job_type == "test_gap":
-                                sql = "UPDATE repos SET last_test_gap_at = ? WHERE id = ?"
-                            elif job_type == "dep_update":
-                                sql = "UPDATE repos SET last_dep_update_at = ? WHERE id = ?"
-                            elif job_type == "refactor":
-                                sql = "UPDATE repos SET last_refactor_at = ? WHERE id = ?"
-                            else:
-                                sql = None
-                            if sql:
-                                store.db.execute(sql, (now_ms(), target["id"]))
-                                store.db.commit()
-            else:
-                result: Row = {  # type: ignore[no-redef]
-                    "idle": "no queued findings, no enabled repos",
-                }
-                if sync is not None:
-                    result["sync"] = sync
-                store.log_event("cycle", "idle: nothing to do")
-                return result
+        # Prevent never-run starvation for repo-level rotation jobs: if a
+        # job type had never run and this attempt didn't succeed (failed,
+        # killed, or done without output), mark it attempted so it stops
+        # winning "never run" priority every single cycle. hunt has its
+        # own watermark logic (set_last_hunt) and is exempt.
+        if kind in ("test_gap", "dep_update", "refactor"):
+            was_never_run = (target.get(f"last_{kind}_at") or 0) == 0
+            failed = (
+                result.get("state") in ("killed", "failed")
+                or result.get("error")
+                or result.get("ingest_error")
+                or (result.get("state") == "done" and "ingest" not in result)
+            )
+            if was_never_run and failed:
+                sql = f"UPDATE repos SET last_{kind}_at = ? WHERE id = ?"  # noqa: S608
+                store.db.execute(sql, (now_ms(), target["id"]))
+                store.db.commit()
 
         if sync is not None:
             result["sync"] = sync
@@ -1621,3 +1614,4 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
         with contextlib.suppress(Exception):
             store.log_event("error", f"cycle crashed: {e!r}")
         return {"error": str(e)}
+

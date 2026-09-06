@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import hunter.budget as budget_module
-from hunter.budget import decide, ramp_5h, ramp_7d, read_windows
+from hunter.budget import decide, ramp_5h, ramp_7d, read_windows, retry_at_5h, retry_at_7d
 from hunter.types import Config, WindowState
 
 # ---------------------------------------------------------------------------
@@ -121,6 +121,9 @@ def test_7d_used_above_ramp_deny():
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
     assert "ramp" in d.reason
+    # retry_at: when the 7d ramp would reach used_fraction=0.30 -- 20% of
+    # a week from now (started at -10%, needs +30%, currently at -10%+... )
+    assert d.retry_at == pytest.approx(_NOW_MS + 0.20 * _WEEK_MS, abs=2000)
 
 
 def test_7d_used_below_ramp_allow():
@@ -168,6 +171,10 @@ def test_5h_harvest_halfway_high_usage_deny():
     assert not d.allow
     assert "5h" in d.reason
     assert "harvest" in d.reason
+    # retry_at: ramp reaches 0.60 at 0.45h from now (window started 2.75h
+    # ago; 0.60 of the 4.5h harvest ramp, plus the 0.5h headroom, is 3.2h
+    # after window start = 0.45h from now).
+    assert d.retry_at == pytest.approx(_NOW_MS + 0.45 * 3600 * 1000, abs=2000)
 
 def test_5h_harvest_end_high_usage_allow():
     """4.95h elapsed → ramp ≈ 0.989; usage 0.90 < 0.989 → allow."""
@@ -179,9 +186,35 @@ def test_5h_harvest_end_high_usage_allow():
 def test_5h_exhausted_deny():
     """Exhausted 5h window → deny regardless of timing."""
     windows = _healthy_windows(w5_elapsed_h=4.5)
-    windows["anthropic:5h"] = _ws("anthropic:5h", used_fraction=1.0, status="exhausted")
+    resets_at = _NOW_MS + _WEEK_MS // 2
+    windows["anthropic:5h"] = _ws(
+        "anthropic:5h", used_fraction=1.0, status="exhausted", resets_at=resets_at,
+    )
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
+    # Exhaustion is a hard cap, not a ramp -- resolves exactly at reset.
+    assert d.retry_at == resets_at
+
+
+def test_7d_denial_during_5h_headroom_uses_7d_retry_not_5h_timing():
+    """Regression: a 7d-ramp denial that happens to coincide with the 5h
+    window's initial headroom period must report a retry_at based on the
+    7d ramp, not get confused with 5h headroom timing (the daemon's old
+    sleep computation had exactly this bug -- it branched on "are we in
+    5h headroom" before even checking whether the denial was a 5h or 7d
+    one). decide() checks 7d first and returns immediately on a 7d deny,
+    so this is structurally impossible to get wrong now: the 5h headroom
+    logic is never reached at all when 7d already denied."""
+    resets_5h = _NOW_MS + int(4.75 * 3600 * 1000)  # 15min into a fresh 5h window
+    resets_7d = _NOW_MS + int(_WEEK_MS * 0.90)  # 10% elapsed into the 7d window
+    windows = {
+        "anthropic:5h": _ws("anthropic:5h", used_fraction=0.0, resets_at=resets_5h),
+        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.30, resets_at=resets_7d),
+    }
+    d = decide(_cfg(), "hunt", windows)
+    assert not d.allow
+    assert d.reason.startswith("anthropic:7d")
+    assert d.retry_at == pytest.approx(_NOW_MS + 0.20 * _WEEK_MS, abs=2000)
 
 
 # ---------------------------------------------------------------------------
@@ -385,3 +418,36 @@ class TestRamp5h:
     def test_never_negative(self):
         resets_at = _NOW_MS + _5H_MS  # just started -> before headroom ends
         assert ramp_5h(resets_at, _NOW_MS) == 0.0
+
+
+class TestRetryAt7d:
+    def test_no_resets_at_returns_none(self):
+        assert retry_at_7d(None, 0.5) is None
+
+    def test_is_the_exact_inverse_of_ramp_7d(self):
+        """retry_at_7d(resets_at, u) is the timestamp t at which
+        ramp_7d(resets_at, t) == u -- verify the round trip directly
+        rather than trusting the algebra by eye."""
+        resets_at = _NOW_MS + int(_WEEK_MS * 0.4)
+        for u in (0.0, 0.1, 0.5, 0.9):
+            t = retry_at_7d(resets_at, u)
+            assert t is not None
+            assert ramp_7d(resets_at, t) == pytest.approx(u, abs=1e-9)
+
+
+class TestRetryAt5h:
+    def test_no_resets_at_returns_none(self):
+        assert retry_at_5h(None, 0.5) is None
+
+    def test_is_the_exact_inverse_of_ramp_5h(self):
+        resets_at = _NOW_MS + int(3.2 * 3600 * 1000)
+        for u in (0.0, 0.25, 0.5, 0.9):
+            t = retry_at_5h(resets_at, u)
+            assert t is not None
+            assert ramp_5h(resets_at, t) == pytest.approx(u, abs=1e-9)
+
+    def test_zero_used_lands_at_headroom_end(self):
+        resets_at = _NOW_MS + int(4 * 3600 * 1000)  # window started 1h ago
+        window_start = resets_at - _5H_MS
+        t = retry_at_5h(resets_at, 0.0)
+        assert t == pytest.approx(window_start + 30 * 60 * 1000)

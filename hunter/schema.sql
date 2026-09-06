@@ -122,3 +122,16 @@ CREATE TABLE IF NOT EXISTS pr_state (
   needs_attention TEXT,                    -- comma-joined reasons; NULL = calm
   synced_at     INTEGER
 );
+
+-- Single-row snapshot of the daemon loop's own reasoning: what it just
+-- did, why it's currently sleeping (or nothing to do), and its best
+-- current estimate of when it'll check again. Purely informational
+-- (the Status page's "what's happening" panel) -- never read by any
+-- scheduling decision.
+CREATE TABLE IF NOT EXISTS scheduler_state (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  state         TEXT NOT NULL,             -- idle | denied | error
+  detail        TEXT NOT NULL,
+  next_wake_at  INTEGER,                   -- epoch ms, best-effort estimate
+  updated_at    INTEGER NOT NULL
+);

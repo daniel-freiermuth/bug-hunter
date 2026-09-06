@@ -1,0 +1,177 @@
+"""Tests for hunter.scheduler.pick_next -- the single, pure, side-effect-
+free selection function shared by run_cycle (execution) and the Status
+page's "what's next" preview (display). Testing it directly, rather than
+only through run_cycle's side effects, is what lets the preview be
+proven to match reality instead of merely hoped to."""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from hunter.scheduler import pick_next
+from hunter.store import Store
+from hunter.types import Config
+
+
+@pytest.fixture
+def cfg(tmp_path: Path) -> Config:
+    return Config(work_root=tmp_path, db_path=tmp_path / "test.db")
+
+
+@pytest.fixture
+def store(cfg: Config) -> Store:
+    return Store(cfg)
+
+
+def _make_finding(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "fingerprint": "repo:f.py:fn:logic",
+        "file": "f.py",
+        "symbol": "fn",
+        "line": 10,
+        "bug_class": "logic",
+        "severity": "high",
+        "confidence": 0.9,
+        "summary": "Bug found",
+        "detail": "Details here",
+        "evidence_plan": "plan",
+        "introduced_by": "abc123",
+    }
+    base.update(overrides)
+    return base
+
+
+class TestPickNextEmpty:
+    def test_nothing_at_all_returns_none(self, store: Store, cfg: Config) -> None:
+        assert pick_next(store, cfg) is None
+
+    def test_disabled_repo_is_ignored(self, store: Store, cfg: Config) -> None:
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        store.update_repo(rid, enabled=False)
+        assert pick_next(store, cfg) is None
+
+
+class TestPickNextPriority:
+    def test_attention_beats_rechecking_and_queued_and_repos(
+        self, store: Store, cfg: Config
+    ) -> None:
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        fid_r, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-recheck"))
+        store.set_status(fid_r, "rechecking")
+        fid_q, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-queued"))
+        store.set_status(fid_q, "queued")
+        fid_a, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-attn"))
+        store.set_status(fid_a, "pr_open")
+        store.upsert_pr_state(fid_a, pr_number=1, needs_attention="new_comments", synced_at=1)
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "engage"
+        assert target["id"] == fid_a
+
+    def test_rechecking_beats_queued_and_repos(self, store: Store, cfg: Config) -> None:
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        fid_q, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-queued"))
+        store.set_status(fid_q, "queued")
+        fid_r, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-recheck"))
+        store.set_status(fid_r, "rechecking")
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "recheck"
+        assert target["id"] == fid_r
+
+    def test_queued_beats_repos(self, store: Store, cfg: Config) -> None:
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        fid_q, _ = store.upsert_finding(rid, _make_finding())
+        store.set_status(fid_q, "queued")
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "fix"
+        assert target["id"] == fid_q
+
+    def test_oldest_queued_wins(self, store: Store, cfg: Config) -> None:
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        fid_old, _ = store.upsert_finding(rid, _make_finding(fingerprint="old"))
+        store.set_status(fid_old, "queued")
+        fid_new, _ = store.upsert_finding(rid, _make_finding(fingerprint="new"))
+        store.set_status(fid_new, "queued")
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "fix"
+        assert target["id"] == fid_old  # DESC-ordered list, last = oldest
+
+    def test_budget_override_jumps_the_queue_ahead_of_higher_priority_category(
+        self, store: Store, cfg: Config
+    ) -> None:
+        """An overridden queued fix must win even though an attention item
+        (normally higher priority) exists without an override."""
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        fid_a, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-attn"))
+        store.set_status(fid_a, "pr_open")
+        store.upsert_pr_state(fid_a, pr_number=1, needs_attention="new_comments", synced_at=1)
+        fid_q, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-override"))
+        store.set_status(fid_q, "queued")
+        store.set_budget_override(fid_q, "once")
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "fix"
+        assert target["id"] == fid_q
+
+
+class TestPickNextRepoRotation:
+    def test_not_yet_cloned_picks_hunt(self, store: Store, cfg: Config) -> None:
+        rid = store.add_repo("r", "https://r", "/definitely/not/cloned")
+        kind, target = pick_next(store, cfg)
+        assert kind == "hunt"
+        assert target["id"] == rid
+
+    def test_never_run_job_types_picked_alphabetically(
+        self, store: Store, cfg: Config, tmp_path: Path
+    ) -> None:
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        rid = store.add_repo("r", "https://r", str(repo_path))
+        store.set_last_hunt(rid, "deadbeef")  # hunt has run; others haven't
+
+        kind, _target = pick_next(store, cfg)
+        # never-run set is {test_gap, dep_update, refactor} -> alphabetically first
+        assert kind == "dep_update"
+
+    def test_oldest_last_run_wins_when_none_are_never_run(
+        self, store: Store, cfg: Config, tmp_path: Path
+    ) -> None:
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        rid = store.add_repo("r", "https://r", str(repo_path))
+        store.db.execute(
+            "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
+            " last_dep_update_at=?, last_refactor_at=? WHERE id=?",
+            (500, 400, 300, 100, rid),  # refactor is oldest (100)
+        )
+        store.db.commit()
+
+        kind, _target = pick_next(store, cfg)
+        assert kind == "refactor"
+
+    def test_least_recently_hunted_repo_wins(self, store: Store, cfg: Config) -> None:
+        r1 = store.add_repo("r1", "https://r1", "/nonexistent1")
+        r2 = store.add_repo("r2", "https://r2", "/nonexistent2")
+        store.set_last_hunt(r1, "sha1")  # r1 has hunted before, r2 never has
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "hunt"
+        assert target["id"] == r2  # never-hunted beats already-hunted
+
+    def test_force_repo_overrides_selection(self, store: Store, cfg: Config) -> None:
+        r1 = store.add_repo("r1", "https://r1", "/nonexistent1")
+        store.add_repo("r2", "https://r2", "/nonexistent2")
+
+        kind, target = pick_next(store, cfg, force_repo="r1")
+        assert kind == "hunt"
+        assert target["id"] == r1
+
+    def test_force_repo_unknown_raises(self, store: Store, cfg: Config) -> None:
+        with pytest.raises(ValueError, match="unknown repo"):
+            pick_next(store, cfg, force_repo="nonexistent-repo-name")
