@@ -1,18 +1,29 @@
 // Idle-Token Bug Hunter — triage dashboard
 
+import { z } from "zod";
+
 // ---------------------------------------------------------------------------
 // API types (mirror hunter.types / hunter.store)
 // ---------------------------------------------------------------------------
 
-interface WindowInfo {
-  used_fraction: number | null;
-  status: string | null;
-  resets_at: number | null;
-  age_s: number;
-  stale: boolean;
-  ramp: number | null;
-  available_tokens: number | null;
-}
+// Zod schemas double as the runtime-validated wire contract AND (via
+// z.infer) the compile-time type -- one definition, not two that can
+// silently drift. Only the /api/summary boundary is validated this way
+// (see refresh() below); Finding/Job/Event/Repo below it stay plain
+// interfaces for the OTHER endpoints (findings/jobs/events/repos) that
+// aren't in scope here, though Job/Event/Repo/CurrentJob/NextCandidate/
+// SchedulerState/ActivityStatus/Summary further down ARE zod-derived,
+// since /api/summary embeds all of them.
+const WindowInfoSchema = z.object({
+  used_fraction: z.number().nullable(),
+  status: z.string().nullable(),
+  resets_at: z.number().nullable(),
+  age_s: z.number(),
+  stale: z.boolean(),
+  ramp: z.number().nullable(),
+  available_tokens: z.number().nullable(),
+});
+type WindowInfo = z.infer<typeof WindowInfoSchema>;
 
 interface Finding {
   type: string;  // 'bug' | 'dep_update' | 'test_gap' | 'refactor' | 'modernization'
@@ -54,64 +65,70 @@ interface Finding {
   needs_attention: string | null;
 }
 
-interface Job {
-  id: number;
-  kind: string;
-  repo_id: number;
-  repo_name: string;
-  finding_id: number | null;
-  state: string;
-  tokens_new: number | null;
-  calls: number | null;
-  exit_code: number | null;
-  killed_reason: string | null;
-  started_at: number | null;
-  finished_at: number | null;
-}
+const JobSchema = z.object({
+  id: z.number(),
+  kind: z.string(),
+  repo_id: z.number(),
+  repo_name: z.string(),
+  finding_id: z.number().nullable(),
+  state: z.string(),
+  tokens_new: z.number().nullable(),
+  calls: z.number().nullable(),
+  exit_code: z.number().nullable(),
+  killed_reason: z.string().nullable(),
+  started_at: z.number().nullable(),
+  finished_at: z.number().nullable(),
+});
+type Job = z.infer<typeof JobSchema>;
 
-interface Event {
-  id: number;
-  at: number;
-  kind: string;
-  message: string;
-  job_id: number | null;
-  finding_id: number | null;
-}
+const EventSchema = z.object({
+  id: z.number(),
+  at: z.number(),
+  kind: z.string(),
+  message: z.string(),
+  job_id: z.number().nullable(),
+  finding_id: z.number().nullable(),
+});
+type Event = z.infer<typeof EventSchema>;
 
-interface Repo {
-  id: number;
-  name: string;
-  url: string;
-  path: string;
-  forge: string;
-  default_branch: string;
-  last_hunt_sha: string | null;
-  last_hunt_at: number | null;
-  enabled: number;
-  added_at: number;
-}
+const RepoSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  url: z.string(),
+  path: z.string(),
+  forge: z.string(),
+  default_branch: z.string(),
+  last_hunt_sha: z.string().nullable(),
+  last_hunt_at: z.number().nullable(),
+  enabled: z.number(),
+  added_at: z.number(),
+});
+type Repo = z.infer<typeof RepoSchema>;
 
-interface CurrentJob extends Job {
-  finding_summary?: string | null;
-  finding_fingerprint?: string | null;
-}
+const CurrentJobSchema = JobSchema.extend({
+  finding_summary: z.string().nullable().optional(),
+  finding_fingerprint: z.string().nullable().optional(),
+});
+type CurrentJob = z.infer<typeof CurrentJobSchema>;
 
-interface NextCandidate {
-  kind: string;
-  id: number;
-  label: string | null;
-  is_finding: boolean;
-  budget_state: string; // "allowed" | "denied" | "exempt"
-  budget_reason: string;
-  budget_retry_at: number | null;
-}
+const NextCandidateSchema = z.object({
+  kind: z.string(),
+  id: z.number(),
+  label: z.string().nullable(),
+  is_finding: z.boolean(),
+  budget_state: z.string(), // "allowed" | "denied" | "exempt"
+  budget_reason: z.string(),
+  budget_retry_at: z.number().nullable(),
+});
+type NextCandidate = z.infer<typeof NextCandidateSchema>;
 
-interface SchedulerState {
-  state: string; // "idle" | "denied" | "error"
-  detail: string;
-  next_wake_at: number | null;
-  updated_at: number;
-}
+const SchedulerStateSchema = z.object({
+  state: z.string(), // "idle" | "denied" | "error"
+  detail: z.string(),
+  next_wake_at: z.number().nullable(),
+  updated_at: z.number(),
+});
+type SchedulerState = z.infer<typeof SchedulerStateSchema>;
 
 // The single, canonical answer to "what is hunter doing right now" --
 // computed once server-side (see hunter.server._activity_status, whose
@@ -122,28 +139,33 @@ interface SchedulerState {
 // actually has -- no "job: null" on a variant that was never running):
 // renderActivity's switch below is checked exhaustively against this
 // by assertNever, so adding a kind here without a case there is a
-// compile error, not a silent gap.
-type ActivityStatus =
-  | { kind: "running"; job: CurrentJob }
-  | { kind: "working" }
-  | { kind: "error"; detail: string }
-  | { kind: "paused"; candidate: NextCandidate }
-  | { kind: "ready"; candidate: NextCandidate }
-  | { kind: "idle" }
-  | { kind: "warming_up" };
+// compile error, not a silent gap. z.discriminatedUnion also means a
+// malformed or unrecognized "kind" value from the wire is rejected at
+// parse time, before renderActivity ever sees it.
+const ActivityStatusSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("running"), job: CurrentJobSchema }),
+  z.object({ kind: z.literal("working") }),
+  z.object({ kind: z.literal("error"), detail: z.string() }),
+  z.object({ kind: z.literal("paused"), candidate: NextCandidateSchema }),
+  z.object({ kind: z.literal("ready"), candidate: NextCandidateSchema }),
+  z.object({ kind: z.literal("idle") }),
+  z.object({ kind: z.literal("warming_up") }),
+]);
+type ActivityStatus = z.infer<typeof ActivityStatusSchema>;
 
-interface Summary {
-  windows: Record<string, WindowInfo>;
-  counts: Record<string, number>;
-  type_counts: Record<string, number>;
-  repos: Repo[];
-  last_cycle: Event | null;
-  cycle_running: boolean;
-  current_job: CurrentJob | null;
-  next_candidate: NextCandidate | null;
-  scheduler_state: SchedulerState | null;
-  activity_status: ActivityStatus;
-}
+const SummarySchema = z.object({
+  windows: z.record(z.string(), WindowInfoSchema),
+  counts: z.record(z.string(), z.number()),
+  type_counts: z.record(z.string(), z.number()),
+  repos: z.array(RepoSchema),
+  last_cycle: EventSchema.nullable(),
+  cycle_running: z.boolean(),
+  current_job: CurrentJobSchema.nullable(),
+  next_candidate: NextCandidateSchema.nullable(),
+  scheduler_state: SchedulerStateSchema.nullable(),
+  activity_status: ActivityStatusSchema,
+});
+type Summary = z.infer<typeof SummarySchema>;
 
 interface ApiResult<T> {
   status: number;
@@ -635,8 +657,8 @@ function renderWindows(windows: Record<string, WindowInfo>): void {
 }
 
 function renderActivity(s: Summary): void {
-  const a = s.activity_status;
-  const ss = s.scheduler_state;
+  const a: ActivityStatus = s.activity_status;
+  const ss: SchedulerState | null = s.scheduler_state;
   const rows: string[] = [];
 
   // Every branch below renders a.kind, computed once server-side by
@@ -646,7 +668,7 @@ function renderActivity(s: Summary): void {
   // See _activity_status's docstring for why that split matters.
   switch (a.kind) {
     case "running": {
-      const cj = a.job;
+      const cj: CurrentJob = a.job;
       const label =
         cj.finding_id != null
           ? `#${cj.finding_id} ${esc(cj.finding_summary || cj.finding_fingerprint || "")}`
@@ -666,7 +688,7 @@ function renderActivity(s: Summary): void {
       rows.push(`<div class="row"><b class="error">\u26a0 error</b> ${esc(a.detail)}</div>`);
       break;
     case "paused": {
-      const nc = a.candidate;
+      const nc: NextCandidate = a.candidate;
       const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
       rows.push(
         `<div class="row"><b class="paused">\u23f8 paused</b> next up: ${esc(nc.kind)} ${label}` +
@@ -693,7 +715,7 @@ function renderActivity(s: Summary): void {
       break;
     }
     case "ready": {
-      const nc = a.candidate;
+      const nc: NextCandidate = a.candidate;
       const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
       rows.push(
         `<div class="row"><b class="ready">\u25b7 ready</b> next up: ${esc(nc.kind)} ${label}` +
@@ -983,7 +1005,14 @@ async function refresh(): Promise<void> {
     ) {
       throw new Error("api error");
     }
-    const s = summary.body!;
+    // Re-verify the actual bytes that came back against SummarySchema --
+    // TypeScript's `api<Summary>(...)` cast above is compile-time only
+    // and trusts the wire unconditionally; this is the runtime half,
+    // mirroring hunter.server._validate_summary on the Python side.
+    // Throws (caught below) on any mismatch instead of silently
+    // rendering whatever shape came back -- e.g. a wrong-typed field
+    // that used to just print "NaNs" with no error at all.
+    const s = SummarySchema.parse(summary.body);
     const all = findings.body!;
 
     // Snapshot open <details> elements before DOM rebuild.
