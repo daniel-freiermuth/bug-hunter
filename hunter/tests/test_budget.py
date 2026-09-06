@@ -196,6 +196,29 @@ def test_5h_exhausted_deny():
     assert d.retry_at == resets_at
 
 
+def test_5h_exhausted_but_stale_still_denies():
+    """Regression: an "exhausted" reading older than stale_after_s must NOT
+    be treated as "no active window" (opener-safe). resets_at is still in
+    the future, so the window is definitely still exhausted -- staleness
+    only means nobody has re-probed since, not that it reopened early.
+    Production incident: a probe recorded exhausted+ok-fresh, then ~29s
+    later (still 4 minutes before resets_at) the SAME reading crossed the
+    staleAfterS=1800 age threshold mid-cycle and decide() flipped to allow,
+    starting a fix job before the real reset."""
+    stale_age = 3600.0  # well above default stale_after_s=1800
+    resets_at = _NOW_MS + 4 * 60 * 1000  # reset is still 4 minutes away
+    windows = {
+        "anthropic:5h": _ws(
+            "anthropic:5h", used_fraction=1.0, status="exhausted",
+            resets_at=resets_at, age_s=stale_age,
+        ),
+        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10, age_s=stale_age),
+    }
+    d = decide(_cfg(), "hunt", windows)
+    assert not d.allow
+    assert d.retry_at == resets_at
+
+
 def test_7d_denial_during_5h_headroom_uses_7d_retry_not_5h_timing():
     """Regression: a 7d-ramp denial that happens to coincide with the 5h
     window's initial headroom period must report a retry_at based on the
