@@ -640,9 +640,14 @@ function renderActivity(s: Summary): void {
       );
     }
   } else if (nc) {
+    // budget_state is "allowed" or "exempt" here (the "denied" case is
+    // handled above) -- the very next cycle attempt will dispatch this,
+    // not "idle" in any sense a reader would recognize: nothing is
+    // blocking it, it just hasn't been picked up by the daemon's own
+    // wake timer yet.
     const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
     rows.push(
-      `<div class="row"><b class="idle">\u25cf idle</b> next up: ${esc(nc.kind)} ${label}` +
+      `<div class="row"><b class="ready">\u25b7 ready</b> next up: ${esc(nc.kind)} ${label}` +
         ` \u00b7 budget: <span class="b-${esc(nc.budget_state)}">${esc(nc.budget_state)}</span></div>`,
     );
   } else if (ss) {
@@ -657,12 +662,13 @@ function renderActivity(s: Summary): void {
     // "next check" only means "the daemon loop wakes up again" -- with
     // sync_prs running (nearly) every cycle to never delay noticing PR
     // feedback, that wake is often just a cheap heartbeat, not a real
-    // chance to start a job while the budget gate is still shut.
+    // chance to start a job while the budget gate is still shut. While
+    // ready, there's no such ambiguity -- the next wake IS the start.
     const heartbeatOnly =
       nc?.budget_state === "denied" &&
       nc.budget_retry_at != null &&
       ss.next_wake_at < nc.budget_retry_at;
-    const label = heartbeatOnly ? "next sync check" : "next check";
+    const label = nc && nc.budget_state !== "denied" ? "starting" : heartbeatOnly ? "next sync check" : "next check";
     const note = heartbeatOnly ? " \u2014 budget still closed" : "";
     rows.push(
       `<div class="row dim">${label} ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})${note}</div>`,
