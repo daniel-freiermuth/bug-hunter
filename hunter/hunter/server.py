@@ -16,7 +16,7 @@ import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, TypedDict
 from urllib.parse import parse_qs, urlparse
 
 from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
@@ -666,12 +666,55 @@ def _describe_cycle(summary: Row) -> tuple[str, str]:
     return "idle", "cycle produced no actionable outcome"
 
 
+class _RunningStatus(TypedDict):
+    kind: Literal["running"]
+    job: Row
+
+
+class _WorkingStatus(TypedDict):
+    kind: Literal["working"]
+
+
+class _ErrorStatus(TypedDict):
+    kind: Literal["error"]
+    detail: str
+
+
+class _PausedStatus(TypedDict):
+    kind: Literal["paused"]
+    candidate: Row
+
+
+class _ReadyStatus(TypedDict):
+    kind: Literal["ready"]
+    candidate: Row
+
+
+class _IdleStatus(TypedDict):
+    kind: Literal["idle"]
+
+
+class _WarmingUpStatus(TypedDict):
+    kind: Literal["warming_up"]
+
+
+ActivityStatus = (
+    _RunningStatus
+    | _WorkingStatus
+    | _ErrorStatus
+    | _PausedStatus
+    | _ReadyStatus
+    | _IdleStatus
+    | _WarmingUpStatus
+)
+
+
 def _activity_status(
     current_job: Row | None,
     cycle_running: bool,
     next_candidate: Row | None,
     scheduler_state: Row | None,
-) -> Row:
+) -> ActivityStatus:
     """The single, canonical answer to "what is hunter doing right now" --
     every rendering surface (the Status page's activity panel AND the
     manual-run button) must derive its text from this function's output
@@ -691,6 +734,17 @@ def _activity_status(
     the same lesson: stop computing "what's happening" more than once.
     This function is that one computation, and it's covered by tests
     the way the client-side version it replaced never was.
+
+    ActivityStatus is a discriminated union (Literal "kind" tag, one
+    TypedDict per variant carrying only the fields that variant actually
+    has -- no "job: None" on a status that was never running) rather
+    than one shape with always-present nullable fields: mypy checks each
+    return statement against its variant's exact shape, so "attach a job
+    to the paused variant" is a type error here, not just a convention.
+    The consuming switch in ui/src/app.ts has the equivalent TypeScript
+    discriminated union plus an exhaustiveness check, so adding a new
+    variant here without updating that switch is a compile error on
+    both ends -- the guarantee this whole function exists to provide.
 
     Priority, highest first -- each check answers "do we know something
     more current than the next one down":
@@ -712,18 +766,18 @@ def _activity_status(
       7. nothing at all -> "warming_up": no cycle has ever run.
     """
     if current_job is not None:
-        return {"kind": "running", "job": current_job, "candidate": None, "detail": None}
+        return {"kind": "running", "job": current_job}
     if cycle_running:
-        return {"kind": "working", "job": None, "candidate": None, "detail": None}
+        return {"kind": "working"}
     if scheduler_state is not None and scheduler_state.get("state") == "error":
-        return {"kind": "error", "job": None, "candidate": None, "detail": scheduler_state["detail"]}
+        return {"kind": "error", "detail": scheduler_state["detail"]}
     if next_candidate is not None and next_candidate.get("budget_state") == "denied":
-        return {"kind": "paused", "job": None, "candidate": next_candidate, "detail": None}
+        return {"kind": "paused", "candidate": next_candidate}
     if next_candidate is not None:
-        return {"kind": "ready", "job": None, "candidate": next_candidate, "detail": None}
+        return {"kind": "ready", "candidate": next_candidate}
     if scheduler_state is not None:
-        return {"kind": "idle", "job": None, "candidate": None, "detail": None}
-    return {"kind": "warming_up", "job": None, "candidate": None, "detail": None}
+        return {"kind": "idle"}
+    return {"kind": "warming_up"}
 
 
 def _compute_sleep_s(store: Any, summary: Row) -> float:

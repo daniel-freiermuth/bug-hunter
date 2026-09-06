@@ -114,15 +114,23 @@ interface SchedulerState {
 }
 
 // The single, canonical answer to "what is hunter doing right now" --
-// computed once server-side (see hunter.server._activity_status) so this
-// panel and the manual-run button can never independently disagree about
-// it again.
-interface ActivityStatus {
-  kind: "running" | "working" | "error" | "paused" | "ready" | "idle" | "warming_up";
-  job: CurrentJob | null;
-  candidate: NextCandidate | null;
-  detail: string | null;
-}
+// computed once server-side (see hunter.server._activity_status, whose
+// docstring names the four incidents this replaced) so this panel and
+// the manual-run button can never independently disagree about it
+// again. A real discriminated union, mirroring the Python TypedDict
+// union exactly (one variant per kind, only the fields that kind
+// actually has -- no "job: null" on a variant that was never running):
+// renderActivity's switch below is checked exhaustively against this
+// by assertNever, so adding a kind here without a case there is a
+// compile error, not a silent gap.
+type ActivityStatus =
+  | { kind: "running"; job: CurrentJob }
+  | { kind: "working" }
+  | { kind: "error"; detail: string }
+  | { kind: "paused"; candidate: NextCandidate }
+  | { kind: "ready"; candidate: NextCandidate }
+  | { kind: "idle" }
+  | { kind: "warming_up" };
 
 interface Summary {
   windows: Record<string, WindowInfo>;
@@ -218,6 +226,16 @@ const ESC_MAP: Record<string, string> = {
 
 function esc(s: unknown): string {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ESC_MAP[c] ?? c);
+}
+
+// Exhaustiveness check for discriminated unions (the TS analog of
+// Rust's "match must cover every enum variant, or it's a compile
+// error") -- calling this with a value TypeScript hasn't already
+// narrowed to `never` is itself a compile error, so a switch that
+// forgets a case fails to build instead of silently falling through
+// at runtime.
+function assertNever(x: never): never {
+  throw new Error(`unreachable: unhandled variant ${JSON.stringify(x)}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +646,7 @@ function renderActivity(s: Summary): void {
   // See _activity_status's docstring for why that split matters.
   switch (a.kind) {
     case "running": {
-      const cj = a.job!;
+      const cj = a.job;
       const label =
         cj.finding_id != null
           ? `#${cj.finding_id} ${esc(cj.finding_summary || cj.finding_fingerprint || "")}`
@@ -645,10 +663,10 @@ function renderActivity(s: Summary): void {
       );
       break;
     case "error":
-      rows.push(`<div class="row"><b class="error">\u26a0 error</b> ${esc(a.detail || "")}</div>`);
+      rows.push(`<div class="row"><b class="error">\u26a0 error</b> ${esc(a.detail)}</div>`);
       break;
     case "paused": {
-      const nc = a.candidate!;
+      const nc = a.candidate;
       const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
       rows.push(
         `<div class="row"><b class="paused">\u23f8 paused</b> next up: ${esc(nc.kind)} ${label}` +
@@ -675,7 +693,7 @@ function renderActivity(s: Summary): void {
       break;
     }
     case "ready": {
-      const nc = a.candidate!;
+      const nc = a.candidate;
       const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
       rows.push(
         `<div class="row"><b class="ready">\u25b7 ready</b> next up: ${esc(nc.kind)} ${label}` +
@@ -701,6 +719,8 @@ function renderActivity(s: Summary): void {
     case "warming_up":
       rows.push('<div class="row dim">warming up \u2014 no cycle has run yet</div>');
       break;
+    default:
+      assertNever(a);
   }
 
   // Last log -- what the most recently COMPLETED cycle actually did.
