@@ -372,6 +372,139 @@ class TestWindowLog:
         assert dict(rows[0])["source_age_s"] == 5
 
 
+# -- calibration -------------------------------------------------------
+
+
+class TestCalibration:
+    """log_window's calibration_samples side effect and estimate_capacity."""
+
+    _RESETS_AT = 99_999_999_999
+
+    def _probe(self, used_fraction: float) -> WindowState:
+        return WindowState(
+            limit_id="anthropic:5h",
+            used_fraction=used_fraction,
+            status="ok",
+            resets_at=self._RESETS_AT,
+            recorded_at=1,
+            age_s=1.0,
+        )
+
+    def test_first_probe_records_no_sample(self, store: Store) -> None:
+        """Nothing to compare against yet -- no prior row for this window."""
+        store.log_window([self._probe(0.10)])
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_fresh_probe_with_hunter_spend_records_a_sample(self, store: Store) -> None:
+        import time
+
+        from hunter.types import now_ms
+
+        rid = store.add_repo("r", "https://r", "/r")
+        store.log_window([self._probe(0.10)])
+        time.sleep(0.02)
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
+        time.sleep(0.02)
+        store.log_window([self._probe(0.20)])
+
+        rows = store.db.execute("SELECT * FROM calibration_samples").fetchall()
+        assert len(rows) == 1
+        row = dict(rows[0])
+        assert row["limit_id"] == "anthropic:5h"
+        assert row["hunter_tokens"] == 500_000
+        assert row["used_fraction_delta"] == pytest.approx(0.10)
+        assert row["window_resets_at"] == self._RESETS_AT
+
+    def test_unchanged_used_fraction_records_no_sample(self, store: Store) -> None:
+        """A re-read of the same stale probe (used_fraction didn't move)
+        must not fabricate a sample out of noise."""
+        import time
+
+        from hunter.types import now_ms
+
+        rid = store.add_repo("r", "https://r", "/r")
+        store.log_window([self._probe(0.10)])
+        time.sleep(0.02)
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
+        time.sleep(0.02)
+        store.log_window([self._probe(0.10)])  # same fraction -- no fresh probe
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_no_hunter_spend_records_no_sample(self, store: Store) -> None:
+        """used_fraction moved but hunter didn't run anything in the gap
+        (e.g. a human's own interactive usage) -- nothing attributable."""
+        import time
+
+        store.log_window([self._probe(0.10)])
+        time.sleep(0.02)
+        store.log_window([self._probe(0.20)])
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_different_window_instance_not_compared(self, store: Store) -> None:
+        """A genuinely new window (different resets_at) must not be
+        diffed against the previous instance's used_fraction."""
+        import time
+
+        from hunter.types import now_ms
+
+        rid = store.add_repo("r", "https://r", "/r")
+        store.log_window([self._probe(0.90)])  # old window, nearly full
+        time.sleep(0.02)
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
+        time.sleep(0.02)
+        fresh = WindowState(
+            limit_id="anthropic:5h", used_fraction=0.05, status="ok",
+            resets_at=self._RESETS_AT + 6 * 3600 * 1000, recorded_at=1, age_s=1.0,
+        )
+        store.log_window([fresh])
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_estimate_capacity_no_data_returns_none(self, store: Store) -> None:
+        assert store.estimate_capacity("anthropic:5h") is None
+
+    def test_estimate_capacity_uses_75th_percentile(self, store: Store) -> None:
+        """Confounded samples can only understate capacity (concurrent
+        non-hunter spend inflates the delta without showing up in
+        hunter_tokens), never overstate it -- so the estimate should sit
+        near the top of the observed distribution, not the median."""
+        ratios = [1_000_000, 2_000_000, 3_000_000, 4_000_000, 10_000_000]
+        for i, r in enumerate(ratios):
+            store.db.execute(
+                "INSERT INTO calibration_samples"
+                " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
+                " VALUES (?, 'anthropic:5h', 1, 0.10, ?)",
+                (i, r * 0.10),
+            )
+        store.db.commit()
+        estimate = store.estimate_capacity("anthropic:5h")
+        # int(5 * 0.75) = 3 (0-indexed) -> the 4th of 5 sorted ratios, well
+        # above the median (3,000,000) but not simply the single max either.
+        assert estimate == 4_000_000
+
+    def test_estimate_capacity_filters_tiny_deltas(self, store: Store) -> None:
+        """A delta smaller than min_delta is dominated by Anthropic's own
+        ~1%-quantized reporting and must not pollute the estimate."""
+        store.db.execute(
+            "INSERT INTO calibration_samples"
+            " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
+            " VALUES (1, 'anthropic:5h', 1, 0.01, 50000)"
+        )
+        store.db.commit()
+        assert store.estimate_capacity("anthropic:5h", min_delta=0.02) is None
+
+    def test_estimate_capacity_scoped_by_limit_id(self, store: Store) -> None:
+        store.db.execute(
+            "INSERT INTO calibration_samples"
+            " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
+            " VALUES (1, 'anthropic:7d', 1, 0.10, 5000000)"
+        )
+        store.db.commit()
+        assert store.estimate_capacity("anthropic:5h") is None
+
+
 # -- update_finding_analysis -----------------------------------------------
 
 

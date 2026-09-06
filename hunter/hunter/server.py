@@ -173,6 +173,7 @@ class Handler(BaseHTTPRequestHandler):
     def _summary(self) -> Row:
         from . import budget, scheduler
 
+        store = self._store()
         now_ms = time.time() * 1000
         windows: Row = {}
         for limit_id, w in budget.read_windows().items():
@@ -182,6 +183,12 @@ class Handler(BaseHTTPRequestHandler):
                 ramp = budget.ramp_7d(w.resets_at, now_ms)
             else:
                 ramp = None
+            capacity = store.estimate_capacity(limit_id)
+            available_tokens = (
+                max(0.0, (ramp if ramp is not None else 1.0) - w.used_fraction) * capacity
+                if capacity is not None and w.used_fraction is not None
+                else None
+            )
             windows[limit_id] = {
                 "used_fraction": w.used_fraction,
                 "status": w.status,
@@ -189,8 +196,8 @@ class Handler(BaseHTTPRequestHandler):
                 "age_s": w.age_s,
                 "stale": w.stale,
                 "ramp": ramp,
+                "available_tokens": available_tokens,
             }
-        store = self._store()
         counts: dict[str, int] = dict.fromkeys(FINDING_STATUSES, 0)
         all_findings = store.list_all_findings()
         counts.update(Counter(f["status"] for f in all_findings))
