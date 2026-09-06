@@ -85,7 +85,18 @@ def decide(
     for lid, w in windows.items():
         if ":7d" not in lid or w.used_fraction is None:
             continue
-        if w.resets_at and w.resets_at > now_ms:
+        if w.resets_at and w.resets_at <= now_ms:
+            # This window's own cycle has already ended -- the recorded
+            # used_fraction describes a bygone week, not the current one
+            # (e.g. a per-model-class window nobody has probed since the
+            # config stopped routing jobs to that model; resets_at can be
+            # weeks in the past). Using it here would gate live decisions
+            # on data for a period that is definitionally over. Skip it,
+            # same as "no data for this dimension" -- unlike the missing-
+            # resets_at case below, we know for certain this reading is
+            # stale, not just imprecise.
+            continue
+        if w.resets_at:
             started_ms = w.resets_at - _WEEK_MS
             elapsed_frac = min((now_ms - started_ms) / _WEEK_MS, 1.0)
         else:

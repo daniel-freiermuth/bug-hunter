@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sqlite3
-from typing import Any
+from typing import Any, Iterator
 
 from .types import (
     ACTIVE_STATUSES,
@@ -341,6 +342,39 @@ class Store:
         self.db.execute(f"UPDATE findings SET {', '.join(sets)} WHERE id = ?", args)
         self.db.commit()
 
+    @contextlib.contextmanager
+    def in_progress(self, fid: int, status: str, fallback: str) -> Iterator[None]:
+        """Structural guard for a status that must never be observed
+        outside the dynamic extent of the wrapped block (e.g. 'fixing' --
+        the normal work queue never scans for it, so leaving a finding
+        there is a silent, indefinite disappearance).
+
+        Sets `status` on entry. On exit -- normal return, early return,
+        OR an exception raised anywhere in the block -- checks whether
+        anything already moved the finding to a DIFFERENT status; if
+        not, forces it to `fallback`. This makes "the function raised
+        before reaching its own terminal set_status call" structurally
+        indistinguishable, in effect on the finding, from "the function
+        finished and explicitly chose to requeue" -- there is no code
+        path left that both (a) leaves `status` set and (b) exits the
+        block, because Python guarantees `finally` runs on every exit
+        including via exception or `return`.
+
+        Does NOT cover the process itself being killed (SIGKILL, a hard
+        crash) -- `finally` cannot run then. That residual case is what
+        Store.reconcile_orphaned_jobs() exists for; this context manager
+        is what makes everything short of total process death (which is
+        the common case: any exception in git/network/file-IO code)
+        impossible to get wrong, rather than merely repaired after.
+        """
+        self.set_status(fid, status)
+        try:
+            yield
+        finally:
+            current = self.get_finding(fid)
+            if current is not None and current["status"] == status:
+                self.set_status(fid, fallback)
+
     def set_budget_override(self, fid: int, mode: str | None) -> None:
         """Set budget override: 'once', 'exempt', or None to clear."""
         if mode not in (None, "once", "exempt"):
@@ -446,6 +480,61 @@ class Store:
                 (limit,),
             )
         )
+
+    def reconcile_orphaned_jobs(self) -> dict[str, list[Row]]:
+        """Last-resort net for total process death (crash, systemctl
+        restart, host reboot -- SIGKILL, or any signal that doesn't let
+        Python's `finally` run). Any plain exception mid-run_fix is
+        already handled structurally by `in_progress()`'s try/finally;
+        this exists only for the residual case where the process itself
+        stops executing, not just one function call.
+
+        Safe to call unconditionally at the top of every cycle attempt:
+        a single daemon process owns the job lifecycle exclusively (the
+        systemd unit runs exactly one `hunter daemon`, and _cycle_lock
+        serializes the loop against POST /api/cycle within that
+        process), so at the moment THIS call runs -- before this process
+        has started any new job this cycle -- nothing can legitimately
+        still be mid-fix. Any finding found at 'fixing' here was
+        orphaned by a process that died before `in_progress()`'s
+        `finally` could run at all.
+
+        Keys off findings.status directly, not jobs.state, for the same
+        reason `in_progress()` does: a job row can already be terminal
+        (written by _record_job) while the finding is still 'fixing' if
+        the process died in the stretch after that but before
+        `in_progress()`'s cleanup ran. 'fixing' is never scanned by the
+        normal work queue (only queued/rechecking/pr_open-with-attention
+        are), so without this it sits invisible and unretried
+        indefinitely (observed in production: finding #57 sat stuck for
+        a month after an old crash, before either mechanism existed).
+
+        Job rows still 'running' are handled separately and marked
+        'killed' so they stop inflating _running_jobs_cap's inflight sum
+        forever -- that's a real but lower-stakes leak (only makes the
+        budget more conservative, doesn't strand any finding), so it is
+        not required for the finding-status recovery above to work.
+
+        Returns {"findings": [...], "jobs": [...]} -- the rows touched.
+        """
+        stuck_findings = _rows(
+            self.db.execute("SELECT * FROM findings WHERE status = 'fixing'")
+        )
+        for f in stuck_findings:
+            self.set_status(f["id"], "queued")
+
+        orphaned_jobs = _rows(
+            self.db.execute("SELECT * FROM jobs WHERE state = 'running'")
+        )
+        for r in orphaned_jobs:
+            self.update_job(
+                r["id"],
+                state="killed",
+                killed_reason="orphaned",
+                finished_at=now_ms(),
+                notes="reconciled at cycle startup -- prior process died mid-job",
+            )
+        return {"findings": stuck_findings, "jobs": orphaned_jobs}
 
     # -- events / window log -------------------------------------------
     def log_event(

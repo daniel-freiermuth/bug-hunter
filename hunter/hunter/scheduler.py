@@ -863,144 +863,144 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
 
     job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens)
     pre_usage = _usage_snapshot(windows)
-    store.set_status(fid, "fixing")
-    store.update_job(job, state="running")
-    build_prompt = build_fix_prompt if is_bug else build_apply_improvement_prompt
-    prompt = build_prompt(finding, worktree, branch, repo, store.repo_notes(repo["id"]))
-    model = cfg.model_for("fix")
-    rr = runner.run_worker(
-        cfg,
-        worktree,
-        prompt,
-        dec.cap_tokens,
-        cfg.fix_max_wall_s,
-        model=model,
-    )
-    post_usage = _usage_snapshot(budget.read_windows())
-    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-    state = _record_job(store, job, rr, model=model, usage_delta=delta)
-    summary: Row = {
-        "kind": "fix",
-        "finding": fid,
-        "job": job,
-        "state": state,
-        "branch": branch,
-        "tokens_new": rr.tokens_new,
-    }
-
-    # (a) Worker declined this finding, or hit a blocker.
-    decline_file = worktree / ("NOT-A-BUG.md" if is_bug else "DECLINED.md")
-    blocked_file = worktree / "BLOCKED.md"
-    outcome_file = decline_file if decline_file.exists() else (blocked_file if blocked_file.exists() else None)
-    if outcome_file is not None:
-        reason = outcome_file.read_text()[:500]
-        store.set_status(fid, "rejected", verdict_reason=reason)
-        first_line = reason.splitlines()[0][:120] if reason else ""
-        verb = "rejected" if outcome_file == decline_file else "blocked"
-        store.log_event(
-            "fix",
-            f"#{fid} {verb} by worker: {first_line}",
-            job_id=job,
-            finding_id=fid,
+    with store.in_progress(fid, "fixing", fallback="queued"):
+        store.update_job(job, state="running")
+        build_prompt = build_fix_prompt if is_bug else build_apply_improvement_prompt
+        prompt = build_prompt(finding, worktree, branch, repo, store.repo_notes(repo["id"]))
+        model = cfg.model_for("fix")
+        rr = runner.run_worker(
+            cfg,
+            worktree,
+            prompt,
+            dec.cap_tokens,
+            cfg.fix_max_wall_s,
+            model=model,
         )
-        _drop_worktree(delete_branch=True)
-        summary["outcome"] = "rejected"
-        return summary
+        post_usage = _usage_snapshot(budget.read_windows())
+        delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+        state = _record_job(store, job, rr, model=model, usage_delta=delta)
+        summary: Row = {
+            "kind": "fix",
+            "finding": fid,
+            "job": job,
+            "state": state,
+            "branch": branch,
+            "tokens_new": rr.tokens_new,
+        }
 
-    # (b) Commits + PR description -> ship a draft PR.
-    rc, commits = run_cmd(
-        [
-            "git",
-            "-C",
-            str(worktree),
-            "log",
-            f"origin/{db}..HEAD",
-            "--oneline",
-        ]
-    )
-    if rc != 0:
+        # (a) Worker declined this finding, or hit a blocker.
+        decline_file = worktree / ("NOT-A-BUG.md" if is_bug else "DECLINED.md")
+        blocked_file = worktree / "BLOCKED.md"
+        outcome_file = decline_file if decline_file.exists() else (blocked_file if blocked_file.exists() else None)
+        if outcome_file is not None:
+            reason = outcome_file.read_text()[:500]
+            store.set_status(fid, "rejected", verdict_reason=reason)
+            first_line = reason.splitlines()[0][:120] if reason else ""
+            verb = "rejected" if outcome_file == decline_file else "blocked"
+            store.log_event(
+                "fix",
+                f"#{fid} {verb} by worker: {first_line}",
+                job_id=job,
+                finding_id=fid,
+            )
+            _drop_worktree(delete_branch=True)
+            summary["outcome"] = "rejected"
+            return summary
+
+        # (b) Commits + PR description -> ship a draft PR.
         rc, commits = run_cmd(
             [
                 "git",
                 "-C",
                 str(worktree),
                 "log",
-                f"{db}..HEAD",
+                f"origin/{db}..HEAD",
                 "--oneline",
             ]
         )
-    pr_desc = worktree / "PR-DESCRIPTION.md"
-    failure: str | None = None
-    if rc == 0 and commits and pr_desc.exists():
-        forge = forge_for(repo)
-        push_url = forge.ssh_url(repo["url"])
-        rc, out = run_cmd(
-            ["git", "-C", str(worktree), "push", "--force", push_url, "HEAD"],
-            timeout=600,
-        )
-        if rc == 0:
-            _, title = run_cmd(
+        if rc != 0:
+            rc, commits = run_cmd(
                 [
                     "git",
                     "-C",
                     str(worktree),
                     "log",
-                    "-1",
-                    "--format=%s",
+                    f"{db}..HEAD",
+                    "--oneline",
                 ]
             )
-            owner_slug = forge.owner_repo(repo["url"])
-            if not owner_slug:
-                failure = f"unparseable repo url for PR: {repo['url']!r}"
-            else:
-                rc, pr_url_or_err = forge.create_pr(
-                    owner_slug,
-                    branch,
-                    title or branch,
-                    pr_desc,
-                    cwd=str(worktree),
+        pr_desc = worktree / "PR-DESCRIPTION.md"
+        failure: str | None = None
+        if rc == 0 and commits and pr_desc.exists():
+            forge = forge_for(repo)
+            push_url = forge.ssh_url(repo["url"])
+            rc, out = run_cmd(
+                ["git", "-C", str(worktree), "push", "--force", push_url, "HEAD"],
+                timeout=600,
+            )
+            if rc == 0:
+                _, title = run_cmd(
+                    [
+                        "git",
+                        "-C",
+                        str(worktree),
+                        "log",
+                        "-1",
+                        "--format=%s",
+                    ]
                 )
-                if rc != 0 and "already exists" in pr_url_or_err:
-                    # Prior attempt already created the PR — extract its URL.
-                    m = re.search(r"https://\S+/pull/\d+", pr_url_or_err)
-                    if m:
-                        rc, pr_url_or_err = 0, m.group()
-                if rc == 0:
-                    store.set_status(fid, "pr_open", pr_url=pr_url_or_err)
-                    store.log_event(
-                        "ship",
-                        f"#{fid} draft PR: {pr_url_or_err}",
-                        job_id=job,
-                        finding_id=fid,
+                owner_slug = forge.owner_repo(repo["url"])
+                if not owner_slug:
+                    failure = f"unparseable repo url for PR: {repo['url']!r}"
+                else:
+                    rc, pr_url_or_err = forge.create_pr(
+                        owner_slug,
+                        branch,
+                        title or branch,
+                        pr_desc,
+                        cwd=str(worktree),
                     )
-                    _drop_worktree(delete_branch=False)
-                    summary.update(outcome="pr_open", pr_url=pr_url_or_err)
-                    if override == "once":
-                        store.set_budget_override(fid, None)
-                    return summary
-                failure = f"PR create failed: {pr_url_or_err[-300:]}"
-        else:
-            failure = f"push failed: {out[-300:]}"
-    elif failure is None:
-        failure = (
-            ("no commits" if not commits else "no PR-DESCRIPTION.md")
-            if state == "done"
-            else f"worker {state}"
-        )
+                    if rc != 0 and "already exists" in pr_url_or_err:
+                        # Prior attempt already created the PR — extract its URL.
+                        m = re.search(r"https://\S+/pull/\d+", pr_url_or_err)
+                        if m:
+                            rc, pr_url_or_err = 0, m.group()
+                    if rc == 0:
+                        store.set_status(fid, "pr_open", pr_url=pr_url_or_err)
+                        store.log_event(
+                            "ship",
+                            f"#{fid} draft PR: {pr_url_or_err}",
+                            job_id=job,
+                            finding_id=fid,
+                        )
+                        _drop_worktree(delete_branch=False)
+                        summary.update(outcome="pr_open", pr_url=pr_url_or_err)
+                        if override == "once":
+                            store.set_budget_override(fid, None)
+                        return summary
+                    failure = f"PR create failed: {pr_url_or_err[-300:]}"
+            else:
+                failure = f"push failed: {out[-300:]}"
+        elif failure is None:
+            failure = (
+                ("no commits" if not commits else "no PR-DESCRIPTION.md")
+                if state == "done"
+                else f"worker {state}"
+            )
 
-    # (c) Salvage: requeue, keep the worktree for the next attempt.
-    store.set_status(fid, "queued")
-    tail = (rr.stdout_tail or "")[-300:]
-    store.log_event(
-        "fix",
-        f"#{fid} incomplete ({failure}); worktree kept at {worktree}. tail: {tail}",
-        job_id=job,
-        finding_id=fid,
-    )
-    summary.update(outcome="requeued", failure=failure, worktree=str(worktree))
-    if override == "once":
-        store.set_budget_override(fid, None)
-    return summary
+        # (c) Salvage: requeue, keep the worktree for the next attempt.
+        store.set_status(fid, "queued")
+        tail = (rr.stdout_tail or "")[-300:]
+        store.log_event(
+            "fix",
+            f"#{fid} incomplete ({failure}); worktree kept at {worktree}. tail: {tail}",
+            job_id=job,
+            finding_id=fid,
+        )
+        summary.update(outcome="requeued", failure=failure, worktree=str(worktree))
+        if override == "once":
+            store.set_budget_override(fid, None)
+        return summary
 
 
 # -- pr sync ----------------------------------------------------------------
