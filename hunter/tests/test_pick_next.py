@@ -127,7 +127,7 @@ class TestPickNextRepoRotation:
         assert kind == "hunt"
         assert target["id"] == rid
 
-    def test_never_run_job_types_picked_alphabetically(
+    def test_never_run_job_types_picked_by_priority_not_alphabetically(
         self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
         repo_path = tmp_path / "repo"
@@ -136,8 +136,29 @@ class TestPickNextRepoRotation:
         store.set_last_hunt(rid, "deadbeef")  # hunt has run; others haven't
 
         kind, _target = pick_next(store, cfg)
-        # never-run set is {test_gap, dep_update, refactor} -> alphabetically first
-        assert kind == "dep_update"
+        # never-run set is {test_gap, dep_update, refactor}; priority order
+        # (hunt, test_gap, dep_update, refactor, modernization) picks
+        # test_gap first -- NOT "dep_update", which is where alphabetical
+        # sorting would have landed (and did, before this was fixed).
+        assert kind == "test_gap"
+
+    def test_denied_hunt_is_retried_before_a_never_run_sibling(
+        self, store: Store, cfg: Config, tmp_path: Path
+    ) -> None:
+        """Reproduces a real production incident (repo `recentIP`): hunt got
+        denied for budget, leaving last_hunt_at at 0 (a denial never updates
+        the watermark -- see run_hunt's deny path). The next cycle must
+        retry hunt, not jump to dep_update just because "dep_update" sorts
+        before "hunt" alphabetically and both are tied at 0."""
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()  # already cloned (a denied hunt still clones first)
+        rid = store.add_repo("r", "https://r", str(repo_path))
+        # hunt was attempted and denied -- last_hunt_at is still unset, exactly
+        # like every other never-run job type for this brand-new repo.
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "hunt"
+        assert target["id"] == rid
 
     def test_oldest_last_run_wins_when_none_are_never_run(
         self, store: Store, cfg: Config, tmp_path: Path
