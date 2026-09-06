@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
-from typing import TYPE_CHECKING, Any, ClassVar, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -24,6 +24,15 @@ from .types import (
     WindowState,
     now_ms,
 )
+
+# The value types SQLite actually stores for every column these dynamic
+# setters (update_repo/update_job/upsert_pr_state) and query-parameter
+# builders (list_findings/list_all_findings/set_status/
+# update_finding_analysis) touch -- str/int/float per schema.sql, plus
+# None for nullable columns. Precise enough to catch a real type error
+# (e.g. passing a dict or a list by mistake) while still fitting every
+# legitimate column value, without Any's "stop checking entirely."
+SqlParam = str | int | float | None
 
 _JOB_COLUMNS = {
     "state",
@@ -155,7 +164,7 @@ class Store:
         )
         self.db.commit()
 
-    def update_repo(self, repo_id: int, **fields: Any) -> None:
+    def update_repo(self, repo_id: int, **fields: str | int) -> None:
         allowed = {"name", "url", "default_branch", "forge", "enabled"}
         bad = set(fields) - allowed
         if bad:
@@ -287,7 +296,7 @@ class Store:
         min_severity: str | None = None,
     ) -> list[Row]:
         q = "SELECT * FROM findings"
-        args: list[Any] = []
+        args: list[SqlParam] = []
         conds: list[str] = []
         if status:
             conds.append("status = ?")
@@ -318,7 +327,7 @@ class Store:
         display (bug_class | update_type | 'coverage' | smell_type).
         """
         conds: list[str] = []
-        args: list[Any] = []
+        args: list[SqlParam] = []
         if status:
             conds.append("status = ?")
             args.append(status)
@@ -363,7 +372,7 @@ class Store:
             msg = f"invalid status: {status}"
             raise ValueError(msg)
         sets: list[str] = ["status = ?", "updated_at = ?"]
-        args: list[Any] = [status, now_ms()]
+        args: list[SqlParam] = [status, now_ms()]
         if verdict_reason is not None:
             sets.append("verdict_reason = ?")
             args.append(verdict_reason)
@@ -454,7 +463,7 @@ class Store:
         r = self.db.execute("SELECT * FROM pr_state WHERE finding_id = ?", (fid,)).fetchone()
         return dict(r) if r else None
 
-    def upsert_pr_state(self, fid: int, **fields: Any) -> None:
+    def upsert_pr_state(self, fid: int, **fields: SqlParam) -> None:
         bad = set(fields) - _PR_STATE_COLUMNS
         if bad:
             msg = f"invalid pr_state fields: {bad}"
@@ -509,7 +518,7 @@ class Store:
         assert cur.lastrowid is not None
         return cur.lastrowid
 
-    def update_job(self, job_id: int, **fields: Any) -> None:
+    def update_job(self, job_id: int, **fields: SqlParam) -> None:
         bad = set(fields) - _JOB_COLUMNS
         if bad:
             msg = f"invalid job fields: {bad}"
@@ -761,7 +770,7 @@ class Store:
         Never touches status or verdict_reason.
         """
         sets: list[str] = ["updated_at = ?"]
-        args: list[Any] = [now_ms()]
+        args: list[SqlParam] = [now_ms()]
         if summary is not None:
             sets.append("summary = ?")
             args.append(summary)

@@ -16,7 +16,7 @@ import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, ClassVar, Literal, TypedDict, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
 
 from pydantic import TypeAdapter
@@ -33,6 +33,16 @@ from .types import (
     Row,
     SchedulerStateDict,
 )
+
+if TYPE_CHECKING:
+    # Type-only: store/budget/scheduler stay runtime-lazy-imported inside
+    # handlers (see module docstring) so this module keeps importing
+    # cleanly while siblings build; this import never executes (PEP 563
+    # postponed evaluation via `from __future__ import annotations` above
+    # means annotations referencing Store are never evaluated at runtime
+    # either), so it can't reintroduce that problem -- it only lets mypy
+    # replace the Any that used to stand in for Store's real shape below.
+    from .store import Store
 
 log = logging.getLogger(__name__)
 
@@ -53,7 +63,7 @@ _wake = threading.Event()
 PR_SYNC_INTERVAL_S = 5 * 60.0
 
 
-def _reconcile_and_log(store: Any) -> None:
+def _reconcile_and_log(store: Store) -> None:
     """Recover jobs/findings orphaned by a previous process dying mid-job
     (crash, systemctl restart, host reboot, or an in-process exception
     run_cycle's own catch-all swallowed). Safe to call at the top of every
@@ -91,7 +101,7 @@ class Handler(BaseHTTPRequestHandler):
     def log_error(self, format: str, *args: Any) -> None:  # noqa: A002
         log.warning(format, *args)
 
-    def _store(self) -> Any:
+    def _store(self) -> Store:
         from .store import Store
 
         return Store(self.cfg)
@@ -527,7 +537,7 @@ class Handler(BaseHTTPRequestHandler):
         if repo is None:
             self._error(404, f"no repo {rid}")
             return
-        fields: dict[str, object] = {}
+        fields: dict[str, str | int] = {}
         if "enabled" in body:
             fields["enabled"] = 1 if body["enabled"] else 0
         if "url" in body and isinstance(body["url"], str) and body["url"].strip():
@@ -867,7 +877,7 @@ def _activity_status(
     return {"kind": "warming_up"}
 
 
-def _compute_sleep_s(store: Any, summary: Row) -> float:
+def _compute_sleep_s(store: Store, summary: Row) -> float:
     """How long the daemon loop should sleep after this cycle attempt --
     extracted from the loop body so it's directly testable rather than
     only observable by running the real infinite loop.
