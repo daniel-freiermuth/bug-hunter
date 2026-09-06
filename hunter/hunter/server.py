@@ -37,8 +37,14 @@ def _reconcile_and_log(store: Any) -> None:
     cycle attempt: _cycle_lock guarantees this daemon process is never
     itself mid-run_cycle when this runs, so any 'running' row found here
     cannot belong to still-live work."""
-    orphaned = store.reconcile_orphaned_jobs()
-    for r in orphaned:
+    result = store.reconcile_orphaned_jobs()
+    for f in result["findings"]:
+        store.log_event(
+            "error",
+            f"reconciled #{f['id']} stuck 'fixing' -> 'queued' -- prior process died mid-fix",
+            finding_id=f["id"],
+        )
+    for r in result["jobs"]:
         store.log_event(
             "error",
             f"reconciled orphaned {r['kind']} job #{r['id']} "

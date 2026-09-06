@@ -447,41 +447,60 @@ class Store:
             )
         )
 
-    def reconcile_orphaned_jobs(self) -> list[Row]:
-        """Recover from a daemon crash/restart that happened mid-job.
+    def reconcile_orphaned_jobs(self) -> dict[str, list[Row]]:
+        """Recover from a daemon crash/restart, OR a plain in-process
+        exception run_cycle's own catch-all swallows, that happened
+        mid-job.
 
-        A single daemon process owns the job lifecycle exclusively (the
-        systemd unit runs exactly one `hunter daemon`), so any job row
-        still marked 'running' when THIS process starts up cannot
-        actually be running -- the process that set it 'running' died
-        before it could record a terminal outcome. Mark those jobs
+        The correct invariant, and the reason this is safe to call
+        unconditionally at the top of every cycle attempt: a single
+        daemon process owns the job lifecycle exclusively (the systemd
+        unit runs exactly one `hunter daemon`, and _cycle_lock serializes
+        the loop against POST /api/cycle within that process), so at the
+        moment THIS call runs -- before this process has started any new
+        job this cycle -- nothing can legitimately still be mid-fix.  Any
+        finding found at 'fixing' here was orphaned by a PRIOR call that
+        never reached its own terminal set_status.
+
+        This must key off findings.status directly, not jobs.state:
+        run_fix records the job's terminal state (_record_job) BEFORE
+        the git-push/PR-create/salvage code that follows it, so an
+        exception anywhere in that later stretch (a git edge case, a
+        network blip in forge.create_pr, ...) leaves the JOB row already
+        terminal while the FINDING is still stuck at 'fixing' -- a
+        job-state-based check alone would miss exactly that case.
+        'fixing' is never scanned by the normal work queue (only
+        queued/rechecking/pr_open-with-attention are), so without this it
+        sits invisible and unretried indefinitely (observed in
+        production: finding #57 sat stuck for a month after an old
+        crash).
+
+        Job rows still 'running' are handled separately and marked
         'killed' so they stop inflating _running_jobs_cap's inflight sum
-        forever, and for 'fix' jobs, reset the finding out of the
-        transient 'fixing' status back to 'queued' -- that status is
-        never scanned by the normal work queue, so without this it would
-        sit invisible and unretried indefinitely (observed in production:
-        finding #57's job sat 'running' for a month after an old crash).
-        Returns the reconciled job rows.
+        forever -- that's a real but lower-stakes leak (only makes the
+        budget more conservative, doesn't strand any finding), so it is
+        not required for the finding-status recovery above to work.
+
+        Returns {"findings": [...], "jobs": [...]} -- the rows touched.
         """
-        rows = _rows(
-            self.db.execute(
-                "SELECT * FROM jobs WHERE state = 'running'"
-            )
+        stuck_findings = _rows(
+            self.db.execute("SELECT * FROM findings WHERE status = 'fixing'")
         )
-        for r in rows:
+        for f in stuck_findings:
+            self.set_status(f["id"], "queued")
+
+        orphaned_jobs = _rows(
+            self.db.execute("SELECT * FROM jobs WHERE state = 'running'")
+        )
+        for r in orphaned_jobs:
             self.update_job(
                 r["id"],
                 state="killed",
                 killed_reason="orphaned",
                 finished_at=now_ms(),
-                notes="reconciled at daemon startup -- prior process died mid-job",
+                notes="reconciled at cycle startup -- prior process died mid-job",
             )
-            fid = r.get("finding_id")
-            if r["kind"] == "fix" and fid is not None:
-                finding = self.get_finding(fid)
-                if finding is not None and finding["status"] == "fixing":
-                    self.set_status(fid, "queued")
-        return rows
+        return {"findings": stuck_findings, "jobs": orphaned_jobs}
 
     # -- events / window log -------------------------------------------
     def log_event(
