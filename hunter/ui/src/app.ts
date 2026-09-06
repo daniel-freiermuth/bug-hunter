@@ -626,6 +626,17 @@ function renderActivity(s: Summary): void {
       `<div class="row"><b class="running">\u25b6 running</b> ${esc(cj.kind)}: ${label}` +
         ` <span class="dim">(${dur(cj)}, job #${cj.id})</span></div>`,
     );
+  } else if (s.cycle_running) {
+    // _cycle_lock is held for the WHOLE cycle -- including sync_prs,
+    // which alone can take up to ~40s -- well before a job is ever
+    // created (or the decision to deny one is even made). Without this
+    // check, next_candidate below is a fresh but INDEPENDENT
+    // pick_next/decide preview that doesn't know a real cycle is
+    // already mid-flight, so it can show "ready" (or "paused") right
+    // next to the manual-run button correctly saying "cycle running...".
+    // Once we know a cycle is actually in progress, that's the more
+    // current truth than any hypothetical preview of what it might do.
+    rows.push('<div class="row"><b class="running">\u25b6 running</b> cycle in progress\u2026</div>');
   } else if (ss?.state === "error") {
     rows.push(`<div class="row"><b class="error">\u26a0 error</b> ${esc(ss.detail)}</div>`);
   } else if (nc?.budget_state === "denied") {
@@ -657,8 +668,9 @@ function renderActivity(s: Summary): void {
   }
 
   // Next scheduler wake -- only meaningful while nothing is actively
-  // running (once dispatched, "next wake" doesn't apply until it ends).
-  if (!cj && ss?.next_wake_at) {
+  // running or in progress (once dispatched or already cycling, "next
+  // wake" doesn't apply until this one ends).
+  if (!cj && !s.cycle_running && ss?.next_wake_at) {
     // "next check" only means "the daemon loop wakes up again" -- with
     // sync_prs running (nearly) every cycle to never delay noticing PR
     // feedback, that wake is often just a cheap heartbeat, not a real
