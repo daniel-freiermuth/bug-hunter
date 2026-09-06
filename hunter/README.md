@@ -12,16 +12,14 @@ Python 3.14 stdlib only. State in `data/hunter.db` (SQLite).
 
 ```sh
 cd hunter
-python3 -m hunter init
-python3 -m hunter add-repo NAME https://github.com/owner/repo [--branch main]
 python3 -m hunter daemon         # run forever: UI (:8377) + scheduler loop
-python3 -m hunter cycle          # one manual scheduling step
 python3 -m hunter serve          # UI only, no scheduler
 ```
 
-Other commands: `repos`, `findings [--status S]`, `verdict FID STATUS
-[--reason ...]`, `ingest FILE --repo NAME`, `jobs`, `events`, `hunt REPO
-[--force]`, `fix FID`, `recheck FID`, `sync` (refresh PR state, no tokens).
+Register the first repo, triage findings, add notes, pause/resume repos,
+and trigger manual cycles/rechecks -- all through the UI, not the CLI:
+the CLI is reduced to the two commands above (the web UI at `:8377`
+grew to cover everything else, see `hunter/ui`).
 
 ### Install as a service
 
@@ -62,7 +60,7 @@ Every wake passes the budget gate before spending anything.
   commits, and posts a reply comment (or withdraws via `WITHDRAW.md`).
 - **Cycle order**: sync PRs → engage stalest flagged PR → fix oldest queued
   finding → hunt.
-- **Recheck** (`recheck FID` or the Recheck button in the UI): re-evaluates
+- **Recheck** (Recheck button in the UI): re-evaluates
   a finding in status `new` against the CURRENT codebase with an adversarial
   second opinion. Uses the hunt budget/model. Outcomes: `confirmed` (updates
   analysis fields, status stays `new`), `stale` (→ `wontfix`), or `invalid`

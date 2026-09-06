@@ -50,11 +50,21 @@ def read_windows() -> dict[str, WindowState]:
     now = time.time() * 1000
     out: dict[str, WindowState] = {}
     for r in rows:
+        resets_at = r["resets_at"]
+        if resets_at and resets_at <= now:
+            # This window's own cycle has already ended -- e.g. a
+            # per-model-class window nobody has probed since hunter's
+            # config stopped routing jobs to that model (observed:
+            # anthropic:7d:fable, resets_at ~26 days in the past, no
+            # fresh row in 26+ days). The recorded used_fraction
+            # describes a bygone period, not now -- drop it entirely
+            # rather than surface it as if it were current data.
+            continue
         out[r["limit_id"]] = WindowState(
             limit_id=r["limit_id"],
             used_fraction=r["used_fraction"],
             status=r["status"],
-            resets_at=r["resets_at"],
+            resets_at=resets_at,
             recorded_at=r["recorded_at"],
             age_s=(now - r["recorded_at"]) / 1000,
         )
