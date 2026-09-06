@@ -212,11 +212,12 @@ class Handler(BaseHTTPRequestHandler):
                 if override:
                     budget_state, budget_reason, budget_retry_at = "exempt", f"override: {override}", None
                 else:
+                    raw_windows = budget.read_windows()
                     dec = budget.decide(
                         cfg=self.cfg,
                         kind=budget_kind,
-                        windows=budget.read_windows(),
-                        running_jobs_cap=scheduler._running_jobs_cap(store),  # noqa: SLF001
+                        windows=raw_windows,
+                        unaccounted_tokens=scheduler._unaccounted_tokens(store, raw_windows),  # noqa: SLF001
                     )
                     budget_state = "allowed" if dec.allow else "denied"
                     budget_reason = dec.reason

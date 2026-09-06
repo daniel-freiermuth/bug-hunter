@@ -81,15 +81,59 @@ def test_empty_windows_deny():
     assert "no window data" in d.reason
 
 
-def test_all_stale_5h_allows_as_opener():
-    """Stale 5h data → treated as no active window → allow (7d still gates)."""
-    stale_age = 3600.0  # well above default stale_after_s=1800
+def test_stale_5h_low_usage_allows_via_ramp_not_bypass():
+    """A stale-but-realistic 5h reading with low usage still allows -- not
+    because staleness is special-cased, but because the ramp has
+    genuinely grown past it by now (ramp is computed from live wall-clock
+    time, independent of when the reading was taken)."""
+    stale_age = 3600.0  # 1h old, well above default stale_after_s=1800
+    resets_at = _NOW_MS + int(1.0 * 3600 * 1000)  # 4h into a live 5h window
     windows = {
-        "anthropic:5h": _ws("anthropic:5h", age_s=stale_age),
+        "anthropic:5h": _ws("anthropic:5h", used_fraction=0.10, resets_at=resets_at, age_s=stale_age),
         "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10, age_s=stale_age),
     }
     d = decide(_cfg(), "hunt", windows)
     assert d.allow
+
+
+def test_stale_5h_high_usage_still_denies():
+    """Regression: a stale (>30min old) 5h reading whose used_fraction is
+    still ahead of the live ramp must keep denying -- staleness is no
+    longer a bypass. Reproduces the production incident: a probe recorded
+    used=0.12 early in a window, then ~26 jobs ran back to back with zero
+    fresh probes landing for 98 minutes (a common gap -- Anthropic's probe
+    is sparse and doesn't track hunter's own job cadence); the old
+    "stale ramp data -> treat as no window -> allow" bypass meant none of
+    those jobs were gated at all until a probe finally landed, by which
+    point usage had already blown from 12% to 69% against a ~50% ramp."""
+    stale_age = 3600.0
+    resets_at = _NOW_MS + int(1.0 * 3600 * 1000)  # 4h elapsed -> ramp ~0.778
+    windows = {
+        "anthropic:5h": _ws("anthropic:5h", used_fraction=0.90, resets_at=resets_at, age_s=stale_age),
+        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10, age_s=stale_age),
+    }
+    d = decide(_cfg(), "hunt", windows)
+    assert not d.allow
+    assert "5h" in d.reason
+
+
+def test_stale_5h_own_finished_jobs_count_toward_effective_used():
+    """Regression: tokens hunter's own jobs have already spent since the
+    last probe must push effective_used up even while the raw reading
+    itself is still fresh-looking and low -- this is what actually closes
+    the production gap (a plain staleness check wouldn't have caught it
+    the moment the probe age crossed 30min; this catches it immediately,
+    on the very next job, regardless of probe age)."""
+    resets_at = _NOW_MS + int(1.0 * 3600 * 1000)  # ramp ~0.778
+    windows = {
+        "anthropic:5h": _ws("anthropic:5h", used_fraction=0.10, resets_at=resets_at, age_s=30.0),
+        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10, age_s=30.0),
+    }
+    # 1.6M unaccounted tokens (finished jobs the probe hasn't caught up to
+    # yet) -> 1.6M/200k * 10% = 0.80 additional effective usage.
+    d = decide(_cfg(), "hunt", windows, unaccounted_tokens=1_600_000)
+    assert not d.allow
+    assert "5h" in d.reason
 
 
 def test_stale_5h_denied_by_7d_ramp():

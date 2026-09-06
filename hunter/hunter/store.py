@@ -555,7 +555,7 @@ class Store:
         a month after an old crash, before either mechanism existed).
 
         Job rows still 'running' are handled separately and marked
-        'killed' so they stop inflating _running_jobs_cap's inflight sum
+        'killed' so they stop inflating _unaccounted_tokens's running-job sum
         forever -- that's a real but lower-stakes leak (only makes the
         budget more conservative, doesn't strand any finding), so it is
         not required for the finding-status recovery above to work.
