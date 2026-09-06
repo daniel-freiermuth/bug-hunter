@@ -58,7 +58,12 @@ blocking claim.
 ### For `type = 'dep_update'`:
 
 a. **Check for local patches** in patches/, .patch files, or vendored code
-b. **Upgrade the dependency** to the target version
+b. **Upgrade the dependency** to the target version -- or to the highest
+   version you can safely reach this pass if the full target isn't
+   achievable (a peer-dependency/toolchain constraint, needs a coordinated
+   bump elsewhere). If you settle for anything below the finding's own
+   `latest_version`, treat that gap as real, mandatory work for step 5
+   below -- see there for why this is easy to miss.
 c. **Handle patches**:
    - If patches exist, try to rebase/update them for the new version
    - If patches conflict or fail, document in BLOCKED.md
@@ -100,13 +105,33 @@ moment — committed work survives, uncommitted work dies.
 
 ## 5. Flag anything you deferred
 
-If applying this improvement means NOT doing something else that's now clearly
-worth doing (e.g. a dep upgrade lands but a bigger DSL/API migration it enables
-is deliberately left for later, a flag is left off pending a follow-up, a
-patch is dropped but its underlying issue still needs a real fix upstream) —
-do NOT just mention this in PR-DESCRIPTION.md prose. A merged PR closes out
-and stops being watched; a note buried in its body is never read again. File
-it as a real, queryable follow-up instead: see FOLLOW-UPS.json below.
+Two distinct triggers below. Both are real deferred work; neither is optional
+when it applies.
+
+- **You didn't reach the finding's own target.** The single most common case,
+  and the easiest to miss precisely because it feels like "I already did the
+  work": for `type = 'dep_update'`, if you shipped anything below the
+  finding's `latest_version` (stopped short at an intermediate version due to
+  a peer-dependency/toolchain constraint), the gap between what you shipped
+  and that original target is NOT closed -- it is deferred work, every time,
+  unless the constraint is structural and permanent (the package genuinely
+  stopped publishing further versions, or the target version doesn't exist).
+  "Requires a coordinated bump I didn't attempt this pass" is NOT permanent --
+  file the remainder (your-shipped-version -> the finding's original
+  latest_version) in FOLLOW-UPS.json. This is exactly the failure mode that
+  motivated FOLLOW-UPS.json existing at all: a real PR once explained in
+  careful prose exactly why it stopped short of its target and by how much,
+  and that reasoning was never picked up again because nothing captured it
+  structurally.
+- **Something else is now clearly worth doing.** E.g. a dep upgrade lands but
+  a bigger DSL/API migration it enables is deliberately left for later, a
+  flag is left off pending a follow-up, a patch is dropped but its underlying
+  issue still needs a real fix upstream.
+
+Either way: do NOT just mention this in PR-DESCRIPTION.md prose. A merged PR
+closes out and stops being watched; a note buried in its body is never read
+again. File it as a real, queryable follow-up instead: see FOLLOW-UPS.json
+below.
 
 # Deliverables
 
