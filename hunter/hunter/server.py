@@ -19,7 +19,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
-from .budget import HEADROOM_MS, _RAMP_MS
 from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
 
 log = logging.getLogger(__name__)
@@ -208,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
                 budget_kind = "fix" if kind in ("engage", "fix") else "hunt"
                 override = target.get("budget_override") if is_finding else None
                 if override:
-                    budget_state, budget_reason = "exempt", f"override: {override}"
+                    budget_state, budget_reason, budget_retry_at = "exempt", f"override: {override}", None
                 else:
                     dec = budget.decide(
                         cfg=self.cfg,
@@ -218,6 +217,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     budget_state = "allowed" if dec.allow else "denied"
                     budget_reason = dec.reason
+                    budget_retry_at = dec.retry_at
                 next_candidate = {
                     "kind": kind,
                     "id": target["id"],
@@ -225,6 +225,7 @@ class Handler(BaseHTTPRequestHandler):
                     "is_finding": is_finding,
                     "budget_state": budget_state,
                     "budget_reason": budget_reason,
+                    "budget_retry_at": budget_retry_at,
                 }
 
         return {
@@ -703,26 +704,19 @@ def daemon(cfg: Config) -> None:
                         # Truly idle (no repos) - back off
                         sleep_s = 15 * 60
                 elif summary.get("denied"):
-                    # Sleep until the harvest window opens (HEADROOM into 5h window)
-                    # or until a new window can be opened.
-                    w5 = budget.read_windows().get("anthropic:5h")
-                    if w5 and w5.resets_at:
-                        harvest_at = (w5.resets_at - _RAMP_MS) / 1000
-                        until_harvest = harvest_at - time.time()
-                        if until_harvest > 0:
-                            sleep_s = max(60.0, min(until_harvest + 30, 60 * 60))
-                        elif summary["denied"].startswith("5h:"):
-                            # Still in harvest; ramp rising linearly.
-                            # Compute seconds until ramp exceeds usage.
-                            if w5.used_fraction is not None:
-                                harvest_elapsed = time.time() - harvest_at
-                                need_s = w5.used_fraction * (_RAMP_MS / 1000) - harvest_elapsed
-                                sleep_s = max(60.0, min(need_s + 30, 15 * 60))
-                            else:
-                                sleep_s = 3 * 60
-                        else:
-                            # Denied for another reason (7d ramp) -- back off.
-                            sleep_s = 30 * 60
+                    # dec.retry_at (threaded through every "denied" return
+                    # in scheduler.py) is computed at the source, directly
+                    # from the WindowState that caused the denial -- an
+                    # exact answer to "when would this specific denial
+                    # resolve", not re-derived here from the reason
+                    # string. None means no informed estimate exists
+                    # (e.g. missing resets_at); fall back to a generic
+                    # backoff rather than a value that looks precise but
+                    # isn't.
+                    retry_at = summary.get("retry_at")
+                    if retry_at:
+                        until_retry = retry_at / 1000 - time.time()
+                        sleep_s = max(60.0, min(until_retry + 30, 60 * 60))
                     else:
                         sleep_s = 30 * 60
                 state_label, detail = _describe_cycle(summary)

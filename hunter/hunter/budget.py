@@ -96,6 +96,27 @@ def ramp_5h(resets_at: int | None, now_ms: float) -> float | None:
     return max(0.0, (elapsed_ms - HEADROOM_MS) / _RAMP_MS)
 
 
+def retry_at_7d(resets_at: int | None, effective_used: float) -> float | None:
+    """Epoch ms when the 7d ramp would reach effective_used (assuming no
+    further spend) -- the earliest a 7d-ramp denial at this used level
+    could resolve. None if resets_at is unknown: no informed estimate is
+    possible, callers should fall back to a generic backoff rather than
+    a value that looks precise but isn't."""
+    if not resets_at:
+        return None
+    started_ms = resets_at - _WEEK_MS
+    return started_ms + effective_used * _WEEK_MS
+
+
+def retry_at_5h(resets_at: int | None, effective_used: float) -> float | None:
+    """Epoch ms when the 5h harvest ramp would reach effective_used
+    (assuming no further spend). None if resets_at is unknown."""
+    if not resets_at:
+        return None
+    window_start_ms = resets_at - _5H_MS
+    return window_start_ms + HEADROOM_MS + effective_used * _RAMP_MS
+
+
 def decide(
     cfg: Config,
     kind: str,
@@ -139,6 +160,7 @@ def decide(
                 False,
                 f"{lid}: used {w.used_fraction:.2f} + inflight {inflight_reservation:.2f}"
                 f" = {effective_used:.2f} >= ramp {elapsed_frac:.2f}",
+                retry_at=retry_at_7d(w.resets_at, effective_used),
             )
 
     # -- 5h ramp (configurable headroom, then linear harvest) ------------------
@@ -150,7 +172,9 @@ def decide(
     w5 = windows.get("anthropic:5h")
     if w5 is not None and w5.age_s <= cfg.stale_after_s:
         if w5.status == "exhausted":
-            return BudgetDecision(False, "5h window exhausted")
+            # A hard cap, not a ramp -- resolves exactly at reset, not at
+            # some computed ramp-catchup point.
+            return BudgetDecision(False, "5h window exhausted", retry_at=w5.resets_at)
         allowed = ramp_5h(w5.resets_at, now_ms)
         if allowed is not None and w5.used_fraction is not None:
             effective_used = w5.used_fraction + inflight_reservation
@@ -159,5 +183,6 @@ def decide(
                     False,
                     f"5h: used {w5.used_fraction:.2f} + inflight {inflight_reservation:.2f}"
                     f" = {effective_used:.2f} >= ramp {allowed:.2f}",
+                    retry_at=retry_at_5h(w5.resets_at, effective_used),
                 )
     return BudgetDecision(True, "ok", base)

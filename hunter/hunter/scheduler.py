@@ -218,7 +218,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         job = store.create_job("hunt", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"hunt {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
     job = store.create_job("hunt", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.findings.json"
@@ -349,7 +349,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
             job_id=job,
             finding_id=fid,
         )
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
     job = store.create_job("recheck", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"recheck{fid}.json"
@@ -481,7 +481,7 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
         job = store.create_job("test_gap", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"test_gap {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
     
     job = store.create_job("test_gap", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.test_gaps.json"
@@ -580,7 +580,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
         job = store.create_job("dep_update", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"dep_update {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
     
     job = store.create_job("dep_update", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.dep_updates.json"
@@ -678,7 +678,7 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
         job = store.create_job("refactor", rid)
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"refactor {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
     
     job = store.create_job("refactor", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.refactorings.json"
@@ -860,7 +860,7 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
             job_id=job,
             finding_id=fid,
         )
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
     job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens)
     pre_usage = _usage_snapshot(windows)
@@ -1301,7 +1301,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
             job_id=job,
             finding_id=fid,
         )
-        return {"denied": dec.reason, "job": job}
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
 
     rc, pr, raw = forge.view_pr_engage(owner_slug, num)
     if pr is None:

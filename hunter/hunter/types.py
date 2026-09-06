@@ -182,3 +182,4 @@ class BudgetDecision:
     allow: bool
     reason: str
     cap_tokens: int = 0  # effective per-job cap when allowed
+    retry_at: float | None = None  # epoch ms: best-known time this could change

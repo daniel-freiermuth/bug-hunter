@@ -99,6 +99,7 @@ interface NextCandidate {
   is_finding: boolean;
   budget_state: string; // "allowed" | "denied" | "exempt"
   budget_reason: string;
+  budget_retry_at: number | null;
 }
 
 interface SchedulerState {
@@ -627,6 +628,11 @@ function renderActivity(s: Summary): void {
       `<div class="row dim">next up: ${esc(nc.kind)} ${label}` +
         ` \u00b7 budget: <span class="b-${esc(nc.budget_state)}">${esc(nc.budget_state)}</span>${reason}</div>`,
     );
+    if (nc.budget_state === "denied" && nc.budget_retry_at) {
+      rows.push(
+        `<div class="row dim">budget available ~${countdown(nc.budget_retry_at)} (${ts(nc.budget_retry_at)})</div>`,
+      );
+    }
   }
   $("activity").innerHTML = rows.join("");
 }
