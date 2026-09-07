@@ -1839,6 +1839,62 @@ _RUNNERS: dict[str, Callable[[Store, Config, Row], Row]] = {
 }
 
 
+def refresh_stale_probe(cfg: Config, windows: dict[str, WindowState]) -> bool:
+    """Force a fresh usage probe if the anthropic:5h reading is stale or
+    entirely missing.
+
+    Root cause of "why don't we get new information on the 5h/7d window
+    usage" (investigated live in production): headless `omp -p` -- 100%
+    of what every hunter worker uses -- does NOT refresh usage_history as
+    a side effect, confirmed empirically (identical recorded_at before
+    and after a real, token-spending `omp -p` run). So no matter how many
+    jobs hunter runs, nothing it does ever closes a stale-probe gap on
+    its own; the only things that ever have are entirely outside hunter's
+    control (a human's interactive session, or someone manually forcing
+    a probe).
+
+    `omp usage invalidate --provider anthropic` before the read: plain
+    `omp usage` alone can serve its own client-side cache without
+    reaching the network at all, so invalidating first is necessary to
+    even ATTEMPT a live fetch. It is not, on its own, sufficient --
+    Anthropic's /usage endpoint itself has a hard floor on how often a
+    genuinely fresh reading exists at all: measured directly from every
+    recorded anthropic:5h row this project has ever seen (421 rows),
+    the smallest gap ever observed between two distinct real fetches is
+    ~242s, and 99.8% of gaps are 400s+, REGARDLESS of how the fetch was
+    triggered (interactive session or plain CLI) or how many times
+    invalidate+read was retried in between -- a call inside that window
+    just returns the same still-cached value with exit code 0 (no
+    error, no new row). This is why cfg.stale_after_s below is set well
+    above that floor (300s default) rather than as low as this project
+    first tried (180s, which mostly produced silent no-op "successes"):
+    asking more often than the floor allows wastes calls without ever
+    getting fresher data.
+
+    Called from the daemon's dedicated usage-prober thread (see
+    server.py's _usage_prober_loop), NOT from run_cycle -- deliberately
+    decoupled from job-dispatch cadence. run_cycle's own sleep backs off
+    up to 60min when budget is denied, which would have silently starved
+    this of a chance to run for just as long, right when a fresh reading
+    matters most. A short, fixed, independent tick keeps the two
+    concerns (when to run jobs vs. when to refresh usage data) simple
+    and separately reasoned about.
+
+    Finally gives cfg.stale_after_s (loaded from config.json's
+    budget.staleAfterS, previously read but never actually consulted
+    anywhere) a real effect. Best-effort throughout: run_cmd never
+    raises, and a failed, timed-out, or floor-throttled probe just
+    leaves windows exactly as stale as they already were -- the next
+    tick tries again.
+    """
+    w5 = windows.get("anthropic:5h")
+    if w5 is not None and w5.age_s <= cfg.stale_after_s:
+        return False
+    run_cmd([cfg.omp_bin, "usage", "invalidate", "--provider", "anthropic"], timeout=15)
+    rc, _out = run_cmd([cfg.omp_bin, "usage", "--provider", "anthropic"], timeout=30)
+    return rc == 0
+
+
 def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
     try:
         windows = budget.read_windows()

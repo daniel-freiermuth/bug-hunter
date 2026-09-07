@@ -178,7 +178,7 @@ class TestConfig:
         assert cfg.hunt_max_findings == 8
         assert cfg.fix_cap_tokens == 150_000
         assert cfg.fix_max_wall_s == 2700
-        assert cfg.stale_after_s == 1800
+        assert cfg.stale_after_s == 300
         assert cfg.serve_port == 8377
         assert cfg.poll_s == 2.0
         assert cfg.model_default is None
