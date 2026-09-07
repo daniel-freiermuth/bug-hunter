@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import re
 import sys
 import threading
 import time
@@ -601,6 +602,9 @@ class Handler(BaseHTTPRequestHandler):
         if not name or not url:
             self._error(400, "name and url are required")
             return
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+            self._error(400, f"invalid repo name {name!r}")
+            return
         branch = body.get("branch")
         branch = branch.strip() if isinstance(branch, str) and branch.strip() else "main"
         forge = body.get("forge") or None
@@ -613,7 +617,13 @@ class Handler(BaseHTTPRequestHandler):
         if store.get_repo(name) is not None:
             self._error(409, f"repo {name!r} already exists")
             return
-        path = self.cfg.work_root / "repos" / name
+        repos_root = (self.cfg.work_root / "repos").resolve()
+        path = (repos_root / name).resolve()
+        try:
+            path.relative_to(repos_root)
+        except ValueError:
+            self._error(400, f"invalid repo name {name!r}")
+            return
         rid = store.add_repo(name, url, str(path), branch, forge=forge)
         store.log_event("repo", f"added {name} ({forge}) -> {path}")
         self._json({"ok": True, "repo": store.get_repo(rid)}, 201)

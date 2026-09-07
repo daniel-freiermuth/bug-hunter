@@ -59,7 +59,7 @@ def _suppressions_block(suppressions: list[Row]) -> str:
     still-applicable verdict instead of re-filing the same non-issue."""
     return (
         "\n".join(
-            f"- {s['fingerprint']} -- {_escape_braces(s.get('verdict_reason') or '(no reason recorded)')}"
+            f"- {_escape_braces(s['fingerprint'])} -- {_escape_braces(s.get('verdict_reason') or '(no reason recorded)')}"
             for s in suppressions
         )
         or "(none yet)"
@@ -69,7 +69,7 @@ def _suppressions_block(suppressions: list[Row]) -> str:
 def _known_block(known: list[Row]) -> str:
     """Active (non-terminal) findings, for novelty comparison."""
     return (
-        "\n".join(f"- {k['fingerprint']} [{k['status']}] -- {_escape_braces(k.get('summary', ''))}" for k in known)
+        "\n".join(f"- {_escape_braces(k['fingerprint'])} [{k['status']}] -- {_escape_braces(k.get('summary', ''))}" for k in known)
         or "(none yet)"
     )
 

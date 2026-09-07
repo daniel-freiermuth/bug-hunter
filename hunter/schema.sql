@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS findings (
   budget_override TEXT,
   fix_attempts  INTEGER NOT NULL DEFAULT 0, -- consecutive run_fix attempts hitting last_fix_failure
   last_fix_failure TEXT,                   -- fingerprint of the last fix attempt's failure reason
+  recheck_attempts INTEGER NOT NULL DEFAULT 0, -- consecutive run_recheck attempts hitting last_recheck_failure
+  last_recheck_failure TEXT,               -- fingerprint of the last recheck attempt's failure reason
   
   -- Dep update fields (nullable for other types)
   ecosystem     TEXT,
@@ -61,7 +63,6 @@ CREATE TABLE IF NOT EXISTS findings (
   smell_type    TEXT,
   suggested_refactor TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS findings_fingerprint ON findings(fingerprint);
 CREATE INDEX IF NOT EXISTS findings_status ON findings(status);
 CREATE INDEX IF NOT EXISTS findings_repo ON findings(repo_id, status);
 CREATE INDEX IF NOT EXISTS findings_type ON findings(type);
@@ -163,7 +164,9 @@ CREATE TABLE IF NOT EXISTS pr_state (
                                             -- (which check fails, review state, conflict) changes.
                                             -- Cleared the moment it does (see run_engage/sync_prs).
   synced_at     INTEGER,
-  harvested_at  INTEGER                    -- epoch ms run_harvest reviewed this merged PR; NULL = pending
+  harvested_at  INTEGER,                   -- epoch ms run_harvest reviewed this merged PR; NULL = pending
+  harvest_attempts INTEGER NOT NULL DEFAULT 0, -- consecutive run_harvest attempts hitting last_harvest_failure
+  last_harvest_failure TEXT                -- fingerprint of the last harvest attempt's failure reason
 );
 
 -- Single-row snapshot of the daemon loop's own reasoning: what it just

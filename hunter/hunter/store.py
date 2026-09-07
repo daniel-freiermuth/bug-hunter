@@ -66,6 +66,8 @@ _PR_STATE_COLUMNS = {
     "addressed_fingerprint",
     "synced_at",
     "harvested_at",
+    "harvest_attempts",
+    "last_harvest_failure",
 }
 
 _FINDING_KEYS = (
@@ -154,12 +156,40 @@ class Store:
                 "findings",
                 "ALTER TABLE findings ADD COLUMN last_fix_failure TEXT",
             ),
+            (
+                "recheck_attempts",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN recheck_attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_recheck_failure",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN last_recheck_failure TEXT",
+            ),
+            (
+                "harvest_attempts",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN harvest_attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_harvest_failure",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN last_harvest_failure TEXT",
+            ),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
             except sqlite3.OperationalError:
                 self.db.execute(sql)
                 self.db.commit()
+
+        # One-time cleanup: `findings.fingerprint` already has an inline
+        # UNIQUE constraint (SQLite backs it with an implicit index), so
+        # the explicit `findings_fingerprint` index schema.sql used to
+        # also create was a fully redundant duplicate. DROP INDEX IF
+        # EXISTS is itself idempotent, so this needs no try/except probe.
+        self.db.execute("DROP INDEX IF EXISTS findings_fingerprint")
+        self.db.commit()
 
     # -- repos ---------------------------------------------------------
     def add_repo(
@@ -489,6 +519,46 @@ class Store:
             (now_ms(), fid),
         )
         self.db.commit()
+
+    def record_recheck_attempt(self, fid: int, failure: str) -> int:
+        """Same streak tracking as record_fix_attempt, scoped to run_recheck
+        attempts that end without a parseable confirmed/stale/invalid
+        verdict (killed, failed, or a missing/unparseable verdict file)."""
+        current = self.get_finding(fid)
+        prev_failure = current.get("last_recheck_failure") if current else None
+        prev_attempts = (current.get("recheck_attempts") or 0) if current else 0
+        attempts = prev_attempts + 1 if failure == prev_failure else 1
+        self.db.execute(
+            "UPDATE findings SET recheck_attempts = ?, last_recheck_failure = ?, updated_at = ?"
+            " WHERE id = ?",
+            (attempts, failure, now_ms(), fid),
+        )
+        self.db.commit()
+        return attempts
+
+    def clear_recheck_attempts(self, fid: int) -> None:
+        """Reset the recheck-retry streak once a recheck reaches a real
+        verdict (or the finding otherwise leaves the retry loop)."""
+        self.db.execute(
+            "UPDATE findings SET recheck_attempts = 0, last_recheck_failure = NULL, updated_at = ?"
+            " WHERE id = ?",
+            (now_ms(), fid),
+        )
+        self.db.commit()
+
+    def record_harvest_attempt(self, fid: int, failure: str) -> int:
+        """Same streak tracking as record_fix_attempt, scoped to run_harvest
+        attempts that don't reach a successful worker completion."""
+        current = self.get_pr_state(fid)
+        prev_failure = current.get("last_harvest_failure") if current else None
+        prev_attempts = (current.get("harvest_attempts") or 0) if current else 0
+        attempts = prev_attempts + 1 if failure == prev_failure else 1
+        self.upsert_pr_state(fid, harvest_attempts=attempts, last_harvest_failure=failure)
+        return attempts
+
+    def clear_harvest_attempts(self, fid: int) -> None:
+        """Reset the harvest-retry streak once a harvest attempt succeeds."""
+        self.upsert_pr_state(fid, harvest_attempts=0, last_harvest_failure=None)
 
     def clear_all_overrides(self) -> int:
         """Clear all budget overrides. Returns count of affected rows."""

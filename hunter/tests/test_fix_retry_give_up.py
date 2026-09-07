@@ -8,7 +8,7 @@ retried by the daemon at zero-sleep pace (server._compute_sleep_s sleeps
 0s whenever the fix queue is non-empty) forever, burning real tokens on
 an outcome guaranteed to repeat. Store.record_fix_attempt now tracks a
 consecutive-identical-failure streak; run_fix gives up (status ->
-rejected) once it crosses FIX_MAX_CONSECUTIVE_SAME_FAILURE, and a
+rejected) once it crosses MAX_CONSECUTIVE_SAME_FAILURE, and a
 genuinely different failure reason resets the streak instead of
 accumulating it.
 """
@@ -22,7 +22,7 @@ from typing import Any
 import pytest
 
 from hunter import scheduler
-from hunter.scheduler import FIX_MAX_CONSECUTIVE_SAME_FAILURE, run_fix
+from hunter.scheduler import MAX_CONSECUTIVE_SAME_FAILURE, run_fix
 from hunter.store import Store
 from hunter.types import Config, RunResult
 
@@ -130,7 +130,7 @@ class TestFixRetryGiveUp:
             scheduler.runner, "run_worker", _worker_that_commits_without_pr_description
         )
 
-        for attempt in range(1, FIX_MAX_CONSECUTIVE_SAME_FAILURE):
+        for attempt in range(1, MAX_CONSECUTIVE_SAME_FAILURE):
             result = run_fix(store, cfg, finding)
             assert result.get("outcome") == "requeued", (attempt, result)
             after = store.get_finding(fid)
@@ -144,7 +144,7 @@ class TestFixRetryGiveUp:
         # than requeue into another guaranteed-identical retry.
         result = run_fix(store, cfg, finding)
         assert result.get("outcome") == "stuck", result
-        assert result.get("attempts") == FIX_MAX_CONSECUTIVE_SAME_FAILURE
+        assert result.get("attempts") == MAX_CONSECUTIVE_SAME_FAILURE
 
         after = store.get_finding(fid)
         assert after is not None

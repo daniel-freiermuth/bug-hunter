@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from hunter.store import Store
-from hunter.types import Config, WindowState
+from hunter.store import Store, _require_keys
+from hunter.types import Config, SchedulerStateDict, WindowState, now_ms
 
 
 @pytest.fixture
@@ -258,7 +259,9 @@ class TestSuppressions:
         refactor findings sharing the same repo -- they use separate playbooks
         and a mixed-type corpus would confuse the bug hunter."""
         rid = store.add_repo("r", "https://r", "/r")
-        bug_fid, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-bug"), finding_type="bug")
+        bug_fid, _ = store.upsert_finding(
+            rid, _make_finding(fingerprint="fp-bug"), finding_type="bug"
+        )
         dep_fid, _ = store.upsert_finding(
             rid, {"fingerprint": "fp-dep", "package": "foo"}, finding_type="dep_update"
         )
@@ -267,7 +270,9 @@ class TestSuppressions:
         assert [s["id"] for s in store.suppressions(rid)] == [bug_fid]
         assert [s["id"] for s in store.suppressions(rid, finding_type="dep_update")] == [dep_fid]
 
-        other_fid, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-bug-2"), finding_type="bug")
+        other_fid, _ = store.upsert_finding(
+            rid, _make_finding(fingerprint="fp-bug-2"), finding_type="bug"
+        )
         assert [a["id"] for a in store.known_active(rid)] == [other_fid]
 
 
@@ -396,10 +401,6 @@ class TestCalibration:
         assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
 
     def test_fresh_probe_with_hunter_spend_records_a_sample(self, store: Store) -> None:
-        import time
-
-        from hunter.types import now_ms
-
         rid = store.add_repo("r", "https://r", "/r")
         store.log_window([self._probe(0.10)])
         time.sleep(0.02)
@@ -419,10 +420,6 @@ class TestCalibration:
     def test_unchanged_used_fraction_records_no_sample(self, store: Store) -> None:
         """A re-read of the same stale probe (used_fraction didn't move)
         must not fabricate a sample out of noise."""
-        import time
-
-        from hunter.types import now_ms
-
         rid = store.add_repo("r", "https://r", "/r")
         store.log_window([self._probe(0.10)])
         time.sleep(0.02)
@@ -435,8 +432,6 @@ class TestCalibration:
     def test_no_hunter_spend_records_no_sample(self, store: Store) -> None:
         """used_fraction moved but hunter didn't run anything in the gap
         (e.g. a human's own interactive usage) -- nothing attributable."""
-        import time
-
         store.log_window([self._probe(0.10)])
         time.sleep(0.02)
         store.log_window([self._probe(0.20)])
@@ -445,10 +440,6 @@ class TestCalibration:
     def test_different_window_instance_not_compared(self, store: Store) -> None:
         """A genuinely new window (different resets_at) must not be
         diffed against the previous instance's used_fraction."""
-        import time
-
-        from hunter.types import now_ms
-
         rid = store.add_repo("r", "https://r", "/r")
         store.log_window([self._probe(0.90)])  # old window, nearly full
         time.sleep(0.02)
@@ -729,17 +720,27 @@ class TestReconcileOrphanedJobs:
         assert finding is not None
         assert finding["status"] == "queued"
 
-    def test_orphaned_non_fix_job_does_not_touch_finding_status(self, store: Store) -> None:
-        """A stuck 'hunt' job has no finding-status side effect to fix --
-        only the job row itself needs cleaning up."""
+    def test_fixing_finding_recovered_regardless_of_orphaned_jobs_kind(
+        self, store: Store
+    ) -> None:
+        """reconcile_orphaned_jobs recovers findings.status == 'fixing' by
+        querying findings directly -- it never joins through jobs.kind or
+        jobs.finding_id. A concurrently orphaned 'hunt' job (which never
+        carries a finding_id) must not suppress recovery of an unrelated
+        finding stuck at 'fixing' in the same pass."""
         rid = store.add_repo("r", "https://r", "/r")
+        fid, _ = store.upsert_finding(rid, _make_finding())
+        store.set_status(fid, "fixing")
         jid = store.create_job("hunt", rid)
         store.update_job(jid, state="running")
 
         result = store.reconcile_orphaned_jobs()
 
-        assert result["findings"] == []
+        assert [f["id"] for f in result["findings"]] == [fid]
         assert [j["id"] for j in result["jobs"]] == [jid]
+        finding = store.get_finding(fid)
+        assert finding is not None
+        assert finding["status"] == "queued"
         assert store.list_jobs()[0]["state"] == "killed"
 
     def test_finding_already_resolved_is_left_alone(self, store: Store) -> None:
@@ -859,9 +860,6 @@ class TestRequireKeys:
     KeyError far downstream in unrelated consuming code."""
 
     def test_passes_through_when_all_keys_present(self) -> None:
-        from hunter.store import _require_keys
-        from hunter.types import SchedulerStateDict
-
         row = {"id": 1, "state": "idle", "detail": "d", "next_wake_at": None, "updated_at": 0}
         result = _require_keys(
             row, "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
@@ -869,24 +867,20 @@ class TestRequireKeys:
         assert result == row
 
     def test_raises_with_exact_missing_keys_and_actual_shape(self) -> None:
-        from hunter.store import _require_keys
-        from hunter.types import SchedulerStateDict
-
         row = {"id": 1, "state": "error"}  # simulates a schema/query drift
         with pytest.raises(ValueError, match=r"detail.*next_wake_at.*updated_at") as exc_info:
             _require_keys(
                 row, "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
             )
         assert "SchedulerStateDict" in str(exc_info.value)
-        assert "['id', 'state']" in str(exc_info.value), "must name what WAS present, not just what's missing"
+        assert "['id', 'state']" in str(exc_info.value), (
+            "must name what WAS present, not just what's missing"
+        )
 
     def test_extra_unexpected_keys_do_not_fail(self) -> None:
         """Not every column needs a home in the TypedDict -- current_job()
         deliberately carries DB columns the frontend never reads. Only
         missing REQUIRED keys are an error."""
-        from hunter.store import _require_keys
-        from hunter.types import SchedulerStateDict
-
         row = {
             "id": 1, "state": "idle", "detail": "d", "next_wake_at": None,
             "updated_at": 0, "some_future_column": "unexpected but harmless",

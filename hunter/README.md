@@ -6,12 +6,14 @@ you triage in a local UI, fix workers ship draft PRs and follow up on PR
 feedback. Design + measured
 grounding: ../IDEA.md, ../EXPERIMENT-*.md.
 
-Python 3.14 stdlib only. State in `data/hunter.db` (SQLite).
+Python 3.13+; the only runtime dependency is `pydantic` (see
+`pyproject.toml`). State in `data/hunter.db` (SQLite).
 
 ## Run
 
 ```sh
 cd hunter
+pip install -e .                 # installs pydantic
 python3 -m hunter daemon         # run forever: UI (:8377) + scheduler loop
 python3 -m hunter serve          # UI only, no scheduler
 ```

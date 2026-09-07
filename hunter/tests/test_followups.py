@@ -237,6 +237,51 @@ class TestHarvestFollowUpIngestion:
         assert ps is not None
         assert ps["harvested_at"] is None
 
+    def test_gives_up_after_consecutive_identical_failures(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other half of the fix: a harvest that fails the SAME way
+        every attempt must eventually stop retrying, or it head-of-line-
+        blocks recheck/fix/rotation work behind it forever (harvest is
+        the top-priority job type after engage in pick_next)."""
+        finding = _setup_harvest(store, tmp_path)
+
+        def failing_worker(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
+            return RunResult(
+                exit_code=1,
+                killed_reason="cap",
+                tokens_new=999_999,
+                calls=1,
+                session_file=None,
+                duration_s=10.0,
+                stdout_tail="ran out of budget",
+            )
+
+        monkeypatch.setattr(scheduler.runner, "run_worker", failing_worker)
+        monkeypatch.setattr(scheduler, "forge_for", lambda repo: _HarvestFakeForge())
+
+        for attempt in range(1, scheduler.MAX_CONSECUTIVE_SAME_FAILURE):
+            result = run_harvest(store, cfg, finding)
+            assert result.get("outcome") == "retry", (attempt, result)
+            ps = store.get_pr_state(finding["id"])
+            assert ps is not None
+            assert ps["harvested_at"] is None
+            assert ps["harvest_attempts"] == attempt
+            finding = store.get_finding(finding["id"])
+            assert finding is not None
+            finding["budget_override"] = "exempt"
+
+        result = run_harvest(store, cfg, finding)
+        assert result.get("outcome") == "stuck", result
+
+        ps = store.get_pr_state(finding["id"])
+        assert ps is not None
+        assert ps["harvested_at"] is not None, (
+            "harvested_at must be stamped once retries are exhausted, or"
+            " list_pending_harvest keeps re-selecting this PR forever"
+        )
+        assert ps["harvest_attempts"] == 0
+
 
 def _make_repo_with_published_branch(tmp_path: Path) -> tuple[Path, Path]:
     seed = tmp_path / "seed"

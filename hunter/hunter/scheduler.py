@@ -532,6 +532,34 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
         "stale",
         "invalid",
     ):
+        if state != "done":
+            failure = f"worker {state}"
+        elif verdict is None and not out_path.exists():
+            failure = "no verdict file"
+        elif verdict is None:
+            failure = "unparseable verdict file"
+        else:
+            failure = "invalid verdict value"
+        streak = store.record_recheck_attempt(fid, failure)
+        if streak >= MAX_CONSECUTIVE_SAME_FAILURE:
+            # Same recheck failure N times running: whatever's wrong isn't
+            # going to resolve itself by retrying identically forever, and
+            # a stuck 'rechecking' item head-of-line-blocks fix/rotation
+            # work behind it (see pick_next's priority ladder). Fall back
+            # to the inbox rather than pretend the recheck is still live.
+            store.set_status(fid, "new")
+            store.clear_recheck_attempts(fid)
+            store.log_event(
+                "recheck",
+                f"#{fid} gave up after {streak} identical failures ({failure});"
+                " back to inbox for human triage",
+                job_id=job,
+                finding_id=fid,
+            )
+            summary["outcome"] = "stuck"
+            if override == "once":
+                store.set_budget_override(fid, None)
+            return summary
         # Leave status at 'rechecking' (don't reset to 'new') -- killed/failed/
         # inconclusive attempts must not look identical to "still relevant",
         # and the next cycle's priority scan naturally retries 'rechecking'
@@ -559,6 +587,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
             severity=verdict.get("updated_severity"),
         )
         store.set_status(fid, "new")  # back to inbox with improved analysis
+        store.clear_recheck_attempts(fid)
         store.log_event(
             "recheck",
             f"#{fid} confirmed: {reason}",
@@ -568,6 +597,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
         summary["outcome"] = "confirmed"
     elif v == "stale":
         store.set_status(fid, "wontfix", verdict_reason=f"recheck: {reason}")
+        store.clear_recheck_attempts(fid)
         store.log_event(
             "recheck",
             f"#{fid} stale: {reason}",
@@ -577,6 +607,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
         summary["outcome"] = "stale"
     elif v == "invalid":
         store.set_status(fid, "rejected", verdict_reason=f"recheck: {reason}")
+        store.clear_recheck_attempts(fid)
         store.log_event(
             "recheck",
             f"#{fid} invalid: {reason}",
@@ -772,13 +803,17 @@ def run_modernize(store: Store, cfg: Config, repo: Row) -> Row:
 # -- fix --------------------------------------------------------------------
 
 
-# Consecutive run_fix attempts that hit the identical failure reason before
-# giving up on a finding instead of requeuing it again. A different reason
-# each time still gets requeued immediately -- only a stuck, unchanging
-# dead end (same push/PR/commit failure every attempt) burns a bounded
-# number of retries rather than looping forever at token-window pace (see
-# _compute_sleep_s's 0s-when-queued policy in server.py).
-FIX_MAX_CONSECUTIVE_SAME_FAILURE = 3
+# Consecutive attempts (of run_fix/run_recheck/run_harvest, tracked
+# per-finding) that hit the IDENTICAL failure reason before giving up
+# instead of retrying again. A different reason each time still retries
+# immediately -- only a stuck, unchanging dead end (same push/PR/commit
+# failure, same unparseable-verdict cause, same PR-view error every
+# attempt) burns a bounded number of retries rather than looping forever
+# at token-window pace (see _compute_sleep_s's 0s-when-queued policy in
+# server.py, and pick_next's fixed engage > harvest > recheck > fix
+# priority ladder, which a permanently-stuck top-priority item would
+# otherwise head-of-line-block forever).
+MAX_CONSECUTIVE_SAME_FAILURE = 3
 
 
 def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
@@ -1038,14 +1073,14 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
             )
 
         # (c) Salvage: either requeue for another attempt, or -- if this
-        # exact failure has now recurred FIX_MAX_CONSECUTIVE_SAME_FAILURE
+        # exact failure has now recurred MAX_CONSECUTIVE_SAME_FAILURE
         # times in a row with nothing changed in between -- give up and
         # surface it for human attention instead of burning tokens on a
         # retry certain to repeat the identical outcome.
         assert failure is not None  # noqa: S101 -- every branch above sets it
         streak = store.record_fix_attempt(fid, failure)
         tail = (rr.stdout_tail or "")[-300:]
-        if streak >= FIX_MAX_CONSECUTIVE_SAME_FAILURE:
+        if streak >= MAX_CONSECUTIVE_SAME_FAILURE:
             store.set_status(
                 fid,
                 "rejected",
@@ -1770,6 +1805,29 @@ def run_harvest(store: Store, cfg: Config, finding: Row) -> Row:
 
     summary: Row = {"kind": "harvest", "finding": fid, "job": job, "state": state, "pr": num}
     if state != "done":
+        failure = f"worker {state}"
+        streak = store.record_harvest_attempt(fid, failure)
+        if streak >= MAX_CONSECUTIVE_SAME_FAILURE:
+            # Same harvest failure N times running (e.g. a worker that
+            # always gets cap-killed on this PR's diff): stop retrying at
+            # top scheduling priority forever (see pick_next's engage >
+            # harvest > recheck > fix ladder) and mark it done-trying.
+            # harvested_at's meaning broadens slightly to "no further
+            # harvest cycles needed" rather than strictly "succeeded";
+            # the event log is the audit trail distinguishing the two.
+            store.upsert_pr_state(fid, harvested_at=now_ms())
+            store.clear_harvest_attempts(fid)
+            store.log_event(
+                "error",
+                f"harvest #{fid}: gave up after {streak} identical failures"
+                f" ({failure}) -- not reviewed, will not retry",
+                job_id=job,
+                finding_id=fid,
+            )
+            summary["outcome"] = "stuck"
+            if override == "once":
+                store.set_budget_override(fid, None)
+            return summary
         # Leave harvested_at unset so this finding is reconsidered next
         # cycle -- matches run_engage's own failure-retry pattern.
         store.log_event(
@@ -1784,6 +1842,7 @@ def run_harvest(store: Store, cfg: Config, finding: Row) -> Row:
         return summary
 
     store.upsert_pr_state(fid, harvested_at=now_ms())
+    store.clear_harvest_attempts(fid)
     store.log_event(
         "harvest",
         f"#{fid} PR #{num} reviewed for follow-ups",

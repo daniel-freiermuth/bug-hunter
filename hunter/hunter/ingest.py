@@ -14,6 +14,18 @@ if TYPE_CHECKING:
 
 _KNOWN_FINDING_TYPES = ("bug", "dep_update", "test_gap", "refactor", "modernization")
 
+# Storage columns that are specific to each non-bug finding type (see
+# store.upsert_finding's INSERT column list) and that the corresponding
+# playbook (hunter/playbooks/<type>.md, "Output contract" section)
+# instructs workers to always emit. A worker that omits one of these
+# would otherwise be stored with that column silently NULL.
+_TYPE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "dep_update": ("ecosystem", "package", "current_version", "latest_version", "update_type"),
+    "test_gap": ("missing_tests", "test_file"),
+    "refactor": ("smell_type", "suggested_refactor"),
+    "modernization": ("modernization_class", "current_approach", "proposed_approach"),
+}
+
 
 def ingest_findings(
     store: Store, repo_id: int, findings_path: Path, finding_type: str | None = "bug"
@@ -82,6 +94,9 @@ def _validate(f: Any, finding_type: str) -> str | None:
         sev = f.get("severity", "medium")
         if sev not in SEVERITIES:
             return f"unknown severity {sev!r}"
+        for field in _TYPE_REQUIRED_FIELDS.get(finding_type, ()):
+            if not f.get(field):
+                return f"missing required field {field!r} for type {finding_type!r}"
     try:
         float(f.get("confidence", 0.0))
     except (TypeError, ValueError):

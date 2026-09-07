@@ -23,7 +23,8 @@
     padding: 16px 0;
   }
   #nav .nav-item {
-    padding: 9px 22px; font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+    display: block; width: 100%; text-align: left; background: none; border: none;
+    font: inherit; padding: 9px 22px; font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
     color: var(--dim); cursor: pointer; border-left: 2px solid transparent;
   }
   #nav .nav-item:hover { color: var(--fg); }
@@ -87,6 +88,7 @@
   .type-dep_update { background: #eff; color: #36c; border-color: #36c; }
   .type-test_gap { background: #fef; color: #93c; border-color: #93c; }
   .type-refactor { background: #efe; color: #256029; border-color: #256029; }
+  .type-modernization { background: #eef; color: #3b4b9c; border-color: #3b4b9c; }
   /* Status badges (findingCard, any status -- see All Findings page) */
   .status-merged { color: var(--green); border-color: var(--green); }
   .status-rejected, .status-wontfix { color: var(--faint); }
@@ -236,13 +238,13 @@
 <body>
 <div class="app">
   <nav id="nav">
-    <div class="nav-item" data-page="status">Status</div>
-    <div class="nav-item" data-page="inbox">Inbox</div>
-    <div class="nav-item" data-page="pipeline">Kanban / Pipeline</div>
-    <div class="nav-item" data-page="findings">All Findings</div>
-    <div class="nav-item" data-page="repos">Repos</div>
-    <div class="nav-item" data-page="stats">Stats</div>
-    <div class="nav-item" data-page="log">Log</div>
+    <button type="button" class="nav-item" data-page="status">Status</button>
+    <button type="button" class="nav-item" data-page="inbox">Inbox</button>
+    <button type="button" class="nav-item" data-page="pipeline">Kanban / Pipeline</button>
+    <button type="button" class="nav-item" data-page="findings">All Findings</button>
+    <button type="button" class="nav-item" data-page="repos">Repos</button>
+    <button type="button" class="nav-item" data-page="stats">Stats</button>
+    <button type="button" class="nav-item" data-page="log">Log</button>
   </nav>
   <main>
     <div id="err"></div>
