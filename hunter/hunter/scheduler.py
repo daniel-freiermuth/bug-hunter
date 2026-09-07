@@ -1839,9 +1839,42 @@ _RUNNERS: dict[str, Callable[[Store, Config, Row], Row]] = {
 }
 
 
+def _refresh_stale_probe(cfg: Config, windows: dict[str, WindowState]) -> bool:
+    """Force a fresh usage probe if the anthropic:5h reading is stale or
+    entirely missing.
+
+    Root cause of "why don't we get new information on the 5h/7d window
+    usage" (investigated live in production): headless `omp -p` -- 100%
+    of what every hunter worker uses -- does NOT refresh usage_history as
+    a side effect, confirmed empirically (identical recorded_at before
+    and after a real, token-spending `omp -p` run). So no matter how many
+    jobs hunter runs, nothing it does ever closes a stale-probe gap on
+    its own; the only things that ever have are entirely outside hunter's
+    control (a human's interactive session, or someone manually running
+    `omp usage`). `omp usage` itself is a cheap, zero-inference metadata
+    call (~3-5s, confirmed empirically) that DOES write a fresh row --
+    gated on staleness rather than called every cycle, since Anthropic
+    itself rate-limits /usage aggressively per source IP (see
+    omp://auth-broker-gateway.md).
+
+    Finally gives cfg.stale_after_s (loaded from config.json's
+    budget.staleAfterS, previously read but never actually consulted
+    anywhere) a real effect. Best-effort: run_cmd never raises, and a
+    failed/timed-out probe just leaves windows exactly as stale as they
+    already were -- callers already tolerate that via unaccounted_tokens.
+    """
+    w5 = windows.get("anthropic:5h")
+    if w5 is not None and w5.age_s <= cfg.stale_after_s:
+        return False
+    rc, _out = run_cmd([cfg.omp_bin, "usage"], timeout=30)
+    return rc == 0
+
+
 def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
     try:
         windows = budget.read_windows()
+        if _refresh_stale_probe(cfg, windows):
+            windows = budget.read_windows()  # pick up the row the forced probe just wrote
         store.log_window(list(windows.values()))
 
         # (0) Cheap PR sync -- gh reads only, no tokens.
