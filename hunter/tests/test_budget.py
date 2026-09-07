@@ -10,7 +10,7 @@ import pytest
 
 import hunter.budget as budget_module
 from hunter.budget import decide, ramp_5h, ramp_7d, read_windows, retry_at_5h, retry_at_7d
-from hunter.types import Config, WindowState
+from hunter.types import Config, UnaccountedTokens, WindowState
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -131,7 +131,7 @@ def test_stale_5h_own_finished_jobs_count_toward_effective_used():
     }
     # 1.6M unaccounted tokens (finished jobs the probe hasn't caught up to
     # yet) -> 1.6M/200k * 10% = 0.80 additional effective usage.
-    d = decide(_cfg(), "hunt", windows, unaccounted_tokens=1_600_000)
+    d = decide(_cfg(), "hunt", windows, UnaccountedTokens(for_5h=1_600_000))
     assert not d.allow
     assert "5h" in d.reason
 
@@ -147,6 +147,31 @@ def test_stale_5h_denied_by_7d_ramp():
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
     assert "7d" in d.reason
+
+
+def test_5h_and_7d_unaccounted_reservations_are_independent():
+    """The actual fix this session: for_5h and for_7d must never be
+    derived from one another via a capacity ratio -- each window's
+    reservation responds ONLY to its own field. A single shared int
+    scaled down for 7d (the pre-fix design) silently assumed both
+    windows' unaccounted spend shared one baseline, which is false the
+    moment their probes diverge (see test_unaccounted_tokens.py's
+    regression on the scheduler side). Prove it two ways: a huge for_7d
+    denies even with for_5h=0 (5h healthy on its own), and a huge for_5h
+    denies even with for_7d=0 (7d healthy on its own)."""
+    # for_7d alone must be able to deny, independent of for_5h.
+    resets_7d = _NOW_MS + int(_WEEK_MS * 0.90)  # 10% elapsed -> ramp ~0.10
+    windows = _healthy_windows(w5_used=0.0, w5_elapsed_h=4.5)  # 5h healthy on its own
+    windows["anthropic:7d"] = _ws("anthropic:7d", used_fraction=0.02, resets_at=resets_7d)
+    d = decide(_cfg(), "hunt", windows, UnaccountedTokens(for_5h=0, for_7d=20_000_000))
+    assert not d.allow
+    assert "anthropic:7d: used" in d.reason
+
+    # for_5h alone must be able to deny, independent of for_7d.
+    windows2 = _healthy_windows(w5_used=0.0, w5_elapsed_h=3.0)
+    d2 = decide(_cfg(), "hunt", windows2, UnaccountedTokens(for_5h=5_000_000, for_7d=0))
+    assert not d2.allow
+    assert "5h" in d2.reason
 
 
 # ---------------------------------------------------------------------------
@@ -436,6 +461,114 @@ def test_read_windows_keeps_active_window(tmp_path, monkeypatch):
 
     assert set(windows) == {"anthropic:7d"}
     assert windows["anthropic:7d"].used_fraction == 0.3
+
+
+def test_read_windows_rolls_forward_expired_5h_window(tmp_path, monkeypatch):
+    """Regression: a real production incident. anthropic:5h's own cycle
+    ended (resets_at passed) and no fresh probe had landed yet for the new
+    cycle -- the old behavior dropped the row entirely, decide() saw no
+    anthropic:5h data at all, and fell through to "no active window ->
+    allow", completely bypassing unaccounted_tokens for as long as the gap
+    lasted. A cascade of modernization jobs (which routinely cost 2-5x
+    their nominal cap on a cold-cache first call) burned ~2.9M tokens
+    across the freshly-rolled-over window with zero denials.
+
+    Fixed: the window must be rolled forward, not dropped -- a brand-new
+    cycle legitimately starts at 0% (unlike a truly abandoned per-model
+    dimension, see test_read_windows_drops_expired_cycle_window), and
+    recorded_at must be the boundary the new cycle actually started at (the
+    old resets_at), not `now` -- otherwise unaccounted_tokens's "finished
+    since the last probe" query would only count jobs from this instant
+    forward instead of the whole gap."""
+    db_path = tmp_path / "agent.db"
+    now = int(time.time() * 1000)
+    old_resets_at = now - 47 * 60 * 1000  # cycle ended 47 minutes ago
+    _make_agent_db(
+        db_path,
+        [("anthropic:5h", 0.36, "ok", old_resets_at, old_resets_at - 3600_000)],
+    )
+    monkeypatch.setattr(budget_module, "OMP_AGENT_DB", db_path)
+
+    windows = read_windows()
+
+    assert "anthropic:5h" in windows, "expired window must be rolled forward, not dropped"
+    w5 = windows["anthropic:5h"]
+    assert w5.used_fraction == 0.0
+    assert w5.status == "ok"
+    assert w5.resets_at == old_resets_at + _5H_MS
+    assert w5.recorded_at == old_resets_at  # the new cycle's actual start
+
+
+def test_read_windows_rolls_forward_expired_7d_window(tmp_path, monkeypatch):
+    """Same fix, the account-wide anthropic:7d dimension -- NOT the
+    per-model-class variants (see test_read_windows_drops_expired_cycle_window,
+    which must keep dropping those)."""
+    db_path = tmp_path / "agent.db"
+    now = int(time.time() * 1000)
+    old_resets_at = now - 2 * 3600_000  # cycle ended 2 hours ago
+    _make_agent_db(
+        db_path,
+        [("anthropic:7d", 0.55, "ok", old_resets_at, old_resets_at - _WEEK_MS)],
+    )
+    monkeypatch.setattr(budget_module, "OMP_AGENT_DB", db_path)
+
+    windows = read_windows()
+
+    assert "anthropic:7d" in windows
+    w7 = windows["anthropic:7d"]
+    assert w7.used_fraction == 0.0
+    assert w7.resets_at == old_resets_at + _WEEK_MS
+    assert w7.recorded_at == old_resets_at
+
+
+def test_read_windows_rolls_forward_through_multiple_missed_cycles(tmp_path, monkeypatch):
+    """If MULTIPLE cycles have elapsed since the last probe (a long outage,
+    not just one rollover), the synthesized window must land on the
+    CURRENT cycle, not the first one after the stale reading."""
+    db_path = tmp_path / "agent.db"
+    now = int(time.time() * 1000)
+    old_resets_at = now - int(2.3 * _5H_MS)  # ~2.3 windows' worth stale
+    _make_agent_db(
+        db_path,
+        [("anthropic:5h", 0.80, "ok", old_resets_at, old_resets_at - _5H_MS)],
+    )
+    monkeypatch.setattr(budget_module, "OMP_AGENT_DB", db_path)
+
+    windows = read_windows()
+
+    w5 = windows["anthropic:5h"]
+    assert w5.resets_at > now
+    assert w5.resets_at - now <= _5H_MS  # exactly one window ahead of now, not further
+    assert w5.used_fraction == 0.0
+
+
+def test_decide_denies_on_unaccounted_alone_through_a_fresh_rollover():
+    """End-to-end regression, decide()'s side of the same incident: a 5h
+    window that just rolled over (used_fraction=0.0, recorded_at at the
+    true cycle boundary -- exactly what read_windows() now produces) must
+    still deny once hunter's own unaccounted spend alone crosses the ramp,
+    even though the raw probe shows 0% used and looks perfectly healthy.
+    Before the fix, this situation never reached decide() at all -- the
+    window was dropped upstream and decide() saw "no window data"."""
+    elapsed_h = 3.0  # well past headroom -> real ramp
+    resets_at = _NOW_MS + int((5 - elapsed_h) * 3600 * 1000)
+    window_start = resets_at - _5H_MS
+    windows = {
+        "anthropic:5h": WindowState(
+            limit_id="anthropic:5h",
+            used_fraction=0.0,
+            status="ok",
+            resets_at=resets_at,
+            recorded_at=window_start,
+            age_s=(_NOW_MS - window_start) / 1000,
+        ),
+        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10),
+    }
+    # ~2.9M tokens burned since the rollover (the actual incident's scale) --
+    # 2_900_000 / 200_000 * 10% = 1.45 effective usage, far past any ramp.
+    d = decide(_cfg(), "hunt", windows, UnaccountedTokens(for_5h=2_900_000))
+    assert not d.allow
+    assert "5h" in d.reason
 
 
 # ---------------------------------------------------------------------------

@@ -263,9 +263,10 @@ class Handler(BaseHTTPRequestHandler):
                         cfg=self.cfg,
                         kind=budget_kind,
                         windows=raw_windows,
-                        unaccounted_tokens=(
-                            scheduler._unaccounted_tokens(store, raw_windows)  # noqa: SLF001
-                            + scheduler._anticipated_tokens(store, repo_id, kind)  # noqa: SLF001
+                        unaccounted=scheduler._unaccounted_tokens(  # noqa: SLF001
+                            store,
+                            raw_windows,
+                            scheduler._anticipated_tokens(store, repo_id, kind),  # noqa: SLF001
                         ),
                     )
                     budget_state = "allowed" if dec.allow else "denied"

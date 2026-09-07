@@ -27,33 +27,68 @@ from .playbooks import (
     build_test_gap_prompt,
 )
 from .store import Store
-from .types import BudgetDecision, Config, Row, RunResult, WindowState, now_ms
+from .types import BudgetDecision, Config, Row, RunResult, UnaccountedTokens, WindowState, now_ms
 from .util import run_cmd
 
 
-def _unaccounted_tokens(store: Store, windows: dict[str, WindowState]) -> int:
-    """Tokens hunter knows it has spent (or is spending) that the latest
-    probe can't yet reflect: jobs still 'running' (cap_tokens is an
-    estimate -- final usage isn't known until they finish) plus jobs that
-    already finished after the most recent probe's recorded_at (their real
-    tokens_new -- known exactly). The latter closes a real gap: Anthropic's
-    usage probe is sparse and can lag well behind hunter's own job cadence
-    during an active run (observed in production: 26 jobs and ~4M tokens
-    spent across a 98-minute stretch with zero fresh probes landing), so
-    without it budget.decide() only ever sees whichever single job happens
-    to still be 'running' right now -- never the many jobs that already
+def _unaccounted_tokens(
+    store: Store, windows: dict[str, WindowState], anticipated: int = 0
+) -> UnaccountedTokens:
+    """Tokens hunter knows about that a window's own probe reading
+    doesn't reflect yet: jobs still 'running' (cap_tokens is an estimate
+    -- final usage isn't known until they finish) plus jobs that already
+    finished after THAT window's own probe recorded_at (their real
+    tokens_new -- known exactly), plus `anticipated` -- a pre-reservation
+    for the job about to be decided on (see _anticipated_tokens), which
+    applies identically to both windows since it doesn't depend on any
+    probe baseline. Anthropic's usage probe is sparse and can lag well
+    behind hunter's own job cadence during an active run (observed in
+    production: 26 jobs and ~4M tokens spent across a 98-minute stretch
+    with zero fresh probes landing), so without the "finished since"
+    term budget.decide() only ever sees whichever single job happens to
+    still be 'running' right now -- never the many jobs that already
     finished and moved the needle since the last probe.
+
+    Returns SEPARATE 5h/7d counts -- never one shared number -- because
+    anthropic:5h and anthropic:7d generally have DIFFERENT probe
+    recency: 5h rolls over ~33.6x more often than 7d, so after almost
+    any 5h rollover the two have diverged (read_windows() rolls an
+    expired 5h window's recorded_at forward to the new cycle's actual
+    start boundary; 7d, not having rolled over, keeps its own older
+    recorded_at from its last real probe). A single combined number,
+    scaled by a capacity ratio to approximate the 7d figure (the
+    pre-this-fix design), silently assumes both probes share a
+    baseline -- observed in production immediately after the 5h-only
+    version of this fix landed: unaccounted read identically before AND
+    after a 5h rollover, because the 7d probe's stale recorded_at kept
+    winning a shared min() and the "since the last probe" baseline
+    never actually moved for the 5h side either. Computing each
+    independently, against its OWN window's own recorded_at, is what
+    actually closes that gap for both dimensions at once -- see
+    test_unaccounted_tokens.py's regression.
     """
     running = store.db.execute(
         "SELECT COALESCE(SUM(cap_tokens), 0) AS total FROM jobs WHERE state = 'running'"
     ).fetchone()["total"]
-    probe_at = min((w.recorded_at for w in windows.values()), default=0)
-    finished_since_probe = store.db.execute(
-        "SELECT COALESCE(SUM(tokens_new), 0) AS total FROM jobs"
-        " WHERE state != 'running' AND finished_at > ?",
-        (probe_at,),
-    ).fetchone()["total"]
-    return running + finished_since_probe
+
+    def _finished_since(probe_at: int) -> int:
+        r = store.db.execute(
+            "SELECT COALESCE(SUM(tokens_new), 0) AS total FROM jobs"
+            " WHERE state != 'running' AND finished_at > ?",
+            (probe_at,),
+        ).fetchone()
+        return int(r["total"])
+
+    fallback = min((w.recorded_at for w in windows.values()), default=0)
+    w5 = windows.get("anthropic:5h")
+    w7 = windows.get("anthropic:7d")
+    probe_at_5h = w5.recorded_at if w5 is not None else fallback
+    probe_at_7d = w7.recorded_at if w7 is not None else fallback
+    base = running + anticipated
+    return UnaccountedTokens(
+        for_5h=base + _finished_since(probe_at_5h),
+        for_7d=base + _finished_since(probe_at_7d),
+    )
 
 
 _CACHE_TTL_MS = 3600 * 1000  # Anthropic's observed ephemeral-cache lifetime
@@ -299,7 +334,10 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
 
     windows = budget.read_windows()
     dec = budget.decide(
-        cfg, "hunt", windows, _unaccounted_tokens(store, windows) + _anticipated_tokens(store, rid, "hunt")
+        cfg,
+        "hunt",
+        windows,
+        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, "hunt")),
     )
     if not dec.allow:
         job = store.create_job("hunt", rid)
@@ -429,7 +467,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
             cfg,
             "hunt",
             windows,
-            _unaccounted_tokens(store, windows) + _anticipated_tokens(store, repo["id"], "recheck"),
+            _unaccounted_tokens(store, windows, _anticipated_tokens(store, repo["id"], "recheck")),
         )
     if not dec.allow:
         job = store.create_job("recheck", repo["id"], finding_id=fid)
@@ -567,7 +605,10 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
     # Budget check
     windows = budget.read_windows()
     dec = budget.decide(
-        cfg, "hunt", windows, _unaccounted_tokens(store, windows) + _anticipated_tokens(store, rid, "test_gap")
+        cfg,
+        "hunt",
+        windows,
+        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, "test_gap")),
     )  # Use hunt budget for now
     if not dec.allow:
         job = store.create_job("test_gap", rid)
@@ -667,7 +708,10 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
     # Budget check
     windows = budget.read_windows()
     dec = budget.decide(
-        cfg, "hunt", windows, _unaccounted_tokens(store, windows) + _anticipated_tokens(store, rid, "dep_update")
+        cfg,
+        "hunt",
+        windows,
+        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, "dep_update")),
     )
     if not dec.allow:
         job = store.create_job("dep_update", rid)
@@ -766,7 +810,10 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
     # Budget check
     windows = budget.read_windows()
     dec = budget.decide(
-        cfg, "hunt", windows, _unaccounted_tokens(store, windows) + _anticipated_tokens(store, rid, "refactor")
+        cfg,
+        "hunt",
+        windows,
+        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, "refactor")),
     )
     if not dec.allow:
         job = store.create_job("refactor", rid)
@@ -871,7 +918,7 @@ def run_modernize(store: Store, cfg: Config, repo: Row) -> Row:
         cfg,
         "hunt",
         windows,
-        _unaccounted_tokens(store, windows) + _anticipated_tokens(store, rid, "modernization"),
+        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, "modernization")),
     )
     if not dec.allow:
         job = store.create_job("modernization", rid)
@@ -1052,7 +1099,10 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         dec = BudgetDecision(True, f"override:{override}", base)
     else:
         dec = budget.decide(
-            cfg, "fix", windows, _unaccounted_tokens(store, windows) + _anticipated_tokens(store, repo["id"], "fix")
+            cfg,
+            "fix",
+            windows,
+            _unaccounted_tokens(store, windows, _anticipated_tokens(store, repo["id"], "fix")),
         )
     if not dec.allow:
         _drop_worktree(delete_branch=True)
@@ -1505,7 +1555,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
             cfg,
             "fix",
             windows,
-            _unaccounted_tokens(store, windows) + _anticipated_tokens(store, repo["id"], "engage"),
+            _unaccounted_tokens(store, windows, _anticipated_tokens(store, repo["id"], "engage")),
         )
     if not dec.allow:
         _drop_worktree()
