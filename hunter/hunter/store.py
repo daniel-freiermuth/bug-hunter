@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
 from .types import (
     ACTIVE_STATUSES,
@@ -143,6 +144,16 @@ class Store:
                 "pr_state",
                 "ALTER TABLE pr_state ADD COLUMN addressed_fingerprint TEXT",
             ),
+            (
+                "fix_attempts",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN fix_attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_fix_failure",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN last_fix_failure TEXT",
+            ),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
@@ -219,8 +230,6 @@ class Store:
     # -- repo notes ----------------------------------------------------
     def repo_notes_path(self, repo_id: int) -> Path:
         """Return path to repo's NOTES.md file (ID-based for stability)."""
-        from pathlib import Path as PathType
-        
         repo = self.get_repo(repo_id)
         if not repo:
             msg = f"repo {repo_id} not found"
@@ -447,6 +456,37 @@ class Store:
         self.db.execute(
             "UPDATE findings SET budget_override = ?, updated_at = ? WHERE id = ?",
             (mode, now_ms(), fid),
+        )
+        self.db.commit()
+
+    def record_fix_attempt(self, fid: int, failure: str) -> int:
+        """Track consecutive run_fix attempts that hit the SAME failure
+        reason for this finding. A genuinely different failure resets the
+        streak to 1 (new information, worth an immediate retry); the SAME
+        reason recurring means nothing changed and retrying again right
+        now would just re-burn tokens for the identical outcome. Returns
+        the new streak count.
+        """
+        current = self.get_finding(fid)
+        prev_failure = current.get("last_fix_failure") if current else None
+        prev_attempts = (current.get("fix_attempts") or 0) if current else 0
+        attempts = prev_attempts + 1 if failure == prev_failure else 1
+        self.db.execute(
+            "UPDATE findings SET fix_attempts = ?, last_fix_failure = ?, updated_at = ?"
+            " WHERE id = ?",
+            (attempts, failure, now_ms(), fid),
+        )
+        self.db.commit()
+        return attempts
+
+    def clear_fix_attempts(self, fid: int) -> None:
+        """Reset the fix-retry streak once a finding leaves the retry loop
+        (shipped, rejected, blocked) so a future manual re-queue starts
+        fresh rather than inheriting a stale streak."""
+        self.db.execute(
+            "UPDATE findings SET fix_attempts = 0, last_fix_failure = NULL, updated_at = ?"
+            " WHERE id = ?",
+            (now_ms(), fid),
         )
         self.db.commit()
 

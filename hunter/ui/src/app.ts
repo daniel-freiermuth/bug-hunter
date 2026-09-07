@@ -717,7 +717,7 @@ async function addRepoNote(id: number): Promise<void> {
 // it or re-fetches it.
 // ---------------------------------------------------------------------------
 
-const findingDetailCache = new Map<number, FindingDetail | "loading" | "error">();
+const findingDetailCache = new Map<number, FindingDetail | "loading">();
 
 async function toggleFindingDetail(id: number, opened: boolean): Promise<void> {
   if (!opened) return;
@@ -725,21 +725,33 @@ async function toggleFindingDetail(id: number, opened: boolean): Promise<void> {
     findingDetailCache.set(id, "loading");
     renderFindingDetailBody(id);
     const r = await api<FindingDetail>(`/api/finding?id=${id}`);
-    findingDetailCache.set(id, r.status === 200 && r.body ? r.body : "error");
+    if (r.status === 200 && r.body) {
+      findingDetailCache.set(id, r.body);
+    } else {
+      // Don't pin the failure in the cache -- a transient error would
+      // otherwise permanently block retrying (has() stays true forever).
+      // Show the failure for this one render pass via the `failed` flag,
+      // then leave the cache empty so the next toggle re-fetches.
+      findingDetailCache.delete(id);
+      renderFindingDetailBody(id, true);
+      return;
+    }
   }
   renderFindingDetailBody(id);
 }
 
-function renderFindingDetailBody(id: number): void {
+function renderFindingDetailBody(id: number, failed = false): void {
   const el = document.getElementById(`fd-body-${id}`);
   if (!el) return;
   const state = findingDetailCache.get(id);
-  if (state === "loading" || state === undefined) {
-    el.innerHTML = '<div class="empty">loading\u2026</div>';
+  if (state === undefined) {
+    el.innerHTML = failed
+      ? '<div class="empty">failed to load</div>'
+      : '<div class="empty">loading\u2026</div>';
     return;
   }
-  if (state === "error") {
-    el.innerHTML = '<div class="empty">failed to load</div>';
+  if (state === "loading") {
+    el.innerHTML = '<div class="empty">loading\u2026</div>';
     return;
   }
   const { jobs, pr_state } = state;
@@ -963,7 +975,7 @@ function findingCard(f: Finding, withActions: boolean): string {
     refactor: "♻️ Refactor",
     modernization: "🔬 Modern",
   };
-  const typeLabel = typeLabels[f.type] || f.type || "?";
+  const typeLabel = typeLabels[f.type] || esc(f.type) || "?";
   const category = f.category || f.bug_class || "";
   const approach =
     f.current_approach || f.proposed_approach
@@ -972,7 +984,7 @@ function findingCard(f: Finding, withActions: boolean): string {
 
   return `<div class="card">
     <div class="top">
-      <span class="badge type-${f.type || 'bug'}">${typeLabel}</span>
+      <span class="badge type-${esc(f.type) || "bug"}">${esc(typeLabel)}</span>
       <span class="badge sev-${sev}">${sev} \u00b7 ${conf}</span>
       <span class="badge">${esc(category)}</span>
       <span class="badge status-${esc(f.status)}">${esc(f.status)}</span>

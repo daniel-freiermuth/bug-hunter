@@ -9,14 +9,16 @@ actually completed.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from hunter import scheduler
 from hunter.scheduler import run_recheck
 from hunter.store import Store
-from hunter.types import Config
+from hunter.types import Config, RunResult
 
 
 @pytest.fixture
@@ -134,15 +136,14 @@ class TestRunRecheckStaysRecheckingOnFailure:
         relevant. This is the exact scenario reported in production: a
         recheck hit its token cap, got SIGTERM'd, and silently reappeared
         as 'new' with no indication the recheck never actually completed."""
-        import subprocess
-
-        from hunter import scheduler
-        from hunter.types import RunResult
 
         # Minimal real git repo so fetch/checkout/pull succeed.
         repo_path = tmp_path / "repos" / "real-repo"
         repo_path.mkdir(parents=True)
-        run = lambda *a: subprocess.run(a, cwd=repo_path, check=True, capture_output=True)
+
+        def run(*a: str) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(a, cwd=repo_path, check=True, capture_output=True)
+
         run("git", "init", "-b", "main")
         run("git", "config", "user.email", "t@t.com")
         run("git", "config", "user.name", "t")
@@ -180,5 +181,6 @@ class TestRunRecheckStaysRecheckingOnFailure:
         after = store.get_finding(fid)
         assert after is not None
         assert after["status"] == "rechecking", (
-            f"finding reset to {after['status']!r} after a killed worker, expected to stay 'rechecking'"
+            f"finding reset to {after['status']!r} after a killed worker, "
+            "expected to stay 'rechecking'"
         )

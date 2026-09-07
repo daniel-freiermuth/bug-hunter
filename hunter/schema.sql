@@ -42,6 +42,8 @@ CREATE TABLE IF NOT EXISTS findings (
   rung_achieved INTEGER,                   -- 1..3 once fixed; NULL before
   verdict_reason TEXT,                     -- REQUIRED for rejected/wontfix (suppression corpus)
   budget_override TEXT,
+  fix_attempts  INTEGER NOT NULL DEFAULT 0, -- consecutive run_fix attempts hitting last_fix_failure
+  last_fix_failure TEXT,                   -- fingerprint of the last fix attempt's failure reason
   
   -- Dep update fields (nullable for other types)
   ecosystem     TEXT,

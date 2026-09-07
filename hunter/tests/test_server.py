@@ -140,8 +140,6 @@ class TestComputeSleepS:
         assert _compute_sleep_s(store, {"state": "done"}) == 15 * 60
 
     def test_denied_with_retry_at_derives_sleep(self, store: Store) -> None:
-        import time
-
         retry_at = (time.time() + 120) * 1000  # 2 minutes from now
         sleep_s = _compute_sleep_s(store, {"denied": "x", "retry_at": retry_at})
         assert sleep_s == pytest.approx(150, abs=2)  # 120 + 30 buffer

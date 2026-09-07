@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from hunter.scheduler import _anticipated_tokens, _CACHE_TTL_MS
+from hunter.scheduler import _CACHE_TTL_MS, _anticipated_tokens
 from hunter.store import Store
 from hunter.types import Config, now_ms
 
@@ -92,3 +92,25 @@ def test_kind_scoped_independently(store: Store) -> None:
     for i, t in enumerate([1_000] * 9 + [700_000]):
         _finished_job(store, rid, "dep_update", t, old - i * 1000)
     assert _anticipated_tokens(store, rid, "hunt") == 0
+
+
+def _denied_job(store: Store, repo_id: int, kind: str, finished_at: int) -> None:
+    jid = store.create_job(kind, repo_id)
+    store.update_job(jid, state="denied", notes="budget", finished_at=finished_at)
+
+
+def test_denied_job_does_not_count_as_warm(store: Store) -> None:
+    """A budget-denied job never made an LLM call, so its prompt cache
+    claim is fictional -- it must not downgrade the estimate from p90 to
+    median the way a genuine recent run would."""
+    rid = store.add_repo("r", "https://r", "/r")
+    old = now_ms() - 2 * _CACHE_TTL_MS
+    tokens = [1_000] * 9 + [700_000]
+    for i, t in enumerate(tokens):
+        _finished_job(store, rid, "dep_update", t, old - i * 1000)
+    # This repo/kind pair was DENIED moments ago -- no worker ever ran.
+    _denied_job(store, rid, "dep_update", now_ms() - 60_000)
+    anticipated = _anticipated_tokens(store, rid, "dep_update")
+    assert anticipated == 700_000, (
+        "a denied job must not be mistaken for a warm prompt cache -- it never ran"
+    )
