@@ -15,7 +15,7 @@ import pytest
 from hunter import scheduler
 from hunter.scheduler import run_engage
 from hunter.store import Store
-from hunter.types import Config, RunResult
+from hunter.types import Config, RunResult, now_ms
 
 
 @pytest.fixture
@@ -51,6 +51,7 @@ class _FakeForge:
 
     def __init__(self) -> None:
         self.comments: list[str] = []
+        self.checks_failing = False  # only consulted by view_pr_sync/parse_pr_url callers
 
     def owner_repo(self, url: str) -> str:
         return "owner/repo"
@@ -64,6 +65,26 @@ class _FakeForge:
     def comment_pr(self, slug: str, number: int, body_file: Path, timeout: int = 60):
         self.comments.append(Path(body_file).read_text())
         return 0, ""
+
+    def parse_pr_url(self, url: str):
+        return "owner/repo", 1
+
+    def view_pr_sync(self, slug: str, number: int, timeout: int = 30):
+        rollup = [{"name": "CI", "conclusion": "FAILURE"}] if self.checks_failing else []
+        return (
+            0,
+            {
+                "state": "OPEN",
+                "comments": [],
+                "reviews": [],
+                "reviewDecision": None,
+                "mergeable": "MERGEABLE",
+                "statusCheckRollup": rollup,
+                "updatedAt": "2026-01-01T00:00:00Z",
+                "headRefName": "feature",
+            },
+            "",
+        )
 
 
 def _run(*args: str, cwd: Path) -> None:
@@ -229,3 +250,124 @@ class TestEngageNeverTargetsDefaultBranch:
         result = run_engage(store, cfg, finding)
         assert "error" in result
         assert not called, "worker must never run when head_ref is the default branch"
+
+
+class TestEngageAttentionBackoff:
+    """The other half of the fairness/loop fix (see
+    scheduler.ENGAGE_BACKOFF_MS): a reply that changes nothing must not
+    let the identical still-outstanding reason re-trigger next cycle.
+    Reproduces the production incident directly -- recentIP PR #6 replied
+    to an unresolved 'checks_failing' five times in ~7 minutes because
+    nothing ever suppressed the immediate re-flag."""
+
+    def test_backoff_is_set_when_replying_without_pushing(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        finding, fake_forge = _setup(store, tmp_path)
+        monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
+
+        def fake_run_worker(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
+            # No commits -- just a decline/explanation, matching the
+            # observed "pre-existing on main, not this PR's fault" reply.
+            (worktree / "PR-REPLY.md").write_text("This is pre-existing, not caused by this PR.\n")
+            return _fake_result()
+
+        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
+
+        result = run_engage(store, cfg, finding)
+        assert result.get("outcome") == "engaged", result
+        assert result.get("pushed") is False
+
+        ps = store.get_pr_state(finding["id"])
+        assert ps is not None
+        # needs_attention is deliberately left as-is -- sync_prs (which
+        # always runs before pick_next) is the sole authority on it;
+        # run_engage overwriting it here previously destroyed the
+        # continuity attention_since/backoff depend on.
+        assert ps["attention_backoff_until"] is not None
+        assert ps["attention_backoff_until"] > now_ms()
+
+    def test_backoff_is_not_set_when_commits_are_pushed(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A genuine attempt (a push) is worth re-checking promptly --
+        the underlying problem may actually be resolved now."""
+        finding, fake_forge = _setup(store, tmp_path)
+        monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
+
+        def fake_run_worker(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
+            (worktree / "f.py").write_text("pass\npublished\nfixed\n")
+            _run("git", "add", "-A", cwd=worktree)
+            _run("git", "commit", "-m", "fix the actual problem", cwd=worktree)
+            (worktree / "PR-REPLY.md").write_text("Fixed.\n")
+            return _fake_result()
+
+        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
+
+        result = run_engage(store, cfg, finding)
+        assert result.get("outcome") == "engaged", result
+        assert result.get("pushed") is True
+
+        ps = store.get_pr_state(finding["id"])
+        assert ps is not None
+        assert ps["attention_backoff_until"] is None
+
+    def test_backoff_is_set_on_pure_no_op(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Neither pushed nor replied (nothing needed doing) is exactly
+        as unproductive as a decline-only reply and must back off too."""
+        finding, fake_forge = _setup(store, tmp_path)
+        monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
+        monkeypatch.setattr(scheduler.runner, "run_worker", lambda *_a, **_kw: _fake_result())
+
+        result = run_engage(store, cfg, finding)
+        assert result.get("outcome") == "engaged", result
+        assert result.get("pushed") is False
+        assert result.get("replied") is False
+
+        ps = store.get_pr_state(finding["id"])
+        assert ps is not None
+        assert ps["attention_backoff_until"] is not None
+
+    def test_backoff_survives_the_next_sync_prs_pass(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exact bug caught live seconds after this fix first shipped:
+        a naive version cleared needs_attention to None in run_engage,
+        which made the VERY NEXT sync_prs pass see a false None -> reason
+        transition (since the still-failing check computes the same
+        reason again) and treat it as genuinely new, wiping the backoff
+        this same call had just set. This is the actual production
+        sequence -- sync_prs, then run_engage, then sync_prs again -- not
+        just each function tested in isolation."""
+        from hunter.scheduler import sync_prs
+
+        finding, fake_forge = _setup(store, tmp_path)
+        fake_forge.checks_failing = True
+        monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
+
+        sync_prs(store, cfg)
+        before = store.get_pr_state(finding["id"])
+        assert before is not None
+        assert before["needs_attention"] == "checks_failing"
+
+        def fake_run_worker(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
+            (worktree / "PR-REPLY.md").write_text("This is a pre-existing failure, not mine.\n")
+            return _fake_result()
+
+        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
+        result = run_engage(store, cfg, finding)
+        assert result.get("outcome") == "engaged", result
+        assert result.get("pushed") is False
+
+        # The check is STILL failing (nothing was pushed) -- exactly the
+        # production scenario. This is the pass that used to wipe the
+        # backoff.
+        sync_prs(store, cfg)
+
+        after = store.get_pr_state(finding["id"])
+        assert after is not None
+        assert after["attention_backoff_until"] is not None
+        assert after["attention_backoff_until"] > now_ms()
+        assert store.list_attention() == []  # correctly suppressed, not re-picked

@@ -38,6 +38,22 @@ Title: {{PR_TITLE}}
    COMMIT PER STEP (you may be killed at any moment; committed work
    survives). If a suggestion is wrong, do not implement it — decline it in
    PR-REPLY.md with a technical argument.
+
+   If the feedback above shows you (or an earlier engage cycle on this
+   same PR) already declined this EXACT request once with a technical
+   reason, and a human explicitly repeats or insists on it anyway (e.g.
+   "then let's fix it anyway") — do NOT just restate the same explanation
+   again. Pick one: (a) comply, especially if it's safe/mechanical (e.g.
+   running the project's own formatter across the repo, even though the
+   drift predates this PR) -- an explicit human instruction outranks the
+   default "stay minimal" scope discipline; or (b) if you still judge it
+   genuinely wrong to do here, give a NEW, more specific technical reason
+   than before AND a concrete next step (e.g. "I'll open a dedicated
+   formatting PR instead of folding it into this dependency bump" —
+   actually propose that follow-up via FOLLOW-UPS.json if there's a
+   fresher engagement occasion for it, or say so plainly if not). A
+   verbatim-repeated decline reads as the human's instruction being
+   ignored, not as a considered response — never do that.
 3. Merge conflict -> bring {{BRANCH}} up to date with
    `origin/{{DEFAULT_BRANCH}}` (merge or rebase, your choice — a rebase
    is fine here too) and resolve.

@@ -1402,6 +1402,19 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
             reasons.append("checks_failing")
         attention = ",".join(reasons) or None
 
+        # attention_since/attention_backoff_until are the fairness/loop
+        # fix (see list_attention's docstring and run_engage's backoff
+        # below) -- only touch them when the reason actually CHANGED.
+        # Left alone otherwise, so attention_since keeps reflecting when
+        # THIS reason first appeared (not "whenever sync_prs last ran",
+        # which is every cycle for every pr_open finding) and a live
+        # backoff isn't silently reset by an unrelated resync.
+        prev_attention = prev.get("needs_attention") if prev else None
+        reason_fields: dict[str, int | None] = {}
+        if attention != prev_attention:
+            reason_fields["attention_since"] = now_ms() if attention else None
+            reason_fields["attention_backoff_until"] = None
+
         store.upsert_pr_state(
             fid,
             pr_number=num,
@@ -1413,6 +1426,7 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
             last_engaged_activity_at=engaged,
             needs_attention=attention,
             synced_at=now_ms(),
+            **reason_fields,
         )
         if attention and (prev is None or prev.get("needs_attention") != attention):
             store.log_event(
@@ -1427,6 +1441,15 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
 
 
 # -- engage -----------------------------------------------------------------
+
+
+# How long a merely-declined-with-explanation engage reply (no commits
+# pushed) suppresses re-flagging the SAME unresolved reason -- see the
+# loop-breaker comment inside run_engage for the production incident that
+# motivated this (20min: long enough to actually break a tight sub-2min
+# thrash loop, short enough that a genuinely stuck PR still gets revisited
+# a handful of times per day rather than effectively forever).
+ENGAGE_BACKOFF_MS = 20 * 60 * 1000
 
 
 def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
@@ -1705,11 +1728,35 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
     # posted our own comment, advance to now + 3s to absorb clock skew
     # between local time and GitHub's createdAt timestamp.
     engaged_mark = (now_ms() + 3_000) if replied else (ps.get("last_activity_at") or now_ms())
+    # Loop-breaker: if nothing was actually pushed, the underlying reason
+    # (e.g. a still-failing check the worker declined to fix) is almost
+    # certainly still true, and the very next sync_prs pass will re-derive
+    # the identical attention reason and re-flag it immediately -- observed
+    # live: recentIP PR #6 looped 5 engage cycles in ~7 minutes, every one
+    # a pure "checks_failing -> replied" no-op, while a different PR sat
+    # flagged and unaddressed for ~10 minutes because this one kept
+    # re-winning the (then-broken) tie-break. Back off; sync_prs clears
+    # this the moment the reason actually changes (new comment, a
+    # different check starts failing, etc.), so genuine new activity is
+    # never held hostage by it.
+    #
+    # Deliberately NOT clearing needs_attention here (unlike the withdraw
+    # branch above, where it's moot -- status leaves pr_open entirely):
+    # sync_prs always runs before pick_next on every cycle (see run_cycle)
+    # and unconditionally recomputes needs_attention from live GitHub
+    # state, so clearing it here was always redundant for correctness --
+    # and actively WRONG once attention_since exists: it made sync_prs's
+    # very next pass see a false None -> "checks_failing" transition,
+    # which read as "the reason genuinely changed" and wiped the backoff
+    # this same call just set, defeating the loop-breaker entirely (the
+    # bug this comment is now warning against was caught live, seconds
+    # after this fix first shipped).
+    backoff = {} if pushed else {"attention_backoff_until": now_ms() + ENGAGE_BACKOFF_MS}
     store.upsert_pr_state(
         fid,
         last_engaged_activity_at=engaged_mark,
-        needs_attention=None,
         synced_at=now_ms(),
+        **backoff,
     )
     did = [b for b, on in (("pushed", pushed), ("replied", replied)) if on] or ["no-op"]
     store.log_event(
@@ -1917,7 +1964,7 @@ def pick_next(
     from what actually runs.
 
     Priority: a budget-overridden finding (any category) jumps the
-    queue -> flagged PR (stalest sync first) -> oldest merged PR pending
+    queue -> flagged PR (oldest-outstanding reason first) -> oldest merged PR pending
     follow-up review (oldest merge first) -> oldest rechecking -> oldest
     queued fix -> the most stale-of-rotation job type for the
     least-recently-hunted enabled repo (hunt if never cloned, else
@@ -1950,7 +1997,7 @@ def pick_next(
                 return kind, f
 
     if attention:
-        return "engage", attention[0]  # stalest sync first
+        return "engage", attention[0]  # oldest-flagged reason first (see list_attention)
     if pending_harvest:
         return "harvest", pending_harvest[0]  # oldest merge first
     if rechecking:

@@ -139,6 +139,21 @@ CREATE TABLE IF NOT EXISTS pr_state (
   last_activity_at INTEGER,                -- newest comment/review timestamp (epoch ms)
   last_engaged_activity_at INTEGER,        -- activity high-water mark we responded to
   needs_attention TEXT,                    -- comma-joined reasons; NULL = calm
+  attention_since INTEGER,                 -- epoch ms the CURRENT reason first appeared (unchanged
+                                            -- while the reason string stays the same); the real
+                                            -- fairness key for list_attention() -- synced_at is
+                                            -- refreshed for EVERY pr_open finding EVERY cycle in a
+                                            -- fixed order, so it reflects loop iteration order, not
+                                            -- how long a PR has genuinely been waiting (regression:
+                                            -- recentIP PR #6 hogged 5 straight cycles while PR #3 sat
+                                            -- flagged for ~10min, purely because #6 has a higher
+                                            -- finding id and got synced first every pass)
+  attention_backoff_until INTEGER,         -- epoch ms; list_attention() skips this row until then --
+                                            -- set when an engage reply changed nothing (no commits
+                                            -- pushed), so an unresolved reason (e.g. a still-failing
+                                            -- check the worker declined to fix) doesn't immediately
+                                            -- re-trigger next cycle; cleared the moment the reason
+                                            -- actually changes
   synced_at     INTEGER,
   harvested_at  INTEGER                    -- epoch ms run_harvest reviewed this merged PR; NULL = pending
 );

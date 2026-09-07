@@ -60,6 +60,8 @@ _PR_STATE_COLUMNS = {
     "last_activity_at",
     "last_engaged_activity_at",
     "needs_attention",
+    "attention_since",
+    "attention_backoff_until",
     "synced_at",
     "harvested_at",
 }
@@ -125,6 +127,16 @@ class Store:
             ("current_approach", "findings", "ALTER TABLE findings ADD COLUMN current_approach TEXT"),
             ("proposed_approach", "findings", "ALTER TABLE findings ADD COLUMN proposed_approach TEXT"),
             ("harvested_at", "pr_state", "ALTER TABLE pr_state ADD COLUMN harvested_at INTEGER"),
+            (
+                "attention_since",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN attention_since INTEGER",
+            ),
+            (
+                "attention_backoff_until",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN attention_backoff_until INTEGER",
+            ),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
@@ -481,13 +493,27 @@ class Store:
         self.db.commit()
 
     def list_attention(self) -> list[Row]:
-        """pr_open findings whose PR needs a response, stalest sync first."""
+        """pr_open findings whose PR needs a response and isn't currently
+        backed off, ordered by how long the CURRENT reason has been
+        outstanding (oldest first) -- NOT by synced_at, which sync_prs
+        bulk-refreshes for every pr_open finding every single cycle in a
+        fixed id-DESC order, making it reflect loop iteration order
+        rather than genuine wait time. Regression this fixes, observed
+        live: a higher-id finding won every tie-break for 5 straight
+        cycles while another finding sat flagged and unaddressed for
+        ~10 minutes, purely because it happened to sync later each pass.
+        attention_backoff_until excludes a finding whose last engage
+        reply changed nothing (see run_engage) -- re-checking an
+        unresolved, unchanged reason immediately is pure waste."""
         return _rows(
             self.db.execute(
-                "SELECT f.*, p.pr_number, p.head_ref, p.needs_attention, p.synced_at"
+                "SELECT f.*, p.pr_number, p.head_ref, p.needs_attention,"
+                " p.attention_since, p.synced_at"
                 " FROM findings f JOIN pr_state p ON p.finding_id = f.id"
                 " WHERE p.needs_attention IS NOT NULL AND f.status = 'pr_open'"
-                " ORDER BY p.synced_at"
+                " AND (p.attention_backoff_until IS NULL OR p.attention_backoff_until <= ?)"
+                " ORDER BY COALESCE(p.attention_since, p.synced_at)",
+                (now_ms(),),
             )
         )
 
