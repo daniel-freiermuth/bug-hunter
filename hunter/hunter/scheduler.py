@@ -43,11 +43,34 @@ def _unaccounted_tokens(store: Store, windows: dict[str, WindowState]) -> int:
     without it budget.decide() only ever sees whichever single job happens
     to still be 'running' right now -- never the many jobs that already
     finished and moved the needle since the last probe.
+
+    probe_at anchors specifically on anthropic:5h's own recorded_at, NOT
+    min() across every window. read_windows() rolls an expired 5h window
+    forward with recorded_at set to the new cycle's actual start boundary
+    (see budget.read_windows) -- but anthropic:7d, which rolls over far
+    less often, usually still carries an OLDER recorded_at from its own
+    last real probe. min() across both meant a 5h rollover never actually
+    reset this baseline: 7d's stale timestamp kept anchoring "since the
+    last probe" to a point BEFORE the new 5h window even started,
+    permanently over-counting -- observed in production immediately after
+    a rollover fix landed: unaccounted read 0.67 both immediately before
+    AND immediately after the 5h window rolled over, identical to the
+    decimal, because the query's baseline never moved. 5h is what this
+    reservation actually needs to be precise about (decide() gates the
+    frequent admission checks on it; 7d moves slowly enough that some
+    imprecision there is fine, per budget.py's own reasoning). Falls back
+    to min() across whatever's present only if anthropic:5h is missing
+    entirely.
     """
     running = store.db.execute(
         "SELECT COALESCE(SUM(cap_tokens), 0) AS total FROM jobs WHERE state = 'running'"
     ).fetchone()["total"]
-    probe_at = min((w.recorded_at for w in windows.values()), default=0)
+    w5 = windows.get("anthropic:5h")
+    probe_at = (
+        w5.recorded_at
+        if w5 is not None
+        else min((w.recorded_at for w in windows.values()), default=0)
+    )
     finished_since_probe = store.db.execute(
         "SELECT COALESCE(SUM(tokens_new), 0) AS total FROM jobs"
         " WHERE state != 'running' AND finished_at > ?",
