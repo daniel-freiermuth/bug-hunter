@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS findings (
   rung_achieved INTEGER,                   -- 1..3 once fixed; NULL before
   verdict_reason TEXT,                     -- REQUIRED for rejected/wontfix (suppression corpus)
   budget_override TEXT,
+  fix_attempts  INTEGER NOT NULL DEFAULT 0, -- consecutive run_fix attempts hitting last_fix_failure
+  last_fix_failure TEXT,                   -- fingerprint of the last fix attempt's failure reason
+  recheck_attempts INTEGER NOT NULL DEFAULT 0, -- consecutive run_recheck attempts hitting last_recheck_failure
+  last_recheck_failure TEXT,               -- fingerprint of the last recheck attempt's failure reason
   
   -- Dep update fields (nullable for other types)
   ecosystem     TEXT,
@@ -59,7 +63,6 @@ CREATE TABLE IF NOT EXISTS findings (
   smell_type    TEXT,
   suggested_refactor TEXT
 );
-CREATE UNIQUE INDEX IF NOT EXISTS findings_fingerprint ON findings(fingerprint);
 CREATE INDEX IF NOT EXISTS findings_status ON findings(status);
 CREATE INDEX IF NOT EXISTS findings_repo ON findings(repo_id, status);
 CREATE INDEX IF NOT EXISTS findings_type ON findings(type);
@@ -155,13 +158,23 @@ CREATE TABLE IF NOT EXISTS pr_state (
   addressed_fingerprint TEXT,              -- the fingerprint an engage reply already declined to
                                             -- fix (no commits pushed); sync_prs suppresses re-flagging
                                             -- a static reason whose CURRENT fingerprint still matches
-                                            -- this -- state-based, not time-based: no re-poking a
+                                            -- this AND whose head_sha still matches addressed_head_sha
+                                            -- -- state-based, not time-based: no re-poking a
                                             -- worker explained itself on once, no matter how long the
                                             -- daemon then runs unattended, until the actual situation
-                                            -- (which check fails, review state, conflict) changes.
+                                            -- (which check fails, review state, conflict, or the code
+                                            -- itself via a human push) changes.
                                             -- Cleared the moment it does (see run_engage/sync_prs).
+  head_sha      TEXT,                      -- PR/MR's head commit SHA as of the last sync
+  addressed_head_sha TEXT,                 -- head_sha at the moment addressed_fingerprint was set;
+                                            -- a mismatch means new code landed since the decline, so
+                                            -- a same-looking static reason is treated as fresh, not
+                                            -- suppressed (a human push always deserves a fresh look
+                                            -- even if, coincidentally, the same check is still red)
   synced_at     INTEGER,
-  harvested_at  INTEGER                    -- epoch ms run_harvest reviewed this merged PR; NULL = pending
+  harvested_at  INTEGER,                   -- epoch ms run_harvest reviewed this merged PR; NULL = pending
+  harvest_attempts INTEGER NOT NULL DEFAULT 0, -- consecutive run_harvest attempts hitting last_harvest_failure
+  last_harvest_failure TEXT                -- fingerprint of the last harvest attempt's failure reason
 );
 
 -- Single-row snapshot of the daemon loop's own reasoning: what it just

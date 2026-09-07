@@ -126,6 +126,11 @@ ignore = [
 "hunter/runner.py" = [
     "TC003",    # Path used at runtime for file operations
 ]
+# Validator checks fingerprint/type/severity/confidence plus a per-type
+# required-fields list, each as its own early-return reason string.
+"hunter/ingest.py" = [
+    "PLR0911",  # too many return statements (one per validation reason)
+]
 "hunter/playbooks.py" = [
     "TC003",    # Path used at runtime for file I/O
 ]

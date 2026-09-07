@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
 from .types import (
     ACTIVE_STATUSES,
@@ -63,8 +64,12 @@ _PR_STATE_COLUMNS = {
     "attention_since",
     "attention_fingerprint",
     "addressed_fingerprint",
+    "head_sha",
+    "addressed_head_sha",
     "synced_at",
     "harvested_at",
+    "harvest_attempts",
+    "last_harvest_failure",
 }
 
 _FINDING_KEYS = (
@@ -143,12 +148,56 @@ class Store:
                 "pr_state",
                 "ALTER TABLE pr_state ADD COLUMN addressed_fingerprint TEXT",
             ),
+            (
+                "fix_attempts",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN fix_attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_fix_failure",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN last_fix_failure TEXT",
+            ),
+            (
+                "recheck_attempts",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN recheck_attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_recheck_failure",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN last_recheck_failure TEXT",
+            ),
+            (
+                "harvest_attempts",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN harvest_attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_harvest_failure",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN last_harvest_failure TEXT",
+            ),
+            ("head_sha", "pr_state", "ALTER TABLE pr_state ADD COLUMN head_sha TEXT"),
+            (
+                "addressed_head_sha",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN addressed_head_sha TEXT",
+            ),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
             except sqlite3.OperationalError:
                 self.db.execute(sql)
                 self.db.commit()
+
+        # One-time cleanup: `findings.fingerprint` already has an inline
+        # UNIQUE constraint (SQLite backs it with an implicit index), so
+        # the explicit `findings_fingerprint` index schema.sql used to
+        # also create was a fully redundant duplicate. DROP INDEX IF
+        # EXISTS is itself idempotent, so this needs no try/except probe.
+        self.db.execute("DROP INDEX IF EXISTS findings_fingerprint")
+        self.db.commit()
 
     # -- repos ---------------------------------------------------------
     def add_repo(
@@ -219,8 +268,6 @@ class Store:
     # -- repo notes ----------------------------------------------------
     def repo_notes_path(self, repo_id: int) -> Path:
         """Return path to repo's NOTES.md file (ID-based for stability)."""
-        from pathlib import Path as PathType
-        
         repo = self.get_repo(repo_id)
         if not repo:
             msg = f"repo {repo_id} not found"
@@ -449,6 +496,77 @@ class Store:
             (mode, now_ms(), fid),
         )
         self.db.commit()
+
+    def record_fix_attempt(self, fid: int, failure: str) -> int:
+        """Track consecutive run_fix attempts that hit the SAME failure
+        reason for this finding. A genuinely different failure resets the
+        streak to 1 (new information, worth an immediate retry); the SAME
+        reason recurring means nothing changed and retrying again right
+        now would just re-burn tokens for the identical outcome. Returns
+        the new streak count.
+        """
+        current = self.get_finding(fid)
+        prev_failure = current.get("last_fix_failure") if current else None
+        prev_attempts = (current.get("fix_attempts") or 0) if current else 0
+        attempts = prev_attempts + 1 if failure == prev_failure else 1
+        self.db.execute(
+            "UPDATE findings SET fix_attempts = ?, last_fix_failure = ?, updated_at = ?"
+            " WHERE id = ?",
+            (attempts, failure, now_ms(), fid),
+        )
+        self.db.commit()
+        return attempts
+
+    def clear_fix_attempts(self, fid: int) -> None:
+        """Reset the fix-retry streak once a finding leaves the retry loop
+        (shipped, rejected, blocked) so a future manual re-queue starts
+        fresh rather than inheriting a stale streak."""
+        self.db.execute(
+            "UPDATE findings SET fix_attempts = 0, last_fix_failure = NULL, updated_at = ?"
+            " WHERE id = ?",
+            (now_ms(), fid),
+        )
+        self.db.commit()
+
+    def record_recheck_attempt(self, fid: int, failure: str) -> int:
+        """Same streak tracking as record_fix_attempt, scoped to run_recheck
+        attempts that end without a parseable confirmed/stale/invalid
+        verdict (killed, failed, or a missing/unparseable verdict file)."""
+        current = self.get_finding(fid)
+        prev_failure = current.get("last_recheck_failure") if current else None
+        prev_attempts = (current.get("recheck_attempts") or 0) if current else 0
+        attempts = prev_attempts + 1 if failure == prev_failure else 1
+        self.db.execute(
+            "UPDATE findings SET recheck_attempts = ?, last_recheck_failure = ?, updated_at = ?"
+            " WHERE id = ?",
+            (attempts, failure, now_ms(), fid),
+        )
+        self.db.commit()
+        return attempts
+
+    def clear_recheck_attempts(self, fid: int) -> None:
+        """Reset the recheck-retry streak once a recheck reaches a real
+        verdict (or the finding otherwise leaves the retry loop)."""
+        self.db.execute(
+            "UPDATE findings SET recheck_attempts = 0, last_recheck_failure = NULL, updated_at = ?"
+            " WHERE id = ?",
+            (now_ms(), fid),
+        )
+        self.db.commit()
+
+    def record_harvest_attempt(self, fid: int, failure: str) -> int:
+        """Same streak tracking as record_fix_attempt, scoped to run_harvest
+        attempts that don't reach a successful worker completion."""
+        current = self.get_pr_state(fid)
+        prev_failure = current.get("last_harvest_failure") if current else None
+        prev_attempts = (current.get("harvest_attempts") or 0) if current else 0
+        attempts = prev_attempts + 1 if failure == prev_failure else 1
+        self.upsert_pr_state(fid, harvest_attempts=attempts, last_harvest_failure=failure)
+        return attempts
+
+    def clear_harvest_attempts(self, fid: int) -> None:
+        """Reset the harvest-retry streak once a harvest attempt succeeds."""
+        self.upsert_pr_state(fid, harvest_attempts=0, last_harvest_failure=None)
 
     def clear_all_overrides(self) -> int:
         """Clear all budget overrides. Returns count of affected rows."""

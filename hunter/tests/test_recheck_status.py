@@ -9,14 +9,16 @@ actually completed.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from hunter import scheduler
 from hunter.scheduler import run_recheck
 from hunter.store import Store
-from hunter.types import Config
+from hunter.types import Config, RunResult
 
 
 @pytest.fixture
@@ -134,15 +136,14 @@ class TestRunRecheckStaysRecheckingOnFailure:
         relevant. This is the exact scenario reported in production: a
         recheck hit its token cap, got SIGTERM'd, and silently reappeared
         as 'new' with no indication the recheck never actually completed."""
-        import subprocess
-
-        from hunter import scheduler
-        from hunter.types import RunResult
 
         # Minimal real git repo so fetch/checkout/pull succeed.
         repo_path = tmp_path / "repos" / "real-repo"
         repo_path.mkdir(parents=True)
-        run = lambda *a: subprocess.run(a, cwd=repo_path, check=True, capture_output=True)
+
+        def run(*a: str) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(a, cwd=repo_path, check=True, capture_output=True)
+
         run("git", "init", "-b", "main")
         run("git", "config", "user.email", "t@t.com")
         run("git", "config", "user.name", "t")
@@ -180,5 +181,76 @@ class TestRunRecheckStaysRecheckingOnFailure:
         after = store.get_finding(fid)
         assert after is not None
         assert after["status"] == "rechecking", (
-            f"finding reset to {after['status']!r} after a killed worker, expected to stay 'rechecking'"
+            f"finding reset to {after['status']!r} after a killed worker, "
+            "expected to stay 'rechecking'"
         )
+
+
+class TestRecheckGiveUp:
+    """The other half of the fix: a recheck that fails the SAME way over
+    and over must eventually stop -- 'stays rechecking forever' is itself
+    a starvation bug (see hunter.scheduler.MAX_CONSECUTIVE_SAME_FAILURE),
+    since pick_next always retries the oldest 'rechecking' item first."""
+
+    def test_gives_up_after_consecutive_identical_failures(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        repo_path = tmp_path / "repos" / "real-repo"
+        repo_path.mkdir(parents=True)
+
+        def run(*a: str) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(a, cwd=repo_path, check=True, capture_output=True)
+
+        run("git", "init", "-b", "main")
+        run("git", "config", "user.email", "t@t.com")
+        run("git", "config", "user.name", "t")
+        (repo_path / "f.py").write_text("pass\n")
+        run("git", "add", ".")
+        run("git", "commit", "-m", "init")
+        run("git", "remote", "add", "origin", str(repo_path))
+        run("git", "fetch", "origin")
+        run("git", "branch", "--set-upstream-to=origin/main", "main")
+
+        repo_id = store.add_repo(
+            "real-repo", str(repo_path), str(repo_path), default_branch="main"
+        )
+        fid, _ = store.upsert_finding(repo_id, _make_finding(fingerprint="repo:f.py:fn:give-up"))
+        store.set_status(fid, "rechecking")
+
+        def fake_run_worker(*_args: object, **_kwargs: object) -> RunResult:
+            return RunResult(
+                exit_code=-15,
+                killed_reason="cap",
+                tokens_new=200_000,
+                calls=10,
+                session_file=None,
+                duration_s=30.0,
+                stdout_tail="investigating...",
+            )
+
+        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
+
+        finding = store.get_finding(fid)
+        assert finding is not None
+        finding["budget_override"] = "exempt"
+
+        for attempt in range(1, scheduler.MAX_CONSECUTIVE_SAME_FAILURE):
+            result = run_recheck(store, cfg, finding)
+            assert result.get("outcome") == "requeued", (attempt, result)
+            after = store.get_finding(fid)
+            assert after is not None
+            assert after["status"] == "rechecking"
+            assert after["recheck_attempts"] == attempt
+            finding = after
+            finding["budget_override"] = "exempt"
+
+        result = run_recheck(store, cfg, finding)
+        assert result.get("outcome") == "stuck", result
+
+        after = store.get_finding(fid)
+        assert after is not None
+        assert after["status"] == "new", (
+            f"expected the finding back in the inbox as 'new' after giving up on a"
+            f" stuck recheck, got {after['status']!r}"
+        )
+        assert after["recheck_attempts"] == 0

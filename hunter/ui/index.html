@@ -23,7 +23,8 @@
     padding: 16px 0;
   }
   #nav .nav-item {
-    padding: 9px 22px; font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
+    display: block; width: 100%; text-align: left; background: none; border: none;
+    font: inherit; padding: 9px 22px; font-size: 11px; text-transform: uppercase; letter-spacing: .1em;
     color: var(--dim); cursor: pointer; border-left: 2px solid transparent;
   }
   #nav .nav-item:hover { color: var(--fg); }
@@ -86,7 +87,8 @@
   .type-bug { background: #fee; color: #c33; border-color: #c33; }
   .type-dep_update { background: #eff; color: #36c; border-color: #36c; }
   .type-test_gap { background: #fef; color: #93c; border-color: #93c; }
-  .type-refactor { background: #efe; color: #393; border-color: #393; }
+  .type-refactor { background: #efe; color: #256029; border-color: #256029; }
+  .type-modernization { background: #eef; color: #3b4b9c; border-color: #3b4b9c; }
   /* Status badges (findingCard, any status -- see All Findings page) */
   .status-merged { color: var(--green); border-color: var(--green); }
   .status-rejected, .status-wontfix { color: var(--faint); }
@@ -236,13 +238,13 @@
 <body>
 <div class="app">
   <nav id="nav">
-    <div class="nav-item" data-page="status">Status</div>
-    <div class="nav-item" data-page="inbox">Inbox</div>
-    <div class="nav-item" data-page="pipeline">Kanban / Pipeline</div>
-    <div class="nav-item" data-page="findings">All Findings</div>
-    <div class="nav-item" data-page="repos">Repos</div>
-    <div class="nav-item" data-page="stats">Stats</div>
-    <div class="nav-item" data-page="log">Log</div>
+    <button type="button" class="nav-item" data-page="status">Status</button>
+    <button type="button" class="nav-item" data-page="inbox">Inbox</button>
+    <button type="button" class="nav-item" data-page="pipeline">Kanban / Pipeline</button>
+    <button type="button" class="nav-item" data-page="findings">All Findings</button>
+    <button type="button" class="nav-item" data-page="repos">Repos</button>
+    <button type="button" class="nav-item" data-page="stats">Stats</button>
+    <button type="button" class="nav-item" data-page="log">Log</button>
   </nav>
   <main>
     <div id="err"></div>
@@ -253,7 +255,7 @@
       <div id="ops">
         <div id="windows"><span class="empty">no window data</span></div>
         <div id="opsRight">
-          <button id="runCycle">Run Cycle</button>
+          <button type="button" id="runCycle">Run Cycle</button>
           <div id="lastEvent">&nbsp;</div>
         </div>
       </div>
@@ -267,7 +269,7 @@
     </section>
 
     <section id="page-pipeline" class="page">
-      <h2>Pipeline <button class="ov-btn" onclick="clearAllOverrides()" style="font-size:10px;vertical-align:middle">Clear all overrides</button></h2>
+      <h2>Pipeline <button type="button" class="ov-btn" onclick="clearAllOverrides()" style="font-size:10px;vertical-align:middle">Clear all overrides</button></h2>
       <div id="filters-pipeline" class="filters"></div>
       <div id="pipeline"></div>
 
@@ -285,7 +287,7 @@
     </section>
 
     <section id="page-repos" class="page">
-      <h2>Repos <button class="ov-btn" onclick="document.getElementById('addRepoDialog').showModal()">+ Add Repo</button></h2>
+      <h2>Repos <button type="button" class="ov-btn" onclick="document.getElementById('addRepoDialog').showModal()">+ Add Repo</button></h2>
       <div id="repos"></div>
     </section>
 
@@ -302,8 +304,8 @@
         </select></label>
       </div>
       <div class="dlg-actions">
-        <button class="q" onclick="addRepo()">Add</button>
-        <button onclick="document.getElementById('addRepoDialog').close()">Cancel</button>
+        <button type="button" class="q" onclick="addRepo()">Add</button>
+        <button type="button" onclick="document.getElementById('addRepoDialog').close()">Cancel</button>
       </div>
     </dialog>
 

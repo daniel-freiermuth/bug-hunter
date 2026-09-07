@@ -23,6 +23,8 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 
 import pytest
 from pydantic import ValidationError
@@ -40,7 +42,7 @@ from hunter.server import (
     _validate_summary,
 )
 from hunter.store import Store
-from hunter.types import Config
+from hunter.types import Config, Row
 
 
 class TestDescribeCycle:
@@ -140,8 +142,6 @@ class TestComputeSleepS:
         assert _compute_sleep_s(store, {"state": "done"}) == 15 * 60
 
     def test_denied_with_retry_at_derives_sleep(self, store: Store) -> None:
-        import time
-
         retry_at = (time.time() + 120) * 1000  # 2 minutes from now
         sleep_s = _compute_sleep_s(store, {"denied": "x", "retry_at": retry_at})
         assert sleep_s == pytest.approx(150, abs=2)  # 120 + 30 buffer
@@ -422,3 +422,90 @@ class TestUsageProberLoop:
         """The whole point of decoupling this from job-dispatch cadence:
         usage data should never be more than a few minutes stale."""
         assert 60.0 <= USAGE_PROBE_TICK_S <= 300.0
+
+
+class TestAddRepoPathTraversal:
+    """Regression: name from POST /api/repos was interpolated straight into
+    ``work_root / "repos" / name`` with only a non-empty check. A name
+    containing ``../`` escapes work_root/repos entirely, and pathlib's ``/``
+    operator makes an *absolute* name silently replace the whole prefix
+    (``Path("/x") / "/etc/passwd" == Path("/etc/passwd")``). _add_repo must
+    reject both before ever touching the store or the filesystem."""
+
+    @staticmethod
+    def _handler(
+        cfg: Config,
+        body: Row,
+        add_repo_calls: list[tuple[object, ...]],
+        errors: list[tuple[int, str]],
+        responses: list[tuple[int, object]],
+    ) -> server.Handler:
+        handler = server.Handler.__new__(server.Handler)
+        handler.cfg = cfg
+        handler._body_json = lambda: body  # type: ignore[method-assign]
+        handler._error = lambda status, message: errors.append((status, message))  # type: ignore[method-assign]
+        handler._json = lambda obj, status=200: responses.append((status, obj))  # type: ignore[method-assign]
+
+        def fake_add_repo(*args: object, **kwargs: object) -> int:
+            add_repo_calls.append(args)
+            return 1
+
+        fake_store = SimpleNamespace(
+            get_repo=lambda _name: None,
+            add_repo=fake_add_repo,
+            log_event=lambda *a, **k: None,
+        )
+        handler._store = lambda: cast("Store", fake_store)  # type: ignore[method-assign]
+        return handler
+
+    @pytest.mark.parametrize(
+        "bad_name",
+        ["../../etc", "/etc/passwd", "..", "a/../../../b", "repos/../../x"],
+    )
+    def test_rejects_traversal_and_absolute_names(self, cfg: Config, bad_name: str) -> None:
+        add_repo_calls: list[tuple[object, ...]] = []
+        errors: list[tuple[int, str]] = []
+        responses: list[tuple[int, object]] = []
+        handler = self._handler(
+            cfg,
+            {"name": bad_name, "url": "https://example.com/r.git"},
+            add_repo_calls,
+            errors,
+            responses,
+        )
+
+        handler._add_repo()
+
+        assert add_repo_calls == []
+        assert responses == []
+        assert errors
+        status, message = errors[0]
+        assert status == 400
+        assert bad_name in message
+        # Nothing should have been created outside work_root/repos either.
+        assert not (cfg.work_root / "repos").exists() or not any(
+            (cfg.work_root / "repos").iterdir()
+        )
+
+    def test_accepts_a_plain_safe_name(self, cfg: Config) -> None:
+        add_repo_calls: list[tuple[object, ...]] = []
+        errors: list[tuple[int, str]] = []
+        responses: list[tuple[int, object]] = []
+        handler = self._handler(
+            cfg,
+            {"name": "my-repo_1.0", "url": "https://example.com/r.git"},
+            add_repo_calls,
+            errors,
+            responses,
+        )
+
+        handler._add_repo()
+
+        assert not errors
+        assert responses
+        assert responses[0][0] == 201
+        assert len(add_repo_calls) == 1
+        name, _url, path_str, _branch = add_repo_calls[0][:4]
+        assert name == "my-repo_1.0"
+        assert Path(path_str) == (cfg.work_root / "repos" / "my-repo_1.0").resolve()  # type: ignore[arg-type]
+

@@ -8,6 +8,7 @@ import contextlib
 import json
 import re
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -115,7 +116,8 @@ def _anticipated_tokens(store: Store, repo_id: int, kind: str) -> int:
     """
     warm = (
         store.db.execute(
-            "SELECT 1 FROM jobs WHERE repo_id = ? AND kind = ? AND finished_at > ? LIMIT 1",
+            "SELECT 1 FROM jobs WHERE repo_id = ? AND kind = ? AND finished_at > ?"
+            " AND state != 'denied' LIMIT 1",
             (repo_id, kind, now_ms() - _CACHE_TTL_MS),
         ).fetchone()
         is not None
@@ -402,6 +404,17 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
                     (now_ms(), rid),
                 )
                 store.db.commit()
+            elif last_full is None:
+                # Seed the periodic-full-rehunt clock on this repo's first
+                # completed hunt (whatever its scope). Without this,
+                # last_full_hunt_at stays NULL forever: rehunt_due requires
+                # it non-null, but the only other writer is gated behind
+                # rehunt_due itself -- hunt_rehunt_days would never fire.
+                store.db.execute(
+                    "UPDATE repos SET last_full_hunt_at = ? WHERE id = ?",
+                    (now_ms(), rid),
+                )
+                store.db.commit()
     else:
         store.log_event(
             "hunt",
@@ -519,6 +532,34 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
         "stale",
         "invalid",
     ):
+        if state != "done":
+            failure = f"worker {state}"
+        elif verdict is None and not out_path.exists():
+            failure = "no verdict file"
+        elif verdict is None:
+            failure = "unparseable verdict file"
+        else:
+            failure = "invalid verdict value"
+        streak = store.record_recheck_attempt(fid, failure)
+        if streak >= MAX_CONSECUTIVE_SAME_FAILURE:
+            # Same recheck failure N times running: whatever's wrong isn't
+            # going to resolve itself by retrying identically forever, and
+            # a stuck 'rechecking' item head-of-line-blocks fix/rotation
+            # work behind it (see pick_next's priority ladder). Fall back
+            # to the inbox rather than pretend the recheck is still live.
+            store.set_status(fid, "new")
+            store.clear_recheck_attempts(fid)
+            store.log_event(
+                "recheck",
+                f"#{fid} gave up after {streak} identical failures ({failure});"
+                " back to inbox for human triage",
+                job_id=job,
+                finding_id=fid,
+            )
+            summary["outcome"] = "stuck"
+            if override == "once":
+                store.set_budget_override(fid, None)
+            return summary
         # Leave status at 'rechecking' (don't reset to 'new') -- killed/failed/
         # inconclusive attempts must not look identical to "still relevant",
         # and the next cycle's priority scan naturally retries 'rechecking'
@@ -546,6 +587,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
             severity=verdict.get("updated_severity"),
         )
         store.set_status(fid, "new")  # back to inbox with improved analysis
+        store.clear_recheck_attempts(fid)
         store.log_event(
             "recheck",
             f"#{fid} confirmed: {reason}",
@@ -555,6 +597,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
         summary["outcome"] = "confirmed"
     elif v == "stale":
         store.set_status(fid, "wontfix", verdict_reason=f"recheck: {reason}")
+        store.clear_recheck_attempts(fid)
         store.log_event(
             "recheck",
             f"#{fid} stale: {reason}",
@@ -564,6 +607,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
         summary["outcome"] = "stale"
     elif v == "invalid":
         store.set_status(fid, "rejected", verdict_reason=f"recheck: {reason}")
+        store.clear_recheck_attempts(fid)
         store.log_event(
             "recheck",
             f"#{fid} invalid: {reason}",
@@ -579,314 +623,173 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
     return summary
 
 
-# -- test gap ---------------------------------------------------------------
+# -- analysis jobs (test gap / dep update / refactor / modernization) -------
+
+
+@dataclass(frozen=True)
+class _AnalysisSpec:
+    """Static per-kind wiring for _run_analysis_job -- the only things that
+    differ between test_gap/dep_update/refactor/modernization."""
+
+    kind: str
+    out_plural: str  # output filename plural, e.g. job{N}.<out_plural>.json
+    no_output_noun: str  # "no <noun> file" log wording when out_path is missing
+    scope_note: str
+    prompt_builder: Callable[
+        [Row, str, list[Row], list[Row], Path, int, str], str
+    ]
+
+
+def _run_analysis_job(store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec) -> Row:
+    """Shared body for the four repo-level analysis job types: sync the repo
+    to its default branch, budget-gate, run the worker, ingest output, and
+    advance the rotation timestamp on success. The only per-kind variation
+    is which prompt builder runs and where the output/timestamp land.
+    """
+    rid: int = repo["id"]
+    rname: str = repo["name"]
+    rpath = Path(repo["path"])
+    kind = spec.kind
+
+    if not rpath.exists():
+        store.log_event("error", f"{kind} {rname}: repo not cloned")
+        return {"error": "repo not cloned"}
+
+    for cmd in (
+        ["git", "fetch", "origin"],
+        ["git", "checkout", repo["default_branch"]],
+        ["git", "pull", "--ff-only"],
+    ):
+        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+        if rc != 0:
+            store.log_event("error", f"{kind} {rname}: {' '.join(cmd)} failed: {out[-300:]}")
+            return {"error": f"{' '.join(cmd)} failed"}
+
+    # Budget check -- analysis jobs share the hunt budget/model for now
+    windows = budget.read_windows()
+    dec = budget.decide(
+        cfg,
+        "hunt",
+        windows,
+        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, kind)),
+    )
+    if not dec.allow:
+        job = store.create_job(kind, rid)
+        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
+        store.log_event("deny", f"{kind} {rname}: {dec.reason}", job_id=job)
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
+
+    job = store.create_job(kind, rid, cap_tokens=dec.cap_tokens, state="running")
+    out_path = cfg.work_root / "out" / f"job{job}.{spec.out_plural}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    suppressions = store.suppressions(rid, finding_type=kind)
+    known = store.known_active(rid, finding_type=kind)
+    prompt = spec.prompt_builder(
+        repo,
+        spec.scope_note,
+        suppressions,
+        known,
+        out_path,
+        cfg.hunt_max_findings,  # reuse hunt max for now
+        store.repo_notes(rid),
+    )
+
+    pre_usage = _usage_snapshot(windows)
+    model = cfg.model_for("hunt")
+    rr = runner.run_worker(
+        cfg,
+        rpath,
+        prompt,
+        dec.cap_tokens,
+        cfg.hunt_max_wall_s,
+        model=model,
+    )
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+
+    summary: Row = {
+        "kind": kind,
+        "repo": rname,
+        "job": job,
+        "state": state,
+        "tokens_new": rr.tokens_new,
+    }
+
+    if out_path.exists():
+        counts = ingest_findings(store, rid, out_path, finding_type=kind)
+        summary["ingest"] = counts
+        store.log_event(
+            kind,
+            f"{rname}: job {job} {state} -- +{counts['inserted']} new / {counts['duplicates']} dup"
+            f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+        # Only update timestamp after successful output + ingestion
+        if state == "done":
+            sql = f"UPDATE repos SET last_{kind}_at = ? WHERE id = ?"  # noqa: S608
+            store.db.execute(sql, (now_ms(), rid))
+            store.db.commit()
+    else:
+        store.log_event(
+            kind,
+            f"{rname}: job {job} {state}, no {spec.no_output_noun} file ({rr.tokens_new} tok)",
+            job_id=job,
+        )
+
+    return summary
+
+
+_TEST_GAP_SPEC = _AnalysisSpec(
+    kind="test_gap",
+    out_plural="test_gaps",
+    no_output_noun="gaps",
+    scope_note="Full repository scan for test coverage gaps.",
+    prompt_builder=build_test_gap_prompt,
+)
+_DEP_UPDATE_SPEC = _AnalysisSpec(
+    kind="dep_update",
+    out_plural="dep_updates",
+    no_output_noun="updates",
+    scope_note="Check all package manifests for outdated dependencies.",
+    prompt_builder=build_dep_update_prompt,
+)
+_REFACTOR_SPEC = _AnalysisSpec(
+    kind="refactor",
+    out_plural="refactorings",
+    no_output_noun="refactorings",
+    scope_note=(
+        "Scan for safe, mechanical refactoring opportunities"
+        " (duplication, dead code, complexity)."
+    ),
+    prompt_builder=build_refactor_prompt,
+)
+_MODERNIZATION_SPEC = _AnalysisSpec(
+    kind="modernization",
+    out_plural="modernizations",
+    no_output_noun="modernizations",
+    scope_note=(
+        "Scan for SOTA-drift modernization opportunities (deprecated/unmaintained deps,"
+        " language-feature gaps, format/protocol shifts, major version debt, platform EOL)."
+    ),
+    prompt_builder=build_modernization_prompt,
+)
 
 
 def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
     """Hunt for test coverage gaps in a repo."""
-    rid: int = repo["id"]
-    rname: str = repo["name"]
-    rpath = Path(repo["path"])
-    
-    # Ensure repo is up-to-date (same as hunt)
-    if not rpath.exists():
-        store.log_event("error", f"test_gap {rname}: repo not cloned")
-        return {"error": "repo not cloned"}
-    
-    for cmd in (
-        ["git", "fetch", "origin"],
-        ["git", "checkout", repo["default_branch"]],
-        ["git", "pull", "--ff-only"],
-    ):
-        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
-        if rc != 0:
-            store.log_event("error", f"test_gap {rname}: {' '.join(cmd)} failed: {out[-300:]}")
-            return {"error": f"{' '.join(cmd)} failed"}
-    
-    # Budget check
-    windows = budget.read_windows()
-    dec = budget.decide(
-        cfg,
-        "hunt",
-        windows,
-        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, "test_gap")),
-    )  # Use hunt budget for now
-    if not dec.allow:
-        job = store.create_job("test_gap", rid)
-        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.log_event("deny", f"test_gap {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
-    
-    job = store.create_job("test_gap", rid, cap_tokens=dec.cap_tokens, state="running")
-    out_path = cfg.work_root / "out" / f"job{job}.test_gaps.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    suppressions = store.suppressions(rid, finding_type="test_gap")
-    known = store.known_active(rid, finding_type="test_gap")
-
-    prompt = build_test_gap_prompt(
-        repo,
-        "Full repository scan for test coverage gaps.",
-        suppressions,
-        known,
-        out_path,
-        cfg.hunt_max_findings,  # Reuse hunt max for now
-        store.repo_notes(rid),
-    )
-    
-    pre_usage = _usage_snapshot(windows)
-    model = cfg.model_for("hunt")
-    rr = runner.run_worker(
-        cfg,
-        rpath,
-        prompt,
-        dec.cap_tokens,
-        cfg.hunt_max_wall_s,
-        model=model,
-    )
-    post_usage = _usage_snapshot(budget.read_windows())
-    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-    state = _record_job(store, job, rr, model=model, usage_delta=delta)
-    
-    summary: Row = {
-        "kind": "test_gap",
-        "repo": rname,
-        "job": job,
-        "state": state,
-        "tokens_new": rr.tokens_new,
-    }
-    
-    if out_path.exists():
-        counts = ingest_findings(store, rid, out_path, finding_type="test_gap")
-        summary["ingest"] = counts
-        store.log_event(
-            "test_gap",
-            f"{rname}: job {job} {state} -- +{counts['inserted']} new / {counts['duplicates']} dup"
-            f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
-            job_id=job,
-        )
-        # Only update timestamp after successful output + ingestion
-        if state == "done":
-            store.db.execute(
-                "UPDATE repos SET last_test_gap_at = ? WHERE id = ?",
-                (now_ms(), rid),
-            )
-            store.db.commit()
-    else:
-        store.log_event(
-            "test_gap",
-            f"{rname}: job {job} {state}, no gaps file ({rr.tokens_new} tok)",
-            job_id=job,
-        )
-    return summary
-
-
-
-# -- dependency updates -----------------------------------------------------
+    return _run_analysis_job(store, cfg, repo, _TEST_GAP_SPEC)
 
 
 def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
     """Check for outdated dependencies."""
-    rid: int = repo["id"]
-    rname: str = repo["name"]
-    rpath = Path(repo["path"])
-    
-    # Ensure repo is up-to-date
-    if not rpath.exists():
-        store.log_event("error", f"dep_update {rname}: repo not cloned")
-        return {"error": "repo not cloned"}
-    
-    for cmd in (
-        ["git", "fetch", "origin"],
-        ["git", "checkout", repo["default_branch"]],
-        ["git", "pull", "--ff-only"],
-    ):
-        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
-        if rc != 0:
-            store.log_event("error", f"dep_update {rname}: {' '.join(cmd)} failed: {out[-300:]}")
-            return {"error": f"{' '.join(cmd)} failed"}
-    
-    # Budget check
-    windows = budget.read_windows()
-    dec = budget.decide(
-        cfg,
-        "hunt",
-        windows,
-        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, "dep_update")),
-    )
-    if not dec.allow:
-        job = store.create_job("dep_update", rid)
-        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.log_event("deny", f"dep_update {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
-    
-    job = store.create_job("dep_update", rid, cap_tokens=dec.cap_tokens, state="running")
-    out_path = cfg.work_root / "out" / f"job{job}.dep_updates.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    suppressions = store.suppressions(rid, finding_type="dep_update")
-    known = store.known_active(rid, finding_type="dep_update")
-
-    prompt = build_dep_update_prompt(
-        repo,
-        "Check all package manifests for outdated dependencies.",
-        suppressions,
-        known,
-        out_path,
-        cfg.hunt_max_findings,
-        store.repo_notes(rid),
-    )
-    
-    pre_usage = _usage_snapshot(windows)
-    model = cfg.model_for("hunt")
-    rr = runner.run_worker(
-        cfg,
-        rpath,
-        prompt,
-        dec.cap_tokens,
-        cfg.hunt_max_wall_s,
-        model=model,
-    )
-    post_usage = _usage_snapshot(budget.read_windows())
-    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-    state = _record_job(store, job, rr, model=model, usage_delta=delta)
-    
-    summary: Row = {
-        "kind": "dep_update",
-        "repo": rname,
-        "job": job,
-        "state": state,
-        "tokens_new": rr.tokens_new,
-    }
-    
-    if out_path.exists():
-        counts = ingest_findings(store, rid, out_path, finding_type="dep_update")
-        summary["ingest"] = counts
-        store.log_event(
-            "dep_update",
-            f"{rname}: job {job} {state} -- +{counts['inserted']} new / {counts['duplicates']} dup"
-            f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
-            job_id=job,
-        )
-        # Only update timestamp after successful output + ingestion
-        if state == "done":
-            store.db.execute(
-                "UPDATE repos SET last_dep_update_at = ? WHERE id = ?",
-                (now_ms(), rid),
-            )
-            store.db.commit()
-    else:
-        store.log_event(
-            "dep_update",
-            f"{rname}: job {job} {state}, no updates file ({rr.tokens_new} tok)",
-            job_id=job,
-        )
-    
-    return summary
-
-
-# -- refactoring ------------------------------------------------------------
+    return _run_analysis_job(store, cfg, repo, _DEP_UPDATE_SPEC)
 
 
 def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
     """Hunt for mechanical refactoring opportunities."""
-    rid: int = repo["id"]
-    rname: str = repo["name"]
-    rpath = Path(repo["path"])
-    
-    # Ensure repo is up-to-date
-    if not rpath.exists():
-        store.log_event("error", f"refactor {rname}: repo not cloned")
-        return {"error": "repo not cloned"}
-    
-    for cmd in (
-        ["git", "fetch", "origin"],
-        ["git", "checkout", repo["default_branch"]],
-        ["git", "pull", "--ff-only"],
-    ):
-        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
-        if rc != 0:
-            store.log_event("error", f"refactor {rname}: {' '.join(cmd)} failed: {out[-300:]}")
-            return {"error": f"{' '.join(cmd)} failed"}
-    
-    # Budget check
-    windows = budget.read_windows()
-    dec = budget.decide(
-        cfg,
-        "hunt",
-        windows,
-        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, "refactor")),
-    )
-    if not dec.allow:
-        job = store.create_job("refactor", rid)
-        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.log_event("deny", f"refactor {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
-    
-    job = store.create_job("refactor", rid, cap_tokens=dec.cap_tokens, state="running")
-    out_path = cfg.work_root / "out" / f"job{job}.refactorings.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    suppressions = store.suppressions(rid, finding_type="refactor")
-    known = store.known_active(rid, finding_type="refactor")
-    prompt = build_refactor_prompt(
-        repo,
-        "Scan for safe, mechanical refactoring opportunities (duplication, dead code, complexity).",
-        suppressions,
-        known,
-        out_path,
-        cfg.hunt_max_findings,
-        store.repo_notes(rid),
-    )
-    
-    pre_usage = _usage_snapshot(windows)
-    model = cfg.model_for("hunt")
-    rr = runner.run_worker(
-        cfg,
-        rpath,
-        prompt,
-        dec.cap_tokens,
-        cfg.hunt_max_wall_s,
-        model=model,
-    )
-    post_usage = _usage_snapshot(budget.read_windows())
-    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-    state = _record_job(store, job, rr, model=model, usage_delta=delta)
-    
-    summary: Row = {
-        "kind": "refactor",
-        "repo": rname,
-        "job": job,
-        "state": state,
-        "tokens_new": rr.tokens_new,
-    }
-    
-    if out_path.exists():
-        counts = ingest_findings(store, rid, out_path, finding_type="refactor")
-        summary["ingest"] = counts
-        store.log_event(
-            "refactor",
-            f"{rname}: job {job} {state} -- +{counts['inserted']} new / {counts['duplicates']} dup"
-            f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
-            job_id=job,
-        )
-        # Only update timestamp after successful output + ingestion
-        if state == "done":
-            store.db.execute(
-                "UPDATE repos SET last_refactor_at = ? WHERE id = ?",
-                (now_ms(), rid),
-            )
-            store.db.commit()
-    else:
-        store.log_event(
-            "refactor",
-            f"{rname}: job {job} {state}, no refactorings file ({rr.tokens_new} tok)",
-            job_id=job,
-        )
-    
-    return summary
-
-
-# -- modernization ------------------------------------------------------------
+    return _run_analysis_job(store, cfg, repo, _REFACTOR_SPEC)
 
 
 def run_modernize(store: Store, cfg: Config, repo: Row) -> Row:
@@ -894,105 +797,23 @@ def run_modernize(store: Store, cfg: Config, repo: Row) -> Row:
     unmaintained dependencies, language-feature gaps, format/protocol
     shifts, major version debt, platform EOL. Explicitly NOT bounded to
     safe/mechanical changes like refactor/dep_update; see modernization.md."""
-    rid: int = repo["id"]
-    rname: str = repo["name"]
-    rpath = Path(repo["path"])
-
-    # Ensure repo is up-to-date
-    if not rpath.exists():
-        store.log_event("error", f"modernize {rname}: repo not cloned")
-        return {"error": "repo not cloned"}
-
-    for cmd in (
-        ["git", "fetch", "origin"],
-        ["git", "checkout", repo["default_branch"]],
-        ["git", "pull", "--ff-only"],
-    ):
-        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
-        if rc != 0:
-            store.log_event("error", f"modernize {rname}: {' '.join(cmd)} failed: {out[-300:]}")
-            return {"error": f"{' '.join(cmd)} failed"}
-
-    # Budget check
-    windows = budget.read_windows()
-    dec = budget.decide(
-        cfg,
-        "hunt",
-        windows,
-        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, "modernization")),
-    )
-    if not dec.allow:
-        job = store.create_job("modernization", rid)
-        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.log_event("deny", f"modernize {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
-
-    job = store.create_job("modernization", rid, cap_tokens=dec.cap_tokens, state="running")
-    out_path = cfg.work_root / "out" / f"job{job}.modernizations.json"
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    suppressions = store.suppressions(rid, finding_type="modernization")
-    known = store.known_active(rid, finding_type="modernization")
-    prompt = build_modernization_prompt(
-        repo,
-        "Scan for SOTA-drift modernization opportunities (deprecated/unmaintained deps,"
-        " language-feature gaps, format/protocol shifts, major version debt, platform EOL).",
-        suppressions,
-        known,
-        out_path,
-        cfg.hunt_max_findings,
-        store.repo_notes(rid),
-    )
-
-    pre_usage = _usage_snapshot(windows)
-    model = cfg.model_for("hunt")
-    rr = runner.run_worker(
-        cfg,
-        rpath,
-        prompt,
-        dec.cap_tokens,
-        cfg.hunt_max_wall_s,
-        model=model,
-    )
-    post_usage = _usage_snapshot(budget.read_windows())
-    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-    state = _record_job(store, job, rr, model=model, usage_delta=delta)
-
-    summary: Row = {
-        "kind": "modernization",
-        "repo": rname,
-        "job": job,
-        "state": state,
-        "tokens_new": rr.tokens_new,
-    }
-
-    if out_path.exists():
-        counts = ingest_findings(store, rid, out_path, finding_type="modernization")
-        summary["ingest"] = counts
-        store.log_event(
-            "modernization",
-            f"{rname}: job {job} {state} -- +{counts['inserted']} new / {counts['duplicates']} dup"
-            f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
-            job_id=job,
-        )
-        # Only update timestamp after successful output + ingestion
-        if state == "done":
-            store.db.execute(
-                "UPDATE repos SET last_modernization_at = ? WHERE id = ?",
-                (now_ms(), rid),
-            )
-            store.db.commit()
-    else:
-        store.log_event(
-            "modernization",
-            f"{rname}: job {job} {state}, no modernizations file ({rr.tokens_new} tok)",
-            job_id=job,
-        )
-
-    return summary
+    return _run_analysis_job(store, cfg, repo, _MODERNIZATION_SPEC)
 
 
 # -- fix --------------------------------------------------------------------
+
+
+# Consecutive attempts (of run_fix/run_recheck/run_harvest, tracked
+# per-finding) that hit the IDENTICAL failure reason before giving up
+# instead of retrying again. A different reason each time still retries
+# immediately -- only a stuck, unchanging dead end (same push/PR/commit
+# failure, same unparseable-verdict cause, same PR-view error every
+# attempt) burns a bounded number of retries rather than looping forever
+# at token-window pace (see _compute_sleep_s's 0s-when-queued policy in
+# server.py, and pick_next's fixed engage > harvest > recheck > fix
+# priority ladder, which a permanently-stuck top-priority item would
+# otherwise head-of-line-block forever).
+MAX_CONSECUTIVE_SAME_FAILURE = 3
 
 
 def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
@@ -1156,6 +977,7 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         if outcome_file is not None:
             reason = outcome_file.read_text()[:500]
             store.set_status(fid, "rejected", verdict_reason=reason)
+            store.clear_fix_attempts(fid)
             first_line = reason.splitlines()[0][:120] if reason else ""
             verb = "rejected" if outcome_file == decline_file else "blocked"
             store.log_event(
@@ -1228,6 +1050,7 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
                             rc, pr_url_or_err = 0, m.group()
                     if rc == 0:
                         store.set_status(fid, "pr_open", pr_url=pr_url_or_err)
+                        store.clear_fix_attempts(fid)
                         store.log_event(
                             "ship",
                             f"#{fid} draft PR: {pr_url_or_err}",
@@ -1249,9 +1072,37 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
                 else f"worker {state}"
             )
 
-        # (c) Salvage: requeue, keep the worktree for the next attempt.
-        store.set_status(fid, "queued")
+        # (c) Salvage: either requeue for another attempt, or -- if this
+        # exact failure has now recurred MAX_CONSECUTIVE_SAME_FAILURE
+        # times in a row with nothing changed in between -- give up and
+        # surface it for human attention instead of burning tokens on a
+        # retry certain to repeat the identical outcome.
+        assert failure is not None  # noqa: S101 -- every branch above sets it
+        streak = store.record_fix_attempt(fid, failure)
         tail = (rr.stdout_tail or "")[-300:]
+        if streak >= MAX_CONSECUTIVE_SAME_FAILURE:
+            store.set_status(
+                fid,
+                "rejected",
+                verdict_reason=(
+                    f"stuck: {streak} consecutive fix attempts hit the same"
+                    f" failure: {failure}"
+                ),
+            )
+            store.clear_fix_attempts(fid)
+            store.log_event(
+                "fix",
+                f"#{fid} gave up after {streak} identical failures ({failure}); "
+                f"worktree kept at {worktree}. tail: {tail}",
+                job_id=job,
+                finding_id=fid,
+            )
+            _drop_worktree(delete_branch=True)
+            summary.update(outcome="stuck", failure=failure, attempts=streak)
+            if override == "once":
+                store.set_budget_override(fid, None)
+            return summary
+        store.set_status(fid, "queued")
         store.log_event(
             "fix",
             f"#{fid} incomplete ({failure}); worktree kept at {worktree}. tail: {tail}",
@@ -1432,7 +1283,19 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
         # of whether the static situation is unchanged.
         fp = _attention_fingerprint(pr, failing_names)
         addressed_fp = prev.get("addressed_fingerprint") if prev else None
-        suppressed = fp is not None and fp == addressed_fp
+        addressed_sha = prev.get("addressed_head_sha") if prev else None
+        head_sha = pr.get("headRefOid")
+        # A push that happens to leave the SAME check name red (or the
+        # same review/conflict state) is still new information -- the
+        # code changed even if today's static snapshot looks identical to
+        # what was declined before. Require the head sha to match too, not
+        # just the fingerprint string, before trusting the suppression.
+        suppressed = (
+            fp is not None
+            and fp == addressed_fp
+            and addressed_sha is not None
+            and head_sha == addressed_sha
+        )
 
         reasons: list[str] = []
         if last_activity > (engaged or 0):
@@ -1456,15 +1319,17 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
         if attention != prev_attention:
             reason_fields["attention_since"] = now_ms() if attention else None
         # Any change from what was last addressed (resolved to nothing
-        # wrong, OR changed to a genuinely different problem) clears the
-        # stale marker -- so a LATER recurrence of the ORIGINAL problem,
-        # even after an unrelated one intervened in between, is treated
-        # as fresh rather than auto-suppressed by memory of a
-        # since-superseded decline. Comparing here, before the write
-        # below, against the fingerprint this decision (suppressed,
-        # above) was actually based on.
+        # wrong, changed to a genuinely different problem, OR the code
+        # moved since the decline) clears the stale marker -- so a LATER
+        # recurrence of the ORIGINAL problem, even after an unrelated one
+        # intervened in between, is treated as fresh rather than
+        # auto-suppressed by memory of a since-superseded decline.
+        # Comparing here, before the write below, against the fingerprint
+        # and sha this decision (suppressed, above) was actually based on.
         clear_addressed = (
-            {"addressed_fingerprint": None} if addressed_fp and fp != addressed_fp else {}
+            {"addressed_fingerprint": None, "addressed_head_sha": None}
+            if addressed_fp and (fp != addressed_fp or head_sha != addressed_sha)
+            else {}
         )
 
         store.upsert_pr_state(
@@ -1474,6 +1339,7 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
             mergeable=pr.get("mergeable"),
             checks=checks,
             head_ref=pr.get("headRefName"),
+            head_sha=head_sha,
             last_activity_at=last_activity,
             last_engaged_activity_at=engaged,
             needs_attention=attention,
@@ -1802,6 +1668,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
         last_engaged_activity_at=engaged_mark,
         synced_at=now_ms(),
         addressed_fingerprint=None if pushed else ps.get("attention_fingerprint"),
+        addressed_head_sha=None if pushed else ps.get("head_sha"),
     )
     did = [b for b, on in (("pushed", pushed), ("replied", replied)) if on] or ["no-op"]
     store.log_event(
@@ -1954,6 +1821,29 @@ def run_harvest(store: Store, cfg: Config, finding: Row) -> Row:
 
     summary: Row = {"kind": "harvest", "finding": fid, "job": job, "state": state, "pr": num}
     if state != "done":
+        failure = f"worker {state}"
+        streak = store.record_harvest_attempt(fid, failure)
+        if streak >= MAX_CONSECUTIVE_SAME_FAILURE:
+            # Same harvest failure N times running (e.g. a worker that
+            # always gets cap-killed on this PR's diff): stop retrying at
+            # top scheduling priority forever (see pick_next's engage >
+            # harvest > recheck > fix ladder) and mark it done-trying.
+            # harvested_at's meaning broadens slightly to "no further
+            # harvest cycles needed" rather than strictly "succeeded";
+            # the event log is the audit trail distinguishing the two.
+            store.upsert_pr_state(fid, harvested_at=now_ms())
+            store.clear_harvest_attempts(fid)
+            store.log_event(
+                "error",
+                f"harvest #{fid}: gave up after {streak} identical failures"
+                f" ({failure}) -- not reviewed, will not retry",
+                job_id=job,
+                finding_id=fid,
+            )
+            summary["outcome"] = "stuck"
+            if override == "once":
+                store.set_budget_override(fid, None)
+            return summary
         # Leave harvested_at unset so this finding is reconsidered next
         # cycle -- matches run_engage's own failure-retry pattern.
         store.log_event(
@@ -1968,6 +1858,7 @@ def run_harvest(store: Store, cfg: Config, finding: Row) -> Row:
         return summary
 
     store.upsert_pr_state(fid, harvested_at=now_ms())
+    store.clear_harvest_attempts(fid)
     store.log_event(
         "harvest",
         f"#{fid} PR #{num} reviewed for follow-ups",
@@ -2179,20 +2070,24 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
         kind, target = picked
         result = _RUNNERS[kind](store, cfg, target)
 
-        # Prevent never-run starvation for repo-level rotation jobs: if a
-        # job type had never run and this attempt didn't succeed (failed,
-        # killed, or done without output), mark it attempted so it stops
-        # winning "never run" priority every single cycle. hunt has its
-        # own watermark logic (set_last_hunt) and is exempt.
+        # Prevent starvation of repo-level rotation jobs: if this attempt
+        # didn't succeed (failed, killed, or done without output), still
+        # bump the timestamp so this job type stops being the perpetual
+        # "oldest" pick. Without this, a job type that succeeded once and
+        # then fails persistently keeps a frozen-old timestamp while its
+        # siblings' timestamps advance past it on their own successes --
+        # min()-based fairness then re-selects the stuck job type every
+        # cycle forever, starving hunt/test_gap/dep_update/refactor/
+        # modernization of their turns. hunt has its own watermark logic
+        # (set_last_hunt) and is exempt.
         if kind in ("test_gap", "dep_update", "refactor", "modernization"):
-            was_never_run = (target.get(f"last_{kind}_at") or 0) == 0
             failed = (
                 result.get("state") in ("killed", "failed")
                 or result.get("error")
                 or result.get("ingest_error")
                 or (result.get("state") == "done" and "ingest" not in result)
             )
-            if was_never_run and failed:
+            if failed:
                 sql = f"UPDATE repos SET last_{kind}_at = ? WHERE id = ?"  # noqa: S608
                 store.db.execute(sql, (now_ms(), target["id"]))
                 store.db.commit()

@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from hunter import scheduler
-from hunter.scheduler import run_engage
+from hunter.scheduler import run_engage, sync_prs
 from hunter.store import Store
 from hunter.types import Config, RunResult
 
@@ -52,6 +52,7 @@ class _FakeForge:
     def __init__(self) -> None:
         self.comments: list[str] = []
         self.checks_failing = False  # only consulted by view_pr_sync/parse_pr_url callers
+        self.head_sha = "sha1"  # override to simulate a human push between syncs
 
     def owner_repo(self, url: str) -> str:
         return "owner/repo"
@@ -82,6 +83,7 @@ class _FakeForge:
                 "statusCheckRollup": rollup,
                 "updatedAt": "2026-01-01T00:00:00Z",
                 "headRefName": "feature",
+                "headRefOid": self.head_sha,
             },
             "",
         )
@@ -358,8 +360,6 @@ class TestEngageAddressedFingerprint:
         test asserts no expiry because the mechanism has none to expire
         -- unlike a time-based backoff, there is nothing here for a
         months-long unattended daemon run to eventually re-trigger."""
-        from hunter.scheduler import sync_prs
-
         finding, fake_forge = _setup(store, tmp_path)
         fake_forge.checks_failing = True
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
@@ -389,3 +389,51 @@ class TestEngageAddressedFingerprint:
         assert after["addressed_fingerprint"] == "checks:CI"
         assert after["needs_attention"] is None  # suppressed, not re-flagged
         assert store.list_attention() == []  # correctly suppressed, not re-picked
+
+    def test_human_push_with_same_failing_check_is_not_suppressed(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gap this fix closes: fingerprint-only suppression can't
+        distinguish 'nothing changed since the decline' from 'a human
+        pushed real new code that happens to leave the same check red'.
+        The full production sequence -- sync_prs, no-push decline via
+        run_engage, a genuine human push, sync_prs again -- must re-flag
+        once the head sha moves, even though the static fingerprint
+        string is identical both times."""
+        finding, fake_forge = _setup(store, tmp_path)
+        fake_forge.checks_failing = True
+        fake_forge.head_sha = "sha1"
+        monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
+
+        sync_prs(store, cfg)
+        before = store.get_pr_state(finding["id"])
+        assert before is not None
+        assert before["head_sha"] == "sha1"
+
+        def fake_run_worker(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
+            (worktree / "PR-REPLY.md").write_text("This is a pre-existing failure, not mine.\n")
+            return _fake_result()
+
+        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
+        result = run_engage(store, cfg, finding)
+        assert result.get("pushed") is False
+
+        declined = store.get_pr_state(finding["id"])
+        assert declined is not None
+        assert declined["addressed_fingerprint"] == "checks:CI"
+        assert declined["addressed_head_sha"] == "sha1"
+
+        # A human pushes new code; the (different) new code happens to
+        # still fail the same-named check.
+        fake_forge.head_sha = "sha2"
+        sync_prs(store, cfg)
+
+        after = store.get_pr_state(finding["id"])
+        assert after is not None
+        assert after["attention_fingerprint"] == "checks:CI"  # same-looking reason
+        assert after["needs_attention"] == "checks_failing", (
+            "a human push must re-flag even when the static reason string is unchanged"
+        )
+        assert after["addressed_fingerprint"] is None
+        assert after["addressed_head_sha"] is None
+        assert store.list_attention() != []
