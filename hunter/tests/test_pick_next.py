@@ -71,6 +71,78 @@ class TestPickNextPriority:
         assert kind == "engage"
         assert target["id"] == fid_a
 
+    def test_attention_beats_pending_harvest(self, store: Store, cfg: Config) -> None:
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        fid_h, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-harvest"))
+        store.set_status(fid_h, "merged")
+        store.upsert_pr_state(fid_h, pr_number=1, state="MERGED", synced_at=1)
+        fid_a, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-attn"))
+        store.set_status(fid_a, "pr_open")
+        store.upsert_pr_state(fid_a, pr_number=2, needs_attention="new_comments", synced_at=1)
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "engage"
+        assert target["id"] == fid_a
+
+    def test_pending_harvest_beats_rechecking_and_queued_and_repos(
+        self, store: Store, cfg: Config
+    ) -> None:
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        fid_q, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-queued"))
+        store.set_status(fid_q, "queued")
+        fid_r, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-recheck"))
+        store.set_status(fid_r, "rechecking")
+        fid_h, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-harvest"))
+        store.set_status(fid_h, "merged")
+        store.upsert_pr_state(fid_h, pr_number=1, state="MERGED", synced_at=1)
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "harvest"
+        assert target["id"] == fid_h
+
+    def test_oldest_merge_wins_for_harvest(self, store: Store, cfg: Config) -> None:
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        fid_new, _ = store.upsert_finding(rid, _make_finding(fingerprint="new"))
+        store.set_status(fid_new, "merged")
+        store.upsert_pr_state(fid_new, pr_number=1, state="MERGED", synced_at=100)
+        fid_old, _ = store.upsert_finding(rid, _make_finding(fingerprint="old"))
+        store.set_status(fid_old, "merged")
+        store.upsert_pr_state(fid_old, pr_number=2, state="MERGED", synced_at=1)
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "harvest"
+        assert target["id"] == fid_old
+
+    def test_already_harvested_merge_is_not_repicked(self, store: Store, cfg: Config) -> None:
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        store.update_repo(rid, enabled=False)  # isolate: no repo-rotation fallback
+        fid_h, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-harvest"))
+        store.set_status(fid_h, "merged")
+        store.upsert_pr_state(
+            fid_h, pr_number=1, state="MERGED", synced_at=1, harvested_at=now_ms()
+        )
+
+        assert pick_next(store, cfg) is None
+
+    def test_budget_override_on_pending_harvest_jumps_the_queue(
+        self, store: Store, cfg: Config
+    ) -> None:
+        """An overridden merged-pending-harvest finding must win even
+        though an attention item (normally higher priority) exists
+        without an override -- same rule as every other category."""
+        rid = store.add_repo("r", "https://r", "/nonexistent")
+        fid_a, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-attn"))
+        store.set_status(fid_a, "pr_open")
+        store.upsert_pr_state(fid_a, pr_number=1, needs_attention="new_comments", synced_at=1)
+        fid_h, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-harvest"))
+        store.set_status(fid_h, "merged")
+        store.upsert_pr_state(fid_h, pr_number=2, state="MERGED", synced_at=1)
+        store.set_budget_override(fid_h, "once")
+
+        kind, target = pick_next(store, cfg)
+        assert kind == "harvest"
+        assert target["id"] == fid_h
+
     def test_rechecking_beats_queued_and_repos(self, store: Store, cfg: Config) -> None:
         rid = store.add_repo("r", "https://r", "/nonexistent")
         fid_q, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-queued"))

@@ -606,6 +606,44 @@ class TestPrState:
         assert attn[0]["id"] == fid2
         assert attn[1]["id"] == fid1
 
+    def test_list_pending_harvest(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        fid1, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp1"))
+        fid2, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp2"))
+        fid3, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp3"))
+
+        store.set_status(fid1, "merged")
+        store.set_status(fid2, "merged")
+        store.set_status(fid3, "pr_open")  # not merged yet
+
+        store.upsert_pr_state(fid1, pr_number=1, state="MERGED", synced_at=100)
+        store.upsert_pr_state(fid2, pr_number=2, state="MERGED", synced_at=200, harvested_at=999)
+        store.upsert_pr_state(fid3, pr_number=3, state="OPEN", synced_at=50)
+
+        pending = store.list_pending_harvest()
+        # fid1: merged + harvested_at NULL → included
+        # fid2: merged but already harvested → excluded
+        # fid3: not merged → excluded
+        assert len(pending) == 1
+        assert pending[0]["id"] == fid1
+
+    def test_list_pending_harvest_sorted_by_synced_at(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        fid1, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp1"))
+        fid2, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp2"))
+
+        store.set_status(fid1, "merged")
+        store.set_status(fid2, "merged")
+
+        store.upsert_pr_state(fid1, pr_number=1, state="MERGED", synced_at=200)
+        store.upsert_pr_state(fid2, pr_number=2, state="MERGED", synced_at=100)
+
+        pending = store.list_pending_harvest()
+        assert len(pending) == 2
+        # Oldest merge first
+        assert pending[0]["id"] == fid2
+        assert pending[1]["id"] == fid1
+
 
 # -- reconcile_orphaned_jobs -------------------------------------------------
 

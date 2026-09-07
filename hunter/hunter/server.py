@@ -260,8 +260,8 @@ class Handler(BaseHTTPRequestHandler):
                 picked = None
             if picked is not None:
                 kind, target = picked
-                is_finding = kind in ("engage", "recheck", "fix")
-                budget_kind = "fix" if kind in ("engage", "fix") else "hunt"
+                is_finding = kind in ("engage", "harvest", "recheck", "fix")
+                budget_kind = "fix" if kind in ("engage", "harvest", "fix") else "hunt"
                 override = target.get("budget_override") if is_finding else None
                 if override:
                     budget_state, budget_reason, budget_retry_at = "exempt", f"override: {override}", None

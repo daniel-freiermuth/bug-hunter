@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS findings_type_status ON findings(type, status);
 
 CREATE TABLE IF NOT EXISTS jobs (
   id            INTEGER PRIMARY KEY,
-  kind          TEXT NOT NULL,             -- hunt | fix | engage | recheck
+  kind          TEXT NOT NULL,             -- hunt | fix | engage | recheck | harvest | ...
   repo_id       INTEGER NOT NULL REFERENCES repos(id),
   finding_id    INTEGER REFERENCES findings(id),
   state         TEXT NOT NULL DEFAULT 'queued',
@@ -139,7 +139,8 @@ CREATE TABLE IF NOT EXISTS pr_state (
   last_activity_at INTEGER,                -- newest comment/review timestamp (epoch ms)
   last_engaged_activity_at INTEGER,        -- activity high-water mark we responded to
   needs_attention TEXT,                    -- comma-joined reasons; NULL = calm
-  synced_at     INTEGER
+  synced_at     INTEGER,
+  harvested_at  INTEGER                    -- epoch ms run_harvest reviewed this merged PR; NULL = pending
 );
 
 -- Single-row snapshot of the daemon loop's own reasoning: what it just

@@ -15,6 +15,7 @@ from hunter.playbooks import (
     build_dep_update_prompt,
     build_engage_prompt,
     build_fix_prompt,
+    build_harvest_prompt,
     build_hunt_prompt,
     build_modernization_prompt,
     build_recheck_prompt,
@@ -273,6 +274,47 @@ class TestBuildEngagePrompt:
         )
         # Should not raise on unfilled placeholder
         assert isinstance(result, str)
+
+
+# -- build_harvest_prompt -----------------------------------------------
+
+
+class TestBuildHarvestPrompt:
+    def test_returns_nonempty_string(self):
+        pr: dict = {
+            "title": "deps: bump AGP to 8.5.0",
+            "body": "Capped at 8.5.0 due to a toolchain constraint.",
+            "comments": [],
+            "reviews": [],
+        }
+        result = build_harvest_prompt(
+            finding=_finding(),
+            worktree=Path("/tmp/wt"),
+            repo=_repo(),
+            pr=pr,
+            pr_number=11,
+        )
+        assert isinstance(result, str)
+        assert len(result) > 0
+        assert "{{" not in result
+        assert "11" in result
+
+    def test_braces_in_pr_title_escaped(self):
+        pr: dict = {
+            "title": "Fix {{template}} issue",
+            "body": "",
+            "comments": [],
+            "reviews": [],
+        }
+        result = build_harvest_prompt(
+            finding=_finding(),
+            worktree=Path("/tmp/wt"),
+            repo=_repo(),
+            pr=pr,
+            pr_number=3,
+        )
+        assert isinstance(result, str)
+        assert "{{" not in result
 
 
 # -- build_recheck_prompt ----------------------------------------------------
