@@ -61,6 +61,7 @@ _PR_STATE_COLUMNS = {
     "last_engaged_activity_at",
     "needs_attention",
     "synced_at",
+    "harvested_at",
 }
 
 _FINDING_KEYS = (
@@ -123,6 +124,7 @@ class Store:
             ("modernization_class", "findings", "ALTER TABLE findings ADD COLUMN modernization_class TEXT"),
             ("current_approach", "findings", "ALTER TABLE findings ADD COLUMN current_approach TEXT"),
             ("proposed_approach", "findings", "ALTER TABLE findings ADD COLUMN proposed_approach TEXT"),
+            ("harvested_at", "pr_state", "ALTER TABLE pr_state ADD COLUMN harvested_at INTEGER"),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
@@ -485,6 +487,22 @@ class Store:
                 "SELECT f.*, p.pr_number, p.head_ref, p.needs_attention, p.synced_at"
                 " FROM findings f JOIN pr_state p ON p.finding_id = f.id"
                 " WHERE p.needs_attention IS NOT NULL AND f.status = 'pr_open'"
+                " ORDER BY p.synced_at"
+            )
+        )
+
+    def list_pending_harvest(self) -> list[Row]:
+        """Merged findings whose PR hasn't yet been reviewed for follow-up
+        work, oldest merge first -- run_harvest's queue. A PR's true final
+        scope is only known once merged (see run_harvest's docstring for
+        why this is a separate pass from run_fix's ship-time snapshot and
+        run_engage's withdraw-time one), so this stays open until that
+        review actually happens, however long after the merge that is."""
+        return _rows(
+            self.db.execute(
+                "SELECT f.*, p.pr_number, p.head_ref, p.synced_at"
+                " FROM findings f JOIN pr_state p ON p.finding_id = f.id"
+                " WHERE f.status = 'merged' AND p.harvested_at IS NULL"
                 " ORDER BY p.synced_at"
             )
         )

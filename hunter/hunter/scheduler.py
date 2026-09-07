@@ -20,6 +20,7 @@ from .playbooks import (
     build_dep_update_prompt,
     build_engage_prompt,
     build_fix_prompt,
+    build_harvest_prompt,
     build_hunt_prompt,
     build_modernization_prompt,
     build_recheck_prompt,
@@ -1233,8 +1234,6 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
                             job_id=job,
                             finding_id=fid,
                         )
-                        # Read before _drop_worktree below removes the file.
-                        _ingest_followups(store, repo["id"], worktree, fid, job)
                         _drop_worktree(delete_branch=False)
                         summary.update(outcome="pr_open", pr_url=pr_url_or_err)
                         if override == "once":
@@ -1726,6 +1725,169 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
     return summary
 
 
+# -- harvest ------------------------------------------------------------
+
+
+def run_harvest(store: Store, cfg: Config, finding: Row) -> Row:
+    """Review a just-merged PR's complete lifetime (title, body, every
+    comment/review, and the actual shipped diff) to propose genuine
+    follow-up findings.
+
+    Deliberately a separate pass from run_fix's ship-time ingestion (now
+    removed) and run_engage's withdraw-time one: a PR's true final scope
+    is only known once it's done. What looked deferred when the PR opened
+    can collapse entirely (a human pushes further through ordinary
+    review, closing the gap inside the SAME PR -- observed live: a
+    dep_update PR's target grew from an intermediate version to its full
+    original goal purely through engage replies, with the PR body's own
+    "what was deliberately NOT changed" text never updated to match) and
+    what wasn't yet known can newly emerge (a reviewer flags a cosmetic
+    deprecation warning as "separate refactor work" in a late comment --
+    also observed on the same PR). A point-in-time snapshot taken during
+    the PR's open life structurally cannot see either of these.
+    """
+    fid: int = finding["id"]
+    repo = store.get_repo(finding["repo_id"])
+    if repo is None:
+        store.log_event(
+            "error",
+            f"harvest #{fid}: repo {finding['repo_id']} missing",
+            finding_id=fid,
+        )
+        return {"error": "repo missing"}
+    ps = store.get_pr_state(fid)
+    if not ps or not ps.get("pr_number"):
+        store.log_event(
+            "error",
+            f"harvest #{fid}: no pr_state/pr_number -- sync first",
+            finding_id=fid,
+        )
+        return {"error": "no pr_state"}
+    forge = forge_for(repo)
+    owner_slug = forge.owner_repo(repo["url"])
+    if not owner_slug:
+        store.log_event(
+            "error",
+            f"harvest #{fid}: unparseable repo url {repo['url']!r}",
+            finding_id=fid,
+        )
+        return {"error": "unparseable repo url"}
+    rpath: str = repo["path"]
+    num: int = ps["pr_number"]
+    default_branch: str = repo["default_branch"]
+
+    worktree = cfg.work_root / "wt" / f"h{fid}"
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    if worktree.exists():
+        run_cmd(["git", "-C", rpath, "worktree", "remove", "--force", str(worktree)])
+        store.log_event(
+            "harvest",
+            f"#{fid}: reclaimed stale worktree from prior attempt",
+            finding_id=fid,
+        )
+
+    def _drop_worktree() -> None:
+        run_cmd(["git", "-C", rpath, "worktree", "remove", "--force", str(worktree)])
+
+    rc, out = run_cmd(["git", "-C", rpath, "fetch", "origin", default_branch], timeout=600)
+    if rc != 0:
+        store.log_event(
+            "error",
+            f"harvest #{fid}: fetch {default_branch} failed: {out[-300:]}",
+            finding_id=fid,
+        )
+        return {"error": f"fetch failed: {out[-300:]}"}
+    rc, out = run_cmd(
+        [
+            "git",
+            "-C",
+            rpath,
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree),
+            f"origin/{default_branch}",
+        ]
+    )
+    if rc != 0:
+        store.log_event(
+            "error",
+            f"harvest #{fid}: worktree add failed: {out[-300:]}",
+            finding_id=fid,
+        )
+        return {"error": f"worktree add failed: {out[-300:]}"}
+
+    override = finding.get("budget_override")
+    windows = budget.read_windows()
+    if override:
+        dec = BudgetDecision(True, f"override:{override}", cfg.fix_cap_tokens)
+    else:
+        dec = budget.decide(
+            cfg,
+            "fix",
+            windows,
+            _unaccounted_tokens(store, windows, _anticipated_tokens(store, repo["id"], "harvest")),
+        )
+    if not dec.allow:
+        _drop_worktree()
+        job = store.create_job("harvest", repo["id"], finding_id=fid)
+        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
+        store.log_event("deny", f"harvest #{fid}: {dec.reason}", job_id=job, finding_id=fid)
+        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
+
+    rc, pr, raw = forge.view_pr_engage(owner_slug, num)
+    if pr is None:
+        store.log_event(
+            "error",
+            f"harvest #{fid}: PR/MR view failed: {(raw or '')[-300:]}",
+            finding_id=fid,
+        )
+        _drop_worktree()
+        return {"error": "PR/MR view failed"}
+
+    job = store.create_job(
+        "harvest", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens, state="running"
+    )
+    prompt = build_harvest_prompt(finding, worktree, repo, pr, num, store.repo_notes(repo["id"]))
+    pre_usage = _usage_snapshot(windows)
+    model = cfg.model_for("fix")
+    rr = runner.run_worker(cfg, worktree, prompt, dec.cap_tokens, cfg.fix_max_wall_s, model=model)
+    post_usage = _usage_snapshot(budget.read_windows())
+    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
+    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+
+    # Read before _drop_worktree below removes the file.
+    _ingest_followups(store, repo["id"], worktree, fid, job)
+    _drop_worktree()
+
+    summary: Row = {"kind": "harvest", "finding": fid, "job": job, "state": state, "pr": num}
+    if state != "done":
+        # Leave harvested_at unset so this finding is reconsidered next
+        # cycle -- matches run_engage's own failure-retry pattern.
+        store.log_event(
+            "error",
+            f"harvest #{fid}: worker {state}, will retry",
+            job_id=job,
+            finding_id=fid,
+        )
+        summary["outcome"] = "retry"
+        if override == "once":
+            store.set_budget_override(fid, None)
+        return summary
+
+    store.upsert_pr_state(fid, harvested_at=now_ms())
+    store.log_event(
+        "harvest",
+        f"#{fid} PR #{num} reviewed for follow-ups",
+        job_id=job,
+        finding_id=fid,
+    )
+    summary["outcome"] = "harvested"
+    if override == "once":
+        store.set_budget_override(fid, None)
+    return summary
+
+
 # -- cycle ------------------------------------------------------------------
 
 
@@ -1755,8 +1917,9 @@ def pick_next(
     from what actually runs.
 
     Priority: a budget-overridden finding (any category) jumps the
-    queue -> flagged PR (stalest sync first) -> oldest rechecking ->
-    oldest queued fix -> the most stale-of-rotation job type for the
+    queue -> flagged PR (stalest sync first) -> oldest merged PR pending
+    follow-up review (oldest merge first) -> oldest rechecking -> oldest
+    queued fix -> the most stale-of-rotation job type for the
     least-recently-hunted enabled repo (hunt if never cloned, else
     whichever of hunt/test_gap/dep_update/refactor is oldest/never-run;
     modernization joins that pool too, but only once
@@ -1766,21 +1929,30 @@ def pick_next(
     single cycle).
 
     Returns (kind, target): target is a finding row for
-    engage/recheck/fix, a repo row for
+    engage/harvest/recheck/fix, a repo row for
     hunt/test_gap/dep_update/refactor/modernization. None means nothing
-    to do (no queued/attention/rechecking work and no enabled repos).
+    to do (no queued/attention/pending-harvest/rechecking work and no
+    enabled repos).
     """
     rechecking = store.list_findings(status="rechecking")
     attention = store.list_attention()
+    pending_harvest = store.list_pending_harvest()
     queued = store.list_findings(status="queued")
 
-    for kind, items in (("engage", attention), ("recheck", rechecking), ("fix", queued)):
+    for kind, items in (
+        ("engage", attention),
+        ("harvest", pending_harvest),
+        ("recheck", rechecking),
+        ("fix", queued),
+    ):
         for f in items:
             if f.get("budget_override"):
                 return kind, f
 
     if attention:
         return "engage", attention[0]  # stalest sync first
+    if pending_harvest:
+        return "harvest", pending_harvest[0]  # oldest merge first
     if rechecking:
         return "recheck", rechecking[-1]  # DESC -> last = oldest
     if queued:
@@ -1829,6 +2001,7 @@ def pick_next(
 
 _RUNNERS: dict[str, Callable[[Store, Config, Row], Row]] = {
     "engage": run_engage,
+    "harvest": run_harvest,
     "recheck": run_recheck,
     "fix": run_fix,
     "hunt": run_hunt,

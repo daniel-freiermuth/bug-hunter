@@ -221,6 +221,34 @@ def build_engage_prompt(
             "REPO_NOTES": notes,
         },
     )
+
+
+def build_harvest_prompt(
+    finding: Row,
+    worktree: Path,
+    repo: Row,
+    pr: Row,
+    pr_number: int,
+    repo_notes: str = "",
+) -> str:
+    subset = _finding_subset(finding)
+    notes = _escape_braces(repo_notes) if repo_notes else "(No notes yet)"
+    return _render(
+        (PLAYBOOK_DIR / "harvest.md").read_text(),
+        {
+            "WORKTREE": worktree,
+            "REPO_NAME": repo["name"],
+            "DEFAULT_BRANCH": repo["default_branch"],
+            "FINDING_JSON": _escape_braces(json.dumps(subset, indent=2)),
+            "PR_NUMBER": pr_number,
+            "PR_TITLE": _escape_braces(pr.get("title") or ""),
+            "PR_BODY": _escape_braces(pr.get("body") or "(no description)"),
+            "FEEDBACK": _escape_braces(_feedback_blocks(pr)),
+            "REPO_NOTES": notes,
+        },
+    )
+
+
 def build_recheck_prompt(finding: Row, repo: Row, out_path: Path, repo_notes: str = "") -> str:
     subset = _finding_subset(finding)
     notes = _escape_braces(repo_notes) if repo_notes else "(No notes yet)"

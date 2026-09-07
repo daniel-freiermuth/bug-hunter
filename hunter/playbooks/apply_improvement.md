@@ -103,7 +103,7 @@ All green, or the improvement does not ship.
 COMMIT AFTER EVERY STEP with descriptive messages. You may be killed at any
 moment — committed work survives, uncommitted work dies.
 
-## 5. Flag anything you deferred
+## 5. Be explicit about anything you deferred
 
 Two distinct triggers below. Both are real deferred work; neither is optional
 when it applies.
@@ -116,22 +116,21 @@ when it applies.
   and that original target is NOT closed -- it is deferred work, every time,
   unless the constraint is structural and permanent (the package genuinely
   stopped publishing further versions, or the target version doesn't exist).
-  "Requires a coordinated bump I didn't attempt this pass" is NOT permanent --
-  file the remainder (your-shipped-version -> the finding's original
-  latest_version) in FOLLOW-UPS.json. This is exactly the failure mode that
-  motivated FOLLOW-UPS.json existing at all: a real PR once explained in
-  careful prose exactly why it stopped short of its target and by how much,
-  and that reasoning was never picked up again because nothing captured it
-  structurally.
+  "Requires a coordinated bump I didn't attempt this pass" is NOT permanent.
 - **Something else is now clearly worth doing.** E.g. a dep upgrade lands but
   a bigger DSL/API migration it enables is deliberately left for later, a
   flag is left off pending a follow-up, a patch is dropped but its underlying
   issue still needs a real fix upstream.
 
-Either way: do NOT just mention this in PR-DESCRIPTION.md prose. A merged PR
-closes out and stops being watched; a note buried in its body is never read
-again. File it as a real, queryable follow-up instead: see FOLLOW-UPS.json
-below.
+Either way: name it precisely, with numbers/versions/file references, in
+PR-DESCRIPTION.md's "what you deliberately did NOT change" section below --
+not "some further work may be possible" hedging. A dedicated pass reviews
+every PR once it MERGES (its final shape, after any review discussion, is
+the only reliable signal of what's actually still open) and turns anything
+real you named here into a fresh, queryable finding automatically. Vague
+prose here produces nothing; specific prose does the job without you having
+to hand-author a JSON entry that a PR-open-time snapshot would get wrong
+anyway if review pushes the PR further before it merges.
 
 # Deliverables
 
@@ -142,32 +141,6 @@ below.
   - What changed (version bump + patch rebase, new test cases, simplified code)
   - Verification performed with observed results
   - What you deliberately did NOT change
-- **FOLLOW-UPS.json** at the worktree root, NOT COMMITTED, OPTIONAL — only if
-  step 5 identified real deferred work. A JSON array; the scheduler ingests
-  it into the finding queue right after the PR ships, so it becomes a
-  normal, triage-able finding instead of prose no one re-reads. Empty array
-  or omit the file entirely if there is nothing to flag — do NOT file
-  speculative or trivial items just to produce output. Each entry MUST set
-  `"type"` to whichever shape actually fits (usually `"modernization"` for
-  an architectural migration you deferred; `"dep_update"` if the deferred
-  work is really just "this same package could go further later" with its
-  own ecosystem/package/current_version/latest_version fields instead of
-  modernization_class/current_approach/proposed_approach):
-  ```json
-  {
-    "type": "modernization",
-    "fingerprint": "{{REPO_NAME}}:area:short-slug",
-    "file": "path/file.ext or directory/area",
-    "modernization_class": "deferred-followup",
-    "current_approach": "what this PR left in place, concretely",
-    "proposed_approach": "what the follow-up should do instead, concretely",
-    "severity": "high|medium|low",
-    "confidence": 0.0,
-    "summary": "one sentence",
-    "detail": "why this was deferred now, what the follow-up entails, scope/risk",
-    "introduced_by": "deferred while applying <this finding's type and fingerprint, from the JSON above>"
-  }
-  ```
 
 OR if not actionable:
 
