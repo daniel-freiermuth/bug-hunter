@@ -139,6 +139,27 @@ CREATE TABLE IF NOT EXISTS pr_state (
   last_activity_at INTEGER,                -- newest comment/review timestamp (epoch ms)
   last_engaged_activity_at INTEGER,        -- activity high-water mark we responded to
   needs_attention TEXT,                    -- comma-joined reasons; NULL = calm
+  attention_since INTEGER,                 -- epoch ms the CURRENT reason first appeared (unchanged
+                                            -- while the reason string stays the same); the real
+                                            -- fairness key for list_attention() -- synced_at is
+                                            -- refreshed for EVERY pr_open finding EVERY cycle in a
+                                            -- fixed order, so it reflects loop iteration order, not
+                                            -- how long a PR has genuinely been waiting (regression:
+                                            -- recentIP PR #6 hogged 5 straight cycles while PR #3 sat
+                                            -- flagged for ~10min, purely because #6 has a higher
+                                            -- finding id and got synced first every pass)
+  attention_fingerprint TEXT,              -- signature of the CURRENT static (non-comment) problem
+                                            -- state -- review decision, conflict, and WHICH checks
+                                            -- are failing; refreshed every sync_prs pass, same as
+                                            -- mergeable/checks
+  addressed_fingerprint TEXT,              -- the fingerprint an engage reply already declined to
+                                            -- fix (no commits pushed); sync_prs suppresses re-flagging
+                                            -- a static reason whose CURRENT fingerprint still matches
+                                            -- this -- state-based, not time-based: no re-poking a
+                                            -- worker explained itself on once, no matter how long the
+                                            -- daemon then runs unattended, until the actual situation
+                                            -- (which check fails, review state, conflict) changes.
+                                            -- Cleared the moment it does (see run_engage/sync_prs).
   synced_at     INTEGER,
   harvested_at  INTEGER                    -- epoch ms run_harvest reviewed this merged PR; NULL = pending
 );

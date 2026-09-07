@@ -1289,20 +1289,52 @@ def _latest_activity_ms(pr: Row) -> int:
 
 def _checks_summary(
     rollup: list[Row] | None,
-) -> tuple[str | None, bool]:
-    """(short human summary, any_failing) from a statusCheckRollup list."""
+) -> tuple[str | None, bool, list[str]]:
+    """(short human summary, any_failing, sorted failing check names)."""
     if not rollup:
-        return None, False
-    concl = [(c.get("conclusion") or c.get("state") or "").upper() for c in rollup]
-    failing = sum(1 for c in concl if c in _FAIL_CONCLUSIONS)
-    passing = sum(1 for c in concl if c in ("SUCCESS", "NEUTRAL", "SKIPPED"))
-    pending = len(concl) - failing - passing
+        return None, False, []
+    named = [
+        (
+            c.get("name") or c.get("context") or "?",
+            (c.get("conclusion") or c.get("state") or "").upper(),
+        )
+        for c in rollup
+    ]
+    failing_names = sorted({name for name, concl in named if concl in _FAIL_CONCLUSIONS})
+    passing = sum(1 for _, concl in named if concl in ("SUCCESS", "NEUTRAL", "SKIPPED"))
+    pending = len(named) - len(failing_names) - passing
     parts = [f"{passing} pass"]
-    if failing:
-        parts.append(f"{failing} fail")
+    if failing_names:
+        parts.append(f"{len(failing_names)} fail")
     if pending:
         parts.append(f"{pending} pending")
-    return " / ".join(parts), failing > 0
+    return " / ".join(parts), bool(failing_names), failing_names
+
+
+def _attention_fingerprint(pr: Row, failing_names: list[str]) -> str | None:
+    """Signature of the STATIC (non-comment) part of "what's wrong" --
+    review decision, merge conflicts, and WHICH checks are failing (not
+    just whether any are). None means nothing static is wrong.
+
+    Deliberately excludes comment/review activity: that has its own,
+    already-correct mechanism (the last_engaged_activity_at watermark --
+    a genuinely new comment always produces last_activity > engaged,
+    every time, no fingerprint needed). This is only for the reasons
+    that can recur identically forever without new information -- the
+    same check staying red, the same conflict staying unresolved, the
+    same review staying unaddressed -- where "still true" and "true
+    again" are indistinguishable from a boolean, but distinguishable
+    once you name exactly which checks are failing."""
+    review = (pr.get("reviewDecision") or "").upper()
+    mergeable = (pr.get("mergeable") or "").upper()
+    parts = []
+    if review == "CHANGES_REQUESTED":
+        parts.append(f"review:{review}")
+    if mergeable == "CONFLICTING":
+        parts.append(f"mergeable:{mergeable}")
+    if failing_names:
+        parts.append(f"checks:{','.join(failing_names)}")
+    return "|".join(parts) or None
 
 
 def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
@@ -1383,7 +1415,7 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
 
         prev = store.get_pr_state(fid)
         last_activity = _latest_activity_ms(pr)
-        checks, failing = _checks_summary(pr.get("statusCheckRollup"))
+        checks, failing, failing_names = _checks_summary(pr.get("statusCheckRollup"))
         if prev is None or prev.get("last_engaged_activity_at") is None:
             # First sync: the PR-creation chatter is our own -- baseline the
             # watermark at the PR's current activity without flagging.
@@ -1391,16 +1423,49 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
         else:
             engaged = prev["last_engaged_activity_at"]
 
+        # Suppression: don't re-flag a static (non-comment) reason that
+        # is IDENTICAL to the one an engage cycle already declined to
+        # fix without any new information -- see run_engage's
+        # attention_fingerprint comment for the production incident this
+        # replaced a time-based backoff for. new_comments is exempt: a
+        # genuinely new comment always deserves a fresh look regardless
+        # of whether the static situation is unchanged.
+        fp = _attention_fingerprint(pr, failing_names)
+        addressed_fp = prev.get("addressed_fingerprint") if prev else None
+        suppressed = fp is not None and fp == addressed_fp
+
         reasons: list[str] = []
         if last_activity > (engaged or 0):
             reasons.append("new_comments")
-        if (pr.get("reviewDecision") or "").upper() == "CHANGES_REQUESTED":
-            reasons.append("changes_requested")
-        if (pr.get("mergeable") or "").upper() == "CONFLICTING":
-            reasons.append("conflict")
-        if failing:
-            reasons.append("checks_failing")
+        if not suppressed:
+            if (pr.get("reviewDecision") or "").upper() == "CHANGES_REQUESTED":
+                reasons.append("changes_requested")
+            if (pr.get("mergeable") or "").upper() == "CONFLICTING":
+                reasons.append("conflict")
+            if failing:
+                reasons.append("checks_failing")
         attention = ",".join(reasons) or None
+
+        # attention_since is the fairness fix (see list_attention's
+        # docstring) -- only touch it when the reason actually CHANGED.
+        # Left alone otherwise, so it keeps reflecting when THIS reason
+        # first appeared, not "whenever sync_prs last ran" (every cycle,
+        # for every pr_open finding).
+        prev_attention = prev.get("needs_attention") if prev else None
+        reason_fields: dict[str, int | None] = {}
+        if attention != prev_attention:
+            reason_fields["attention_since"] = now_ms() if attention else None
+        # Any change from what was last addressed (resolved to nothing
+        # wrong, OR changed to a genuinely different problem) clears the
+        # stale marker -- so a LATER recurrence of the ORIGINAL problem,
+        # even after an unrelated one intervened in between, is treated
+        # as fresh rather than auto-suppressed by memory of a
+        # since-superseded decline. Comparing here, before the write
+        # below, against the fingerprint this decision (suppressed,
+        # above) was actually based on.
+        clear_addressed = (
+            {"addressed_fingerprint": None} if addressed_fp and fp != addressed_fp else {}
+        )
 
         store.upsert_pr_state(
             fid,
@@ -1412,7 +1477,10 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
             last_activity_at=last_activity,
             last_engaged_activity_at=engaged,
             needs_attention=attention,
+            attention_fingerprint=fp,
             synced_at=now_ms(),
+            **reason_fields,
+            **clear_addressed,
         )
         if attention and (prev is None or prev.get("needs_attention") != attention):
             store.log_event(
@@ -1705,11 +1773,35 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
     # posted our own comment, advance to now + 3s to absorb clock skew
     # between local time and GitHub's createdAt timestamp.
     engaged_mark = (now_ms() + 3_000) if replied else (ps.get("last_activity_at") or now_ms())
+    # Loop-breaker, state-based not time-based (see sync_prs's
+    # addressed_fingerprint comparison for the full mechanism): if
+    # nothing was pushed, record the static-state fingerprint we just
+    # declined to fix (ps["attention_fingerprint"] -- computed by
+    # sync_prs earlier THIS SAME cycle, since it always runs immediately
+    # before pick_next/run_engage; see run_cycle). sync_prs then
+    # suppresses re-flagging the identical static reason for as long as
+    # the underlying facts (which checks fail, review state, conflict)
+    # stay unchanged -- no matter how many cycles or how much wall-clock
+    # time that takes, unlike an earlier version of this fix that used a
+    # flat time-based backoff (rejected: an unattended daemon running for
+    # months would just keep re-poking an already-explained, genuinely
+    # unfixable problem every N minutes forever). A push clears it
+    # instead: a real attempt was made, worth a genuinely fresh look.
+    #
+    # Deliberately NOT clearing needs_attention here (unlike the withdraw
+    # branch above, where it's moot -- status leaves pr_open entirely):
+    # sync_prs always runs before pick_next on every cycle and
+    # unconditionally recomputes needs_attention from live GitHub state,
+    # so clearing it here was always redundant for correctness -- and
+    # was actively WRONG in an earlier version of this fix, once
+    # attention_since existed: it made sync_prs's very next pass see a
+    # false None -> reason transition and wipe state this same call had
+    # just set (caught live before shipping).
     store.upsert_pr_state(
         fid,
         last_engaged_activity_at=engaged_mark,
-        needs_attention=None,
         synced_at=now_ms(),
+        addressed_fingerprint=None if pushed else ps.get("attention_fingerprint"),
     )
     did = [b for b, on in (("pushed", pushed), ("replied", replied)) if on] or ["no-op"]
     store.log_event(
@@ -1917,7 +2009,7 @@ def pick_next(
     from what actually runs.
 
     Priority: a budget-overridden finding (any category) jumps the
-    queue -> flagged PR (stalest sync first) -> oldest merged PR pending
+    queue -> flagged PR (oldest-outstanding reason first) -> oldest merged PR pending
     follow-up review (oldest merge first) -> oldest rechecking -> oldest
     queued fix -> the most stale-of-rotation job type for the
     least-recently-hunted enabled repo (hunt if never cloned, else
@@ -1950,7 +2042,7 @@ def pick_next(
                 return kind, f
 
     if attention:
-        return "engage", attention[0]  # stalest sync first
+        return "engage", attention[0]  # oldest-flagged reason first (see list_attention)
     if pending_harvest:
         return "harvest", pending_harvest[0]  # oldest merge first
     if rechecking:

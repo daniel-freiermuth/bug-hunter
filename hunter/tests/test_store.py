@@ -606,6 +606,36 @@ class TestPrState:
         assert attn[0]["id"] == fid2
         assert attn[1]["id"] == fid1
 
+    def test_list_attention_prefers_attention_since_over_synced_at(self, store: Store) -> None:
+        """Regression: sync_prs bulk-refreshes synced_at for EVERY pr_open
+        finding every cycle in a fixed order, so it reflects loop
+        iteration order, not genuine wait time (observed live: a
+        higher-id finding won 5 straight tie-breaks over one that had
+        actually been waiting far longer). attention_since is the real
+        fairness key and must win whenever both are present."""
+        rid = store.add_repo("r", "https://r", "/r")
+        fid1, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp1"))
+        fid2, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp2"))
+
+        store.set_status(fid1, "pr_open")
+        store.set_status(fid2, "pr_open")
+
+        # fid1 has been flagged since T=1 (long-waiting) but was JUST
+        # resynced (synced_at=999, looks fresh by the old key).
+        store.upsert_pr_state(
+            fid1, pr_number=1, needs_attention="checks_failing", attention_since=1, synced_at=999
+        )
+        # fid2 was flagged much more recently (T=500) but happened to
+        # sync a moment earlier in this cycle's pass (synced_at=100).
+        store.upsert_pr_state(
+            fid2, pr_number=2, needs_attention="checks_failing", attention_since=500, synced_at=100
+        )
+
+        attn = store.list_attention()
+        assert len(attn) == 2
+        assert attn[0]["id"] == fid1  # genuinely longest-waiting, despite the fresher synced_at
+        assert attn[1]["id"] == fid2
+
     def test_list_pending_harvest(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
         fid1, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp1"))
