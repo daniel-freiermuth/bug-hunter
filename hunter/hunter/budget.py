@@ -65,22 +65,60 @@ def read_windows() -> dict[str, WindowState]:
     out: dict[str, WindowState] = {}
     for r in rows:
         resets_at = r["resets_at"]
+        used_fraction = r["used_fraction"]
+        status = r["status"]
+        recorded_at = r["recorded_at"]
         if resets_at and resets_at <= now:
-            # This window's own cycle has already ended -- e.g. a
-            # per-model-class window nobody has probed since hunter's
-            # config stopped routing jobs to that model (observed:
-            # anthropic:7d:fable, resets_at ~26 days in the past, no
-            # fresh row in 26+ days). The recorded used_fraction
-            # describes a bygone period, not now -- drop it entirely
-            # rather than surface it as if it were current data.
-            continue
+            # This window's own cycle has ended -- but that does NOT mean
+            # "no active window": 5h/7d windows are back-to-back, so a new
+            # cycle is definitely running RIGHT NOW, hunter just hasn't
+            # been probed for it yet. Dropping the row entirely (the old
+            # behavior) was a real production incident: decide()'s
+            # unaccounted_tokens reservation exists exactly to survive a
+            # stale-but-still-current probe, but it only ever gets
+            # consulted when a WindowState is present to attach it to --
+            # once this function dropped the row, decide() saw no
+            # anthropic:5h data at all and fell through to its "no active
+            # window -> allow" rule, completely bypassing
+            # unaccounted_tokens regardless of how large it had grown. A
+            # cascade of modernization jobs (which routinely cost 2-5x
+            # their nominal cap on a cold-cache first call, see
+            # runner.py) burned ~2.9M tokens across a freshly-rolled-over
+            # 5h window with zero denials, because nothing was left to
+            # deny against.
+            #
+            # Fix: roll the window forward ourselves instead of dropping
+            # it. A brand-new window legitimately starts at 0% (Anthropic's
+            # own probe will confirm that once it lands) -- what's NOT
+            # legitimate is treating "0% probed" as "0% spent". recorded_at
+            # is set to the boundary the new cycle actually started at (not
+            # `now`), so _unaccounted_tokens's "finished since the last
+            # probe" query correctly sums every job hunter has run since
+            # the rollover, not just since this function last happened to
+            # run.
+            # Scoped to the exact account-wide dimensions decide() actually
+            # gates real work on -- NOT per-model-class variants like
+            # anthropic:7d:fable, which really can go genuinely abandoned
+            # (config stopped routing there) and must stay dropped, both to
+            # avoid decide() noise and to keep the Status page from showing
+            # a synthesized "fresh" window for a dimension nothing uses.
+            period = {"anthropic:5h": _5H_MS, "anthropic:7d": _WEEK_MS}.get(r["limit_id"])
+            if period is None:
+                continue  # per-model-class or unrecognized -- keep the old, safe drop
+            new_resets_at = resets_at
+            while new_resets_at <= now:
+                recorded_at = new_resets_at
+                new_resets_at += period
+            resets_at = new_resets_at
+            used_fraction = 0.0
+            status = "ok"
         out[r["limit_id"]] = WindowState(
             limit_id=r["limit_id"],
-            used_fraction=r["used_fraction"],
-            status=r["status"],
+            used_fraction=used_fraction,
+            status=status,
             resets_at=resets_at,
-            recorded_at=r["recorded_at"],
-            age_s=(now - r["recorded_at"]) / 1000,
+            recorded_at=recorded_at,
+            age_s=(now - recorded_at) / 1000,
         )
     return out
 
