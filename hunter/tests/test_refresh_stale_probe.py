@@ -1,13 +1,17 @@
-"""Tests for hunter.scheduler._refresh_stale_probe.
+"""Tests for hunter.scheduler.refresh_stale_probe.
 
 Root cause investigation (see the function's own docstring): headless
 `omp -p` -- everything hunter's own workers use -- never refreshes
 usage_history, confirmed empirically in production (identical recorded_at
-before and after a real, token-spending `omp -p` run). This is the
-proactive fix: force a fresh probe (`omp usage`, a cheap zero-inference
-metadata call) whenever the current anthropic:5h reading is stale or
-missing, gated on staleness rather than called every cycle since
-Anthropic itself rate-limits /usage aggressively per source IP.
+before and after a real, token-spending `omp -p` run). Separately,
+plain `omp usage` alone was also confirmed insufficient: it has its own
+internal cache, independent of hunter's own staleness gate, and can
+silently return a cached report without reaching the network. Two
+commands are required: `omp usage invalidate --provider anthropic`
+(bust the cache) followed by `omp usage --provider anthropic` (a
+genuinely fresh read), gated on staleness rather than called every
+tick since Anthropic itself rate-limits /usage aggressively per source
+IP.
 """
 
 from __future__ import annotations
@@ -20,8 +24,11 @@ if TYPE_CHECKING:
     import pytest
 
 from hunter import scheduler
-from hunter.scheduler import _refresh_stale_probe
+from hunter.scheduler import refresh_stale_probe
 from hunter.types import Config, WindowState
+
+_INVALIDATE = ["omp", "usage", "invalidate", "--provider", "anthropic"]
+_READ = ["omp", "usage", "--provider", "anthropic"]
 
 
 def _cfg(**overrides: object) -> Config:
@@ -60,22 +67,22 @@ def _patched_run_cmd(monkeypatch: pytest.MonkeyPatch, rc: int = 0) -> list[list[
 
 def test_no_windows_at_all_forces_a_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _patched_run_cmd(monkeypatch)
-    assert _refresh_stale_probe(_cfg(), {}) is True
-    assert calls == [["omp", "usage"]]
+    assert refresh_stale_probe(_cfg(), {}) is True
+    assert calls == [_INVALIDATE, _READ]
 
 
 def test_fresh_window_does_not_force_a_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _patched_run_cmd(monkeypatch)
     windows = {"anthropic:5h": _ws(age_s=60.0)}
-    assert _refresh_stale_probe(_cfg(stale_after_s=1800), windows) is False
+    assert refresh_stale_probe(_cfg(stale_after_s=1800), windows) is False
     assert calls == []
 
 
 def test_stale_window_forces_a_probe(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _patched_run_cmd(monkeypatch)
     windows = {"anthropic:5h": _ws(age_s=2000.0)}
-    assert _refresh_stale_probe(_cfg(stale_after_s=1800), windows) is True
-    assert calls == [["omp", "usage"]]
+    assert refresh_stale_probe(_cfg(stale_after_s=1800), windows) is True
+    assert calls == [_INVALIDATE, _READ]
 
 
 def test_exactly_at_threshold_does_not_force(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -84,7 +91,7 @@ def test_exactly_at_threshold_does_not_force(monkeypatch: pytest.MonkeyPatch) ->
     style elsewhere in this codebase."""
     calls = _patched_run_cmd(monkeypatch)
     windows = {"anthropic:5h": _ws(age_s=1800.0)}
-    assert _refresh_stale_probe(_cfg(stale_after_s=1800), windows) is False
+    assert refresh_stale_probe(_cfg(stale_after_s=1800), windows) is False
     assert calls == []
 
 
@@ -94,15 +101,32 @@ def test_respects_configured_stale_after_s(monkeypatch: pytest.MonkeyPatch) -> N
     effect, not just a value sitting unused."""
     calls = _patched_run_cmd(monkeypatch)
     windows = {"anthropic:5h": _ws(age_s=500.0)}
-    assert _refresh_stale_probe(_cfg(stale_after_s=1800), windows) is False
-    assert _refresh_stale_probe(_cfg(stale_after_s=300), windows) is True
-    assert calls == [["omp", "usage"]]
+    assert refresh_stale_probe(_cfg(stale_after_s=1800), windows) is False
+    assert refresh_stale_probe(_cfg(stale_after_s=300), windows) is True
+    assert calls == [_INVALIDATE, _READ]
+
+
+def test_invalidates_before_reading_so_the_read_cannot_serve_a_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordering matters: invalidate must run BEFORE the read, or the
+    read could serve omp's own internal cache instead of a fresh
+    fetch -- exactly the failure mode observed live (a plain `omp
+    usage` reported "fetched 32.6s ago" while hunter's own DB row was
+    over a minute staler than that)."""
+    calls = _patched_run_cmd(monkeypatch)
+    refresh_stale_probe(_cfg(), {})
+    assert calls[0] == _INVALIDATE
+    assert calls[1] == _READ
 
 
 def test_uses_configured_omp_bin(monkeypatch: pytest.MonkeyPatch) -> None:
     calls = _patched_run_cmd(monkeypatch)
-    _refresh_stale_probe(_cfg(omp_bin="/custom/path/omp"), {})
-    assert calls == [["/custom/path/omp", "usage"]]
+    refresh_stale_probe(_cfg(omp_bin="/custom/path/omp"), {})
+    assert calls == [
+        ["/custom/path/omp", "usage", "invalidate", "--provider", "anthropic"],
+        ["/custom/path/omp", "usage", "--provider", "anthropic"],
+    ]
 
 
 def test_failed_probe_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -110,4 +134,22 @@ def test_failed_probe_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
     probe just reports False, leaving windows exactly as stale as they
     already were. Callers already tolerate that via unaccounted_tokens."""
     _patched_run_cmd(monkeypatch, rc=1)
-    assert _refresh_stale_probe(_cfg(), {}) is False
+    assert refresh_stale_probe(_cfg(), {}) is False
+
+
+def test_failed_invalidate_does_not_block_the_read_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The invalidate step is best-effort like everything else here --
+    if it fails, still attempt the read (which may just serve a cache
+    in that fallback case, but that's strictly no worse than not
+    trying at all)."""
+    calls: list[list[str]] = []
+
+    def fake_run_cmd(cmd: list[str], timeout: int = 300) -> tuple[int, str]:
+        calls.append(cmd)
+        return (1, "") if cmd == _INVALIDATE else (0, "")
+
+    monkeypatch.setattr(scheduler, "run_cmd", fake_run_cmd)
+    assert refresh_stale_probe(_cfg(), {}) is True
+    assert calls == [_INVALIDATE, _READ]

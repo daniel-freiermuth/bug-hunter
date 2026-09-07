@@ -62,6 +62,15 @@ _wake = threading.Event()
 # "never delayed for hours" while cutting that churn ~5x.
 PR_SYNC_INTERVAL_S = 5 * 60.0
 
+# How often the independent usage-prober thread wakes to check
+# anthropic:5h staleness (see _usage_prober_loop). Deliberately NOT tied
+# to the job-dispatch cadence above (_compute_sleep_s ranges 0s-60min) --
+# that coupling is exactly what made a 30min staleness gate capable of
+# silently running 90min stale when budget was denied. A short, fixed
+# tick keeps "when do we refresh usage data" simple and independently
+# reasoned about from "when do we run jobs".
+USAGE_PROBE_TICK_S = 60.0
+
 
 def _reconcile_and_log(store: Store) -> None:
     """Recover jobs/findings orphaned by a previous process dying mid-job
@@ -966,14 +975,52 @@ def _compute_sleep_s(store: Store, summary: Row) -> float:
     return sleep_s
 
 
+def _usage_prober_loop(cfg: Config, stop: threading.Event) -> None:
+    """Independent thread: every USAGE_PROBE_TICK_S, force a fresh usage
+    probe if anthropic:5h has gone stale.
+
+    See scheduler.refresh_stale_probe's docstring for why this exists
+    at all -- headless `omp -p`, everything hunter's workers use, never
+    refreshes usage_history on its own, confirmed empirically in
+    production.
+
+    Its own thread rather than folded into the job-dispatch loop below
+    on purpose: that loop's sleep is intentionally variable (0s-60min,
+    backing off when idle or budget-denied so it doesn't busy-loop for
+    no reason), but "how fresh is our usage data" has nothing to do
+    with "is there a job to run right now" -- a job-cadence backoff
+    must never delay this too. Runs once immediately on startup (so a
+    window that went stale before the daemon last restarted gets caught
+    right away) and every tick thereafter. Best-effort throughout: a
+    failed tick just tries again next tick.
+    """
+    from . import budget, scheduler
+
+    while not stop.is_set():
+        try:
+            windows = budget.read_windows()
+            w5 = windows.get("anthropic:5h")
+            if scheduler.refresh_stale_probe(cfg, windows):
+                log.info(
+                    "usage prober: refreshed a stale anthropic:5h reading (was %.0fs old)",
+                    w5.age_s if w5 else float("inf"),
+                )
+        except Exception:
+            log.exception("usage prober tick failed")
+        stop.wait(USAGE_PROBE_TICK_S)
+
+
 def daemon(cfg: Config) -> None:
-    """Run forever: UI server + scheduler loop in one process.
+    """Run forever: UI server + scheduler loop + usage-prober loop, one
+    process, three threads.
 
-    The loop shares _cycle_lock with POST /api/cycle, so manual and timed
-    cycles never overlap. Idling costs zero tokens -- every wake goes through
-    the budget gate, which is where all spending decisions live.
+    The job-dispatch loop shares _cycle_lock with POST /api/cycle, so
+    manual and timed cycles never overlap. Idling costs zero tokens --
+    every wake goes through the budget gate, which is where all spending
+    decisions live. Wake policy: see _compute_sleep_s.
 
-    Wake policy: see _compute_sleep_s.
+    The usage-prober thread is intentionally separate and unrelated to
+    that cadence -- see _usage_prober_loop and USAGE_PROBE_TICK_S.
     """
     import signal as _signal
 
@@ -987,6 +1034,10 @@ def daemon(cfg: Config) -> None:
     stop = threading.Event()
     for sig in (_signal.SIGTERM, _signal.SIGINT):
         _signal.signal(sig, lambda *_args: stop.set())
+
+    threading.Thread(
+        target=_usage_prober_loop, args=(cfg, stop), name="hunter-usage-prober", daemon=True
+    ).start()
 
     from . import scheduler
     from .store import Store
