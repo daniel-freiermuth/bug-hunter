@@ -69,10 +69,11 @@ class _FakeForge:
 def _pr(
     *,
     checks_failing: bool = False,
+    check_name: str = "CI",
     conflicting: bool = False,
     state: str = "OPEN",
 ) -> dict[str, Any]:
-    rollup = [{"name": "CI", "conclusion": "FAILURE"}] if checks_failing else []
+    rollup = [{"name": check_name, "conclusion": "FAILURE"}] if checks_failing else []
     return {
         "state": state,
         "comments": [],
@@ -159,19 +160,21 @@ class TestAttentionSinceTracking:
         assert second["attention_since"] != first_since
         assert second["attention_since"] is not None
 
-    def test_reason_change_clears_a_stale_backoff(
+    def test_reason_change_clears_a_stale_addressed_marker(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A backoff set for the OLD (now-resolved) reason must not
-        suppress attention for a genuinely NEW reason that just appeared
-        -- new activity is never held hostage by an unrelated backoff."""
+        """An addressed_fingerprint recorded for the OLD (now different)
+        problem must not suppress attention for a genuinely NEW/different
+        one -- new activity is never held hostage by an unrelated
+        decline. Also the stale marker itself must get cleared (not just
+        ignored this once): otherwise, if the ORIGINAL problem later
+        recurs after this unrelated one passes, it would be wrongly
+        auto-suppressed by leftover memory of the first decline."""
         finding = _setup(store, tmp_path)
-        from hunter.types import now_ms
-
         store.upsert_pr_state(
             finding["id"],
             needs_attention="checks_failing",
-            attention_backoff_until=now_ms() + 999_999,
+            addressed_fingerprint="checks:CI",
         )
         monkeypatch.setattr(
             scheduler, "forge_for", lambda repo: _FakeForge(_pr(conflicting=True))
@@ -182,10 +185,54 @@ class TestAttentionSinceTracking:
         ps = store.get_pr_state(finding["id"])
         assert ps is not None
         assert ps["needs_attention"] == "conflict"
-        assert ps["attention_backoff_until"] is None
+        assert ps["addressed_fingerprint"] is None  # stale marker cleared, not just bypassed
         attn = store.list_attention()
         assert len(attn) == 1
         assert attn[0]["id"] == finding["id"]
+
+    def test_identical_addressed_fingerprint_suppresses_the_static_reason(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The core of the mechanism: a static reason whose fingerprint
+        exactly matches what an engage reply already declined is not
+        re-flagged, no matter how many sync_prs passes happen -- and
+        with no time bound at all, unlike a fixed-duration backoff."""
+        finding = _setup(store, tmp_path)
+        store.upsert_pr_state(finding["id"], addressed_fingerprint="checks:CI")
+        monkeypatch.setattr(
+            scheduler, "forge_for", lambda repo: _FakeForge(_pr(checks_failing=True))
+        )
+
+        for _ in range(5):  # repeated syncs, still nothing new -- stays suppressed every time
+            sync_prs(store, cfg)
+
+        ps = store.get_pr_state(finding["id"])
+        assert ps is not None
+        assert ps["needs_attention"] is None
+        assert ps["attention_fingerprint"] == "checks:CI"  # still tracked, just not flagged
+        assert store.list_attention() == []
+
+    def test_a_different_failing_check_is_not_suppressed_by_an_unrelated_decline(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """checks_failing alone (a boolean) would treat 'the same check
+        is still red' and 'a DIFFERENT check just started failing' as
+        identical -- the whole reason this fingerprints WHICH checks
+        fail, not just whether any do."""
+        finding = _setup(store, tmp_path)
+        store.upsert_pr_state(finding["id"], addressed_fingerprint="checks:CI")
+        monkeypatch.setattr(
+            scheduler,
+            "forge_for",
+            lambda repo: _FakeForge(_pr(checks_failing=True, check_name="Lint")),
+        )
+
+        sync_prs(store, cfg)
+
+        ps = store.get_pr_state(finding["id"])
+        assert ps is not None
+        assert ps["needs_attention"] == "checks_failing"  # Lint failing is genuinely new
+        assert ps["attention_fingerprint"] == "checks:Lint"
 
     def test_resolved_reason_clears_attention_since(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

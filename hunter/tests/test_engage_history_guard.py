@@ -15,7 +15,7 @@ import pytest
 from hunter import scheduler
 from hunter.scheduler import run_engage
 from hunter.store import Store
-from hunter.types import Config, RunResult, now_ms
+from hunter.types import Config, RunResult
 
 
 @pytest.fixture
@@ -252,18 +252,23 @@ class TestEngageNeverTargetsDefaultBranch:
         assert not called, "worker must never run when head_ref is the default branch"
 
 
-class TestEngageAttentionBackoff:
+class TestEngageAddressedFingerprint:
     """The other half of the fairness/loop fix (see
-    scheduler.ENGAGE_BACKOFF_MS): a reply that changes nothing must not
-    let the identical still-outstanding reason re-trigger next cycle.
-    Reproduces the production incident directly -- recentIP PR #6 replied
-    to an unresolved 'checks_failing' five times in ~7 minutes because
-    nothing ever suppressed the immediate re-flag."""
+    sync_prs's addressed_fingerprint comparison): a reply that changes
+    nothing must not let the identical still-outstanding static reason
+    (which checks fail, review state, conflict) re-trigger next cycle.
+    State-based, not time-based: no re-poking a worker already explained
+    itself on, no matter how long the daemon then runs unattended, until
+    the actual situation changes. Reproduces the production incident
+    directly -- recentIP PR #6 replied to an unresolved 'checks_failing'
+    five times in ~7 minutes because nothing ever suppressed the
+    immediate re-flag."""
 
-    def test_backoff_is_set_when_replying_without_pushing(
+    def test_addressed_fingerprint_is_set_when_replying_without_pushing(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         finding, fake_forge = _setup(store, tmp_path)
+        store.upsert_pr_state(finding["id"], attention_fingerprint="checks:CI")
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
 
         def fake_run_worker(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
@@ -283,16 +288,22 @@ class TestEngageAttentionBackoff:
         # needs_attention is deliberately left as-is -- sync_prs (which
         # always runs before pick_next) is the sole authority on it;
         # run_engage overwriting it here previously destroyed the
-        # continuity attention_since/backoff depend on.
-        assert ps["attention_backoff_until"] is not None
-        assert ps["attention_backoff_until"] > now_ms()
+        # continuity attention_since/the fingerprint mechanism depend on.
+        assert ps["addressed_fingerprint"] == "checks:CI"
 
-    def test_backoff_is_not_set_when_commits_are_pushed(
+    def test_addressed_fingerprint_is_cleared_when_commits_are_pushed(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A genuine attempt (a push) is worth re-checking promptly --
-        the underlying problem may actually be resolved now."""
+        """A genuine attempt (a push) clears any stale marker from an
+        earlier decline -- the underlying problem may actually be
+        resolved now, worth a genuinely fresh look next sync, not
+        suppressed by memory of what was declined before."""
         finding, fake_forge = _setup(store, tmp_path)
+        store.upsert_pr_state(
+            finding["id"],
+            attention_fingerprint="checks:CI",
+            addressed_fingerprint="checks:CI",  # stale, from an earlier decline
+        )
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
 
         def fake_run_worker(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
@@ -310,14 +321,16 @@ class TestEngageAttentionBackoff:
 
         ps = store.get_pr_state(finding["id"])
         assert ps is not None
-        assert ps["attention_backoff_until"] is None
+        assert ps["addressed_fingerprint"] is None
 
-    def test_backoff_is_set_on_pure_no_op(
+    def test_addressed_fingerprint_is_set_on_pure_no_op(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Neither pushed nor replied (nothing needed doing) is exactly
-        as unproductive as a decline-only reply and must back off too."""
+        as unproductive as a decline-only reply and must record the
+        fingerprint too."""
         finding, fake_forge = _setup(store, tmp_path)
+        store.upsert_pr_state(finding["id"], attention_fingerprint="mergeable:CONFLICTING")
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
         monkeypatch.setattr(scheduler.runner, "run_worker", lambda *_a, **_kw: _fake_result())
 
@@ -328,19 +341,23 @@ class TestEngageAttentionBackoff:
 
         ps = store.get_pr_state(finding["id"])
         assert ps is not None
-        assert ps["attention_backoff_until"] is not None
+        assert ps["addressed_fingerprint"] == "mergeable:CONFLICTING"
 
-    def test_backoff_survives_the_next_sync_prs_pass(
+    def test_suppression_survives_the_next_sync_prs_pass(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The exact bug caught live seconds after this fix first shipped:
-        a naive version cleared needs_attention to None in run_engage,
-        which made the VERY NEXT sync_prs pass see a false None -> reason
-        transition (since the still-failing check computes the same
-        reason again) and treat it as genuinely new, wiping the backoff
-        this same call had just set. This is the actual production
-        sequence -- sync_prs, then run_engage, then sync_prs again -- not
-        just each function tested in isolation."""
+        """The exact bug caught live seconds after an earlier version of
+        this fix first shipped: that version cleared needs_attention to
+        None in run_engage, which made the VERY NEXT sync_prs pass see a
+        false None -> reason transition (since the still-failing check
+        computes the same reason again) and treat it as genuinely new,
+        wiping the suppression this same call had just set. This is the
+        actual production sequence -- sync_prs, then run_engage, then
+        sync_prs again -- not just each function tested in isolation.
+        Also proves the suppression has no time component at all: this
+        test asserts no expiry because the mechanism has none to expire
+        -- unlike a time-based backoff, there is nothing here for a
+        months-long unattended daemon run to eventually re-trigger."""
         from hunter.scheduler import sync_prs
 
         finding, fake_forge = _setup(store, tmp_path)
@@ -351,6 +368,7 @@ class TestEngageAttentionBackoff:
         before = store.get_pr_state(finding["id"])
         assert before is not None
         assert before["needs_attention"] == "checks_failing"
+        assert before["attention_fingerprint"] == "checks:CI"
 
         def fake_run_worker(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
             (worktree / "PR-REPLY.md").write_text("This is a pre-existing failure, not mine.\n")
@@ -363,11 +381,11 @@ class TestEngageAttentionBackoff:
 
         # The check is STILL failing (nothing was pushed) -- exactly the
         # production scenario. This is the pass that used to wipe the
-        # backoff.
+        # suppression.
         sync_prs(store, cfg)
 
         after = store.get_pr_state(finding["id"])
         assert after is not None
-        assert after["attention_backoff_until"] is not None
-        assert after["attention_backoff_until"] > now_ms()
+        assert after["addressed_fingerprint"] == "checks:CI"
+        assert after["needs_attention"] is None  # suppressed, not re-flagged
         assert store.list_attention() == []  # correctly suppressed, not re-picked

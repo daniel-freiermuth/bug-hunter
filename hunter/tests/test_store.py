@@ -636,35 +636,6 @@ class TestPrState:
         assert attn[0]["id"] == fid1  # genuinely longest-waiting, despite the fresher synced_at
         assert attn[1]["id"] == fid2
 
-    def test_list_attention_excludes_backed_off_findings(self, store: Store) -> None:
-        from hunter.types import now_ms
-
-        rid = store.add_repo("r", "https://r", "/r")
-        fid1, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp1"))
-        fid2, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp2"))
-
-        store.set_status(fid1, "pr_open")
-        store.set_status(fid2, "pr_open")
-
-        store.upsert_pr_state(
-            fid1,
-            pr_number=1,
-            needs_attention="checks_failing",
-            synced_at=1,
-            attention_backoff_until=now_ms() + 999_999,  # far future -- still backed off
-        )
-        store.upsert_pr_state(
-            fid2,
-            pr_number=2,
-            needs_attention="checks_failing",
-            synced_at=1,
-            attention_backoff_until=now_ms() - 1,  # already elapsed -- eligible again
-        )
-
-        attn = store.list_attention()
-        assert len(attn) == 1
-        assert attn[0]["id"] == fid2
-
     def test_list_pending_harvest(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
         fid1, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp1"))
