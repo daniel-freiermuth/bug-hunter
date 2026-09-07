@@ -10,7 +10,7 @@ import pytest
 
 import hunter.budget as budget_module
 from hunter.budget import decide, ramp_5h, ramp_7d, read_windows, retry_at_5h, retry_at_7d
-from hunter.types import Config, WindowState
+from hunter.types import Config, UnaccountedTokens, WindowState
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -131,7 +131,7 @@ def test_stale_5h_own_finished_jobs_count_toward_effective_used():
     }
     # 1.6M unaccounted tokens (finished jobs the probe hasn't caught up to
     # yet) -> 1.6M/200k * 10% = 0.80 additional effective usage.
-    d = decide(_cfg(), "hunt", windows, unaccounted_tokens=1_600_000)
+    d = decide(_cfg(), "hunt", windows, UnaccountedTokens(for_5h=1_600_000))
     assert not d.allow
     assert "5h" in d.reason
 
@@ -147,6 +147,31 @@ def test_stale_5h_denied_by_7d_ramp():
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
     assert "7d" in d.reason
+
+
+def test_5h_and_7d_unaccounted_reservations_are_independent():
+    """The actual fix this session: for_5h and for_7d must never be
+    derived from one another via a capacity ratio -- each window's
+    reservation responds ONLY to its own field. A single shared int
+    scaled down for 7d (the pre-fix design) silently assumed both
+    windows' unaccounted spend shared one baseline, which is false the
+    moment their probes diverge (see test_unaccounted_tokens.py's
+    regression on the scheduler side). Prove it two ways: a huge for_7d
+    denies even with for_5h=0 (5h healthy on its own), and a huge for_5h
+    denies even with for_7d=0 (7d healthy on its own)."""
+    # for_7d alone must be able to deny, independent of for_5h.
+    resets_7d = _NOW_MS + int(_WEEK_MS * 0.90)  # 10% elapsed -> ramp ~0.10
+    windows = _healthy_windows(w5_used=0.0, w5_elapsed_h=4.5)  # 5h healthy on its own
+    windows["anthropic:7d"] = _ws("anthropic:7d", used_fraction=0.02, resets_at=resets_7d)
+    d = decide(_cfg(), "hunt", windows, UnaccountedTokens(for_5h=0, for_7d=20_000_000))
+    assert not d.allow
+    assert "anthropic:7d: used" in d.reason
+
+    # for_5h alone must be able to deny, independent of for_7d.
+    windows2 = _healthy_windows(w5_used=0.0, w5_elapsed_h=3.0)
+    d2 = decide(_cfg(), "hunt", windows2, UnaccountedTokens(for_5h=5_000_000, for_7d=0))
+    assert not d2.allow
+    assert "5h" in d2.reason
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +566,7 @@ def test_decide_denies_on_unaccounted_alone_through_a_fresh_rollover():
     }
     # ~2.9M tokens burned since the rollover (the actual incident's scale) --
     # 2_900_000 / 200_000 * 10% = 1.45 effective usage, far past any ramp.
-    d = decide(_cfg(), "hunt", windows, unaccounted_tokens=2_900_000)
+    d = decide(_cfg(), "hunt", windows, UnaccountedTokens(for_5h=2_900_000))
     assert not d.allow
     assert "5h" in d.reason
 

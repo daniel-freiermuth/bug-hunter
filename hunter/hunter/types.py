@@ -254,6 +254,25 @@ class WindowState:
 
 
 @dataclass
+class UnaccountedTokens:
+    """Tokens hunter's own job history knows about that a probe reading
+    doesn't reflect yet -- kept as two SEPARATE fields, never one shared
+    number, because anthropic:5h and anthropic:7d have their own,
+    generally DIFFERENT probe recency (5h rolls over ~33.6x more often
+    than 7d, so after almost any 5h rollover the two have diverged) --
+    collapsing them into a single int and deriving one from the other by
+    a capacity ratio silently assumes they share a baseline, which is
+    false the moment either window's own probe timing moves independently
+    of the other's. Making this two fields instead of one int is the
+    actual fix: budget.decide() can no longer receive an ambiguous
+    number and misapply it to the wrong window -- the caller is forced
+    to say, by name, which window each count is for."""
+
+    for_5h: int = 0
+    for_7d: int = 0
+
+
+@dataclass
 class BudgetDecision:
     allow: bool
     reason: str

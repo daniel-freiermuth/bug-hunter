@@ -17,13 +17,17 @@ ramp-catchup-before-reset risk.
 A window's last known reading is never discarded for being old -- usage
 only increases within a window, so it remains a valid floor. Combined
 with unaccounted_tokens (hunter's own record of spend since that reading
-was taken), and ramps that keep climbing toward 1.0 against live wall-
-clock time regardless of probe staleness, denial resolves itself once
-the ramp naturally catches up -- no bypass needed.
+was taken -- tracked SEPARATELY per window, see types.UnaccountedTokens),
+and ramps that keep climbing toward 1.0 against live wall-clock time
+regardless of probe staleness, denial resolves itself once the ramp
+naturally catches up -- no bypass needed.
 
-No active 5h window (nothing ever probed, or the window's own resets_at
-has passed and read_windows() dropped it) → allow (opens one). The 7d
-ramp is the outer gate. Missing data entirely → deny.
+No active 5h window (truly nothing ever probed, e.g. a fresh install) →
+allow (opens one), gated only by the 7d ramp. A window whose own
+resets_at has passed is NOT "no active window" -- read_windows() rolls
+anthropic:5h/anthropic:7d forward into their current cycle instead of
+dropping them (a genuinely abandoned per-model-class dimension still
+gets dropped; see read_windows). Missing data entirely → deny.
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ from __future__ import annotations
 import sqlite3
 import time
 
-from .types import OMP_AGENT_DB, BudgetDecision, Config, WindowState
+from .types import OMP_AGENT_DB, BudgetDecision, Config, UnaccountedTokens, WindowState
 
 # =============================================================================
 # Configuration: To adjust when hunter can start using the 5h window,
@@ -188,7 +192,7 @@ def decide(
     cfg: Config,
     kind: str,
     windows: dict[str, WindowState],
-    unaccounted_tokens: int = 0,
+    unaccounted: UnaccountedTokens | None = None,
 ) -> BudgetDecision:
     base = cfg.hunt_cap_tokens if kind == "hunt" else cfg.fix_cap_tokens
     now_ms = time.time() * 1000
@@ -201,22 +205,33 @@ def decide(
     # an hour* behind hunter's own job cadence during an active run (observed
     # in production: 26 jobs and ~4M tokens spent across a 98-minute stretch
     # with zero fresh probes landing -- the reading only caught up once, in
-    # one jump, long after the fact). unaccounted_tokens is hunter's own
-    # count of jobs still running (cap_tokens estimate -- final usage isn't
-    # known yet) plus jobs that already finished after the latest probe's
+    # one jump, long after the fact). unaccounted is hunter's own count of
+    # jobs still running (cap_tokens estimate -- final usage isn't known
+    # yet) plus jobs that already finished after each window's OWN probe
     # recorded_at (their real tokens_new -- known exactly, and routinely
     # 2-5x cap_tokens on a cold-cache first call; see runner.py). Folding
     # this in is what actually closes the gap a stale-data bypass cannot:
     # a bypass just stops looking, this keeps counting.
+    #
+    # for_5h and for_7d are computed INDEPENDENTLY by the caller (see
+    # scheduler._unaccounted_tokens), never derived from one another --
+    # anthropic:5h and anthropic:7d generally have different probe
+    # recency (5h rolls over ~33.6x more often), so a shared number
+    # scaled by a capacity ratio silently assumes both probes share a
+    # baseline, which is false the moment either window's rollover
+    # timing moves independently of the other's (a real incident: see
+    # git history for the fix that split this into two fields).
     #
     # Rough conversion, calibrated for the 5h window: reserve 10% of window
     # capacity per 200k tokens (Anthropic 5h ~= 2-5M tokens depending on
     # model, so 200k ~= 4-10%). The 7d window is the same tokens against a
     # ~33.6x larger capacity (a week holds 7*24/5 five-hour windows), so
     # applying the 5h-calibrated fraction there directly would overstate a
-    # burst's weekly impact by ~33x -- scale it down by that same ratio.
-    inflight_reservation_5h = (unaccounted_tokens / 200_000) * 0.10
-    inflight_reservation_7d = inflight_reservation_5h * (_5H_MS / _WEEK_MS)
+    # burst's weekly impact by ~33x -- scale THIS conversion (capacity size,
+    # not probe baseline) down by that same ratio.
+    unaccounted = unaccounted or UnaccountedTokens()
+    inflight_reservation_5h = (unaccounted.for_5h / 200_000) * 0.10
+    inflight_reservation_7d = (unaccounted.for_7d / 200_000) * 0.10 * (_5H_MS / _WEEK_MS)
 
     # -- 7d linear ramp: spend proportionally to elapsed time -----------------
     # allowed_by_7d = ramp_7d(...) > effective_used. The 7d fraction moves
