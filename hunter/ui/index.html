@@ -255,7 +255,7 @@
       <div id="ops">
         <div id="windows"><span class="empty">no window data</span></div>
         <div id="opsRight">
-          <button id="runCycle">Run Cycle</button>
+          <button type="button" id="runCycle">Run Cycle</button>
           <div id="lastEvent">&nbsp;</div>
         </div>
       </div>
@@ -269,7 +269,7 @@
     </section>
 
     <section id="page-pipeline" class="page">
-      <h2>Pipeline <button class="ov-btn" onclick="clearAllOverrides()" style="font-size:10px;vertical-align:middle">Clear all overrides</button></h2>
+      <h2>Pipeline <button type="button" class="ov-btn" onclick="clearAllOverrides()" style="font-size:10px;vertical-align:middle">Clear all overrides</button></h2>
       <div id="filters-pipeline" class="filters"></div>
       <div id="pipeline"></div>
 
@@ -287,7 +287,7 @@
     </section>
 
     <section id="page-repos" class="page">
-      <h2>Repos <button class="ov-btn" onclick="document.getElementById('addRepoDialog').showModal()">+ Add Repo</button></h2>
+      <h2>Repos <button type="button" class="ov-btn" onclick="document.getElementById('addRepoDialog').showModal()">+ Add Repo</button></h2>
       <div id="repos"></div>
     </section>
 
@@ -304,8 +304,8 @@
         </select></label>
       </div>
       <div class="dlg-actions">
-        <button class="q" onclick="addRepo()">Add</button>
-        <button onclick="document.getElementById('addRepoDialog').close()">Cancel</button>
+        <button type="button" class="q" onclick="addRepo()">Add</button>
+        <button type="button" onclick="document.getElementById('addRepoDialog').close()">Cancel</button>
       </div>
     </dialog>
 
