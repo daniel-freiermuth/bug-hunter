@@ -158,11 +158,19 @@ CREATE TABLE IF NOT EXISTS pr_state (
   addressed_fingerprint TEXT,              -- the fingerprint an engage reply already declined to
                                             -- fix (no commits pushed); sync_prs suppresses re-flagging
                                             -- a static reason whose CURRENT fingerprint still matches
-                                            -- this -- state-based, not time-based: no re-poking a
+                                            -- this AND whose head_sha still matches addressed_head_sha
+                                            -- -- state-based, not time-based: no re-poking a
                                             -- worker explained itself on once, no matter how long the
                                             -- daemon then runs unattended, until the actual situation
-                                            -- (which check fails, review state, conflict) changes.
+                                            -- (which check fails, review state, conflict, or the code
+                                            -- itself via a human push) changes.
                                             -- Cleared the moment it does (see run_engage/sync_prs).
+  head_sha      TEXT,                      -- PR/MR's head commit SHA as of the last sync
+  addressed_head_sha TEXT,                 -- head_sha at the moment addressed_fingerprint was set;
+                                            -- a mismatch means new code landed since the decline, so
+                                            -- a same-looking static reason is treated as fresh, not
+                                            -- suppressed (a human push always deserves a fresh look
+                                            -- even if, coincidentally, the same check is still red)
   synced_at     INTEGER,
   harvested_at  INTEGER,                   -- epoch ms run_harvest reviewed this merged PR; NULL = pending
   harvest_attempts INTEGER NOT NULL DEFAULT 0, -- consecutive run_harvest attempts hitting last_harvest_failure

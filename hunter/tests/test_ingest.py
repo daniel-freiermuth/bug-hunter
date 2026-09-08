@@ -328,9 +328,12 @@ def test_modernization_ingested_with_type_columns(env: tuple[Store, int, Path]) 
     assert rows[0]["bug_class"] is None
 
 
-def test_modernization_missing_class_is_not_invalid(env: tuple[Store, int, Path]) -> None:
+def test_modernization_bug_class_is_optional_when_required_fields_present(
+    env: tuple[Store, int, Path],
+) -> None:
     """modernization findings never carry bug_class -- only a generic
-    severity/confidence check applies, same as dep_update/test_gap/refactor."""
+    severity/confidence check plus its own required fields apply, same as
+    dep_update/test_gap/refactor."""
     store, repo_id, fdir = env
     entries = [
         {
@@ -347,6 +350,28 @@ def test_modernization_missing_class_is_not_invalid(env: tuple[Store, int, Path]
         store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
     )
     assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+
+
+def test_modernization_missing_class_is_invalid(env: tuple[Store, int, Path]) -> None:
+    """Unlike bug_class, modernization_class IS a required field for this
+    type -- omitting it must reject the entry, not silently insert it."""
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:x",
+            "severity": "low",
+            "confidence": 0.5,
+            "summary": "x",
+            # modernization_class omitted
+            "current_approach": "old approach",
+            "proposed_approach": "new approach",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
+    )
+    assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
+    assert store.list_all_findings(finding_type="modernization") == []
 
 
 def test_different_types_do_not_leak_into_each_others_known_list(
@@ -436,6 +461,45 @@ def test_test_gap_missing_required_field_is_invalid(env: tuple[Store, int, Path]
     )
     assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
     assert store.list_all_findings(finding_type="test_gap") == []
+
+
+def test_test_gap_malformed_missing_tests_shape_is_invalid_not_a_crash(
+    env: tuple[Store, int, Path],
+) -> None:
+    """missing_tests must be a list (store.upsert_finding only json.dumps()s
+    it when isinstance(..., list)) -- a truthy-but-wrong-shaped value (e.g.
+    a dict) previously passed the old truthy-only check, then reached
+    SQLite unconverted and raised, aborting every LATER entry in the same
+    findings.json batch rather than just this one invalid entry."""
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:foo.py:bar:test-gap-malformed",
+            "file": "foo.py",
+            "symbol": "bar",
+            "summary": "bar has no test for empty input",
+            "missing_tests": {"not": "a list"},
+            "test_file": "test_foo.py",
+        },
+        {
+            "fingerprint": "repo:foo.py:baz:test-gap-after",
+            "file": "foo.py",
+            "symbol": "baz",
+            "summary": "baz has no test for negative input",
+            "missing_tests": ["negative input"],
+            "test_file": "test_foo.py",
+        },
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="test_gap"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 1}, (
+        "the malformed entry must be skipped as invalid, and the LATER valid"
+        " entry must still be processed, not lost to an aborted batch"
+    )
+    rows = store.list_all_findings(finding_type="test_gap")
+    assert len(rows) == 1
+    assert rows[0]["fingerprint"] == "repo:foo.py:baz:test-gap-after"
 
 
 def test_test_gap_all_required_fields_ingests(env: tuple[Store, int, Path]) -> None:

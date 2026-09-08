@@ -338,16 +338,18 @@ class TestBuildHarvestPrompt:
         assert isinstance(result, str)
         assert "{{" not in result
 
-    def test_untrusted_content_guidance_precedes_pr_data_and_survives_injection_attempt(self):
-        """A malicious PR body/comment is a realistic injection vector --
-        run_harvest acts autonomously on whatever it reads here (files
-        FOLLOW-UPS.json entries straight into the finding queue). The
-        rendered prompt must (a) still contain the untrusted-content
-        warning from harvest.md, (b) place it BEFORE the PR title/body/
-        feedback section so the worker reads the warning first, and (c)
-        the injection payload itself must reach the model only as
-        escaped, inert text -- never as something that could be mistaken
-        for a live instruction boundary."""
+    def test_untrusted_content_guidance_precedes_pr_data_in_rendered_prompt(self):
+        """This tests ONE layer of defense -- that the untrusted-content
+        warning from harvest.md actually reaches the rendered prompt, ahead
+        of the PR data it warns about, and that a brace-based injection
+        payload can't break template rendering. It does NOT and cannot
+        prove a worker won't be fooled by the payload; that's a model
+        behavior no unit test can verify. The actual trust boundary --
+        that whatever the worker writes to FOLLOW-UPS.json still has to
+        pass structural ingestion validation before becoming a real
+        finding -- is tested separately, against the real pipeline, in
+        test_followups.py (see TestHarvestFollowUpIngestion's malformed/
+        injection-shaped-entry cases)."""
         pr: dict = {
             "title": "deps: bump AGP to 8.5.0",
             "body": (

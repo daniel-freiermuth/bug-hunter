@@ -72,6 +72,7 @@ def _pr(
     check_name: str = "CI",
     conflicting: bool = False,
     state: str = "OPEN",
+    head_sha: str = "sha1",
 ) -> dict[str, Any]:
     rollup = [{"name": check_name, "conclusion": "FAILURE"}] if checks_failing else []
     return {
@@ -83,6 +84,7 @@ def _pr(
         "statusCheckRollup": rollup,
         "updatedAt": "2026-01-01T00:00:00Z",
         "headRefName": "feature",
+        "headRefOid": head_sha,
     }
 
 
@@ -198,7 +200,9 @@ class TestAttentionSinceTracking:
         re-flagged, no matter how many sync_prs passes happen -- and
         with no time bound at all, unlike a fixed-duration backoff."""
         finding = _setup(store, tmp_path)
-        store.upsert_pr_state(finding["id"], addressed_fingerprint="checks:CI")
+        store.upsert_pr_state(
+            finding["id"], addressed_fingerprint="checks:CI", addressed_head_sha="sha1"
+        )
         monkeypatch.setattr(
             scheduler, "forge_for", lambda repo: _FakeForge(_pr(checks_failing=True))
         )
@@ -211,6 +215,37 @@ class TestAttentionSinceTracking:
         assert ps["needs_attention"] is None
         assert ps["attention_fingerprint"] == "checks:CI"  # still tracked, just not flagged
         assert store.list_attention() == []
+
+    def test_identical_fingerprint_but_new_head_sha_is_not_suppressed(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A human push that happens to leave the SAME check name red is
+        still new information -- the fingerprint string alone can't tell
+        'nothing changed' from 'something changed but the outcome looks
+        the same by coincidence'. Only trusting the static reason string
+        (this test's regression target) would wrongly keep it suppressed
+        forever after any decline, even once real new code landed."""
+        finding = _setup(store, tmp_path)
+        store.upsert_pr_state(
+            finding["id"], addressed_fingerprint="checks:CI", addressed_head_sha="sha1"
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "forge_for",
+            lambda repo: _FakeForge(_pr(checks_failing=True, head_sha="sha2")),
+        )
+
+        sync_prs(store, cfg)
+
+        ps = store.get_pr_state(finding["id"])
+        assert ps is not None
+        assert ps["attention_fingerprint"] == "checks:CI"  # same-looking static reason
+        assert ps["needs_attention"] == "checks_failing", (
+            "a new head sha must re-flag even when the fingerprint string is identical"
+        )
+        assert ps["addressed_fingerprint"] is None, "the stale decline marker must be cleared"
+        assert ps["addressed_head_sha"] is None
+        assert ps["head_sha"] == "sha2"
 
     def test_a_different_failing_check_is_not_suppressed_by_an_unrelated_decline(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

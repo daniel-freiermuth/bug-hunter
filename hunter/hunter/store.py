@@ -64,6 +64,8 @@ _PR_STATE_COLUMNS = {
     "attention_since",
     "attention_fingerprint",
     "addressed_fingerprint",
+    "head_sha",
+    "addressed_head_sha",
     "synced_at",
     "harvested_at",
     "harvest_attempts",
@@ -175,6 +177,12 @@ class Store:
                 "last_harvest_failure",
                 "pr_state",
                 "ALTER TABLE pr_state ADD COLUMN last_harvest_failure TEXT",
+            ),
+            ("head_sha", "pr_state", "ALTER TABLE pr_state ADD COLUMN head_sha TEXT"),
+            (
+                "addressed_head_sha",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN addressed_head_sha TEXT",
             ),
         ]:
             try:

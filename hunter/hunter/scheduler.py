@@ -1283,7 +1283,19 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
         # of whether the static situation is unchanged.
         fp = _attention_fingerprint(pr, failing_names)
         addressed_fp = prev.get("addressed_fingerprint") if prev else None
-        suppressed = fp is not None and fp == addressed_fp
+        addressed_sha = prev.get("addressed_head_sha") if prev else None
+        head_sha = pr.get("headRefOid")
+        # A push that happens to leave the SAME check name red (or the
+        # same review/conflict state) is still new information -- the
+        # code changed even if today's static snapshot looks identical to
+        # what was declined before. Require the head sha to match too, not
+        # just the fingerprint string, before trusting the suppression.
+        suppressed = (
+            fp is not None
+            and fp == addressed_fp
+            and addressed_sha is not None
+            and head_sha == addressed_sha
+        )
 
         reasons: list[str] = []
         if last_activity > (engaged or 0):
@@ -1307,15 +1319,17 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
         if attention != prev_attention:
             reason_fields["attention_since"] = now_ms() if attention else None
         # Any change from what was last addressed (resolved to nothing
-        # wrong, OR changed to a genuinely different problem) clears the
-        # stale marker -- so a LATER recurrence of the ORIGINAL problem,
-        # even after an unrelated one intervened in between, is treated
-        # as fresh rather than auto-suppressed by memory of a
-        # since-superseded decline. Comparing here, before the write
-        # below, against the fingerprint this decision (suppressed,
-        # above) was actually based on.
+        # wrong, changed to a genuinely different problem, OR the code
+        # moved since the decline) clears the stale marker -- so a LATER
+        # recurrence of the ORIGINAL problem, even after an unrelated one
+        # intervened in between, is treated as fresh rather than
+        # auto-suppressed by memory of a since-superseded decline.
+        # Comparing here, before the write below, against the fingerprint
+        # and sha this decision (suppressed, above) was actually based on.
         clear_addressed = (
-            {"addressed_fingerprint": None} if addressed_fp and fp != addressed_fp else {}
+            {"addressed_fingerprint": None, "addressed_head_sha": None}
+            if addressed_fp and (fp != addressed_fp or head_sha != addressed_sha)
+            else {}
         )
 
         store.upsert_pr_state(
@@ -1325,6 +1339,7 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
             mergeable=pr.get("mergeable"),
             checks=checks,
             head_ref=pr.get("headRefName"),
+            head_sha=head_sha,
             last_activity_at=last_activity,
             last_engaged_activity_at=engaged,
             needs_attention=attention,
@@ -1653,6 +1668,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
         last_engaged_activity_at=engaged_mark,
         synced_at=now_ms(),
         addressed_fingerprint=None if pushed else ps.get("attention_fingerprint"),
+        addressed_head_sha=None if pushed else ps.get("head_sha"),
     )
     did = [b for b, on in (("pushed", pushed), ("replied", replied)) if on] or ["no-op"]
     store.log_event(
