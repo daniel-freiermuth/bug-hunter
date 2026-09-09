@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import re
 import sys
 import threading
@@ -45,6 +46,41 @@ if TYPE_CHECKING:
     # replace the Any that used to stand in for Store's real shape below.
     from .backend import Backend
     from .store import Store
+
+
+# Process-level lockfile -- prevents two hunter processes from running
+# against the same database simultaneously.  Two schedulers calling
+# pick_next concurrently would double-dispatch jobs, create duplicate
+# PRs, and blind each other's budget gates to in-flight work.
+# The lock is held for the process lifetime (released on exit/crash
+# automatically by the OS closing the fd).
+_lockfile_fd: int | None = None
+
+
+def _acquire_lockfile(cfg: "Config") -> None:
+    """Acquire an exclusive flock on <work_root>/hunter.lock.
+
+    Fails fast with a clear error if another process already holds it.
+    The fd is kept open (module-global) for the process lifetime;
+    the OS releases the lock when the process exits or is killed.
+    """
+    import fcntl
+
+    global _lockfile_fd  # noqa: PLW0603
+    lock_path = cfg.work_root / "hunter.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise SystemExit(
+            f"error: another hunter process is already running (lock: {lock_path})\n"
+            "  check: ps aux | grep 'hunter daemon'\n"
+            "  or:    systemctl --user status hunter.service"
+        ) from None
+    _lockfile_fd = fd
+
 
 log = logging.getLogger(__name__)
 
@@ -676,6 +712,7 @@ def serve(cfg: Config) -> None:
     from .backends.omp_scavenge import OmpScavengeBackend
     from .store import ThreadLocalLedger
 
+    _acquire_lockfile(cfg)
     backend = OmpScavengeBackend(cfg=cfg, ledger=ThreadLocalLedger(cfg))
     httpd = make_server(cfg, backend)
     log.info("ui http://127.0.0.1:%d/", httpd.server_address[1])
@@ -993,6 +1030,7 @@ def daemon(cfg: Config) -> None:
     from .backends.omp_scavenge import OmpScavengeBackend
     from .store import Store, ThreadLocalLedger
 
+    _acquire_lockfile(cfg)
     backend = OmpScavengeBackend(cfg=cfg, ledger=ThreadLocalLedger(cfg))
 
     httpd = make_server(cfg, backend)
