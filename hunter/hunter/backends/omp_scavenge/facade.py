@@ -383,13 +383,14 @@ class OmpScavengeBackend:
             # Probe age
             probe_age = f"{w.age_s / 60:.0f}m ago"
 
-            # Reset countdown
+            # Reset countdown + absolute time
             if w.resets_at:
                 remain_s = (w.resets_at - now_ms) / 1000
+                reset_abs = time.strftime("%I:%M %p", time.localtime(w.resets_at / 1000)).lstrip("0")
                 if remain_s > 0:
                     h, m = int(remain_s // 3600), int((remain_s % 3600) // 60)
                     countdown = f"{h}h{m:02d}m" if h else f"{m}m"
-                    reset_str = f"resets in {countdown}"
+                    reset_str = f"resets {reset_abs} ({countdown})"
                 else:
                     reset_str = "resetting"
             else:
