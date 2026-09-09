@@ -366,14 +366,16 @@ class OmpScavengeBackend:
             soft_pct = min(100 - fill_pct, max(0, round(unacct * 100)))
             ramp_pct = min(100, round(ramp * 100)) if ramp is not None else None
 
-            # Available tokens estimate
+            # Available headroom
+            avail_frac = max(0.0, (ramp if ramp is not None else 1.0) - (w.used_fraction or 0) - unacct)
+            avail_pct = f"{avail_frac * 100:.0f}%"
             cap = self.ledger.estimate_capacity(lid)
-            avail_tok = (
-                max(0.0, (ramp if ramp is not None else 1.0) - (w.used_fraction or 0) - unacct) * cap
-                if cap is not None and w.used_fraction is not None
-                else None
-            )
-            avail_str = f" \u00b7 ~{self._fmt_tokens(avail_tok)} tok avail" if avail_tok is not None else ""
+            avail_tok = avail_frac * cap if cap is not None else None
+            avail_str = (
+                f" \u00b7 {avail_pct} avail (~{self._fmt_tokens(avail_tok)} tok)"
+                if avail_tok is not None
+                else f" \u00b7 {avail_pct} avail"
+            ) if w.used_fraction is not None else ""
 
             # Determine tone
             is_stale = w.age_s > 1800
