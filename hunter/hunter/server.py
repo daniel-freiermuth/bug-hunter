@@ -1018,7 +1018,6 @@ def daemon(cfg: Config) -> None:
         if _cycle_lock.acquire(blocking=False):
             _wake.clear()
             try:
-                store = Store(cfg)
                 _reconcile_and_log(store)
                 summary = scheduler.run_cycle(store, cfg, backend=backend)
                 sleep_s = _compute_sleep_s(store, summary)

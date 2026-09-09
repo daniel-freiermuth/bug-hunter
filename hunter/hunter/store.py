@@ -113,7 +113,7 @@ class Store:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(cfg.db_path)
+        self.db = sqlite3.connect(cfg.db_path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA_PATH.read_text())
         self.db.commit()
