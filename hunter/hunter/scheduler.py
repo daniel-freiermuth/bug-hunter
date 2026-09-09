@@ -176,7 +176,9 @@ def _record_job(
     return state
 
 
-def _ingest_followups(store: Store, repo_id: int, worktree: Path, fid: int, job: int) -> None:
+def _ingest_followups(
+    store: Store, repo_id: int, worktree: Path, fid: int, job: int, kind: str
+) -> None:
     """Read worktree/FOLLOW-UPS.json (if the worker wrote one) and file its
     entries as real findings -- each entry declares its own "type", since
     a follow-up can be anything (a deferred migration, a dep bump that's
@@ -185,14 +187,17 @@ def _ingest_followups(store: Store, repo_id: int, worktree: Path, fid: int, job:
     PR/comment that stops being read the moment the PR closes or merges --
     see apply_improvement.md step 5 and engage.md's superseded-PR guidance
     for the two places a worker is told to write this file. Call BEFORE
-    the caller drops the worktree."""
+    the caller drops the worktree. `kind` is the CALLER's event kind
+    (engage/harvest), not a fixed value -- so the audit log correctly
+    attributes which job actually filed the follow-up.
+    """
     followups_path = worktree / "FOLLOW-UPS.json"
     if not followups_path.exists():
         return
     counts = ingest_findings(store, repo_id, followups_path, finding_type=None)
     if counts["inserted"]:
         store.log_event(
-            "modernization",
+            kind,
             f"#{fid}: +{counts['inserted']} follow-up(s) filed from deferred/superseded work"
             f" ({counts['duplicates']} dup / {counts['invalid']} invalid)",
             job_id=job,
@@ -1151,12 +1156,13 @@ def _checks_summary(
         )
         for c in rollup
     ]
-    failing_names = sorted({name for name, concl in named if concl in _FAIL_CONCLUSIONS})
+    failing = [name for name, concl in named if concl in _FAIL_CONCLUSIONS]
+    failing_names = sorted(set(failing))
     passing = sum(1 for _, concl in named if concl in ("SUCCESS", "NEUTRAL", "SKIPPED"))
-    pending = len(named) - len(failing_names) - passing
+    pending = len(named) - len(failing) - passing
     parts = [f"{passing} pass"]
     if failing_names:
-        parts.append(f"{len(failing_names)} fail")
+        parts.append(f"{len(failing)} fail")
     if pending:
         parts.append(f"{pending} pending")
     return " / ".join(parts), bool(failing_names), failing_names
@@ -1573,7 +1579,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
         # distinguishing "fully done, nothing left" from "the goal is now
         # MORE reachable, not less" (see engage.md's superseded-PR
         # guidance). Read before _drop_worktree below removes the file.
-        _ingest_followups(store, repo["id"], worktree, fid, job)
+        _ingest_followups(store, repo["id"], worktree, fid, job, "engage")
         _drop_worktree()
         summary["outcome"] = "withdrawn"
         return summary
@@ -1816,7 +1822,7 @@ def run_harvest(store: Store, cfg: Config, finding: Row) -> Row:
     state = _record_job(store, job, rr, model=model, usage_delta=delta)
 
     # Read before _drop_worktree below removes the file.
-    _ingest_followups(store, repo["id"], worktree, fid, job)
+    _ingest_followups(store, repo["id"], worktree, fid, job, "harvest")
     _drop_worktree()
 
     summary: Row = {"kind": "harvest", "finding": fid, "job": job, "state": state, "pr": num}

@@ -9,8 +9,6 @@ review feedback autonomously; a harvest pass reviews each merged PR's full
 lifetime for genuine deferred follow-up work. Runs as a daemon that idles at
 zero token cost and only spends against a budget it never overshoots.
 
-Design + measured grounding: `../IDEA.md`, `../EXPERIMENT-*.md`.
-
 ## Contents
 
 - [Quick start](#quick-start)

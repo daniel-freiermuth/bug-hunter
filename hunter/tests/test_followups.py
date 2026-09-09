@@ -164,6 +164,14 @@ class TestHarvestFollowUpIngestion:
         ps = store.get_pr_state(finding["id"])
         assert ps is not None
         assert ps["harvested_at"] is not None
+        followup_events = [
+            e for e in store.recent_events(limit=20) if "follow-up(s) filed" in e["message"]
+        ]
+        assert len(followup_events) == 1
+        assert followup_events[0]["kind"] == "harvest", (
+            "the follow-up-filed event must be logged under the CALLING job's"
+            " kind (harvest), not a hardcoded value"
+        )
 
     def test_no_followups_file_harvests_with_no_extra_findings(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -484,6 +492,14 @@ class TestEngageWithdrawFollowUpIngestion:
             "repo:gradle:com.google.dagger:hilt-android:2.56.2->2.60.1"
         )
         assert dep_updates[0]["status"] == "new"
+        followup_events = [
+            e for e in store.recent_events(limit=20) if "follow-up(s) filed" in e["message"]
+        ]
+        assert len(followup_events) == 1
+        assert followup_events[0]["kind"] == "engage", (
+            "the follow-up-filed event must be logged under the CALLING job's"
+            " kind (engage), not a hardcoded value"
+        )
 
     def test_withdraw_without_followups_is_unaffected(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
