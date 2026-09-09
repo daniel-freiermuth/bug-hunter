@@ -674,9 +674,9 @@ def make_server(cfg: Config, backend: Backend, port: int | None = None) -> _Serv
 
 def serve(cfg: Config) -> None:
     from .backends.omp_scavenge import OmpScavengeBackend
-    from .store import Store
+    from .store import ThreadLocalLedger
 
-    backend = OmpScavengeBackend(cfg=cfg, ledger=Store(cfg))
+    backend = OmpScavengeBackend(cfg=cfg, ledger=ThreadLocalLedger(cfg))
     httpd = make_server(cfg, backend)
     log.info("ui http://127.0.0.1:%d/", httpd.server_address[1])
     try:
@@ -991,10 +991,9 @@ def daemon(cfg: Config) -> None:
     import signal as _signal
 
     from .backends.omp_scavenge import OmpScavengeBackend
-    from .store import Store
+    from .store import Store, ThreadLocalLedger
 
-    store = Store(cfg)
-    backend = OmpScavengeBackend(cfg=cfg, ledger=store)
+    backend = OmpScavengeBackend(cfg=cfg, ledger=ThreadLocalLedger(cfg))
 
     httpd = make_server(cfg, backend)
     threading.Thread(target=httpd.serve_forever, name="hunter-ui", daemon=True).start()
@@ -1018,6 +1017,7 @@ def daemon(cfg: Config) -> None:
         if _cycle_lock.acquire(blocking=False):
             _wake.clear()
             try:
+                store = Store(cfg)
                 _reconcile_and_log(store)
                 summary = scheduler.run_cycle(store, cfg, backend=backend)
                 sleep_s = _compute_sleep_s(store, summary)

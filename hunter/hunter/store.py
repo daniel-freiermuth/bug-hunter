@@ -113,7 +113,7 @@ class Store:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(cfg.db_path, check_same_thread=False)
+        self.db = sqlite3.connect(cfg.db_path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA_PATH.read_text())
         self.db.commit()
@@ -1042,3 +1042,67 @@ class Store:
             )
         )
         return rows[0] if rows else {}
+
+
+class ThreadLocalLedger:
+    """Thread-safe SpendLedger: one Store (one SQLite connection) per thread.
+
+    SQLite connections must not be shared across threads (check_same_thread
+    enforces this by default).  The daemon has three threads hitting the
+    backend's ledger (scheduler loop, prober, HTTP handlers), so the
+    backend needs per-thread connections.
+
+    Each thread gets its own Store on first access, cached in a
+    threading.local for reuse within that thread's lifetime.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._local = __import__("threading").local()
+
+    def _store(self) -> Store:
+        s = getattr(self._local, "store", None)
+        if s is None:
+            s = Store(self._cfg)
+            self._local.store = s
+        return s
+
+    # -- SpendLedger protocol -------------------------------------------------
+
+    def running_estimate(self) -> int:
+        return self._store().running_estimate()
+
+    def finished_since(self, ts_ms: int) -> int:
+        return self._store().finished_since(ts_ms)
+
+    def finished_between(self, start_ms: int, end_ms: int) -> int:
+        return self._store().finished_between(start_ms, end_ms)
+
+    def log_window_observation(
+        self,
+        limit_id: str,
+        used_fraction: float | None,
+        status: str | None,
+        resets_at: int | None,
+        age_s: float,
+    ) -> None:
+        self._store().log_window_observation(limit_id, used_fraction, status, resets_at, age_s)
+
+    def last_window_observation(
+        self, limit_id: str, resets_at: int
+    ) -> tuple[int, float] | None:
+        return self._store().last_window_observation(limit_id, resets_at)
+
+    def record_calibration_sample(
+        self,
+        limit_id: str,
+        window_resets_at: int,
+        used_fraction_delta: float,
+        hunter_tokens: int,
+    ) -> None:
+        self._store().record_calibration_sample(limit_id, window_resets_at, used_fraction_delta, hunter_tokens)
+
+    def estimate_capacity(
+        self, limit_id: str, min_delta: float = 0.02, sample_limit: int = 200
+    ) -> float | None:
+        return self._store().estimate_capacity(limit_id, min_delta, sample_limit)
