@@ -7,6 +7,7 @@
     "test": "tests"
   },
   "scripts": {
+    "build": "esbuild ui/src/app.ts --bundle --format=iife --outfile=ui/app.js --sourcemap",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
