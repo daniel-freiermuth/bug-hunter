@@ -16,6 +16,26 @@ from hunter import scheduler
 from hunter.scheduler import run_engage, sync_prs
 from hunter.store import Store
 from hunter.types import Config, RunResult
+from hunter.backend import Granted, Outlook
+
+
+class _FakeBackend:
+    """Minimal Backend for tests: always grants, delegates run() to a worker fn."""
+
+    def __init__(self, worker_fn: object) -> None:
+        self._fn = worker_fn
+
+    def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
+        return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
+
+    def run(self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+        return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
+
+    def keep_fresh(self) -> bool:
+        return False
+
+    def status(self) -> str:
+        return ""
 
 
 @pytest.fixture
@@ -175,9 +195,8 @@ class TestEngageAllowsBranchHistoryRewrite:
             (worktree / "PR-REPLY.md").write_text("Addressed the feedback.\n")
             return _fake_result()
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
-
-        result = run_engage(store, cfg, finding)
+        backend = _FakeBackend(fake_run_worker)
+        result = run_engage(store, cfg, finding, backend)
         assert result.get("outcome") == "engaged", result
         assert result.get("pushed") is True
 
@@ -211,9 +230,8 @@ class TestEngageAllowsBranchHistoryRewrite:
             (worktree / "PR-REPLY.md").write_text("Rebased and squashed as requested.\n")
             return _fake_result()
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
-
-        result = run_engage(store, cfg, finding)
+        backend = _FakeBackend(fake_run_worker)
+        result = run_engage(store, cfg, finding, backend)
         assert result.get("outcome") == "engaged", result
         assert result.get("pushed") is True
 
@@ -247,9 +265,8 @@ class TestEngageNeverTargetsDefaultBranch:
             called = True
             return _fake_result()
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
-
-        result = run_engage(store, cfg, finding)
+        backend = _FakeBackend(fake_run_worker)
+        result = run_engage(store, cfg, finding, backend)
         assert "error" in result
         assert not called, "worker must never run when head_ref is the default branch"
 
@@ -279,9 +296,8 @@ class TestEngageAddressedFingerprint:
             (worktree / "PR-REPLY.md").write_text("This is pre-existing, not caused by this PR.\n")
             return _fake_result()
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
-
-        result = run_engage(store, cfg, finding)
+        backend = _FakeBackend(fake_run_worker)
+        result = run_engage(store, cfg, finding, backend)
         assert result.get("outcome") == "engaged", result
         assert result.get("pushed") is False
 
@@ -315,9 +331,8 @@ class TestEngageAddressedFingerprint:
             (worktree / "PR-REPLY.md").write_text("Fixed.\n")
             return _fake_result()
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
-
-        result = run_engage(store, cfg, finding)
+        backend = _FakeBackend(fake_run_worker)
+        result = run_engage(store, cfg, finding, backend)
         assert result.get("outcome") == "engaged", result
         assert result.get("pushed") is True
 
@@ -334,9 +349,8 @@ class TestEngageAddressedFingerprint:
         finding, fake_forge = _setup(store, tmp_path)
         store.upsert_pr_state(finding["id"], attention_fingerprint="mergeable:CONFLICTING")
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
-        monkeypatch.setattr(scheduler.runner, "run_worker", lambda *_a, **_kw: _fake_result())
-
-        result = run_engage(store, cfg, finding)
+        backend = _FakeBackend(lambda *_a, **_kw: _fake_result())
+        result = run_engage(store, cfg, finding, backend)
         assert result.get("outcome") == "engaged", result
         assert result.get("pushed") is False
         assert result.get("replied") is False
@@ -374,8 +388,8 @@ class TestEngageAddressedFingerprint:
             (worktree / "PR-REPLY.md").write_text("This is a pre-existing failure, not mine.\n")
             return _fake_result()
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
-        result = run_engage(store, cfg, finding)
+        backend = _FakeBackend(fake_run_worker)
+        result = run_engage(store, cfg, finding, backend)
         assert result.get("outcome") == "engaged", result
         assert result.get("pushed") is False
 
@@ -414,8 +428,8 @@ class TestEngageAddressedFingerprint:
             (worktree / "PR-REPLY.md").write_text("This is a pre-existing failure, not mine.\n")
             return _fake_result()
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
-        result = run_engage(store, cfg, finding)
+        backend = _FakeBackend(fake_run_worker)
+        result = run_engage(store, cfg, finding, backend)
         assert result.get("pushed") is False
 
         declined = store.get_pr_state(finding["id"])

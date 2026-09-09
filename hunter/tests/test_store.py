@@ -9,7 +9,8 @@ from typing import Any
 import pytest
 
 from hunter.store import Store, _require_keys
-from hunter.types import Config, SchedulerStateDict, WindowState, now_ms
+from hunter.backends.omp_scavenge.capacity import WindowState
+from hunter.types import Config, SchedulerStateDict, now_ms
 
 
 @pytest.fixture
@@ -350,38 +351,24 @@ class TestEvents:
 
 
 class TestWindowLog:
-    def test_log_window(self, store: Store) -> None:
-        states = [
-            WindowState(
-                limit_id="anthropic:5h",
-                used_fraction=0.3,
-                status="ok",
-                resets_at=9999999,
-                recorded_at=1000000,
-                age_s=5.0,
-            ),
-            WindowState(
-                limit_id="anthropic:7d",
-                used_fraction=0.1,
-                status="ok",
-                resets_at=9999999,
-                recorded_at=1000000,
-                age_s=10.0,
-            ),
-        ]
-        store.log_window(states)
+    def test_log_window_observation(self, store: Store) -> None:
+        store.log_window_observation(
+            "anthropic:5h", 0.3, "ok", 9999999, 5.0,
+        )
+        store.log_window_observation(
+            "anthropic:7d", 0.1, "ok", 9999999, 10.0,
+        )
         rows = store.db.execute("SELECT * FROM window_log ORDER BY id").fetchall()
         assert len(rows) == 2
         assert dict(rows[0])["limit_id"] == "anthropic:5h"
         assert dict(rows[1])["limit_id"] == "anthropic:7d"
         assert dict(rows[0])["source_age_s"] == 5
 
-
 # -- calibration -------------------------------------------------------
 
 
 class TestCalibration:
-    """log_window's calibration_samples side effect and estimate_capacity."""
+    """Backend._observe calibration side effect and estimate_capacity."""
 
     _RESETS_AT = 99_999_999_999
 
@@ -395,19 +382,26 @@ class TestCalibration:
             age_s=1.0,
         )
 
+    def _observe(self, store: Store, probe: WindowState) -> None:
+        """Simulate backend._observe for a single probe."""
+        from hunter.backends.omp_scavenge.facade import OmpScavengeBackend
+        cfg = Config(work_root=Path("/tmp"), db_path=Path("/tmp/test.db"))
+        backend = OmpScavengeBackend(cfg=cfg, ledger=store)
+        backend._observe({"anthropic:5h": probe})
+
     def test_first_probe_records_no_sample(self, store: Store) -> None:
         """Nothing to compare against yet -- no prior row for this window."""
-        store.log_window([self._probe(0.10)])
+        self._observe(store, self._probe(0.10))
         assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
 
     def test_fresh_probe_with_hunter_spend_records_a_sample(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
-        store.log_window([self._probe(0.10)])
+        self._observe(store, self._probe(0.10))
         time.sleep(0.02)
         jid = store.create_job("hunt", rid)
         store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
         time.sleep(0.02)
-        store.log_window([self._probe(0.20)])
+        self._observe(store, self._probe(0.20))
 
         rows = store.db.execute("SELECT * FROM calibration_samples").fetchall()
         assert len(rows) == 1
@@ -421,27 +415,27 @@ class TestCalibration:
         """A re-read of the same stale probe (used_fraction didn't move)
         must not fabricate a sample out of noise."""
         rid = store.add_repo("r", "https://r", "/r")
-        store.log_window([self._probe(0.10)])
+        self._observe(store, self._probe(0.10))
         time.sleep(0.02)
         jid = store.create_job("hunt", rid)
         store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
         time.sleep(0.02)
-        store.log_window([self._probe(0.10)])  # same fraction -- no fresh probe
+        self._observe(store, self._probe(0.10))  # same fraction -- no fresh probe
         assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
 
     def test_no_hunter_spend_records_no_sample(self, store: Store) -> None:
         """used_fraction moved but hunter didn't run anything in the gap
         (e.g. a human's own interactive usage) -- nothing attributable."""
-        store.log_window([self._probe(0.10)])
+        self._observe(store, self._probe(0.10))
         time.sleep(0.02)
-        store.log_window([self._probe(0.20)])
+        self._observe(store, self._probe(0.20))
         assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
 
     def test_different_window_instance_not_compared(self, store: Store) -> None:
         """A genuinely new window (different resets_at) must not be
         diffed against the previous instance's used_fraction."""
         rid = store.add_repo("r", "https://r", "/r")
-        store.log_window([self._probe(0.90)])  # old window, nearly full
+        self._observe(store, self._probe(0.90))  # old window, nearly full
         time.sleep(0.02)
         jid = store.create_job("hunt", rid)
         store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
@@ -450,7 +444,7 @@ class TestCalibration:
             limit_id="anthropic:5h", used_fraction=0.05, status="ok",
             resets_at=self._RESETS_AT + 6 * 3600 * 1000, recorded_at=1, age_s=1.0,
         )
-        store.log_window([fresh])
+        self._observe(store, fresh)
         assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
 
     def test_estimate_capacity_no_data_returns_none(self, store: Store) -> None:

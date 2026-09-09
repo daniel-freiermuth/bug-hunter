@@ -5,7 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -22,7 +22,6 @@ from .types import (
     Row,
     SchedulerStateDict,
     Severity,
-    WindowState,
     now_ms,
 )
 
@@ -861,58 +860,6 @@ class Store:
             out.setdefault(r["finding_id"], []).append(r)
         return out
 
-    _CALIBRATION_DURATIONS_MS: ClassVar[dict[str, int]] = {
-        "5h": 5 * 3600 * 1000,
-        "7d": 7 * 24 * 3600 * 1000,
-    }
-
-    def log_window(self, states: list[WindowState]) -> None:
-        """Record each window observation, and -- whenever this is a
-        FRESH probe (used_fraction actually moved since the last row for
-        this exact window instance) -- also record a calibration sample
-        correlating hunter's own token spend in that gap with how much
-        Anthropic's used_fraction moved. See calibration_samples in
-        schema.sql for what this is (and isn't) good for."""
-        t = now_ms()
-        for w in states:
-            horizon = next(
-                (h for h in self._CALIBRATION_DURATIONS_MS if f":{h}" in w.limit_id), None
-            )
-            if horizon and w.resets_at and w.used_fraction is not None:
-                prev = self.db.execute(
-                    "SELECT observed_at, used_fraction FROM window_log"
-                    " WHERE limit_id = ? AND resets_at BETWEEN ? AND ?"
-                    " ORDER BY observed_at DESC LIMIT 1",
-                    (w.limit_id, w.resets_at - 5000, w.resets_at + 5000),
-                ).fetchone()
-                if (
-                    prev is not None
-                    and prev["used_fraction"] is not None
-                    and w.used_fraction > prev["used_fraction"]
-                    and (t - prev["observed_at"]) <= self._CALIBRATION_DURATIONS_MS[horizon]
-                ):
-                    tok = self.db.execute(
-                        "SELECT COALESCE(SUM(tokens_new), 0) AS t FROM jobs"
-                        " WHERE state != 'running' AND finished_at > ? AND finished_at <= ?",
-                        (prev["observed_at"], t),
-                    ).fetchone()["t"]
-                    if tok > 0:
-                        self.db.execute(
-                            "INSERT INTO calibration_samples"
-                            " (observed_at, limit_id, window_resets_at,"
-                            " used_fraction_delta, hunter_tokens)"
-                            " VALUES (?,?,?,?,?)",
-                            (
-                                t, w.limit_id, w.resets_at,
-                                w.used_fraction - prev["used_fraction"], tok,
-                            ),
-                        )
-            self.db.execute(
-                "INSERT INTO window_log (observed_at, limit_id, used_fraction,"
-                " status, resets_at, source_age_s) VALUES (?,?,?,?,?,?)",
-                (t, w.limit_id, w.used_fraction, w.status, w.resets_at, int(w.age_s)),
-            )
-        self.db.commit()
 
     def estimate_capacity(
         self, limit_id: str, min_delta: float = 0.02, sample_limit: int = 200
@@ -941,6 +888,80 @@ class Store:
         if not ratios:
             return None
         return ratios[min(int(len(ratios) * 0.75), len(ratios) - 1)]
+
+    def running_estimate(self) -> int:
+        """SUM(cap_tokens) of jobs currently in state='running'."""
+        r = self.db.execute(
+            "SELECT COALESCE(SUM(cap_tokens), 0) AS total FROM jobs WHERE state = 'running'"
+        ).fetchone()
+        return int(r["total"])
+
+    def finished_since(self, ts_ms: int) -> int:
+        """SUM(tokens_new) of jobs that finished after ts_ms."""
+        r = self.db.execute(
+            "SELECT COALESCE(SUM(tokens_new), 0) AS total FROM jobs"
+            " WHERE state != 'running' AND finished_at > ?",
+            (ts_ms,),
+        ).fetchone()
+        return int(r["total"])
+
+    def finished_between(self, start_ms: int, end_ms: int) -> int:
+        """SUM(tokens_new) of jobs that finished in (start_ms, end_ms]."""
+        r = self.db.execute(
+            "SELECT COALESCE(SUM(tokens_new), 0) AS total FROM jobs"
+            " WHERE state != 'running' AND finished_at > ? AND finished_at <= ?",
+            (start_ms, end_ms),
+        ).fetchone()
+        return int(r["total"])
+
+    def log_window_observation(
+        self,
+        limit_id: str,
+        used_fraction: float | None,
+        status: str | None,
+        resets_at: int | None,
+        age_s: float,
+    ) -> None:
+        """Record a single window observation to window_log."""
+        self.db.execute(
+            "INSERT INTO window_log (observed_at, limit_id, used_fraction,"
+            " status, resets_at, source_age_s) VALUES (?,?,?,?,?,?)",
+            (now_ms(), limit_id, used_fraction, status, resets_at, int(age_s)),
+        )
+        self.db.commit()
+
+    def last_window_observation(
+        self, limit_id: str, resets_at: int
+    ) -> tuple[int, float] | None:
+        """Most recent (observed_at, used_fraction) for this limit_id
+        and resets_at cycle.  None if no prior observation."""
+        row = self.db.execute(
+            "SELECT observed_at, used_fraction FROM window_log"
+            " WHERE limit_id = ? AND resets_at BETWEEN ? AND ?"
+            " ORDER BY observed_at DESC LIMIT 1",
+            (limit_id, resets_at - 5000, resets_at + 5000),
+        ).fetchone()
+        if row is None or row["used_fraction"] is None:
+            return None
+        return (int(row["observed_at"]), float(row["used_fraction"]))
+
+    def record_calibration_sample(
+        self,
+        limit_id: str,
+        window_resets_at: int,
+        used_fraction_delta: float,
+        hunter_tokens: int,
+    ) -> None:
+        """Record a calibration sample correlating token spend with
+        fraction movement."""
+        self.db.execute(
+            "INSERT INTO calibration_samples"
+            " (observed_at, limit_id, window_resets_at,"
+            " used_fraction_delta, hunter_tokens)"
+            " VALUES (?,?,?,?,?)",
+            (now_ms(), limit_id, window_resets_at, used_fraction_delta, hunter_tokens),
+        )
+        self.db.commit()
 
     def update_finding_analysis(
         self,

@@ -2,7 +2,7 @@
 
 ThreadingHTTPServer + hand-rolled JSON routes; serves ui/index.html.
 Thread safety: a fresh Store (own sqlite connection) per request.
-Heavy modules (store, budget, scheduler) are imported lazily inside
+Heavy modules (store, scheduler) are imported lazily inside
 handlers so the server module stays importable while siblings build.
 """
 
@@ -36,13 +36,14 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    # Type-only: store/budget/scheduler stay runtime-lazy-imported inside
+    # Type-only: store/scheduler stay runtime-lazy-imported inside
     # handlers (see module docstring) so this module keeps importing
     # cleanly while siblings build; this import never executes (PEP 563
     # postponed evaluation via `from __future__ import annotations` above
     # means annotations referencing Store are never evaluated at runtime
     # either), so it can't reintroduce that problem -- it only lets mypy
     # replace the Any that used to stand in for Store's real shape below.
+    from .backend import Backend
     from .store import Store
 
 log = logging.getLogger(__name__)
@@ -98,7 +99,8 @@ def _reconcile_and_log(store: Store) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    cfg: Config  # set by make_server()
+    cfg: Config      # set by make_server()
+    backend: Backend  # set by make_server()
     server_version = "hunter/1"
     protocol_version = "HTTP/1.1"
     timeout = 15  # keep-alive timeout: close idle connections after 15s
@@ -211,33 +213,11 @@ class Handler(BaseHTTPRequestHandler):
             self._error(500, "internal error")
 
     def _summary(self) -> SummaryDict:
-        from . import budget, scheduler
+        from . import scheduler
+        from .backend import Denied, Granted
 
         store = self._store()
-        now_ms = time.time() * 1000
-        windows: dict[str, WindowInfoDict] = {}
-        for limit_id, w in budget.read_windows().items():
-            if ":5h" in limit_id:
-                ramp = budget.ramp_5h(w.resets_at, now_ms)
-            elif ":7d" in limit_id:
-                ramp = budget.ramp_7d(w.resets_at, now_ms)
-            else:
-                ramp = None
-            capacity = store.estimate_capacity(limit_id)
-            available_tokens = (
-                max(0.0, (ramp if ramp is not None else 1.0) - w.used_fraction) * capacity
-                if capacity is not None and w.used_fraction is not None
-                else None
-            )
-            windows[limit_id] = {
-                "used_fraction": w.used_fraction,
-                "status": w.status,
-                "resets_at": w.resets_at,
-                "age_s": w.age_s,
-                "stale": w.stale,
-                "ramp": ramp,
-                "available_tokens": available_tokens,
-            }
+        backend_status_html = self.backend.status()
         counts: dict[str, int] = dict.fromkeys(FINDING_STATUSES, 0)
         all_findings = store.list_all_findings()
         counts.update(Counter(f["status"] for f in all_findings))
@@ -250,7 +230,7 @@ class Handler(BaseHTTPRequestHandler):
 
         # "What's happening" panel: what's running now, why nothing is
         # (if not), and what's next -- all derived from the SAME
-        # functions the scheduler itself uses (pick_next, budget.decide),
+        # functions the scheduler itself uses (pick_next, backend.decide),
         # never a separate guess that could drift from reality.
         current_job = store.current_job()
         next_candidate: NextCandidateDict | None = None
@@ -262,31 +242,23 @@ class Handler(BaseHTTPRequestHandler):
             if picked is not None:
                 kind, target = picked
                 is_finding = kind in ("engage", "harvest", "recheck", "fix")
-                budget_kind = "fix" if kind in ("engage", "harvest", "fix") else "hunt"
                 override = target.get("budget_override") if is_finding else None
-                if override:
-                    budget_state, budget_reason, budget_retry_at = "exempt", f"override: {override}", None
-                else:
-                    raw_windows = budget.read_windows()
-                    repo_id = target["repo_id"] if is_finding else target["id"]
-                    dec = budget.decide(
-                        cfg=self.cfg,
-                        kind=budget_kind,
-                        windows=raw_windows,
-                        unaccounted=scheduler._unaccounted_tokens(  # noqa: SLF001
-                            store,
-                            raw_windows,
-                            scheduler._anticipated_tokens(store, repo_id, kind),  # noqa: SLF001
-                        ),
-                    )
-                    budget_state = "allowed" if dec.allow else "denied"
-                    budget_reason = dec.reason
-                    budget_retry_at = dec.retry_at
+                repo_id = target["repo_id"] if is_finding else target["id"]
+                outlook = self.backend.decide(
+                    anticipated_tokens=scheduler.anticipated_tokens(store, repo_id, kind)
+                )
+                verdict = outlook.prioritized if override else outlook.normal
+                match verdict:
+                    case Denied(reason=reason, retry_at=retry_at):
+                        budget_state, budget_reason, budget_retry_at = "denied", reason, retry_at
+                    case Granted(reason=reason):
+                        budget_state, budget_reason, budget_retry_at = "allowed", reason, None
                 next_candidate = {
                     "kind": kind,
                     "id": target["id"],
                     "label": target.get("summary") or target.get("name") or target.get("fingerprint"),
                     "is_finding": is_finding,
+                    "is_prioritized": bool(override),
                     "budget_state": budget_state,
                     "budget_reason": budget_reason,
                     "budget_retry_at": budget_retry_at,
@@ -295,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
         scheduler_state = store.get_scheduler_state()
         cycle_running = _cycle_lock.locked()
         return {
-            "windows": windows,
+            "backend_status_html": backend_status_html,
             "counts": counts,
             "type_counts": dict(type_counts),
             # store.list_repos() stays Row-typed -- its many OTHER callers
@@ -471,6 +443,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "busy"}, 409)
             return
         cfg = self.cfg
+        backend = self.backend
 
         def run() -> None:
             try:
@@ -480,7 +453,7 @@ class Handler(BaseHTTPRequestHandler):
                 store = Store(cfg)
                 _reconcile_and_log(store)
                 try:
-                    scheduler.run_cycle(store, cfg)
+                    scheduler.run_cycle(store, cfg, backend=backend)
                 except Exception:
                     log.exception("cycle failed")
                     with contextlib.suppress(Exception):
@@ -680,8 +653,9 @@ class _Server(ThreadingHTTPServer):
         log.warning("connection error from %s: %s", client_address, sys.exc_info()[1])
 
 
-def make_server(cfg: Config, port: int | None = None) -> _Server:
+def make_server(cfg: Config, backend: Backend, port: int | None = None) -> _Server:
     Handler.cfg = cfg
+    Handler.backend = backend
     addr = ("127.0.0.1", port or cfg.serve_port)
     try:
         httpd = _Server(addr, Handler)
@@ -699,7 +673,11 @@ def make_server(cfg: Config, port: int | None = None) -> _Server:
 
 
 def serve(cfg: Config) -> None:
-    httpd = make_server(cfg)
+    from .backends.omp_scavenge import OmpScavengeBackend
+    from .store import Store
+
+    backend = OmpScavengeBackend(cfg=cfg, ledger=Store(cfg))
+    httpd = make_server(cfg, backend)
     log.info("ui http://127.0.0.1:%d/", httpd.server_address[1])
     try:
         httpd.serve_forever()
@@ -746,28 +724,18 @@ def _describe_cycle(summary: Row) -> tuple[str, str]:
 
 
 class NextCandidateDict(TypedDict):
-    """What pick_next()/budget.decide() would do right now, if run --
+    """What pick_next()/backend.decide() would do right now, if run --
     the "what's next" preview built fresh in _summary(), never a raw DB
     row (no SQL boundary here, so no runtime check needed: mypy alone
     is sufficient since the construction code below is fully typed)."""
-
     kind: str
     id: int
     label: str | None
     is_finding: bool
+    is_prioritized: bool
     budget_state: str
     budget_reason: str
     budget_retry_at: float | None
-
-
-class WindowInfoDict(TypedDict):
-    used_fraction: float | None
-    status: str | None
-    resets_at: int | None
-    age_s: float
-    stale: bool
-    ramp: float | None
-    available_tokens: float | None
 
 
 class _RunningStatus(TypedDict):
@@ -828,7 +796,7 @@ class SummaryDict(TypedDict):
     possible moment before serialization -- the network-boundary half
     of the guarantee _require_keys provides on the SQL-row half."""
 
-    windows: dict[str, WindowInfoDict]
+    backend_status_html: str
     counts: dict[str, int]
     type_counts: dict[str, int]
     repos: list[RepoDict]
@@ -965,9 +933,9 @@ def _compute_sleep_s(store: Store, summary: Row) -> float:
         else:
             sleep_s = 15 * 60
     elif summary.get("denied"):
-        # dec.retry_at (threaded through every "denied" return in
-        # scheduler.py) is computed at the source, directly from the
-        # WindowState that caused the denial -- an exact answer to
+        # retry_at (threaded through every "denied" return in
+        # scheduler.py) is computed at the source by the backend from the
+        # window state that caused the denial -- an exact answer to
         # "when would this specific denial resolve", not re-derived
         # here from the reason string. None means no informed estimate
         # exists (e.g. missing resets_at); fall back to a generic
@@ -985,14 +953,9 @@ def _compute_sleep_s(store: Store, summary: Row) -> float:
     return sleep_s
 
 
-def _usage_prober_loop(cfg: Config, stop: threading.Event) -> None:
-    """Independent thread: every USAGE_PROBE_TICK_S, force a fresh usage
-    probe if anthropic:5h has gone stale.
-
-    See scheduler.refresh_stale_probe's docstring for why this exists
-    at all -- headless `omp -p`, everything hunter's workers use, never
-    refreshes usage_history on its own, confirmed empirically in
-    production.
+def _usage_prober_loop(backend: Backend, stop: threading.Event) -> None:
+    """Independent thread: every USAGE_PROBE_TICK_S, call backend.keep_fresh()
+    to refresh stale accounting data.
 
     Its own thread rather than folded into the job-dispatch loop below
     on purpose: that loop's sleep is intentionally variable (0s-60min,
@@ -1004,19 +967,12 @@ def _usage_prober_loop(cfg: Config, stop: threading.Event) -> None:
     right away) and every tick thereafter. Best-effort throughout: a
     failed tick just tries again next tick.
     """
-    from . import budget, scheduler
-
     while not stop.is_set():
         try:
-            windows = budget.read_windows()
-            w5 = windows.get("anthropic:5h")
-            if scheduler.refresh_stale_probe(cfg, windows):
-                log.info(
-                    "usage prober: refreshed a stale anthropic:5h reading (was %.0fs old)",
-                    w5.age_s if w5 else float("inf"),
-                )
+            if backend.keep_fresh():
+                log.info("usage prober: refreshed stale data")
         except Exception:
-            log.exception("usage prober tick failed")
+            log.exception("usage prober error")
         stop.wait(USAGE_PROBE_TICK_S)
 
 
@@ -1034,7 +990,13 @@ def daemon(cfg: Config) -> None:
     """
     import signal as _signal
 
-    httpd = make_server(cfg)
+    from .backends.omp_scavenge import OmpScavengeBackend
+    from .store import Store
+
+    store = Store(cfg)
+    backend = OmpScavengeBackend(cfg=cfg, ledger=store)
+
+    httpd = make_server(cfg, backend)
     threading.Thread(target=httpd.serve_forever, name="hunter-ui", daemon=True).start()
     log.info(
         "daemon started: ui http://127.0.0.1:%d/ -- scheduler loop live",
@@ -1046,11 +1008,10 @@ def daemon(cfg: Config) -> None:
         _signal.signal(sig, lambda *_args: stop.set())
 
     threading.Thread(
-        target=_usage_prober_loop, args=(cfg, stop), name="hunter-usage-prober", daemon=True
+        target=_usage_prober_loop, args=(backend, stop), name="hunter-usage-prober", daemon=True
     ).start()
 
     from . import scheduler
-    from .store import Store
 
     while not stop.is_set():
         sleep_s: float = 15 * 60
@@ -1059,7 +1020,7 @@ def daemon(cfg: Config) -> None:
             try:
                 store = Store(cfg)
                 _reconcile_and_log(store)
-                summary = scheduler.run_cycle(store, cfg)
+                summary = scheduler.run_cycle(store, cfg, backend=backend)
                 sleep_s = _compute_sleep_s(store, summary)
                 state_label, detail = _describe_cycle(summary)
                 with contextlib.suppress(Exception):

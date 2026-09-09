@@ -29,8 +29,6 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
-from hunter import budget as budget_module
-from hunter import scheduler as scheduler_module
 from hunter import server
 from hunter.server import (
     PR_SYNC_INTERVAL_S,
@@ -263,12 +261,7 @@ def _valid_summary() -> dict:
     below starts from this and breaks exactly one thing, so a failure
     always isolates to the field under test."""
     return {
-        "windows": {
-            "anthropic:5h": {
-                "used_fraction": 0.3, "status": "ok", "resets_at": 999,
-                "age_s": 1.0, "stale": False, "ramp": 0.4, "available_tokens": None,
-            },
-        },
+        "backend_status_html": "",
         "counts": {"new": 1},
         "type_counts": {"bug": 1},
         "repos": [
@@ -325,10 +318,6 @@ class TestValidateSummary:
             _validate_summary(payload)
 
 
-def _cfg(tmp_path: Path) -> Config:
-    return Config(work_root=tmp_path, db_path=tmp_path / "h.db")
-
-
 class TestUsageProberLoop:
     """_usage_prober_loop is the fix for refresh_stale_probe potentially
     starving for up to 60min if it were folded into the job-dispatch
@@ -337,18 +326,20 @@ class TestUsageProberLoop:
     job-dispatch loop is doing (idle, denied, mid-job)."""
 
     def test_runs_immediately_without_waiting_a_full_tick(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         calls: list[int] = []
-        monkeypatch.setattr(budget_module, "read_windows", dict)
-        monkeypatch.setattr(
-            scheduler_module, "refresh_stale_probe", lambda cfg, w: calls.append(1) or False
-        )
+
+        class _B:
+            def keep_fresh(self) -> bool:
+                calls.append(1)
+                return False
+
         # A tick this long would never fire a second time within the test's
         # lifetime -- isolates "ran immediately on start" from "also ticks".
         monkeypatch.setattr(server, "USAGE_PROBE_TICK_S", 3600.0)
         stop = threading.Event()
-        t = threading.Thread(target=_usage_prober_loop, args=(_cfg(tmp_path), stop), daemon=True)
+        t = threading.Thread(target=_usage_prober_loop, args=(_B(), stop), daemon=True)
         t.start()
         for _ in range(100):
             if calls:
@@ -359,16 +350,18 @@ class TestUsageProberLoop:
         assert calls == [1]
 
     def test_ticks_again_after_the_configured_interval(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         calls: list[int] = []
-        monkeypatch.setattr(budget_module, "read_windows", dict)
-        monkeypatch.setattr(
-            scheduler_module, "refresh_stale_probe", lambda cfg, w: calls.append(1) or False
-        )
+
+        class _B:
+            def keep_fresh(self) -> bool:
+                calls.append(1)
+                return False
+
         monkeypatch.setattr(server, "USAGE_PROBE_TICK_S", 0.02)
         stop = threading.Event()
-        t = threading.Thread(target=_usage_prober_loop, args=(_cfg(tmp_path), stop), daemon=True)
+        t = threading.Thread(target=_usage_prober_loop, args=(_B(), stop), daemon=True)
         t.start()
         for _ in range(200):
             if len(calls) >= 3:
@@ -379,13 +372,15 @@ class TestUsageProberLoop:
         assert len(calls) >= 3
 
     def test_stops_promptly_when_the_stop_event_is_set(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(budget_module, "read_windows", dict)
-        monkeypatch.setattr(scheduler_module, "refresh_stale_probe", lambda cfg, w: False)
+        class _B:
+            def keep_fresh(self) -> bool:
+                return False
+
         monkeypatch.setattr(server, "USAGE_PROBE_TICK_S", 5.0)
         stop = threading.Event()
-        t = threading.Thread(target=_usage_prober_loop, args=(_cfg(tmp_path), stop), daemon=True)
+        t = threading.Thread(target=_usage_prober_loop, args=(_B(), stop), daemon=True)
         t.start()
         time.sleep(0.05)  # let it complete its immediate first tick
         stop.set()
@@ -393,21 +388,21 @@ class TestUsageProberLoop:
         assert not t.is_alive()
 
     def test_a_failed_tick_does_not_crash_the_loop(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Root incident this whole mechanism exists to prevent involved
         silent, hours-long gaps -- the prober itself must never go
         silent because one tick raised."""
         calls: list[int] = []
 
-        def boom() -> dict[str, object]:
-            calls.append(1)
-            raise RuntimeError("boom")
+        class _B:
+            def keep_fresh(self) -> bool:
+                calls.append(1)
+                raise RuntimeError("boom")
 
-        monkeypatch.setattr(budget_module, "read_windows", boom)
         monkeypatch.setattr(server, "USAGE_PROBE_TICK_S", 0.02)
         stop = threading.Event()
-        t = threading.Thread(target=_usage_prober_loop, args=(_cfg(tmp_path), stop), daemon=True)
+        t = threading.Thread(target=_usage_prober_loop, args=(_B(), stop), daemon=True)
         t.start()
         for _ in range(200):
             if len(calls) >= 2:

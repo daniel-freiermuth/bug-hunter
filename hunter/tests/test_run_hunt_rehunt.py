@@ -15,10 +15,10 @@ from pathlib import Path
 
 import pytest
 
-from hunter import scheduler
+from hunter.backend import Granted, Outlook
 from hunter.scheduler import run_hunt
 from hunter.store import Store
-from hunter.types import BudgetDecision, Config, RunResult
+from hunter.types import Config, RunResult
 
 
 @pytest.fixture
@@ -76,13 +76,28 @@ def _empty_worker(_cfg: Config, _rpath: Path, prompt: str, *_a: object, **_kw: o
     )
 
 
-def _allow_everything(*_a: object, **_kw: object) -> BudgetDecision:
-    return BudgetDecision(True, "ok", 200_000)
+class _FakeBackend:
+    """Minimal Backend for tests: always grants, delegates run() to a worker fn."""
+
+    def __init__(self, worker_fn: object) -> None:
+        self._fn = worker_fn
+
+    def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
+        return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
+
+    def run(self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+        return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
+
+    def keep_fresh(self) -> bool:
+        return False
+
+    def status(self) -> str:
+        return ""
 
 
 class TestRehuntSeeding:
     def test_first_hunt_seeds_last_full_hunt_at(
-        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
         upstream_path, repo_path = _make_repo(tmp_path)
         rid = store.add_repo("r", str(upstream_path), str(repo_path), default_branch="main")
@@ -90,10 +105,7 @@ class TestRehuntSeeding:
         assert repo is not None
         assert repo["last_full_hunt_at"] is None
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", _empty_worker)
-        monkeypatch.setattr(scheduler.budget, "decide", _allow_everything)
-
-        result = run_hunt(store, cfg, repo)
+        result = run_hunt(store, cfg, repo, _FakeBackend(_empty_worker))
         assert "error" not in result, result
         assert result["state"] == "done"
 
@@ -105,19 +117,18 @@ class TestRehuntSeeding:
         )
 
     def test_ordinary_followup_hunt_does_not_re_seed(
-        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
         """Once seeded, a later ordinary (non-full-rehunt) hunt must leave
         the clock alone -- only a genuine full-rehunt completion should
         ever advance it again."""
         upstream_path, repo_path = _make_repo(tmp_path)
         rid = store.add_repo("r", str(upstream_path), str(repo_path), default_branch="main")
-        monkeypatch.setattr(scheduler.runner, "run_worker", _empty_worker)
-        monkeypatch.setattr(scheduler.budget, "decide", _allow_everything)
+        backend = _FakeBackend(_empty_worker)
 
         repo = store.get_repo(rid)
         assert repo is not None
-        run_hunt(store, cfg, repo)
+        run_hunt(store, cfg, repo, backend)
         seeded_at = store.get_repo(rid)["last_full_hunt_at"]  # type: ignore[index]
         assert seeded_at is not None
 
@@ -127,6 +138,6 @@ class TestRehuntSeeding:
         _run("git", "push", "origin", "main", cwd=repo_path)
         repo2 = store.get_repo(rid)
         assert repo2 is not None
-        run_hunt(store, cfg, repo2)
+        run_hunt(store, cfg, repo2, backend)
 
         assert store.get_repo(rid)["last_full_hunt_at"] == seeded_at  # type: ignore[index]

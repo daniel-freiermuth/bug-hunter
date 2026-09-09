@@ -26,6 +26,26 @@ from hunter import scheduler
 from hunter.scheduler import run_fix
 from hunter.store import Store
 from hunter.types import Config, RunResult
+from hunter.backend import Granted, Outlook
+
+
+class _FakeBackend:
+    """Minimal Backend for tests: always grants, delegates run() to a worker fn."""
+
+    def __init__(self, worker_fn: object) -> None:
+        self._fn = worker_fn
+
+    def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
+        return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
+
+    def run(self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+        return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
+
+    def keep_fresh(self) -> bool:
+        return False
+
+    def status(self) -> str:
+        return ""
 
 
 @pytest.fixture
@@ -117,7 +137,7 @@ class TestFixingStatusNeverStranded:
         """Sanity: the normal success path still reaches pr_open (not
         left at 'fixing', not incorrectly requeued)."""
         finding = _setup(store, tmp_path)
-        monkeypatch.setattr(scheduler.runner, "run_worker", _worker_that_ships_a_commit)
+        backend = _FakeBackend(_worker_that_ships_a_commit)
 
         class FakeForge:
             def ssh_url(self, url: str) -> str:
@@ -131,7 +151,7 @@ class TestFixingStatusNeverStranded:
 
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: FakeForge())
 
-        result = run_fix(store, cfg, finding)
+        result = run_fix(store, cfg, finding, backend)
 
         assert result.get("outcome") == "pr_open", result
         after = store.get_finding(finding["id"])
@@ -139,7 +159,7 @@ class TestFixingStatusNeverStranded:
         assert after["status"] == "pr_open"
 
     def test_exception_inside_worker_call_does_not_strand_fixing(
-        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
         """Fault point 1: the worker call itself raises (not a killed
         RunResult -- an actual Python exception, e.g. a transport error)."""
@@ -148,10 +168,8 @@ class TestFixingStatusNeverStranded:
         def raising_worker(*_a: object, **_kw: object) -> RunResult:
             raise RuntimeError("simulated transport failure")
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", raising_worker)
-
         with pytest.raises(RuntimeError, match="simulated transport failure"):
-            run_fix(store, cfg, finding)
+            run_fix(store, cfg, finding, _FakeBackend(raising_worker))
 
         after = store.get_finding(finding["id"])
         assert after is not None
@@ -166,7 +184,7 @@ class TestFixingStatusNeverStranded:
         between the worker returning and the job's own state being
         written at all."""
         finding = _setup(store, tmp_path)
-        monkeypatch.setattr(scheduler.runner, "run_worker", _worker_that_ships_a_commit)
+        backend = _FakeBackend(_worker_that_ships_a_commit)
 
         def raising_record_job(*_a: object, **_kw: object) -> str:
             raise RuntimeError("simulated DB write failure")
@@ -174,7 +192,7 @@ class TestFixingStatusNeverStranded:
         monkeypatch.setattr(scheduler, "_record_job", raising_record_job)
 
         with pytest.raises(RuntimeError, match="simulated DB write failure"):
-            run_fix(store, cfg, finding)
+            run_fix(store, cfg, finding, backend)
 
         after = store.get_finding(finding["id"])
         assert after is not None
@@ -188,7 +206,7 @@ class TestFixingStatusNeverStranded:
         the git-push/PR-create code that follows raises before reaching
         its own set_status call."""
         finding = _setup(store, tmp_path)
-        monkeypatch.setattr(scheduler.runner, "run_worker", _worker_that_ships_a_commit)
+        backend = _FakeBackend(_worker_that_ships_a_commit)
 
         class RaisingForge:
             def ssh_url(self, url: str) -> str:
@@ -203,7 +221,7 @@ class TestFixingStatusNeverStranded:
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: RaisingForge())
 
         with pytest.raises(RuntimeError, match="simulated gh api outage"):
-            run_fix(store, cfg, finding)
+            run_fix(store, cfg, finding, backend)
 
         after = store.get_finding(finding["id"])
         assert after is not None

@@ -22,6 +22,19 @@ from hunter.store import Store
 from hunter.types import Config
 
 
+class _FakeBackend:
+    def decide(self, *, anticipated_tokens: int = 0):
+        from hunter.backend import Denied, Outlook
+        d = Denied("test")
+        return Outlook(normal=d, prioritized=d)
+    def run(self, cwd, prompt, *, cap_tokens, max_wall_s, job_class):
+        pass
+    def keep_fresh(self):
+        return False
+    def status(self):
+        return ""
+
+
 def _make_finding(**overrides: Any) -> dict[str, Any]:
     base: dict[str, Any] = {
         "fingerprint": "repo:f.py:fn:logic",
@@ -79,7 +92,7 @@ class TestOverrideWakesLoop:
         fid, _ = store.upsert_finding(rid, _make_finding())
         store.set_status(fid, "queued")
 
-        httpd = make_server(cfg)
+        httpd = make_server(cfg, _FakeBackend())
         port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -104,7 +117,7 @@ class TestOverrideWakesLoop:
         fid, _ = store.upsert_finding(rid, _make_finding())
         store.set_status(fid, "queued")
 
-        httpd = make_server(cfg)
+        httpd = make_server(cfg, _FakeBackend())
         port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -127,7 +140,7 @@ class TestOverrideWakesLoop:
         store.set_status(fid, "queued")
         store.set_budget_override(fid, "exempt")
 
-        httpd = make_server(cfg)
+        httpd = make_server(cfg, _FakeBackend())
         port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()

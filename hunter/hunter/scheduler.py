@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import budget, runner
+from .backend import Backend, Denied, Granted, JobClass, Outlook
 from .forge import forge_for
 from .ingest import ingest_findings
 from .playbooks import (
@@ -29,74 +29,14 @@ from .playbooks import (
     build_test_gap_prompt,
 )
 from .store import Store
-from .types import BudgetDecision, Config, Row, RunResult, UnaccountedTokens, WindowState, now_ms
+from .types import Config, Row, RunResult, now_ms
 from .util import run_cmd
 
 
-def _unaccounted_tokens(
-    store: Store, windows: dict[str, WindowState], anticipated: int = 0
-) -> UnaccountedTokens:
-    """Tokens hunter knows about that a window's own probe reading
-    doesn't reflect yet: jobs still 'running' (cap_tokens is an estimate
-    -- final usage isn't known until they finish) plus jobs that already
-    finished after THAT window's own probe recorded_at (their real
-    tokens_new -- known exactly), plus `anticipated` -- a pre-reservation
-    for the job about to be decided on (see _anticipated_tokens), which
-    applies identically to both windows since it doesn't depend on any
-    probe baseline. Anthropic's usage probe is sparse and can lag well
-    behind hunter's own job cadence during an active run (observed in
-    production: 26 jobs and ~4M tokens spent across a 98-minute stretch
-    with zero fresh probes landing), so without the "finished since"
-    term budget.decide() only ever sees whichever single job happens to
-    still be 'running' right now -- never the many jobs that already
-    finished and moved the needle since the last probe.
-
-    Returns SEPARATE 5h/7d counts -- never one shared number -- because
-    anthropic:5h and anthropic:7d generally have DIFFERENT probe
-    recency: 5h rolls over ~33.6x more often than 7d, so after almost
-    any 5h rollover the two have diverged (read_windows() rolls an
-    expired 5h window's recorded_at forward to the new cycle's actual
-    start boundary; 7d, not having rolled over, keeps its own older
-    recorded_at from its last real probe). A single combined number,
-    scaled by a capacity ratio to approximate the 7d figure (the
-    pre-this-fix design), silently assumes both probes share a
-    baseline -- observed in production immediately after the 5h-only
-    version of this fix landed: unaccounted read identically before AND
-    after a 5h rollover, because the 7d probe's stale recorded_at kept
-    winning a shared min() and the "since the last probe" baseline
-    never actually moved for the 5h side either. Computing each
-    independently, against its OWN window's own recorded_at, is what
-    actually closes that gap for both dimensions at once -- see
-    test_unaccounted_tokens.py's regression.
-    """
-    running = store.db.execute(
-        "SELECT COALESCE(SUM(cap_tokens), 0) AS total FROM jobs WHERE state = 'running'"
-    ).fetchone()["total"]
-
-    def _finished_since(probe_at: int) -> int:
-        r = store.db.execute(
-            "SELECT COALESCE(SUM(tokens_new), 0) AS total FROM jobs"
-            " WHERE state != 'running' AND finished_at > ?",
-            (probe_at,),
-        ).fetchone()
-        return int(r["total"])
-
-    fallback = min((w.recorded_at for w in windows.values()), default=0)
-    w5 = windows.get("anthropic:5h")
-    w7 = windows.get("anthropic:7d")
-    probe_at_5h = w5.recorded_at if w5 is not None else fallback
-    probe_at_7d = w7.recorded_at if w7 is not None else fallback
-    base = running + anticipated
-    return UnaccountedTokens(
-        for_5h=base + _finished_since(probe_at_5h),
-        for_7d=base + _finished_since(probe_at_7d),
-    )
+CACHE_TTL_MS = 3600 * 1000  # Anthropic's observed ephemeral-cache lifetime
 
 
-_CACHE_TTL_MS = 3600 * 1000  # Anthropic's observed ephemeral-cache lifetime
-
-
-def _anticipated_tokens(store: Store, repo_id: int, kind: str) -> int:
+def anticipated_tokens(store: Store, repo_id: int, kind: str) -> int:
     """Realistic anticipated cost of the job about to be decided on -- not
     its nominal cap_tokens. A cold prompt-cache first call for a given
     (repo, kind) pair can cost 2-5x cap_tokens in one atomic LLM call the
@@ -118,7 +58,7 @@ def _anticipated_tokens(store: Store, repo_id: int, kind: str) -> int:
         store.db.execute(
             "SELECT 1 FROM jobs WHERE repo_id = ? AND kind = ? AND finished_at > ?"
             " AND state != 'denied' LIMIT 1",
-            (repo_id, kind, now_ms() - _CACHE_TTL_MS),
+            (repo_id, kind, now_ms() - CACHE_TTL_MS),
         ).fetchone()
         is not None
     )
@@ -142,20 +82,13 @@ def _job_state(rr: RunResult) -> str:
     return "done" if rr.exit_code == 0 else "failed"
 
 
-def _usage_snapshot(windows: dict[str, WindowState]) -> float | None:
-    """Max used_fraction across 7d windows, or None if unavailable."""
-    fracs = [
-        w.used_fraction for k, w in windows.items() if ":7d" in k and w.used_fraction is not None
-    ]
-    return max(fracs) if fracs else None
-
 
 def _record_job(
     store: Store,
     job_id: int,
     rr: RunResult,
+    *,
     model: str | None = None,
-    usage_delta: float | None = None,
 ) -> str:
     state = _job_state(rr)
     notes = rr.stdout_tail[-500:] if state != "done" and rr.stdout_tail else None
@@ -169,7 +102,7 @@ def _record_job(
         killed_reason=rr.killed_reason,
         session_file=rr.session_file,
         model=model,
-        usage_delta=usage_delta,
+        usage_delta=rr.usage_delta,
         notes=notes,
         finished_at=now_ms(),
     )
@@ -208,7 +141,7 @@ def _ingest_followups(
 # -- hunt -------------------------------------------------------------------
 
 
-def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
+def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool = False) -> Row:
     rid: int = repo["id"]
     rname: str = repo["name"]
     rpath = Path(repo["path"])
@@ -340,20 +273,19 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         diff_range = f"{base}..{head}"
         scope_note = f"First hunt for this repo: {scope} (base {base[:12]})."
 
-    windows = budget.read_windows()
-    dec = budget.decide(
-        cfg,
-        "hunt",
-        windows,
-        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, "hunt")),
-    )
-    if not dec.allow:
-        job = store.create_job("hunt", rid)
-        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.log_event("deny", f"hunt {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
-
-    job = store.create_job("hunt", rid, cap_tokens=dec.cap_tokens, state="running")
+    cfg_cap = cfg.hunt_cap_tokens
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, rid, "hunt"))
+    verdict = outlook.normal
+    match verdict:
+        case Denied(reason=reason, retry_at=retry_at):
+            job = store.create_job("hunt", rid)
+            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
+            store.log_event("deny", f"hunt {rname}: {reason}", job_id=job)
+            return {"denied": reason, "retry_at": retry_at, "job": job}
+        case Granted(cap_tokens=backend_cap):
+            pass
+    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
+    job = store.create_job("hunt", rid, cap_tokens=cap, state="running")
     out_path = cfg.work_root / "out" / f"job{job}.findings.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prompt = build_hunt_prompt(
@@ -366,19 +298,9 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
         cfg.hunt_max_findings,
         store.repo_notes(rid),
     )
-    pre_usage = _usage_snapshot(windows)
     model = cfg.model_for("hunt")
-    rr = runner.run_worker(
-        cfg,
-        rpath,
-        prompt,
-        dec.cap_tokens,
-        cfg.hunt_max_wall_s,
-        model=model,
-    )
-    post_usage = _usage_snapshot(budget.read_windows())
-    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+    rr = backend.run(rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT)
+    state = _record_job(store, job, rr, model=model)
 
     summary: Row = {
         "kind": "hunt",
@@ -433,7 +355,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
 # -- recheck ----------------------------------------------------------------
 
 
-def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
+def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
     """Re-evaluate a finding against the current codebase. Human-triggered."""
     fid: int = finding["id"]
     if finding["status"] != "rechecking":
@@ -478,44 +400,30 @@ def run_recheck(store: Store, cfg: Config, finding: Row) -> Row:
 
     # Budget gate -- recheck is investigative, like hunt.
     override = finding.get("budget_override")
-    windows = budget.read_windows()
-    if override:
-        dec = BudgetDecision(True, f"override:{override}", cfg.hunt_cap_tokens)
-    else:
-        dec = budget.decide(
-            cfg,
-            "hunt",
-            windows,
-            _unaccounted_tokens(store, windows, _anticipated_tokens(store, repo["id"], "recheck")),
-        )
-    if not dec.allow:
-        job = store.create_job("recheck", repo["id"], finding_id=fid)
-        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.log_event(
-            "deny",
-            f"recheck #{fid}: {dec.reason}",
-            job_id=job,
-            finding_id=fid,
-        )
-        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
-
-    job = store.create_job("recheck", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens, state="running")
+    cfg_cap = cfg.hunt_cap_tokens
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, repo["id"], "recheck"))
+    verdict = outlook.prioritized if override else outlook.normal
+    match verdict:
+        case Denied(reason=reason, retry_at=retry_at):
+            job = store.create_job("recheck", repo["id"], finding_id=fid)
+            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
+            store.log_event(
+                "deny",
+                f"recheck #{fid}: {reason}",
+                job_id=job,
+                finding_id=fid,
+            )
+            return {"denied": reason, "retry_at": retry_at, "job": job}
+        case Granted(cap_tokens=backend_cap):
+            pass
+    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
+    job = store.create_job("recheck", repo["id"], finding_id=fid, cap_tokens=cap, state="running")
     out_path = cfg.work_root / "out" / f"recheck{fid}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prompt = build_recheck_prompt(finding, repo, out_path, store.repo_notes(repo["id"]))
-    pre_usage = _usage_snapshot(windows)
     model = cfg.model_for("hunt")
-    rr = runner.run_worker(
-        cfg,
-        rpath,
-        prompt,
-        dec.cap_tokens,
-        cfg.hunt_max_wall_s,
-        model=model,
-    )
-    post_usage = _usage_snapshot(budget.read_windows())
-    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+    rr = backend.run(rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT)
+    state = _record_job(store, job, rr, model=model)
     summary: Row = {
         "kind": "recheck",
         "finding": fid,
@@ -645,7 +553,7 @@ class _AnalysisSpec:
     ]
 
 
-def _run_analysis_job(store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec) -> Row:
+def _run_analysis_job(store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec, backend: Backend) -> Row:
     """Shared body for the four repo-level analysis job types: sync the repo
     to its default branch, budget-gate, run the worker, ingest output, and
     advance the rotation timestamp on success. The only per-kind variation
@@ -671,20 +579,19 @@ def _run_analysis_job(store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec)
             return {"error": f"{' '.join(cmd)} failed"}
 
     # Budget check -- analysis jobs share the hunt budget/model for now
-    windows = budget.read_windows()
-    dec = budget.decide(
-        cfg,
-        "hunt",
-        windows,
-        _unaccounted_tokens(store, windows, _anticipated_tokens(store, rid, kind)),
-    )
-    if not dec.allow:
-        job = store.create_job(kind, rid)
-        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.log_event("deny", f"{kind} {rname}: {dec.reason}", job_id=job)
-        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
-
-    job = store.create_job(kind, rid, cap_tokens=dec.cap_tokens, state="running")
+    cfg_cap = cfg.hunt_cap_tokens
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, rid, kind))
+    verdict = outlook.normal
+    match verdict:
+        case Denied(reason=reason, retry_at=retry_at):
+            job = store.create_job(kind, rid)
+            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
+            store.log_event("deny", f"{kind} {rname}: {reason}", job_id=job)
+            return {"denied": reason, "retry_at": retry_at, "job": job}
+        case Granted(cap_tokens=backend_cap):
+            pass
+    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
+    job = store.create_job(kind, rid, cap_tokens=cap, state="running")
     out_path = cfg.work_root / "out" / f"job{job}.{spec.out_plural}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -700,19 +607,9 @@ def _run_analysis_job(store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec)
         store.repo_notes(rid),
     )
 
-    pre_usage = _usage_snapshot(windows)
     model = cfg.model_for("hunt")
-    rr = runner.run_worker(
-        cfg,
-        rpath,
-        prompt,
-        dec.cap_tokens,
-        cfg.hunt_max_wall_s,
-        model=model,
-    )
-    post_usage = _usage_snapshot(budget.read_windows())
-    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+    rr = backend.run(rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT)
+    state = _record_job(store, job, rr, model=model)
 
     summary: Row = {
         "kind": kind,
@@ -782,27 +679,27 @@ _MODERNIZATION_SPEC = _AnalysisSpec(
 )
 
 
-def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
+def run_test_gap(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
     """Hunt for test coverage gaps in a repo."""
-    return _run_analysis_job(store, cfg, repo, _TEST_GAP_SPEC)
+    return _run_analysis_job(store, cfg, repo, _TEST_GAP_SPEC, backend)
 
 
-def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
+def run_dep_update(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
     """Check for outdated dependencies."""
-    return _run_analysis_job(store, cfg, repo, _DEP_UPDATE_SPEC)
+    return _run_analysis_job(store, cfg, repo, _DEP_UPDATE_SPEC, backend)
 
 
-def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
+def run_refactor(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
     """Hunt for mechanical refactoring opportunities."""
-    return _run_analysis_job(store, cfg, repo, _REFACTOR_SPEC)
+    return _run_analysis_job(store, cfg, repo, _REFACTOR_SPEC, backend)
 
 
-def run_modernize(store: Store, cfg: Config, repo: Row) -> Row:
+def run_modernize(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
     """Hunt for SOTA-drift modernization opportunities -- deprecated or
     unmaintained dependencies, language-feature gaps, format/protocol
     shifts, major version debt, platform EOL. Explicitly NOT bounded to
     safe/mechanical changes like refactor/dep_update; see modernization.md."""
-    return _run_analysis_job(store, cfg, repo, _MODERNIZATION_SPEC)
+    return _run_analysis_job(store, cfg, repo, _MODERNIZATION_SPEC, backend)
 
 
 # -- fix --------------------------------------------------------------------
@@ -821,7 +718,7 @@ def run_modernize(store: Store, cfg: Config, repo: Row) -> Row:
 MAX_CONSECUTIVE_SAME_FAILURE = 3
 
 
-def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
+def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
     fid: int = finding["id"]
     if finding["status"] != "queued":
         return {
@@ -920,31 +817,25 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
             run_cmd(["git", "-C", rpath, "branch", "-D", branch])
 
     override = finding.get("budget_override")
-    windows = budget.read_windows()
-    if override:
-        base = cfg.fix_cap_tokens
-        dec = BudgetDecision(True, f"override:{override}", base)
-    else:
-        dec = budget.decide(
-            cfg,
-            "fix",
-            windows,
-            _unaccounted_tokens(store, windows, _anticipated_tokens(store, repo["id"], "fix")),
-        )
-    if not dec.allow:
-        _drop_worktree(delete_branch=True)
-        job = store.create_job("fix", repo["id"], finding_id=fid)
-        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.log_event(
-            "deny",
-            f"fix #{fid}: {dec.reason}",
-            job_id=job,
-            finding_id=fid,
-        )
-        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
-
-    job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens, state="running")
-    pre_usage = _usage_snapshot(windows)
+    cfg_cap = cfg.fix_cap_tokens
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, repo["id"], "fix"))
+    verdict = outlook.prioritized if override else outlook.normal
+    match verdict:
+        case Denied(reason=reason, retry_at=retry_at):
+            _drop_worktree(delete_branch=True)
+            job = store.create_job("fix", repo["id"], finding_id=fid)
+            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
+            store.log_event(
+                "deny",
+                f"fix #{fid}: {reason}",
+                job_id=job,
+                finding_id=fid,
+            )
+            return {"denied": reason, "retry_at": retry_at, "job": job}
+        case Granted(cap_tokens=backend_cap):
+            pass
+    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
+    job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=cap, state="running")
     with store.in_progress(fid, "fixing", fallback="queued"):
         build_prompt = (
             build_fix_prompt
@@ -955,17 +846,8 @@ def run_fix(store: Store, cfg: Config, finding: Row) -> Row:
         )
         prompt = build_prompt(finding, worktree, branch, repo, store.repo_notes(repo["id"]))
         model = cfg.model_for("fix")
-        rr = runner.run_worker(
-            cfg,
-            worktree,
-            prompt,
-            dec.cap_tokens,
-            cfg.fix_max_wall_s,
-            model=model,
-        )
-        post_usage = _usage_snapshot(budget.read_windows())
-        delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-        state = _record_job(store, job, rr, model=model, usage_delta=delta)
+        rr = backend.run(worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX)
+        state = _record_job(store, job, rr, model=model)
         summary: Row = {
             "kind": "fix",
             "finding": fid,
@@ -1369,7 +1251,7 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
 # -- engage -----------------------------------------------------------------
 
 
-def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
+def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
     fid: int = finding["id"]
     repo = store.get_repo(finding["repo_id"])
     if repo is None:
@@ -1486,27 +1368,24 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
         )
 
     override = finding.get("budget_override")
-    windows = budget.read_windows()
-    if override:
-        dec = BudgetDecision(True, f"override:{override}", cfg.fix_cap_tokens)
-    else:
-        dec = budget.decide(
-            cfg,
-            "fix",
-            windows,
-            _unaccounted_tokens(store, windows, _anticipated_tokens(store, repo["id"], "engage")),
-        )
-    if not dec.allow:
-        _drop_worktree()
-        job = store.create_job("engage", repo["id"], finding_id=fid)
-        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.log_event(
-            "deny",
-            f"engage #{fid}: {dec.reason}",
-            job_id=job,
-            finding_id=fid,
-        )
-        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
+    cfg_cap = cfg.fix_cap_tokens
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, repo["id"], "engage"))
+    verdict = outlook.prioritized if override else outlook.normal
+    match verdict:
+        case Denied(reason=reason, retry_at=retry_at):
+            _drop_worktree()
+            job = store.create_job("engage", repo["id"], finding_id=fid)
+            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
+            store.log_event(
+                "deny",
+                f"engage #{fid}: {reason}",
+                job_id=job,
+                finding_id=fid,
+            )
+            return {"denied": reason, "retry_at": retry_at, "job": job}
+        case Granted(cap_tokens=backend_cap):
+            pass
+    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
 
     rc, pr, raw = forge.view_pr_engage(owner_slug, num)
     if pr is None:
@@ -1522,7 +1401,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
         "engage",
         repo["id"],
         finding_id=fid,
-        cap_tokens=dec.cap_tokens,
+        cap_tokens=cap,
         state="running",
     )
     prompt = build_engage_prompt(
@@ -1533,19 +1412,9 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
         ps.get("needs_attention") or "",
         store.repo_notes(repo["id"]),
     )
-    pre_usage = _usage_snapshot(windows)
     model = cfg.model_for("fix")
-    rr = runner.run_worker(
-        cfg,
-        worktree,
-        prompt,
-        dec.cap_tokens,
-        cfg.fix_max_wall_s,
-        model=model,
-    )
-    post_usage = _usage_snapshot(budget.read_windows())
-    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+    rr = backend.run(worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX)
+    state = _record_job(store, job, rr, model=model)
     summary: Row = {
         "kind": "engage",
         "finding": fid,
@@ -1693,7 +1562,7 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
 # -- harvest ------------------------------------------------------------
 
 
-def run_harvest(store: Store, cfg: Config, finding: Row) -> Row:
+def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
     """Review a just-merged PR's complete lifetime (title, body, every
     comment/review, and the actual shipped diff) to propose genuine
     follow-up findings.
@@ -1783,22 +1652,19 @@ def run_harvest(store: Store, cfg: Config, finding: Row) -> Row:
         return {"error": f"worktree add failed: {out[-300:]}"}
 
     override = finding.get("budget_override")
-    windows = budget.read_windows()
-    if override:
-        dec = BudgetDecision(True, f"override:{override}", cfg.fix_cap_tokens)
-    else:
-        dec = budget.decide(
-            cfg,
-            "fix",
-            windows,
-            _unaccounted_tokens(store, windows, _anticipated_tokens(store, repo["id"], "harvest")),
-        )
-    if not dec.allow:
-        _drop_worktree()
-        job = store.create_job("harvest", repo["id"], finding_id=fid)
-        store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
-        store.log_event("deny", f"harvest #{fid}: {dec.reason}", job_id=job, finding_id=fid)
-        return {"denied": dec.reason, "retry_at": dec.retry_at, "job": job}
+    cfg_cap = cfg.fix_cap_tokens
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, repo["id"], "harvest"))
+    verdict = outlook.prioritized if override else outlook.normal
+    match verdict:
+        case Denied(reason=reason, retry_at=retry_at):
+            _drop_worktree()
+            job = store.create_job("harvest", repo["id"], finding_id=fid)
+            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
+            store.log_event("deny", f"harvest #{fid}: {reason}", job_id=job, finding_id=fid)
+            return {"denied": reason, "retry_at": retry_at, "job": job}
+        case Granted(cap_tokens=backend_cap):
+            pass
+    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
 
     rc, pr, raw = forge.view_pr_engage(owner_slug, num)
     if pr is None:
@@ -1811,15 +1677,12 @@ def run_harvest(store: Store, cfg: Config, finding: Row) -> Row:
         return {"error": "PR/MR view failed"}
 
     job = store.create_job(
-        "harvest", repo["id"], finding_id=fid, cap_tokens=dec.cap_tokens, state="running"
+        "harvest", repo["id"], finding_id=fid, cap_tokens=cap, state="running"
     )
     prompt = build_harvest_prompt(finding, worktree, repo, pr, num, store.repo_notes(repo["id"]))
-    pre_usage = _usage_snapshot(windows)
     model = cfg.model_for("fix")
-    rr = runner.run_worker(cfg, worktree, prompt, dec.cap_tokens, cfg.fix_max_wall_s, model=model)
-    post_usage = _usage_snapshot(budget.read_windows())
-    delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
-    state = _record_job(store, job, rr, model=model, usage_delta=delta)
+    rr = backend.run(worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX)
+    state = _record_job(store, job, rr, model=model)
 
     # Read before _drop_worktree below removes the file.
     _ingest_followups(store, repo["id"], worktree, fid, job, "harvest")
@@ -1988,7 +1851,7 @@ def pick_next(
     return job_type, target
 
 
-_RUNNERS: dict[str, Callable[[Store, Config, Row], Row]] = {
+_RUNNERS: dict[str, Callable[[Store, Config, Row, Backend], Row]] = {
     "engage": run_engage,
     "harvest": run_harvest,
     "recheck": run_recheck,
@@ -2001,67 +1864,8 @@ _RUNNERS: dict[str, Callable[[Store, Config, Row], Row]] = {
 }
 
 
-def refresh_stale_probe(cfg: Config, windows: dict[str, WindowState]) -> bool:
-    """Force a fresh usage probe if the anthropic:5h reading is stale or
-    entirely missing.
-
-    Root cause of "why don't we get new information on the 5h/7d window
-    usage" (investigated live in production): headless `omp -p` -- 100%
-    of what every hunter worker uses -- does NOT refresh usage_history as
-    a side effect, confirmed empirically (identical recorded_at before
-    and after a real, token-spending `omp -p` run). So no matter how many
-    jobs hunter runs, nothing it does ever closes a stale-probe gap on
-    its own; the only things that ever have are entirely outside hunter's
-    control (a human's interactive session, or someone manually forcing
-    a probe).
-
-    `omp usage invalidate --provider anthropic` before the read: plain
-    `omp usage` alone can serve its own client-side cache without
-    reaching the network at all, so invalidating first is necessary to
-    even ATTEMPT a live fetch. It is not, on its own, sufficient --
-    Anthropic's /usage endpoint itself has a hard floor on how often a
-    genuinely fresh reading exists at all: measured directly from every
-    recorded anthropic:5h row this project has ever seen (421 rows),
-    the smallest gap ever observed between two distinct real fetches is
-    ~242s, and 99.8% of gaps are 400s+, REGARDLESS of how the fetch was
-    triggered (interactive session or plain CLI) or how many times
-    invalidate+read was retried in between -- a call inside that window
-    just returns the same still-cached value with exit code 0 (no
-    error, no new row). This is why cfg.stale_after_s below is set well
-    above that floor (300s default) rather than as low as this project
-    first tried (180s, which mostly produced silent no-op "successes"):
-    asking more often than the floor allows wastes calls without ever
-    getting fresher data.
-
-    Called from the daemon's dedicated usage-prober thread (see
-    server.py's _usage_prober_loop), NOT from run_cycle -- deliberately
-    decoupled from job-dispatch cadence. run_cycle's own sleep backs off
-    up to 60min when budget is denied, which would have silently starved
-    this of a chance to run for just as long, right when a fresh reading
-    matters most. A short, fixed, independent tick keeps the two
-    concerns (when to run jobs vs. when to refresh usage data) simple
-    and separately reasoned about.
-
-    Finally gives cfg.stale_after_s (loaded from config.json's
-    budget.staleAfterS, previously read but never actually consulted
-    anywhere) a real effect. Best-effort throughout: run_cmd never
-    raises, and a failed, timed-out, or floor-throttled probe just
-    leaves windows exactly as stale as they already were -- the next
-    tick tries again.
-    """
-    w5 = windows.get("anthropic:5h")
-    if w5 is not None and w5.age_s <= cfg.stale_after_s:
-        return False
-    run_cmd([cfg.omp_bin, "usage", "invalidate", "--provider", "anthropic"], timeout=15)
-    rc, _out = run_cmd([cfg.omp_bin, "usage", "--provider", "anthropic"], timeout=30)
-    return rc == 0
-
-
-def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
+def run_cycle(store: Store, cfg: Config, force_repo: str | None = None, *, backend: Backend) -> Row:
     try:
-        windows = budget.read_windows()
-        store.log_window(list(windows.values()))
-
         # (0) Cheap PR sync -- gh reads only, no tokens.
         sync: Row | None = sync_prs(store, cfg) if store.list_findings(status="pr_open") else None
 
@@ -2074,7 +1878,7 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
             return result
 
         kind, target = picked
-        result = _RUNNERS[kind](store, cfg, target)
+        result = _RUNNERS[kind](store, cfg, target, backend)
 
         # Prevent starvation of repo-level rotation jobs: if this attempt
         # didn't succeed (failed, killed, or done without output), still

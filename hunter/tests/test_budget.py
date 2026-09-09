@@ -1,4 +1,4 @@
-"""Tests for hunter.budget.decide() and hunter.budget.read_windows()."""
+"""Tests for capacity.decide() and capacity.read_windows()."""
 
 from __future__ import annotations
 
@@ -8,9 +8,10 @@ from pathlib import Path
 
 import pytest
 
-import hunter.budget as budget_module
-from hunter.budget import decide, ramp_5h, ramp_7d, read_windows, retry_at_5h, retry_at_7d
-from hunter.types import Config, UnaccountedTokens, WindowState
+import hunter.backends.omp_scavenge.capacity as budget_module
+from hunter.backends.omp_scavenge.capacity import decide, ramp_5h, ramp_7d, read_windows, retry_at_5h, retry_at_7d
+from hunter.backends.omp_scavenge.capacity import UnaccountedTokens, WindowState
+from hunter.types import Config
 
 # ---------------------------------------------------------------------------
 # Helpers

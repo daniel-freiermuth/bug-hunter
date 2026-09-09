@@ -15,13 +15,11 @@ from hunter.types import (
     SEVERITIES,
     SUPPRESSED_STATUSES,
     VERDICT_STATUSES,
-    BudgetDecision,
     BugClass,
     Config,
     RunResult,
     Severity,
     Status,
-    WindowState,
     now_ms,
 )
 
@@ -307,79 +305,3 @@ class TestRunResult:
         assert rr.stdout_tail == "last output"
 
 
-# ── WindowState ──────────────────────────────────────────────────────
-
-
-class TestWindowState:
-    def test_construction(self):
-        ws = WindowState(
-            limit_id="anthropic:5h",
-            used_fraction=0.5,
-            status="ok",
-            resets_at=1700000000000,
-            recorded_at=1700000000000,
-            age_s=100.0,
-        )
-        assert ws.limit_id == "anthropic:5h"
-        assert ws.used_fraction == 0.5
-        assert ws.status == "ok"
-
-    def test_stale_at_boundary(self):
-        ws_exact = WindowState(
-            limit_id="x",
-            used_fraction=0.0,
-            status="ok",
-            resets_at=0,
-            recorded_at=0,
-            age_s=1800.0,
-        )
-        assert ws_exact.stale is False  # exactly 1800 is NOT stale (> not >=)
-
-    def test_stale_above_boundary(self):
-        ws_over = WindowState(
-            limit_id="x",
-            used_fraction=0.0,
-            status="ok",
-            resets_at=0,
-            recorded_at=0,
-            age_s=1800.1,
-        )
-        assert ws_over.stale is True
-
-    def test_not_stale_below_boundary(self):
-        ws_under = WindowState(
-            limit_id="x",
-            used_fraction=0.0,
-            status="ok",
-            resets_at=0,
-            recorded_at=0,
-            age_s=1799.9,
-        )
-        assert ws_under.stale is False
-
-    def test_default_age(self):
-        ws = WindowState(
-            limit_id="x",
-            used_fraction=None,
-            status=None,
-            resets_at=None,
-            recorded_at=0,
-        )
-        assert ws.age_s == 0.0
-        assert ws.stale is False
-
-
-# ── BudgetDecision ───────────────────────────────────────────────────
-
-
-class TestBudgetDecision:
-    def test_allow(self):
-        bd = BudgetDecision(allow=True, reason="go", cap_tokens=100_000)
-        assert bd.allow is True
-        assert bd.reason == "go"
-        assert bd.cap_tokens == 100_000
-
-    def test_deny(self):
-        bd = BudgetDecision(allow=False, reason="over budget")
-        assert bd.allow is False
-        assert bd.cap_tokens == 0

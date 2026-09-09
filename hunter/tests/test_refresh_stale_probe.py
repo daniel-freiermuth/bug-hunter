@@ -1,4 +1,4 @@
-"""Tests for hunter.scheduler.refresh_stale_probe.
+"""Tests for OmpScavengeBackend.keep_fresh().
 
 Root cause investigation (see the function's own docstring): headless
 `omp -p` -- everything hunter's own workers use -- never refreshes
@@ -19,13 +19,15 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 if TYPE_CHECKING:
     import pytest
 
-from hunter import scheduler
-from hunter.scheduler import refresh_stale_probe
-from hunter.types import Config, WindowState
+from hunter.backends.omp_scavenge.capacity import WindowState
+from hunter.backends.omp_scavenge.facade import OmpScavengeBackend
+from hunter.store import Store
+from hunter.types import Config
 
 _INVALIDATE = ["omp", "usage", "invalidate", "--provider", "anthropic"]
 _READ = ["omp", "usage", "--provider", "anthropic"]
@@ -54,91 +56,138 @@ def _ws(age_s: float) -> WindowState:
     )
 
 
-def _patched_run_cmd(monkeypatch: pytest.MonkeyPatch, rc: int = 0) -> list[list[str]]:
+def _make_backend(cfg: Config, tmp_path: Path) -> OmpScavengeBackend:
+    store_cfg = Config(work_root=tmp_path, db_path=tmp_path / "test.db")
+    store = Store(store_cfg)
+    return OmpScavengeBackend(cfg=cfg, ledger=store)
+
+
+def _patched_run_cmd_and_windows(
+    monkeypatch: "pytest.MonkeyPatch",
+    windows: dict[str, WindowState] | None = None,
+    rc: int = 0,
+) -> list[list[str]]:
+    """Patch both run_cmd and read_windows for keep_fresh tests."""
     calls: list[list[str]] = []
 
     def fake_run_cmd(cmd: list[str], timeout: int = 300) -> tuple[int, str]:
         calls.append(cmd)
         return rc, ""
 
-    monkeypatch.setattr(scheduler, "run_cmd", fake_run_cmd)
+    monkeypatch.setattr("hunter.util.run_cmd", fake_run_cmd)
+    monkeypatch.setattr(
+        "hunter.backends.omp_scavenge.capacity.read_windows",
+        lambda: windows if windows is not None else {},
+    )
     return calls
 
 
-def test_no_windows_at_all_forces_a_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _patched_run_cmd(monkeypatch)
-    assert refresh_stale_probe(_cfg(), {}) is True
+def test_no_windows_at_all_forces_a_probe(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+) -> None:
+    cfg = _cfg()
+    calls = _patched_run_cmd_and_windows(monkeypatch, windows={})
+    backend = _make_backend(cfg, tmp_path)
+    assert backend.keep_fresh() is True
     assert calls == [_INVALIDATE, _READ]
 
 
-def test_fresh_window_does_not_force_a_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _patched_run_cmd(monkeypatch)
-    windows = {"anthropic:5h": _ws(age_s=60.0)}
-    assert refresh_stale_probe(_cfg(stale_after_s=1800), windows) is False
+def test_fresh_window_does_not_force_a_probe(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+) -> None:
+    cfg = _cfg(stale_after_s=1800)
+    ws = _ws(age_s=60.0)
+    calls = _patched_run_cmd_and_windows(monkeypatch, windows={"anthropic:5h": ws})
+    backend = _make_backend(cfg, tmp_path)
+    assert backend.keep_fresh() is False
     assert calls == []
 
 
-def test_stale_window_forces_a_probe(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _patched_run_cmd(monkeypatch)
-    windows = {"anthropic:5h": _ws(age_s=2000.0)}
-    assert refresh_stale_probe(_cfg(stale_after_s=1800), windows) is True
+def test_stale_window_forces_a_probe(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+) -> None:
+    cfg = _cfg(stale_after_s=1800)
+    ws = _ws(age_s=2000.0)
+    calls = _patched_run_cmd_and_windows(monkeypatch, windows={"anthropic:5h": ws})
+    backend = _make_backend(cfg, tmp_path)
+    assert backend.keep_fresh() is True
     assert calls == [_INVALIDATE, _READ]
 
 
-def test_exactly_at_threshold_does_not_force(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exactly_at_threshold_does_not_force(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+) -> None:
     """age_s == stale_after_s is still "fresh enough" -- only strictly
     older forces a probe, matching WindowState.stale's own > comparison
     style elsewhere in this codebase."""
-    calls = _patched_run_cmd(monkeypatch)
-    windows = {"anthropic:5h": _ws(age_s=1800.0)}
-    assert refresh_stale_probe(_cfg(stale_after_s=1800), windows) is False
+    cfg = _cfg(stale_after_s=1800)
+    ws = _ws(age_s=1800.0)
+    calls = _patched_run_cmd_and_windows(monkeypatch, windows={"anthropic:5h": ws})
+    backend = _make_backend(cfg, tmp_path)
+    assert backend.keep_fresh() is False
     assert calls == []
 
 
-def test_respects_configured_stale_after_s(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_respects_configured_stale_after_s(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+) -> None:
     """cfg.stale_after_s was loaded from config.json but never actually
     consulted anywhere before this fix -- prove it now has a real
     effect, not just a value sitting unused."""
-    calls = _patched_run_cmd(monkeypatch)
-    windows = {"anthropic:5h": _ws(age_s=500.0)}
-    assert refresh_stale_probe(_cfg(stale_after_s=1800), windows) is False
-    assert refresh_stale_probe(_cfg(stale_after_s=300), windows) is True
+    ws = _ws(age_s=500.0)
+    calls = _patched_run_cmd_and_windows(monkeypatch, windows={"anthropic:5h": ws})
+
+    backend_fresh = _make_backend(_cfg(stale_after_s=1800), tmp_path)
+    assert backend_fresh.keep_fresh() is False
+
+    backend_stale = _make_backend(_cfg(stale_after_s=300), tmp_path)
+    assert backend_stale.keep_fresh() is True
     assert calls == [_INVALIDATE, _READ]
 
 
 def test_invalidates_before_reading_so_the_read_cannot_serve_a_stale_cache(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
 ) -> None:
     """Ordering matters: invalidate must run BEFORE the read, or the
     read could serve omp's own internal cache instead of a fresh
     fetch -- exactly the failure mode observed live (a plain `omp
     usage` reported "fetched 32.6s ago" while hunter's own DB row was
     over a minute staler than that)."""
-    calls = _patched_run_cmd(monkeypatch)
-    refresh_stale_probe(_cfg(), {})
+    cfg = _cfg()
+    calls = _patched_run_cmd_and_windows(monkeypatch, windows={})
+    backend = _make_backend(cfg, tmp_path)
+    backend.keep_fresh()
     assert calls[0] == _INVALIDATE
     assert calls[1] == _READ
 
 
-def test_uses_configured_omp_bin(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = _patched_run_cmd(monkeypatch)
-    refresh_stale_probe(_cfg(omp_bin="/custom/path/omp"), {})
+def test_uses_configured_omp_bin(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+) -> None:
+    cfg = _cfg(omp_bin="/custom/path/omp")
+    calls = _patched_run_cmd_and_windows(monkeypatch, windows={})
+    backend = _make_backend(cfg, tmp_path)
+    backend.keep_fresh()
     assert calls == [
         ["/custom/path/omp", "usage", "invalidate", "--provider", "anthropic"],
         ["/custom/path/omp", "usage", "--provider", "anthropic"],
     ]
 
 
-def test_failed_probe_returns_false(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_failed_probe_returns_false(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+) -> None:
     """run_cmd never raises (see util.run_cmd) -- a failed/timed-out
     probe just reports False, leaving windows exactly as stale as they
     already were. Callers already tolerate that via unaccounted_tokens."""
-    _patched_run_cmd(monkeypatch, rc=1)
-    assert refresh_stale_probe(_cfg(), {}) is False
+    cfg = _cfg()
+    _patched_run_cmd_and_windows(monkeypatch, windows={}, rc=1)
+    backend = _make_backend(cfg, tmp_path)
+    assert backend.keep_fresh() is False
 
 
 def test_failed_invalidate_does_not_block_the_read_attempt(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
 ) -> None:
     """The invalidate step is best-effort like everything else here --
     if it fails, still attempt the read (which may just serve a cache
@@ -150,6 +199,11 @@ def test_failed_invalidate_does_not_block_the_read_attempt(
         calls.append(cmd)
         return (1, "") if cmd == _INVALIDATE else (0, "")
 
-    monkeypatch.setattr(scheduler, "run_cmd", fake_run_cmd)
-    assert refresh_stale_probe(_cfg(), {}) is True
+    monkeypatch.setattr("hunter.util.run_cmd", fake_run_cmd)
+    monkeypatch.setattr(
+        "hunter.backends.omp_scavenge.capacity.read_windows", lambda: {},
+    )
+    cfg = _cfg()
+    backend = _make_backend(cfg, tmp_path)
+    assert backend.keep_fresh() is True
     assert calls == [_INVALIDATE, _READ]

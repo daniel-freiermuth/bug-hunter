@@ -18,8 +18,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent  # .../hunter
 SCHEMA_PATH = PROJECT_ROOT / "schema.sql"
 PLAYBOOK_DIR = PROJECT_ROOT / "playbooks"
 UI_DIR = PROJECT_ROOT / "ui"
-OMP_SESSIONS_DIR = Path.home() / ".omp/agent/sessions"
-OMP_AGENT_DB = Path.home() / ".omp/agent/agent.db"
 
 
 class Status(StrEnum):
@@ -190,6 +188,7 @@ class Config:
     model_smol: str | None = None  # --smol helper model for lightweight subtasks
     model_hunt: str | None = None  # per-kind overrides of model_default
     model_fix: str | None = None
+    backend_type: str = "omp-scavenge"  # backend discriminator for future extensibility
 
     def model_for(self, kind: str) -> str | None:
         override = self.model_hunt if kind == "hunt" else self.model_fix
@@ -223,7 +222,21 @@ class Config:
             model_smol=raw.get("models", {}).get("smol"),
             model_hunt=raw.get("models", {}).get("hunt"),
             model_fix=raw.get("models", {}).get("fix"),
+            backend_type=raw.get("backend", {}).get("type", "omp-scavenge"),
         )
+
+    def make_backend(self, ledger: object) -> object:
+        """Construct the configured backend.  Returns a Backend instance.
+
+        ``ledger`` must satisfy the backend's SpendLedger protocol (Store).
+        Import is deferred to avoid circular deps and to keep the types
+        module free of backend-package knowledge beyond the discriminator.
+        """
+        if self.backend_type == "omp-scavenge":
+            from .backends.omp_scavenge import OmpScavengeBackend
+
+            return OmpScavengeBackend(cfg=self, ledger=ledger)
+        raise ValueError(f"unknown backend_type: {self.backend_type!r}")
 
 
 @dataclass
@@ -237,44 +250,6 @@ class RunResult:
     session_file: str | None  # the worker's JSONL, for post-mortems
     duration_s: float
     stdout_tail: str = ""
+    usage_delta: float | None = None  # provider-level used_fraction change during this job
 
 
-@dataclass
-class WindowState:
-    limit_id: str
-    used_fraction: float | None
-    status: str | None  # ok | exhausted | ...
-    resets_at: int | None  # epoch ms
-    recorded_at: int  # epoch ms -- when omp probed it
-    age_s: float = field(default=0.0)
-
-    @property
-    def stale(self) -> bool:
-        return self.age_s > 1800
-
-
-@dataclass
-class UnaccountedTokens:
-    """Tokens hunter's own job history knows about that a probe reading
-    doesn't reflect yet -- kept as two SEPARATE fields, never one shared
-    number, because anthropic:5h and anthropic:7d have their own,
-    generally DIFFERENT probe recency (5h rolls over ~33.6x more often
-    than 7d, so after almost any 5h rollover the two have diverged) --
-    collapsing them into a single int and deriving one from the other by
-    a capacity ratio silently assumes they share a baseline, which is
-    false the moment either window's own probe timing moves independently
-    of the other's. Making this two fields instead of one int is the
-    actual fix: budget.decide() can no longer receive an ambiguous
-    number and misapply it to the wrong window -- the caller is forced
-    to say, by name, which window each count is for."""
-
-    for_5h: int = 0
-    for_7d: int = 0
-
-
-@dataclass
-class BudgetDecision:
-    allow: bool
-    reason: str
-    cap_tokens: int = 0  # effective per-job cap when allowed
-    retry_at: float | None = None  # epoch ms: best-known time this could change

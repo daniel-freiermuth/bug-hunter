@@ -55,17 +55,18 @@
     background: var(--panel); border: 1px solid var(--line); border-radius: 4px;
     padding: 10px 12px; margin-top: 12px;
   }
-  #windows { display: flex; gap: 18px; flex-wrap: wrap; flex: 1; }
-  .win { min-width: 190px; }
-  .win .lab { display: flex; justify-content: space-between; font-size: 11px; color: var(--dim); }
-  .win .lab b { color: var(--fg); font-weight: 600; }
-  .bar { height: 6px; background: #0b0d0e; border-radius: 3px; margin: 4px 0 3px; overflow: hidden; position: relative; }
-  .bar i { display: block; height: 100%; border-radius: 3px; }
-  .bar i.ramp { position: absolute; top: 0; width: 2px; background: var(--fg); opacity: .55; border-radius: 0; }
-  .win .sub { font-size: 11px; color: var(--faint); }
-  .ok    { background: var(--green); }
-  .bad   { background: var(--red); }
-  .stale { background: var(--amber); }
+  #windows { flex: 1; display: flex; flex-direction: column; gap: 6px; }
+  .scv-win { min-width: 190px; }
+  .scv-lab { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 2px; }
+  .scv-lab b { font-weight: 600; }
+  .scv-bar { position: relative; height: 14px; background: #2a2a3a; border-radius: 3px; overflow: hidden; }
+  .scv-fill { display: inline-block; height: 100%; }
+  .scv-fill.scv-ok { background: #4e8; }
+  .scv-fill.scv-bad { background: #e54; }
+  .scv-fill.scv-stale { background: #888; }
+  .scv-soft { display: inline-block; height: 100%; background: repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(255,255,255,0.15) 3px, rgba(255,255,255,0.15) 6px); }
+  .scv-ramp { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff8; }
+  .scv-sub { font-size: 11px; color: #999; margin-top: 2px; }
   #opsRight { text-align: right; min-width: 220px; }
   #lastEvent { font-size: 11px; color: var(--dim); margin-top: 6px; max-width: 340px;
                overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

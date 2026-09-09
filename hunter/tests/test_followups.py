@@ -23,6 +23,26 @@ from hunter import scheduler
 from hunter.scheduler import run_engage, run_harvest
 from hunter.store import Store
 from hunter.types import Config, RunResult
+from hunter.backend import Granted, Outlook
+
+
+class _FakeBackend:
+    """Minimal Backend for tests: always grants, delegates run() to a worker fn."""
+
+    def __init__(self, worker_fn: object) -> None:
+        self._fn = worker_fn
+
+    def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
+        return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
+
+    def run(self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+        return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
+
+    def keep_fresh(self) -> bool:
+        return False
+
+    def status(self) -> str:
+        return ""
 
 
 @pytest.fixture
@@ -146,12 +166,10 @@ class TestHarvestFollowUpIngestion:
                 "introduced_by": f"deferred from applying dep_update {finding['fingerprint']}",
             }
         ]
-        monkeypatch.setattr(
-            scheduler.runner, "run_worker", _harvest_worker_with_followups(followups)
-        )
+        backend = _FakeBackend(_harvest_worker_with_followups(followups))
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: _HarvestFakeForge())
 
-        result = run_harvest(store, cfg, finding)
+        result = run_harvest(store, cfg, finding, backend)
 
         assert result.get("outcome") == "harvested", result
         all_findings = store.list_all_findings()
@@ -180,12 +198,10 @@ class TestHarvestFollowUpIngestion:
         change, but harvested_at is still marked so this finding isn't
         reconsidered every cycle forever."""
         finding = _setup_harvest(store, tmp_path)
-        monkeypatch.setattr(
-            scheduler.runner, "run_worker", _harvest_worker_with_followups(None)
-        )
+        backend = _FakeBackend(_harvest_worker_with_followups(None))
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: _HarvestFakeForge())
 
-        result = run_harvest(store, cfg, finding)
+        result = run_harvest(store, cfg, finding, backend)
 
         assert result.get("outcome") == "harvested", result
         all_findings = store.list_all_findings()
@@ -201,12 +217,10 @@ class TestHarvestFollowUpIngestion:
         harvest that already succeeded."""
         finding = _setup_harvest(store, tmp_path)
         followups = [{"summary": "no fingerprint here"}]
-        monkeypatch.setattr(
-            scheduler.runner, "run_worker", _harvest_worker_with_followups(followups)
-        )
+        backend = _FakeBackend(_harvest_worker_with_followups(followups))
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: _HarvestFakeForge())
 
-        result = run_harvest(store, cfg, finding)
+        result = run_harvest(store, cfg, finding, backend)
 
         assert result.get("outcome") == "harvested", result
         all_findings = store.list_all_findings()
@@ -259,12 +273,10 @@ class TestHarvestFollowUpIngestion:
                 # behind it, only urgency.
             },
         ]
-        monkeypatch.setattr(
-            scheduler.runner, "run_worker", _harvest_worker_with_followups(followups)
-        )
+        backend = _FakeBackend(_harvest_worker_with_followups(followups))
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: _HarvestFakeForge())
 
-        result = run_harvest(store, cfg, finding)
+        result = run_harvest(store, cfg, finding, backend)
 
         assert result.get("outcome") == "harvested", result
         all_findings = store.list_all_findings()
@@ -294,10 +306,10 @@ class TestHarvestFollowUpIngestion:
                 stdout_tail="ran out of budget",
             )
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", failing_worker)
+        backend = _FakeBackend(failing_worker)
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: _HarvestFakeForge())
 
-        result = run_harvest(store, cfg, finding)
+        result = run_harvest(store, cfg, finding, backend)
 
         assert result.get("outcome") == "retry", result
         ps = store.get_pr_state(finding["id"])
@@ -324,11 +336,11 @@ class TestHarvestFollowUpIngestion:
                 stdout_tail="ran out of budget",
             )
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", failing_worker)
+        backend = _FakeBackend(failing_worker)
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: _HarvestFakeForge())
 
         for attempt in range(1, scheduler.MAX_CONSECUTIVE_SAME_FAILURE):
-            result = run_harvest(store, cfg, finding)
+            result = run_harvest(store, cfg, finding, backend)
             assert result.get("outcome") == "retry", (attempt, result)
             ps = store.get_pr_state(finding["id"])
             assert ps is not None
@@ -338,7 +350,7 @@ class TestHarvestFollowUpIngestion:
             assert finding is not None
             finding["budget_override"] = "exempt"
 
-        result = run_harvest(store, cfg, finding)
+        result = run_harvest(store, cfg, finding, backend)
         assert result.get("outcome") == "stuck", result
 
         ps = store.get_pr_state(finding["id"])
@@ -469,13 +481,11 @@ class TestEngageWithdrawFollowUpIngestion:
                 "introduced_by": f"reopened while withdrawing {finding['fingerprint']}",
             }
         ]
-        monkeypatch.setattr(
-            scheduler.runner, "run_worker", _engage_worker_with_followups(followups)
-        )
+        backend = _FakeBackend(_engage_worker_with_followups(followups))
         fake_forge = _EngageFakeForge()
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
 
-        result = run_engage(store, cfg, finding)
+        result = run_engage(store, cfg, finding, backend)
 
         assert result.get("outcome") == "withdrawn", result
         assert fake_forge.closed, "close_pr must have been called"
@@ -507,11 +517,11 @@ class TestEngageWithdrawFollowUpIngestion:
         """A genuinely fully-superseded withdrawal (nothing further to
         propose) must behave exactly as before -- opt-in, no new findings."""
         finding = _setup_engage(store, tmp_path)
-        monkeypatch.setattr(scheduler.runner, "run_worker", _engage_worker_with_followups(None))
+        backend = _FakeBackend(_engage_worker_with_followups(None))
         fake_forge = _EngageFakeForge()
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: fake_forge)
 
-        result = run_engage(store, cfg, finding)
+        result = run_engage(store, cfg, finding, backend)
 
         assert result.get("outcome") == "withdrawn", result
         after = store.get_finding(finding["id"])

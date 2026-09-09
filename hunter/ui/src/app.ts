@@ -14,16 +14,6 @@ import { z } from "zod";
 // aren't in scope here, though Job/Event/Repo/CurrentJob/NextCandidate/
 // SchedulerState/ActivityStatus/Summary further down ARE zod-derived,
 // since /api/summary embeds all of them.
-const WindowInfoSchema = z.object({
-  used_fraction: z.number().nullable(),
-  status: z.string().nullable(),
-  resets_at: z.number().nullable(),
-  age_s: z.number(),
-  stale: z.boolean(),
-  ramp: z.number().nullable(),
-  available_tokens: z.number().nullable(),
-});
-type WindowInfo = z.infer<typeof WindowInfoSchema>;
 
 interface Finding {
   type: string;  // 'bug' | 'dep_update' | 'test_gap' | 'refactor' | 'modernization'
@@ -177,7 +167,7 @@ const ActivityStatusSchema = z.discriminatedUnion("kind", [
 type ActivityStatus = z.infer<typeof ActivityStatusSchema>;
 
 const SummarySchema = z.object({
-  windows: z.record(z.string(), WindowInfoSchema),
+  backend_status_html: z.string(),
   counts: z.record(z.string(), z.number()),
   type_counts: z.record(z.string(), z.number()),
   repos: z.array(RepoSchema),
@@ -808,40 +798,9 @@ Object.assign(window, {
 // Renderers
 // ---------------------------------------------------------------------------
 
-function renderWindows(windows: Record<string, WindowInfo>): void {
-  const keys = Object.keys(windows).sort();
-  if (!keys.length) {
-    $("windows").innerHTML =
-      '<span class="empty">no window data</span>';
-    return;
-  }
-  $("windows").innerHTML = keys
-    .map((k) => {
-      const w = windows[k];
-      const pct =
-        w.used_fraction == null
-          ? null
-          : Math.min(100, Math.round(w.used_fraction * 100));
-      const rampPct =
-        w.ramp == null ? null : Math.min(100, Math.round(w.ramp * 100));
-      const availPct =
-        pct == null || rampPct == null ? null : Math.max(0, rampPct - pct);
-      const cls = w.stale
-        ? "stale"
-        : w.status === "exhausted" || (pct !== null && pct >= 100)
-          ? "bad"
-          : "ok";
-      const label = k.replace(/^anthropic:/, "");
-      const avail = availPct == null ? "" : ` \u00b7 ${availPct}% avail`;
-      const marker =
-        rampPct == null ? "" : `<i class="ramp" style="left:${rampPct}%"></i>`;
-      return `<div class="win">
-      <div class="lab"><b>${esc(label)}</b><span>${pct == null ? "?" : pct + "% used"}${avail}${w.stale ? " \u26a0stale" : ""}</span></div>
-      <div class="bar"><i class="${cls}" style="width:${pct ?? 0}%"></i>${marker}</div>
-      <div class="sub">resets ${ts(w.resets_at)}${w.resets_at ? " (" + countdown(w.resets_at) + ")" : ""} \u00b7 probed ${Math.round(w.age_s / 60)}m ago${w.available_tokens == null ? "" : ` \u00b7 ~${fmtTokens(w.available_tokens)} tok avail (est.)`}</div>
-    </div>`;
-    })
-    .join("");
+function renderWindows(html: string): void {
+  const winEl = $("windows");
+  if (winEl) winEl.innerHTML = html;
 }
 
 function renderActivity(s: Summary): void {
@@ -1226,7 +1185,7 @@ async function refresh(): Promise<void> {
       if (card) openDetails.add(card + "|" + label);
     }
 
-    renderWindows(s.windows || {});
+    renderWindows(s.backend_status_html);
     renderActivity(s);
 
     // ---- populate filter dropdowns (preserve selection) ----

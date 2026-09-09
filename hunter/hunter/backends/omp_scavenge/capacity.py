@@ -34,8 +34,58 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from dataclasses import dataclass, field
+from pathlib import Path
 
-from .types import OMP_AGENT_DB, BudgetDecision, Config, UnaccountedTokens, WindowState
+from hunter.types import Config
+
+# ---------------------------------------------------------------------------
+# Locally-defined constants and types (decoupled from hunter.types)
+# ---------------------------------------------------------------------------
+
+OMP_AGENT_DB = Path.home() / ".omp/agent/agent.db"
+
+
+@dataclass
+class WindowState:
+    limit_id: str
+    used_fraction: float | None
+    status: str | None  # ok | exhausted | ...
+    resets_at: int | None  # epoch ms
+    recorded_at: int  # epoch ms -- when omp probed it
+    age_s: float = field(default=0.0)
+
+    @property
+    def stale(self) -> bool:
+        return self.age_s > 1800
+
+
+@dataclass
+class UnaccountedTokens:
+    """Tokens hunter's own job history knows about that a probe reading
+    doesn't reflect yet -- kept as two SEPARATE fields, never one shared
+    number, because anthropic:5h and anthropic:7d have their own,
+    generally DIFFERENT probe recency (5h rolls over ~33.6x more often
+    than 7d, so after almost any 5h rollover the two have diverged) --
+    collapsing them into a single int and deriving one from the other by
+    a capacity ratio silently assumes they share a baseline, which is
+    false the moment either window's own probe timing moves independently
+    of the other's. Making this two fields instead of one int is the
+    actual fix: budget.decide() can no longer receive an ambiguous
+    number and misapply it to the wrong window -- the caller is forced
+    to say, by name, which window each count is for."""
+
+    for_5h: int = 0
+    for_7d: int = 0
+
+
+@dataclass
+class BudgetDecision:
+    allow: bool
+    reason: str
+    cap_tokens: int = 0  # effective per-job cap when allowed
+    retry_at: float | None = None  # epoch ms: best-known time this could change
+
 
 # =============================================================================
 # Configuration: To adjust when hunter can start using the 5h window,

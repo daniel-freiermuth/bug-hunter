@@ -33,7 +33,7 @@ def store(cfg: Config) -> Store:
     return Store(cfg)
 
 
-def _always_fails(_store: Store, _cfg: Config, _repo: Row) -> Row:
+def _always_fails(_store: Store, _cfg: Config, _repo: Row, _backend: object) -> Row:
     return {"kind": "test_gap", "error": "simulated persistent failure"}
 
 
@@ -57,7 +57,7 @@ class TestJobRotationStarvation:
         fake_runners = {**scheduler._RUNNERS, "test_gap": _always_fails}
         monkeypatch.setattr(scheduler, "_RUNNERS", fake_runners)
 
-        result1 = run_cycle(store, cfg)
+        result1 = run_cycle(store, cfg, backend=object())
         assert result1.get("kind") == "test_gap", result1
 
         after1 = store.get_repo(rid)

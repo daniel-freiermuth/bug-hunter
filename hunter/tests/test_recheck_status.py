@@ -19,6 +19,30 @@ from hunter import scheduler
 from hunter.scheduler import run_recheck
 from hunter.store import Store
 from hunter.types import Config, RunResult
+from hunter.backend import Granted, Outlook
+
+
+class _FakeBackend:
+    """Minimal Backend for tests: always grants, delegates run() to a worker fn."""
+
+    def __init__(self, worker_fn: object) -> None:
+        self._fn = worker_fn
+
+    def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
+        return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
+
+    def run(self, cwd: object, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+        return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
+
+    def keep_fresh(self) -> bool:
+        return False
+
+    def status(self) -> str:
+        return ""
+
+
+# Dummy backend for tests that fail before reaching the worker call.
+_DUMMY = _FakeBackend(lambda *a, **kw: None)
 
 
 @pytest.fixture
@@ -67,7 +91,7 @@ class TestRunRecheckStaysRecheckingOnFailure:
         # Point the finding dict at a repo_id that doesn't exist.
         finding["repo_id"] = 9999
 
-        result = run_recheck(store, cfg, finding)
+        result = run_recheck(store, cfg, finding, _DUMMY)
         assert "error" in result
 
         after = store.get_finding(fid)
@@ -92,7 +116,7 @@ class TestRunRecheckStaysRecheckingOnFailure:
 
         finding = store.get_finding(fid)
         assert finding is not None
-        result = run_recheck(store, cfg, finding)
+        result = run_recheck(store, cfg, finding, _DUMMY)
         assert "error" in result
 
         after = store.get_finding(fid)
@@ -118,7 +142,7 @@ class TestRunRecheckStaysRecheckingOnFailure:
 
         finding = store.get_finding(fid)
         assert finding is not None
-        result = run_recheck(store, cfg, finding)
+        result = run_recheck(store, cfg, finding, _DUMMY)
         assert "error" in result
 
         after = store.get_finding(fid)
@@ -128,7 +152,7 @@ class TestRunRecheckStaysRecheckingOnFailure:
         )
 
     def test_killed_worker_stays_rechecking(
-        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
         """When the worker is killed mid-investigation (no valid verdict
         written), the finding must stay 'rechecking' for automatic retry --
@@ -173,9 +197,7 @@ class TestRunRecheckStaysRecheckingOnFailure:
                 stdout_tail="investigating...",
             )
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
-
-        result = run_recheck(store, cfg, finding)
+        result = run_recheck(store, cfg, finding, _FakeBackend(fake_run_worker))
         assert result.get("outcome") == "requeued"
 
         after = store.get_finding(fid)
@@ -193,7 +215,7 @@ class TestRecheckGiveUp:
     since pick_next always retries the oldest 'rechecking' item first."""
 
     def test_gives_up_after_consecutive_identical_failures(
-        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
         repo_path = tmp_path / "repos" / "real-repo"
         repo_path.mkdir(parents=True)
@@ -228,14 +250,14 @@ class TestRecheckGiveUp:
                 stdout_tail="investigating...",
             )
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", fake_run_worker)
+        backend = _FakeBackend(fake_run_worker)
 
         finding = store.get_finding(fid)
         assert finding is not None
         finding["budget_override"] = "exempt"
 
         for attempt in range(1, scheduler.MAX_CONSECUTIVE_SAME_FAILURE):
-            result = run_recheck(store, cfg, finding)
+            result = run_recheck(store, cfg, finding, backend)
             assert result.get("outcome") == "requeued", (attempt, result)
             after = store.get_finding(fid)
             assert after is not None
@@ -244,7 +266,7 @@ class TestRecheckGiveUp:
             finding = after
             finding["budget_override"] = "exempt"
 
-        result = run_recheck(store, cfg, finding)
+        result = run_recheck(store, cfg, finding, backend)
         assert result.get("outcome") == "stuck", result
 
         after = store.get_finding(fid)

@@ -25,6 +25,26 @@ from hunter import scheduler
 from hunter.scheduler import MAX_CONSECUTIVE_SAME_FAILURE, run_fix
 from hunter.store import Store
 from hunter.types import Config, RunResult
+from hunter.backend import Granted, Outlook
+
+
+class _FakeBackend:
+    """Minimal Backend for tests: always grants, delegates run() to a worker fn."""
+
+    def __init__(self, worker_fn: object) -> None:
+        self._fn = worker_fn
+
+    def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
+        return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
+
+    def run(self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+        return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
+
+    def keep_fresh(self) -> bool:
+        return False
+
+    def status(self) -> str:
+        return ""
 
 
 @pytest.fixture
@@ -122,16 +142,14 @@ def _worker_with_no_commits(_cfg: Config, _worktree: Path, *_a: object, **_kw: o
 
 class TestFixRetryGiveUp:
     def test_gives_up_after_consecutive_identical_failures(
-        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
         finding = _setup(store, tmp_path)
         fid = finding["id"]
-        monkeypatch.setattr(
-            scheduler.runner, "run_worker", _worker_that_commits_without_pr_description
-        )
+        backend = _FakeBackend(_worker_that_commits_without_pr_description)
 
         for attempt in range(1, MAX_CONSECUTIVE_SAME_FAILURE):
-            result = run_fix(store, cfg, finding)
+            result = run_fix(store, cfg, finding, backend)
             assert result.get("outcome") == "requeued", (attempt, result)
             after = store.get_finding(fid)
             assert after is not None
@@ -142,7 +160,7 @@ class TestFixRetryGiveUp:
 
         # The Nth identical failure crosses the threshold -> give up rather
         # than requeue into another guaranteed-identical retry.
-        result = run_fix(store, cfg, finding)
+        result = run_fix(store, cfg, finding, backend)
         assert result.get("outcome") == "stuck", result
         assert result.get("attempts") == MAX_CONSECUTIVE_SAME_FAILURE
 
@@ -156,13 +174,12 @@ class TestFixRetryGiveUp:
         )
 
     def test_different_failure_reason_resets_the_streak(
-        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
         finding = _setup(store, tmp_path)
         fid = finding["id"]
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", _worker_with_no_commits)
-        result = run_fix(store, cfg, finding)
+        result = run_fix(store, cfg, finding, _FakeBackend(_worker_with_no_commits))
         assert result.get("failure") == "no commits"
         after = store.get_finding(fid)
         assert after is not None
@@ -170,10 +187,7 @@ class TestFixRetryGiveUp:
         finding = after
         finding["budget_override"] = "exempt"
 
-        monkeypatch.setattr(
-            scheduler.runner, "run_worker", _worker_that_commits_without_pr_description
-        )
-        result = run_fix(store, cfg, finding)
+        result = run_fix(store, cfg, finding, _FakeBackend(_worker_that_commits_without_pr_description))
         assert result.get("failure") == "no PR-DESCRIPTION.md"
         after = store.get_finding(fid)
         assert after is not None
@@ -187,8 +201,7 @@ class TestFixRetryGiveUp:
         finding = _setup(store, tmp_path)
         fid = finding["id"]
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", _worker_with_no_commits)
-        run_fix(store, cfg, finding)
+        run_fix(store, cfg, finding, _FakeBackend(_worker_with_no_commits))
         after = store.get_finding(fid)
         assert after is not None
         assert after["fix_attempts"] == 1
@@ -222,9 +235,8 @@ class TestFixRetryGiveUp:
                 stdout_tail="done",
             )
 
-        monkeypatch.setattr(scheduler.runner, "run_worker", _worker_that_ships)
         monkeypatch.setattr(scheduler, "forge_for", lambda repo: FakeForge())
-        result = run_fix(store, cfg, finding)
+        result = run_fix(store, cfg, finding, _FakeBackend(_worker_that_ships))
         assert result.get("outcome") == "pr_open", result
 
         after = store.get_finding(fid)

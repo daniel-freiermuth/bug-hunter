@@ -1,21 +1,14 @@
-"""Tests for hunter.scheduler._unaccounted_tokens.
+"""Tests for OmpScavengeBackend._unaccounted_fraction.
 
 budget.decide() trusts each window's latest probe used_fraction as a
-floor and relies on this function to add whatever hunter's own job
+floor and relies on this method to add whatever hunter's own job
 history knows has been spent since THAT window's own floor was measured
 (Anthropic's probe is sparse and can lag hours behind an active run --
-see budget.read_windows and its own tests for the window-rollover half
+see capacity.read_windows and its own tests for the window-rollover half
 of this story).
 
-Returns a types.UnaccountedTokens with SEPARATE for_5h/for_7d fields,
-never one shared number -- anthropic:5h and anthropic:7d generally have
-DIFFERENT probe recency (5h rolls over ~33.6x more often than 7d), so a
-single combined figure scaled by a capacity ratio (the original design)
-silently assumes both probes share a baseline. That assumption breaks
-the moment either window's read_windows() rollover moves independently
-of the other's -- this file's regression test reproduces exactly that,
-caught live in production the same day the first (5h-only) version of
-this fix shipped.
+Returns a (reservation_5h, reservation_7d) tuple of fraction reservations,
+each independently computed against its own window's recorded_at.
 """
 
 from __future__ import annotations
@@ -24,15 +17,26 @@ from pathlib import Path
 
 import pytest
 
-from hunter.scheduler import _unaccounted_tokens
+from hunter.backends.omp_scavenge.capacity import WindowState
+from hunter.backends.omp_scavenge.facade import (
+    OmpScavengeBackend,
+    _5H_7D_RATIO,
+    _TOK_PER_FRAC_5H,
+)
 from hunter.store import Store
-from hunter.types import Config, UnaccountedTokens, WindowState, now_ms
+from hunter.types import Config, now_ms
 
 
 @pytest.fixture
 def store(tmp_path: Path) -> Store:
     cfg = Config(work_root=tmp_path, db_path=tmp_path / "test.db")
     return Store(cfg)
+
+
+@pytest.fixture
+def backend(store: Store, tmp_path: Path) -> OmpScavengeBackend:
+    cfg = Config(work_root=tmp_path, db_path=tmp_path / "test.db")
+    return OmpScavengeBackend(cfg=cfg, ledger=store)
 
 
 def _ws(limit_id: str, recorded_at: int) -> WindowState:
@@ -54,15 +58,31 @@ def _running_job(store: Store, repo_id: int, cap_tokens: int) -> None:
     store.create_job("hunt", repo_id, cap_tokens=cap_tokens, state="running")
 
 
-def test_no_jobs_returns_zero(store: Store) -> None:
+def _backing_tokens(res_5h: float, res_7d: float) -> tuple[int, int]:
+    """Convert reservation fractions back to the underlying token counts.
+
+    Inverse of the conversion in _unaccounted_fraction:
+      res_5h = unaccounted_5h / _TOK_PER_FRAC_5H
+      res_7d = unaccounted_7d / _TOK_PER_FRAC_5H * _5H_7D_RATIO
+    """
+    tok_5h = round(res_5h * _TOK_PER_FRAC_5H)
+    tok_7d = round(res_7d / _5H_7D_RATIO * _TOK_PER_FRAC_5H) if res_7d else 0
+    return tok_5h, tok_7d
+
+
+def test_no_jobs_returns_zero(store: Store, backend: OmpScavengeBackend) -> None:
     windows = {
         "anthropic:5h": _ws("anthropic:5h", now_ms() - 3600_000),
         "anthropic:7d": _ws("anthropic:7d", now_ms() - 3600_000),
     }
-    assert _unaccounted_tokens(store, windows) == UnaccountedTokens(for_5h=0, for_7d=0)
+    tok_5h, tok_7d = _backing_tokens(*backend._unaccounted_fraction(windows, 0))
+    assert tok_5h == 0
+    assert tok_7d == 0
 
 
-def test_running_job_counted_via_cap_tokens_in_both_fields(store: Store) -> None:
+def test_running_job_counted_via_cap_tokens_in_both_fields(
+    store: Store, backend: OmpScavengeBackend,
+) -> None:
     """A still-running job's estimated cost is unaccounted-for from
     EITHER window's perspective equally -- it hasn't finished, so no
     probe reflects it yet regardless of which dimension is asked."""
@@ -72,24 +92,28 @@ def test_running_job_counted_via_cap_tokens_in_both_fields(store: Store) -> None
         "anthropic:5h": _ws("anthropic:5h", now_ms() - 3600_000),
         "anthropic:7d": _ws("anthropic:7d", now_ms() - 3600_000),
     }
-    result = _unaccounted_tokens(store, windows)
-    assert result.for_5h == 150_000
-    assert result.for_7d == 150_000
+    tok_5h, tok_7d = _backing_tokens(*backend._unaccounted_fraction(windows, 0))
+    assert tok_5h == 150_000
+    assert tok_7d == 150_000
 
 
-def test_anticipated_added_to_both_fields(store: Store) -> None:
+def test_anticipated_added_to_both_fields(
+    store: Store, backend: OmpScavengeBackend,
+) -> None:
     """The about-to-run job's own anticipated cost applies identically
     to both windows -- it doesn't depend on any probe baseline."""
     windows = {
         "anthropic:5h": _ws("anthropic:5h", now_ms() - 3600_000),
         "anthropic:7d": _ws("anthropic:7d", now_ms() - 3600_000),
     }
-    result = _unaccounted_tokens(store, windows, anticipated=80_000)
-    assert result.for_5h == 80_000
-    assert result.for_7d == 80_000
+    tok_5h, tok_7d = _backing_tokens(*backend._unaccounted_fraction(windows, anticipated=80_000))
+    assert tok_5h == 80_000
+    assert tok_7d == 80_000
 
 
-def test_finished_job_scoped_to_each_windows_own_probe(store: Store) -> None:
+def test_finished_job_scoped_to_each_windows_own_probe(
+    store: Store, backend: OmpScavengeBackend,
+) -> None:
     """A job that finished after BOTH windows' probes counts toward
     both; a job finished before either window's own probe does not
     count toward that specific window."""
@@ -101,12 +125,14 @@ def test_finished_job_scoped_to_each_windows_own_probe(store: Store) -> None:
         "anthropic:5h": _ws("anthropic:5h", probe_5h_at),
         "anthropic:7d": _ws("anthropic:7d", probe_7d_at),
     }
-    result = _unaccounted_tokens(store, windows)
-    assert result.for_5h == 50_000
-    assert result.for_7d == 50_000  # also after 7d's (earlier) probe
+    tok_5h, tok_7d = _backing_tokens(*backend._unaccounted_fraction(windows, 0))
+    assert tok_5h == 50_000
+    assert tok_7d == 50_000  # also after 7d's (earlier) probe
 
 
-def test_stale_7d_probe_no_longer_drags_the_5h_baseline_back(store: Store) -> None:
+def test_stale_7d_probe_no_longer_drags_the_5h_baseline_back(
+    store: Store, backend: OmpScavengeBackend,
+) -> None:
     """Reproduces a real production regression, caught live the same day
     the 5h-rollover fix shipped: immediately before and immediately after
     a 5h window rolled over, the logged "unaccounted" figure was IDENTICAL
@@ -131,12 +157,12 @@ def test_stale_7d_probe_no_longer_drags_the_5h_baseline_back(store: Store) -> No
         "anthropic:5h": _ws("anthropic:5h", five_h_rollover_at),
         "anthropic:7d": _ws("anthropic:7d", seven_d_probe_at),
     }
-    result = _unaccounted_tokens(store, windows)
-    assert result.for_5h == 0, (
+    tok_5h, tok_7d = _backing_tokens(*backend._unaccounted_fraction(windows, 0))
+    assert tok_5h == 0, (
         "a job that finished before the 5h rollover must not count against the new "
         "5h window just because anthropic:7d's probe is still older"
     )
-    assert result.for_7d == 999_999, (
+    assert tok_7d == 999_999, (
         "the same job DOES postdate 7d's own last probe, so it must count toward "
         "for_7d -- excluding it there too (the pre-fix behavior) silently "
         "under-reserves the 7d ramp"
@@ -144,12 +170,14 @@ def test_stale_7d_probe_no_longer_drags_the_5h_baseline_back(store: Store) -> No
 
     # A job finishing after the 5h rollover boundary counts toward both.
     _finished_job(store, rid, tokens=42_000, finished_at=five_h_rollover_at + 60_000)
-    result2 = _unaccounted_tokens(store, windows)
-    assert result2.for_5h == 42_000
-    assert result2.for_7d == 999_999 + 42_000
+    tok_5h2, tok_7d2 = _backing_tokens(*backend._unaccounted_fraction(windows, 0))
+    assert tok_5h2 == 42_000
+    assert tok_7d2 == 999_999 + 42_000
 
 
-def test_falls_back_to_min_when_window_missing(store: Store) -> None:
+def test_falls_back_to_min_when_window_missing(
+    store: Store, backend: OmpScavengeBackend,
+) -> None:
     """No anthropic:5h (or anthropic:7d) entry at all -> that field falls
     back to min() across whatever IS present, rather than crashing or
     silently ignoring everything."""
@@ -157,6 +185,6 @@ def test_falls_back_to_min_when_window_missing(store: Store) -> None:
     probe_at = now_ms() - 3600_000
     _finished_job(store, rid, tokens=10_000, finished_at=probe_at + 30_000)
     windows = {"anthropic:7d": _ws("anthropic:7d", probe_at)}
-    result = _unaccounted_tokens(store, windows)
-    assert result.for_5h == 10_000  # falls back to the only window present
-    assert result.for_7d == 10_000
+    tok_5h, tok_7d = _backing_tokens(*backend._unaccounted_fraction(windows, 0))
+    assert tok_5h == 10_000  # falls back to the only window present
+    assert tok_7d == 10_000
