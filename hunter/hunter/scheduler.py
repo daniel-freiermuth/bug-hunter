@@ -33,10 +33,7 @@ from .types import Config, Row, RunResult, now_ms
 from .util import run_cmd
 
 
-CACHE_TTL_MS = 3600 * 1000  # Anthropic's observed ephemeral-cache lifetime
-
-
-def anticipated_tokens(store: Store, repo_id: int, kind: str) -> int:
+def anticipated_tokens(store: Store, cfg: Config, repo_id: int, kind: str) -> int:
     """Realistic anticipated cost of the job about to be decided on -- not
     its nominal cap_tokens. A cold prompt-cache first call for a given
     (repo, kind) pair can cost 2-5x cap_tokens in one atomic LLM call the
@@ -46,19 +43,20 @@ def anticipated_tokens(store: Store, repo_id: int, kind: str) -> int:
     production: dep_update/refactor jobs cold-starting at 2-4x their
     200k cap while the scheduler's own accounting still assumed 200k).
 
-    If this exact (repo, kind) pair has finished within the last hour
-    (Anthropic's observed cache TTL), its prompt cache is probably still
-    warm -- anticipate this kind's historical median cost. Otherwise
+    If this exact (repo, kind) pair has finished within the configured
+    cache TTL (cfg.cache_ttl_s, default 1h -- Anthropic's observed prompt-
+    cache lifetime), its prompt cache is probably still warm -- anticipate
     anticipate its historical p90: a cold cache-write is likely, and a
     handful of jobs having been merely cheap doesn't mean this one will be.
     No history for this kind yet -> nothing to anticipate beyond whatever
     cap_tokens/inflight accounting already covers.
     """
+    cache_ttl_ms = cfg.cache_ttl_s * 1000
     warm = (
         store.db.execute(
             "SELECT 1 FROM jobs WHERE repo_id = ? AND kind = ? AND finished_at > ?"
             " AND state != 'denied' LIMIT 1",
-            (repo_id, kind, now_ms() - CACHE_TTL_MS),
+            (repo_id, kind, now_ms() - cache_ttl_ms),
         ).fetchone()
         is not None
     )
@@ -274,7 +272,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         scope_note = f"First hunt for this repo: {scope} (base {base[:12]})."
 
     cfg_cap = cfg.hunt_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, rid, "hunt"))
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, rid, "hunt"))
     verdict = outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -401,7 +399,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     # Budget gate -- recheck is investigative, like hunt.
     override = finding.get("budget_override")
     cfg_cap = cfg.hunt_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, repo["id"], "recheck"))
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "recheck"))
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -580,7 +578,7 @@ def _run_analysis_job(store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec,
 
     # Budget check -- analysis jobs share the hunt budget/model for now
     cfg_cap = cfg.hunt_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, rid, kind))
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, rid, kind))
     verdict = outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -818,7 +816,7 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
 
     override = finding.get("budget_override")
     cfg_cap = cfg.fix_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, repo["id"], "fix"))
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "fix"))
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -1369,7 +1367,7 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
 
     override = finding.get("budget_override")
     cfg_cap = cfg.fix_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, repo["id"], "engage"))
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "engage"))
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -1653,7 +1651,7 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
 
     override = finding.get("budget_override")
     cfg_cap = cfg.fix_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, repo["id"], "harvest"))
+    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "harvest"))
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):

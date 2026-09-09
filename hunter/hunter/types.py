@@ -182,6 +182,7 @@ class Config:
     fix_cap_tokens: int = 150_000
     fix_max_wall_s: int = 2700
     stale_after_s: int = 300  # usage-probe refresh threshold (see server._usage_prober_loop)
+    cache_ttl_s: int = 3600  # prompt-cache lifetime for anticipated_tokens warm/cold split
     serve_port: int = 8377
     poll_s: float = 2.0
     model_default: str | None = None  # --model for all workers (None = omp default)
@@ -216,6 +217,7 @@ class Config:
             fix_cap_tokens=raw.get("fix", {}).get("capNewTokens", 150_000),
             fix_max_wall_s=raw.get("fix", {}).get("maxWallS", 2700),
             stale_after_s=raw.get("budget", {}).get("staleAfterS", 300),
+            cache_ttl_s=raw.get("budget", {}).get("cacheTtlS", 3600),
             serve_port=raw.get("serve", {}).get("port", 8377),
             poll_s=raw.get("pollS", 2.0),
             model_default=raw.get("models", {}).get("default"),

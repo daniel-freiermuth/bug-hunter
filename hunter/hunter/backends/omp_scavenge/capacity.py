@@ -16,11 +16,11 @@ ramp-catchup-before-reset risk.
 
 A window's last known reading is never discarded for being old -- usage
 only increases within a window, so it remains a valid floor. Combined
-with unaccounted_tokens (hunter's own record of spend since that reading
-was taken -- tracked SEPARATELY per window, see types.UnaccountedTokens),
-and ramps that keep climbing toward 1.0 against live wall-clock time
-regardless of probe staleness, denial resolves itself once the ramp
-naturally catches up -- no bypass needed.
+with unaccounted-token tracking (computed by the facade from the
+SpendLedger, tracked separately per window), and ramps that keep
+climbing toward 1.0 against live wall-clock time regardless of probe
+staleness, denial resolves itself once the ramp naturally catches up --
+no bypass needed.
 
 No active 5h window (truly nothing ever probed, e.g. a fresh install) →
 allow (opens one), gated only by the 7d ramp. A window whose own
@@ -59,32 +59,6 @@ class WindowState:
     def stale(self) -> bool:
         return self.age_s > 1800
 
-
-@dataclass
-class UnaccountedTokens:
-    """Tokens hunter's own job history knows about that a probe reading
-    doesn't reflect yet -- kept as two SEPARATE fields, never one shared
-    number, because anthropic:5h and anthropic:7d have their own,
-    generally DIFFERENT probe recency (5h rolls over ~33.6x more often
-    than 7d, so after almost any 5h rollover the two have diverged) --
-    collapsing them into a single int and deriving one from the other by
-    a capacity ratio silently assumes they share a baseline, which is
-    false the moment either window's own probe timing moves independently
-    of the other's. Making this two fields instead of one int is the
-    actual fix: budget.decide() can no longer receive an ambiguous
-    number and misapply it to the wrong window -- the caller is forced
-    to say, by name, which window each count is for."""
-
-    for_5h: int = 0
-    for_7d: int = 0
-
-
-@dataclass
-class BudgetDecision:
-    allow: bool
-    reason: str
-    cap_tokens: int = 0  # effective per-job cap when allowed
-    retry_at: float | None = None  # epoch ms: best-known time this could change
 
 
 # =============================================================================
@@ -237,123 +211,3 @@ def _effective_used(w: WindowState, inflight_reservation: float) -> float:
     used = 1.0 if w.status == "exhausted" else w.used_fraction
     return used + inflight_reservation
 
-
-def decide(
-    cfg: Config,
-    kind: str,
-    windows: dict[str, WindowState],
-    unaccounted: UnaccountedTokens | None = None,
-) -> BudgetDecision:
-    base = cfg.hunt_cap_tokens if kind == "hunt" else cfg.fix_cap_tokens
-    now_ms = time.time() * 1000
-
-    if not windows:
-        return BudgetDecision(False, "no window data -- deny until fresh")
-
-    # -- Account for spend the latest probe can't see yet ---------------------
-    # Anthropic's usage probe is sparse and can lag *tens of minutes to over
-    # an hour* behind hunter's own job cadence during an active run (observed
-    # in production: 26 jobs and ~4M tokens spent across a 98-minute stretch
-    # with zero fresh probes landing -- the reading only caught up once, in
-    # one jump, long after the fact). unaccounted is hunter's own count of
-    # jobs still running (cap_tokens estimate -- final usage isn't known
-    # yet) plus jobs that already finished after each window's OWN probe
-    # recorded_at (their real tokens_new -- known exactly, and routinely
-    # 2-5x cap_tokens on a cold-cache first call; see runner.py). Folding
-    # this in is what actually closes the gap a stale-data bypass cannot:
-    # a bypass just stops looking, this keeps counting.
-    #
-    # for_5h and for_7d are computed INDEPENDENTLY by the caller (see
-    # scheduler._unaccounted_tokens), never derived from one another --
-    # anthropic:5h and anthropic:7d generally have different probe
-    # recency (5h rolls over ~33.6x more often), so a shared number
-    # scaled by a capacity ratio silently assumes both probes share a
-    # baseline, which is false the moment either window's rollover
-    # timing moves independently of the other's (a real incident: see
-    # git history for the fix that split this into two fields).
-    #
-    # Rough conversion, calibrated for the 5h window: reserve 10% of window
-    # capacity per 200k tokens (Anthropic 5h ~= 2-5M tokens depending on
-    # model, so 200k ~= 4-10%). The 7d window is the same tokens against a
-    # ~33.6x larger capacity (a week holds 7*24/5 five-hour windows), so
-    # applying the 5h-calibrated fraction there directly would overstate a
-    # burst's weekly impact by ~33x -- scale THIS conversion (capacity size,
-    # not probe baseline) down by that same ratio.
-    unaccounted = unaccounted or UnaccountedTokens()
-    inflight_reservation_5h = (unaccounted.for_5h / 200_000) * 0.10
-    inflight_reservation_7d = (unaccounted.for_7d / 200_000) * 0.10 * (_5H_MS / _WEEK_MS)
-
-    # -- 7d linear ramp: spend proportionally to elapsed time -----------------
-    # allowed_by_7d = ramp_7d(...) > effective_used. The 7d fraction moves
-    # slowly; even somewhat stale data is safe here. "exhausted" needs no
-    # separate branch: _effective_used clamps it to 1.0, and ramp_7d is
-    # itself capped at 1.0 (reached only exactly at resets_at), so an
-    # exhausted window denies for its entire remaining duration for free.
-
-    for lid, w in windows.items():
-        if ":7d" not in lid or (w.status != "exhausted" and w.used_fraction is None):
-            continue
-        if w.resets_at and w.resets_at <= now_ms:
-            # This window's own cycle has already ended -- the recorded
-            # used_fraction describes a bygone week, not the current one
-            # (e.g. a per-model-class window nobody has probed since the
-            # config stopped routing jobs to that model; resets_at can be
-            # weeks in the past). Using it here would gate live decisions
-            # on data for a period that is definitionally over. Skip it,
-            # same as "no data for this dimension" -- unlike the missing-
-            # resets_at case below, we know for certain this reading is
-            # stale, not just imprecise.
-            continue
-        elapsed_frac = ramp_7d(w.resets_at, now_ms)
-        effective_used = _effective_used(w, inflight_reservation_7d)
-        if effective_used >= elapsed_frac:
-            # Hard exhaustion resolves exactly at reset -- not at whatever
-            # point retry_at_7d's ramp-catchup math would compute from a
-            # clamped/reservation-inflated effective_used.
-            retry_at = w.resets_at if w.status == "exhausted" else retry_at_7d(w.resets_at, effective_used)
-            return BudgetDecision(
-                False,
-                f"{lid}: used {effective_used - inflight_reservation_7d:.2f} + unaccounted {inflight_reservation_7d:.2f}"
-                f" = {effective_used:.2f} >= ramp {elapsed_frac:.2f}",
-                retry_at=retry_at,
-            )
-
-    # -- 5h ramp (configurable headroom, then linear harvest) -----------------
-    # Same shape as the 7d check above: allowed_by_5h = ramp_5h(...) >
-    # effective_used, with "exhausted" clamped into effective_used rather
-    # than special-cased.
-    #
-    # No staleness bypass here (there used to be one for "ok" readings, on
-    # the theory that a human could be actively spending the window and an
-    # old fraction would understate that -- see git history a324ab7 / the
-    # "dare to open a 5h-window" commit). That bypass caused two production
-    # incidents: (1) an "exhausted" reading discarded ~30min-stale, letting
-    # a job through minutes before the real reset, and (2) worse, during
-    # any active run once the probe happened to lag past staleAfterS, the
-    # ramp check was skipped ENTIRELY -- not just under-counted -- for as
-    # long as the lag lasted, which is exactly backwards: staleness during
-    # a hunter-driven spending spree should count for *more* caution, not
-    # less. used_fraction only ever increases within a window, so a stale
-    # reading remains a valid floor forever; ramp_5h/ramp_7d are computed
-    # from live now_ms and keep climbing toward 1.0 regardless of probe
-    # staleness, so the "eventually reopens once idle" behavior a bypass
-    # was meant to provide falls out for free -- no special case needed.
-    # unaccounted_tokens (above) is what makes trusting the floor safe
-    # even through an active run: it's hunter's own exact accounting of
-    # what it spent since that floor was measured, independent of when
-    # Anthropic's probe catches up.
-
-    w5 = windows.get("anthropic:5h")
-    if w5 is not None and (w5.status == "exhausted" or w5.used_fraction is not None):
-        allowed = ramp_5h(w5.resets_at, now_ms)
-        if allowed is not None:
-            effective_used = _effective_used(w5, inflight_reservation_5h)
-            if effective_used >= allowed:
-                retry_at = w5.resets_at if w5.status == "exhausted" else retry_at_5h(w5.resets_at, effective_used)
-                return BudgetDecision(
-                    False,
-                    f"5h: used {effective_used - inflight_reservation_5h:.2f} + unaccounted {inflight_reservation_5h:.2f}"
-                    f" = {effective_used:.2f} >= ramp {allowed:.2f}",
-                    retry_at=retry_at,
-                )
-    return BudgetDecision(True, "ok", base)

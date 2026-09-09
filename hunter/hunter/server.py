@@ -245,7 +245,7 @@ class Handler(BaseHTTPRequestHandler):
                 override = target.get("budget_override") if is_finding else None
                 repo_id = target["repo_id"] if is_finding else target["id"]
                 outlook = self.backend.decide(
-                    anticipated_tokens=scheduler.anticipated_tokens(store, repo_id, kind)
+                    anticipated_tokens=scheduler.anticipated_tokens(store, self.cfg, repo_id, kind)
                 )
                 verdict = outlook.prioritized if override else outlook.normal
                 match verdict:
