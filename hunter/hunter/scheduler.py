@@ -1771,12 +1771,12 @@ def pick_next(
     follow-up review (oldest merge first) -> oldest rechecking -> oldest
     queued fix -> the most stale-of-rotation job type for the
     least-recently-hunted enabled repo (hunt if never cloned, else
-    whichever of hunt/test_gap/dep_update/refactor is oldest/never-run;
-    modernization joins that pool too, but only once
-    cfg.modernization_interval_days have passed since it last ran for
-    this repo -- it's a periodic strategic check, not a tight-loop scan,
-    so it must not compete for scan slots against the other four every
-    single cycle).
+    whichever of hunt/test_gap/dep_update/refactor/modernization is
+    oldest/never-run, subject to minimum intervals: each scan type
+    is gated by cfg.scan_interval_days (default 1 day) since its last
+    run for that repo; modernization uses its own longer
+    cfg.modernization_interval_days (default 30 days). If all types
+    are gated for one repo, the next-stalest repo is tried).
 
     Returns (kind, target): target is a finding row for
     engage/harvest/recheck/fix, a repo row for
@@ -1810,43 +1810,53 @@ def pick_next(
 
     repos = [r for r in store.list_repos() if r["enabled"]]
     if force_repo:
-        target = store.get_repo(force_repo)
-        if target is None:
+        candidates = [store.get_repo(force_repo)]
+        if candidates[0] is None:
             msg = f"unknown repo {force_repo!r}"
             raise ValueError(msg)
     else:
-        target = (
-            min(
-                repos,
-                key=lambda r: (r["last_hunt_at"] is not None, r["last_hunt_at"] or 0),
-            )
-            if repos
-            else None
+        # Try repos in staleness order (least-recently-hunted first)
+        candidates = sorted(
+            repos,
+            key=lambda r: (r["last_hunt_at"] is not None, r["last_hunt_at"] or 0),
+        ) if repos else []
+
+    scan_interval_ms = int(cfg.scan_interval_days * 86_400_000)
+    mod_interval_ms = cfg.modernization_interval_days * 86_400_000
+    now = now_ms()
+
+    for target in candidates:
+        rpath = Path(target["path"])
+        if not rpath.exists():
+            return "hunt", target  # not cloned yet -> hunt does the clone
+
+        job_times: dict[str, int] = {}
+        for kind, key in (
+            ("hunt", "last_hunt_at"),
+            ("test_gap", "last_test_gap_at"),
+            ("dep_update", "last_dep_update_at"),
+            ("refactor", "last_refactor_at"),
+        ):
+            last = target.get(key) or 0
+            if last == 0 or (now - last) >= scan_interval_ms:
+                job_times[kind] = last
+
+        last_modernization = target.get("last_modernization_at") or 0
+        if last_modernization == 0 or (now - last_modernization) >= mod_interval_ms:
+            job_times["modernization"] = last_modernization
+
+        if not job_times:
+            continue  # all scan types ran within their intervals for this repo
+
+        never_run = [k for k, v in job_times.items() if v == 0]
+        job_type = (
+            next(k for k in _JOB_TYPE_PRIORITY if k in never_run)
+            if never_run
+            else min(job_times, key=job_times.get)
         )
-    if target is None:
-        return None
+        return job_type, target
 
-    rpath = Path(target["path"])
-    if not rpath.exists():
-        return "hunt", target  # not cloned yet -> hunt does the clone
-
-    job_times = {
-        "hunt": target.get("last_hunt_at") or 0,
-        "test_gap": target.get("last_test_gap_at") or 0,
-        "dep_update": target.get("last_dep_update_at") or 0,
-        "refactor": target.get("last_refactor_at") or 0,
-    }
-    last_modernization = target.get("last_modernization_at") or 0
-    interval_ms = cfg.modernization_interval_days * 86_400_000
-    if last_modernization == 0 or (now_ms() - last_modernization) >= interval_ms:
-        job_times["modernization"] = last_modernization
-    never_run = [k for k, v in job_times.items() if v == 0]
-    job_type = (
-        next(k for k in _JOB_TYPE_PRIORITY if k in never_run)
-        if never_run
-        else min(job_times, key=job_times.get)
-    )
-    return job_type, target
+    return None
 
 
 _RUNNERS: dict[str, Callable[[Store, Config, Row, Backend], Row]] = {
