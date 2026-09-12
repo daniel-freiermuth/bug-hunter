@@ -346,12 +346,11 @@ class OmpScavengeBackend:
             return '<div class="scv-note">No window data available</div>'
 
         now_ms = time.time() * 1000
-        # Use hunt_cap_tokens as a conservative anticipated reservation so the
-        # "avail" display reflects what decide() would actually grant, not a
-        # more optimistic probe-only view. Without this, the bars can show
-        # "13% avail" while decide() denies because it accounts for anticipated
-        # + finished-since-probe tokens the bar didn't include.
-        res_5h, res_7d = self._unaccounted_fraction(windows, self.cfg.hunt_cap_tokens)
+        # anticipated=0: the bars show current observable state (probe reading
+        # + actual in-flight jobs), not the budget gate's hypothetical
+        # reservation. The activity panel explains why the budget may deny
+        # despite the bars showing availability.
+        res_5h, res_7d = self._unaccounted_fraction(windows, 0)
         parts: list[str] = []
 
         for lid, w in sorted(windows.items(), key=lambda kv: kv[0]):
