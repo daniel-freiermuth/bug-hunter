@@ -875,33 +875,50 @@ class Store:
         return out
 
 
+    # Period durations for capacity estimation.
+    _PERIOD_MS: dict[str, int] = {
+        "anthropic:5h": 5 * 3600 * 1000,
+        "anthropic:7d": 7 * 24 * 3600 * 1000,
+    }
+
     def estimate_capacity(
         self, limit_id: str, min_delta: float = 0.02, sample_limit: int = 200
     ) -> float | None:
-        """Empirical estimate of this window's total token capacity, from
-        accumulated calibration_samples -- tokens hunter itself spent
-        divided by how much used_fraction moved in that same gap.
+        """Max tokens hunter has ever spent in one window cycle.
 
-        Informational only (see calibration_samples in schema.sql): any
-        concurrent non-hunter account activity inflates the observed
-        used_fraction move without showing up in hunter_tokens, which can
-        only push a sample's implied capacity DOWN, never up -- so the
-        75th percentile across samples is a better estimate of the true
-        capacity than the median, which is dragged down by however many
-        samples happened to overlap other activity. min_delta discards
-        tiny deltas dominated by Anthropic's own ~1%-quantized reporting.
-        None if there isn't enough data yet to say anything.
+        Uses the known reset boundaries from window_log to align cycles,
+        then sums hunter's actual token spend per cycle and returns the max.
+        No fraction correlation — just observed throughput. None if no data.
         """
-        rows = self.db.execute(
-            "SELECT used_fraction_delta, hunter_tokens FROM calibration_samples"
-            " WHERE limit_id = ? AND used_fraction_delta >= ?"
-            " ORDER BY observed_at DESC LIMIT ?",
-            (limit_id, min_delta, sample_limit),
-        ).fetchall()
-        ratios = sorted(float(r["hunter_tokens"]) / float(r["used_fraction_delta"]) for r in rows)
-        if not ratios:
+        period_ms = self._PERIOD_MS.get(limit_id)
+        if not period_ms:
             return None
-        return ratios[min(int(len(ratios) * 0.75), len(ratios) - 1)]
+        now = now_ms()
+        # Distinct completed cycles (resets_at rounded to 10s to deduplicate
+        # observations from the same cycle with slightly different timestamps)
+        cycles = self.db.execute(
+            "SELECT CAST(resets_at / 10000 AS INT) AS cycle_key,"
+            " MIN(resets_at) AS resets_at"
+            " FROM window_log"
+            " WHERE limit_id = ? AND resets_at < ?"
+            " GROUP BY cycle_key"
+            " ORDER BY cycle_key DESC LIMIT ?",
+            (limit_id, now, sample_limit),
+        ).fetchall()
+        max_tok: float = 0
+        for c in cycles:
+            start = c["resets_at"] - period_ms
+            end = c["resets_at"]
+            tok = self.db.execute(
+                "SELECT COALESCE(SUM(tokens_new), 0) AS t FROM jobs"
+                " WHERE state NOT IN ('denied', 'running')"
+                " AND tokens_new IS NOT NULL"
+                " AND finished_at > ? AND finished_at <= ?",
+                (start, end),
+            ).fetchone()["t"]
+            if tok > max_tok:
+                max_tok = tok
+        return max_tok if max_tok > 0 else None
 
     def running_estimate(self) -> int:
         """SUM(cap_tokens) of jobs currently in state='running'."""

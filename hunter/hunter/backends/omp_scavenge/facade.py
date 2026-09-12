@@ -89,15 +89,9 @@ class OmpScavengeBackend:
         unaccounted_5h = base + self.ledger.finished_since(probe_at_5h)
         unaccounted_7d = base + self.ledger.finished_since(probe_at_7d)
 
-        # Use empirical 5h capacity, derive 7d from it via the known period
-        # ratio.  The direct 7d estimate is fundamentally noisy: hunter's
-        # spend is a tiny fraction of total account activity on the 7d
-        # timescale, so every calibration sample's implied capacity is
-        # dragged down by concurrent human usage — even p95 is ~7x too low.
-        # The 5h estimate has much better signal (hunter is a larger share
-        # of each 5h cycle) and the p75 handles concurrent activity well.
+        # Use per-cycle empirical capacity for each window.
         cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
-        cap_7d = cap_5h / _5H_7D_RATIO  # 5h capacity × 33.6
+        cap_7d = self.ledger.estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)
 
         reservation_5h = unaccounted_5h / cap_5h if cap_5h else 0.0
         reservation_7d = unaccounted_7d / cap_7d if cap_7d else 0.0

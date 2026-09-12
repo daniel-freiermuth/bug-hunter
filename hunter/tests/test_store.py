@@ -450,45 +450,47 @@ class TestCalibration:
     def test_estimate_capacity_no_data_returns_none(self, store: Store) -> None:
         assert store.estimate_capacity("anthropic:5h") is None
 
-    def test_estimate_capacity_uses_75th_percentile(self, store: Store) -> None:
-        """Confounded samples can only understate capacity (concurrent
-        non-hunter spend inflates the delta without showing up in
-        hunter_tokens), never overstate it -- so the estimate should sit
-        near the top of the observed distribution, not the median."""
-        ratios = [1_000_000, 2_000_000, 3_000_000, 4_000_000, 10_000_000]
-        for i, r in enumerate(ratios):
+    def test_estimate_capacity_returns_max_spend_per_cycle(self, store: Store) -> None:
+        """Capacity = max tokens hunter spent in any single window cycle."""
+        now = now_ms()
+        rid = store.add_repo("r", "https://r", "/r")
+        _5H = 5 * 3600 * 1000
+        # Two completed 5h cycles with different spend levels
+        resets1 = now - _5H  # one cycle ago
+        resets2 = now - 2 * _5H  # two cycles ago
+        for ra in (resets1, resets2):
             store.db.execute(
-                "INSERT INTO calibration_samples"
-                " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
-                " VALUES (?, 'anthropic:5h', 1, 0.10, ?)",
-                (i, r * 0.10),
+                "INSERT INTO window_log (observed_at, limit_id, used_fraction, status, resets_at, source_age_s)"
+                " VALUES (?, 'anthropic:5h', 0.5, 'ok', ?, 60)",
+                (ra - 1000, ra),
             )
+        # Cycle 1: 500k tokens
+        jid1 = store.create_job("hunt", rid)
+        store.update_job(jid1, state="done", tokens_new=500_000, finished_at=resets1 - 1000)
+        # Cycle 2: 2M tokens (the max)
+        jid2 = store.create_job("hunt", rid)
+        store.update_job(jid2, state="done", tokens_new=2_000_000, finished_at=resets2 - 1000)
         store.db.commit()
-        estimate = store.estimate_capacity("anthropic:5h")
-        # int(5 * 0.75) = 3 (0-indexed) -> the 4th of 5 sorted ratios, well
-        # above the median (3,000,000) but not simply the single max either.
-        assert estimate == 4_000_000
 
-    def test_estimate_capacity_filters_tiny_deltas(self, store: Store) -> None:
-        """A delta smaller than min_delta is dominated by Anthropic's own
-        ~1%-quantized reporting and must not pollute the estimate."""
-        store.db.execute(
-            "INSERT INTO calibration_samples"
-            " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
-            " VALUES (1, 'anthropic:5h', 1, 0.01, 50000)"
-        )
-        store.db.commit()
-        assert store.estimate_capacity("anthropic:5h", min_delta=0.02) is None
+        cap = store.estimate_capacity("anthropic:5h")
+        assert cap == 2_000_000  # max of the two cycles
 
     def test_estimate_capacity_scoped_by_limit_id(self, store: Store) -> None:
+        """5h and 7d use separate window_log entries."""
+        now = now_ms()
+        rid = store.add_repo("r", "https://r", "/r")
+        resets = now - 7 * 24 * 3600 * 1000
         store.db.execute(
-            "INSERT INTO calibration_samples"
-            " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
-            " VALUES (1, 'anthropic:7d', 1, 0.10, 5000000)"
+            "INSERT INTO window_log (observed_at, limit_id, used_fraction, status, resets_at, source_age_s)"
+            " VALUES (?, 'anthropic:7d', 0.5, 'ok', ?, 60)",
+            (resets - 1000, resets),
         )
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=1_000_000, finished_at=resets - 500)
         store.db.commit()
-        assert store.estimate_capacity("anthropic:5h") is None
 
+        assert store.estimate_capacity("anthropic:5h") is None  # no 5h cycles
+        assert store.estimate_capacity("anthropic:7d") == 1_000_000
 
 # -- update_finding_analysis -----------------------------------------------
 
