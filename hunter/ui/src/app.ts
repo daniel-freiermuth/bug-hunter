@@ -1463,10 +1463,22 @@ async function refresh(): Promise<void> {
     }
     $("err").style.display = "none";
 
-    // If a finding link brought us here (new tab or hash nav), scroll to it
-    // now that the DOM is rebuilt.
-    if (_pendingFindingScroll) {
-      _scrollToFinding(_pendingFindingScroll);
+    // If the URL hash targets a specific finding (e.g. #findings:42 from
+    // a link opened in a new tab), scroll to it now that the DOM is rebuilt.
+    // Reads the hash directly — no shared state to get out of sync.
+    const _hash = location.hash.slice(1);
+    if (_hash.startsWith("findings:")) {
+      const _fid = _hash.split(":")[1];
+      const _card = document.getElementById(`finding-${_fid}`);
+      if (_card) {
+        _card.scrollIntoView({ behavior: "smooth", block: "center" });
+        if (!_card.classList.contains("highlight")) {
+          _card.classList.add("highlight");
+          setTimeout(() => _card.classList.remove("highlight"), 2000);
+        }
+        // Clear the finding ID from hash so subsequent refreshes don't re-scroll
+        location.hash = "findings";
+      }
     }
   } catch (e) {
     $("err").textContent = "refresh failed: " + e;
@@ -1480,12 +1492,7 @@ async function refresh(): Promise<void> {
 
 const NAV_PAGES = ["status", "inbox", "pipeline", "findings", "repos", "stats", "log"];
 
-// Pending scroll target: set when navigating to findings:N, consumed after
-// the next refresh renders the card.
-let _pendingFindingScroll: string | null = null;
-
 function showPage(hash: string): void {
-  // Support findings:42 → show findings page + scroll to finding #42
   const [name, findingId] = hash.includes(":") ? hash.split(":", 2) : [hash, null];
   const page = NAV_PAGES.includes(name) ? name : "inbox";
   for (const el of document.querySelectorAll<HTMLElement>(".page")) {
@@ -1497,21 +1504,17 @@ function showPage(hash: string): void {
   const fullHash = findingId ? `${page}:${findingId}` : page;
   if (location.hash.slice(1) !== fullHash) location.hash = fullHash;
 
+  // Same-tab navigation: card is already rendered, scroll immediately
   if (findingId) {
-    _pendingFindingScroll = findingId;
-    // Try immediately (card may already exist)
-    _scrollToFinding(findingId);
+    const card = document.getElementById(`finding-${findingId}`);
+    if (card) {
+      card.scrollIntoView({ behavior: "smooth", block: "center" });
+      card.classList.add("highlight");
+      setTimeout(() => card.classList.remove("highlight"), 2000);
+      location.hash = "findings";
+    }
+    // Card not found → hash stays as findings:N, refresh() picks it up
   }
-}
-
-function _scrollToFinding(fid: string): boolean {
-  const card = document.getElementById(`finding-${fid}`);
-  if (!card) return false;
-  _pendingFindingScroll = null;
-  card.scrollIntoView({ behavior: "smooth", block: "center" });
-  card.classList.add("highlight");
-  setTimeout(() => card.classList.remove("highlight"), 2000);
-  return true;
 }
 
 for (const el of document.querySelectorAll<HTMLElement>("#nav .nav-item")) {
