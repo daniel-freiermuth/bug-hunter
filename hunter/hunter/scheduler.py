@@ -74,13 +74,7 @@ def anticipated_tokens(store: Store, cfg: Config, repo_id: int, kind: str) -> in
     if not history:
         return 0
     idx = min(int(len(history) * (0.5 if warm else 0.9)), len(history) - 1)
-    estimate = history[idx]
-    # Cap at the configured job cap — the runner SIGTERMs at this limit,
-    # so reserving more over-brakes and causes self-fulfilling denials
-    # (the reservation prevents the job from starting, keeping the cache
-    # cold, keeping the p90 high).
-    job_cap = cfg.hunt_cap_tokens if kind != "fix" else cfg.fix_cap_tokens
-    return min(estimate, job_cap)
+    return history[idx]
 
 
 def _job_state(rr: RunResult) -> str:

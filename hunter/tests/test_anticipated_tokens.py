@@ -49,7 +49,7 @@ def test_cold_uses_p90_not_p50(store: Store, cfg: Config) -> None:
     for i, t in enumerate(tokens):
         _finished_job(store, rid, "dep_update", t, old - i * 1000)
     anticipated = anticipated_tokens(store, cfg, rid, "dep_update")
-    assert anticipated == 200_000, "cold (no recent run) must anticipate the p90, not the median"
+    assert anticipated == 700_000, "cold (no recent run) must anticipate the p90, not the median"
 
 
 def test_warm_uses_median_not_p90(store: Store, cfg: Config) -> None:
@@ -79,11 +79,11 @@ def test_warmth_is_scoped_to_this_repo(store: Store, cfg: Config) -> None:
     for i, t in enumerate([1_000] * 80 + [700_000] * 20):
         _finished_job(store, rid_a, "dep_update", t, old - i * 1000)
     cold_estimate = anticipated_tokens(store, cfg, rid_a, "dep_update")
-    assert cold_estimate == 200_000
+    assert cold_estimate == 700_000
     # Repo B finishes a job well inside the cache TTL -- irrelevant to A.
     _finished_job(store, rid_b, "dep_update", 1_500, now_ms() - 60_000)
     still_cold_estimate = anticipated_tokens(store, cfg, rid_a, "dep_update")
-    assert still_cold_estimate == 200_000, (
+    assert still_cold_estimate == 700_000, (
         "an unrelated repo's recent run must not change this repo's own warm/cold classification"
     )
 
@@ -114,6 +114,6 @@ def test_denied_job_does_not_count_as_warm(store: Store, cfg: Config) -> None:
     # This repo/kind pair was DENIED moments ago -- no worker ever ran.
     _denied_job(store, rid, "dep_update", now_ms() - 60_000)
     anticipated = anticipated_tokens(store, cfg, rid, "dep_update")
-    assert anticipated == 200_000, (
+    assert anticipated == 700_000, (
         "a denied job must not be mistaken for a warm prompt cache -- it never ran"
     )

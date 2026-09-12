@@ -74,6 +74,8 @@ class OmpScavengeBackend:
 
         Returns (reservation_5h, reservation_7d).
         Each is independently computed against its own window's recorded_at.
+        Uses empirical capacity estimates when available; falls back to the
+        hardcoded default (2M for 5h) when calibration data is insufficient.
         """
         running = self.ledger.running_estimate()
 
@@ -87,8 +89,14 @@ class OmpScavengeBackend:
         unaccounted_5h = base + self.ledger.finished_since(probe_at_5h)
         unaccounted_7d = base + self.ledger.finished_since(probe_at_7d)
 
-        reservation_5h = (unaccounted_5h / 200_000) * 0.10
-        reservation_7d = (unaccounted_7d / 200_000) * 0.10 * _5H_7D_RATIO
+        # Use empirical capacity when available — the hardcoded 2M default
+        # can be off by 50%+ and cause over-braking (29% reservation for
+        # what's actually 19% of the real window).
+        cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
+        cap_7d = self.ledger.estimate_capacity("anthropic:7d") or (_TOK_PER_FRAC_5H / _5H_7D_RATIO)
+
+        reservation_5h = unaccounted_5h / cap_5h if cap_5h else 0.0
+        reservation_7d = unaccounted_7d / cap_7d if cap_7d else 0.0
         return reservation_5h, reservation_7d
 
     def _decide_inner(
