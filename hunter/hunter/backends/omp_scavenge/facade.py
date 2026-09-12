@@ -89,11 +89,13 @@ class OmpScavengeBackend:
         unaccounted_5h = base + self.ledger.finished_since(probe_at_5h)
         unaccounted_7d = base + self.ledger.finished_since(probe_at_7d)
 
-        # Use empirical capacity when available — the hardcoded 2M default
-        # can be off by 50%+ and cause over-braking (29% reservation for
-        # what's actually 19% of the real window).
+        # Use empirical 5h capacity when available, derive 7d from it.
+        # The direct 7d estimate is unreliable: the 7d fraction moves very
+        # slowly (~33.6x less per token than 5h), producing noisy samples
+        # that underestimate capacity by ~20x. Deriving from 5h × the known
+        # period ratio gives a consistent, accurate result.
         cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
-        cap_7d = self.ledger.estimate_capacity("anthropic:7d") or (_TOK_PER_FRAC_5H / _5H_7D_RATIO)
+        cap_7d = cap_5h / _5H_7D_RATIO  # 5h capacity × 33.6
 
         reservation_5h = unaccounted_5h / cap_5h if cap_5h else 0.0
         reservation_7d = unaccounted_7d / cap_7d if cap_7d else 0.0
@@ -213,13 +215,13 @@ class OmpScavengeBackend:
 
         return min(caps) if caps else None
 
-    @staticmethod
-    def _frac_to_tokens(frac: float, dim: str) -> int:
-        """Convert a fraction of window capacity to tokens."""
+    def _frac_to_tokens(self, frac: float, dim: str) -> int:
+        """Convert a fraction of window capacity to tokens using calibrated capacity."""
+        cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
         if dim == "5h" or ":5h" in dim:
-            return int(frac * _TOK_PER_FRAC_5H)
-        # 7d window is ~33.6x larger
-        return int(frac * _TOK_PER_FRAC_5H / _5H_7D_RATIO)
+            return int(frac * cap_5h)
+        # 7d derived from 5h × period ratio
+        return int(frac * cap_5h / _5H_7D_RATIO)
 
     def decide(self, *, anticipated_tokens: int) -> Outlook:
         """May background work spend now?  Returns paired verdicts."""
