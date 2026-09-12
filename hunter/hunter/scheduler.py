@@ -323,8 +323,8 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
             f" / {counts['invalid']} invalid ({rr.tokens_new} tok)",
             job_id=job,
         )
-        # Only update watermarks when output is produced
-        if state == "done":
+        # Only update watermarks when output was successfully ingested
+        if state == "done" and counts.get("invalid", 0) == 0:
             store.set_last_hunt(rid, head)
             if full_rehunt_triggered:
                 store.db.execute(
@@ -630,7 +630,7 @@ def _run_analysis_job(store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec,
             job_id=job,
         )
         # Only update timestamp after successful output + ingestion
-        if state == "done":
+        if state == "done" and counts.get("invalid", 0) == 0:
             sql = f"UPDATE repos SET last_{kind}_at = ? WHERE id = ?"  # noqa: S608
             store.db.execute(sql, (now_ms(), rid))
             store.db.commit()

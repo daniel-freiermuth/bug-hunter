@@ -274,10 +274,23 @@ class Store:
         # Use repo_id for path stability (survives renames)
         return self.cfg.work_root / "repos" / f"repo-{repo_id}" / "NOTES.md"
 
+    _MAX_NOTES_CHARS = 4000  # prompt-injection safety + token budget
+
     def repo_notes(self, repo_id: int) -> str:
-        """Read repo notes, or empty string if none exist."""
+        """Read repo notes, bounded to the newest ~4000 chars.
+
+        Notes grow monotonically via append_repo_note and get injected
+        into every worker prompt.  Without a bound they consume an
+        increasing share of each job's token cap.
+        """
         p = self.repo_notes_path(repo_id)
-        return p.read_text() if p.exists() else ""
+        if not p.exists():
+            return ""
+        text = p.read_text()
+        if len(text) <= self._MAX_NOTES_CHARS:
+            return text
+        # Keep the tail (newest entries), prepend a truncation marker
+        return "...(older notes truncated)...\n" + text[-self._MAX_NOTES_CHARS:]
 
     def append_repo_note(self, repo_id: int, note: str, category: str | None = None) -> None:
         """Append timestamped note to repo's NOTES.md."""
