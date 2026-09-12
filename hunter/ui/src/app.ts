@@ -1235,7 +1235,7 @@ function renderJobs(jobs: Job[]): void {
         (j) => {
           const time = datetime(j.started_at || j.finished_at);
           const finding = j.finding_id != null
-            ? `<a href="#findings" class="ev-link" data-finding="${j.finding_id}">#${j.finding_id}</a>`
+            ? `<a href="#findings:${j.finding_id}" class="ev-link">#${j.finding_id}</a>`
             : "\u2013";
           return `<tr>
       <td>${j.id}</td><td class="t">${time}</td><td>${esc(j.kind)}</td><td>${esc(j.repo_name)}</td>
@@ -1250,22 +1250,6 @@ function renderJobs(jobs: Job[]): void {
       )
       .join("")}
   </table>`;
-  // Wire finding links in jobs table (same behavior as events)
-  for (const a of document.querySelectorAll<HTMLAnchorElement>("#jobs .ev-link")) {
-    a.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      const fid = a.dataset.finding;
-      showPage("findings");
-      requestAnimationFrame(() => {
-        const card = document.getElementById(`finding-${fid}`);
-        if (card) {
-          card.scrollIntoView({ behavior: "smooth", block: "center" });
-          card.classList.add("highlight");
-          setTimeout(() => card.classList.remove("highlight"), 2000);
-        }
-      });
-    });
-  }
 }
 
 function renderEvents(events: Event[]): void {
@@ -1279,7 +1263,7 @@ function renderEvents(events: Event[]): void {
       const links: string[] = [];
       if (e.finding_id != null) {
         links.push(
-          `<a href="#findings" class="ev-link" data-finding="${e.finding_id}">#${e.finding_id}</a>`
+          `<a href="#findings:${e.finding_id}" class="ev-link">#${e.finding_id}</a>`
         );
       }
       if (e.job_id != null) {
@@ -1289,23 +1273,6 @@ function renderEvents(events: Event[]): void {
       return `<div class="ev"><span class="t">${datetime(e.at)}</span> <span class="k">${esc(e.kind)}</span> ${esc(e.message)}${suffix}</div>`;
     })
     .join("");
-  // Wire finding links: navigate to All Findings and scroll to the card
-  for (const a of document.querySelectorAll<HTMLAnchorElement>("#events .ev-link")) {
-    a.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      const fid = a.dataset.finding;
-      showPage("findings");
-      // Wait a tick for the page to become visible, then scroll
-      requestAnimationFrame(() => {
-        const card = document.getElementById(`finding-${fid}`);
-        if (card) {
-          card.scrollIntoView({ behavior: "smooth", block: "center" });
-          card.classList.add("highlight");
-          setTimeout(() => card.classList.remove("highlight"), 2000);
-        }
-      });
-    });
-  }
   const last = evs[0];
   $("lastEvent").textContent = `${ts(last.at)} ${last.kind}: ${last.message}`;
 }
@@ -1495,6 +1462,12 @@ async function refresh(): Promise<void> {
       btn.disabled = false;
     }
     $("err").style.display = "none";
+
+    // If a finding link brought us here (new tab or hash nav), scroll to it
+    // now that the DOM is rebuilt.
+    if (_pendingFindingScroll) {
+      _scrollToFinding(_pendingFindingScroll);
+    }
   } catch (e) {
     $("err").textContent = "refresh failed: " + e;
     $("err").style.display = "block";
@@ -1507,7 +1480,13 @@ async function refresh(): Promise<void> {
 
 const NAV_PAGES = ["status", "inbox", "pipeline", "findings", "repos", "stats", "log"];
 
-function showPage(name: string): void {
+// Pending scroll target: set when navigating to findings:N, consumed after
+// the next refresh renders the card.
+let _pendingFindingScroll: string | null = null;
+
+function showPage(hash: string): void {
+  // Support findings:42 → show findings page + scroll to finding #42
+  const [name, findingId] = hash.includes(":") ? hash.split(":", 2) : [hash, null];
   const page = NAV_PAGES.includes(name) ? name : "inbox";
   for (const el of document.querySelectorAll<HTMLElement>(".page")) {
     el.classList.toggle("active", el.id === `page-${page}`);
@@ -1515,7 +1494,24 @@ function showPage(name: string): void {
   for (const el of document.querySelectorAll<HTMLElement>("#nav .nav-item")) {
     el.classList.toggle("active", el.dataset.page === page);
   }
-  if (location.hash.slice(1) !== page) location.hash = page;
+  const fullHash = findingId ? `${page}:${findingId}` : page;
+  if (location.hash.slice(1) !== fullHash) location.hash = fullHash;
+
+  if (findingId) {
+    _pendingFindingScroll = findingId;
+    // Try immediately (card may already exist)
+    _scrollToFinding(findingId);
+  }
+}
+
+function _scrollToFinding(fid: string): boolean {
+  const card = document.getElementById(`finding-${fid}`);
+  if (!card) return false;
+  _pendingFindingScroll = null;
+  card.scrollIntoView({ behavior: "smooth", block: "center" });
+  card.classList.add("highlight");
+  setTimeout(() => card.classList.remove("highlight"), 2000);
+  return true;
 }
 
 for (const el of document.querySelectorAll<HTMLElement>("#nav .nav-item")) {
