@@ -1227,21 +1227,44 @@ function renderJobs(jobs: Job[]): void {
     return;
   }
   $("jobs").innerHTML = `<table>
-    <tr><th>id</th><th>kind</th><th>repo</th><th>state</th>
+    <tr><th>id</th><th>time</th><th>kind</th><th>repo</th><th>finding</th><th>state</th>
         <th class="num">tokens</th><th class="num">calls</th><th class="num">dur</th><th>killed</th></tr>
     ${jobs
       .map(
-        (j) => `<tr>
-      <td>${j.id}</td><td>${esc(j.kind)}</td><td>${esc(j.repo_name)}</td>
+        (j) => {
+          const time = datetime(j.started_at || j.finished_at);
+          const finding = j.finding_id != null
+            ? `<a href="#findings" class="ev-link" data-finding="${j.finding_id}">#${j.finding_id}</a>`
+            : "\u2013";
+          return `<tr>
+      <td>${j.id}</td><td class="t">${time}</td><td>${esc(j.kind)}</td><td>${esc(j.repo_name)}</td>
+      <td>${finding}</td>
       <td class="state-${esc(j.state)}">${esc(j.state)}</td>
       <td class="num">${ktok(j.tokens_new)}</td>
       <td class="num">${j.calls ?? "\u2013"}</td>
       <td class="num">${dur(j)}</td>
       <td>${esc(j.killed_reason || "")}</td>
-    </tr>`,
+    </tr>`;
+        },
       )
       .join("")}
   </table>`;
+  // Wire finding links in jobs table (same behavior as events)
+  for (const a of document.querySelectorAll<HTMLAnchorElement>("#jobs .ev-link")) {
+    a.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      const fid = a.dataset.finding;
+      showPage("findings");
+      requestAnimationFrame(() => {
+        const card = document.getElementById(`finding-${fid}`);
+        if (card) {
+          card.scrollIntoView({ behavior: "smooth", block: "center" });
+          card.classList.add("highlight");
+          setTimeout(() => card.classList.remove("highlight"), 2000);
+        }
+      });
+    });
+  }
 }
 
 function renderEvents(events: Event[]): void {
