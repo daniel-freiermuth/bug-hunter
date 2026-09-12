@@ -326,6 +326,55 @@ Three tiers, in order of complexity:
    The base image can be thin (debian-slim + git + common runtimes) since
    the worker self-provisions the rest.
 
+   Podman fits this well specifically because:
+   - **Rootless by default** — runs as your user, no daemon, no privilege
+     escalation. Matches bwrap's security posture.
+   - **Volumes are just directories** — stored at
+     `~/.local/share/containers/storage/volumes/<name>/_data/`. Inspectable,
+     removable, backuppable. `podman volume rm hunter-env-glosdalen` resets
+     a broken env.
+   - **No registry needed** — `hunter-base` can be built locally from a
+     Dockerfile or `podman import` from a tarball. No network dependency
+     after initial build.
+
+   Concrete shape:
+   ```
+   # One-time per repo
+   podman volume create hunter-env-glosdalen
+
+   # Every worker run
+   podman run --rm \
+     -v hunter-env-glosdalen:/home/hunter \
+     -v $WORKTREE:$WORKTREE \
+     --network=none \           # deny all network (scheduler pushes, not worker)
+     hunter-base \
+     omp -p "..."
+   ```
+
+   The volume persists across `--rm` containers. `apt install`, global caches,
+   tooling config all survive in `/home/hunter`. The container filesystem itself
+   is ephemeral — a corrupted system state is just a re-pull from the base image
+   while the project's deps stay cached.
+
+   Shared caches are possible — content-addressed caches (gradle, cargo
+   registry, pip wheels) can be mounted read-write across repos:
+   ```
+   -v hunter-cache-gradle:/home/hunter/.gradle
+   -v hunter-cache-cargo:/home/hunter/.cargo/registry
+   ```
+
+   omp availability inside the container — options:
+   1. Bind-mount the host binary: `-v $(which omp):/usr/bin/omp:ro`
+   2. Install it in the base image
+   3. Bind-mount `/usr` read-only (same as bwrap — keeps all host tools,
+      container only adds writable overlay for `apt install`). Makes podman
+      behave like "bwrap with network isolation and system package support."
+
+   Option 3 is appealing for single-user: no base image to maintain, host
+   tool updates propagate instantly, and the container's value-add is purely
+   isolation + writable system layer. Option 2 is cleaner for multi-tenant
+   (the container is self-contained, portable, reproducible).
+
 Recommendation: start with tier 1 (host tools + userspace deps). Move
 individual repos to tier 3 (podman) when they genuinely need system
 packages the host doesn't have or when multi-tenancy requires full
