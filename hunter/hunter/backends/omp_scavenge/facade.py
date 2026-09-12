@@ -89,11 +89,13 @@ class OmpScavengeBackend:
         unaccounted_5h = base + self.ledger.finished_since(probe_at_5h)
         unaccounted_7d = base + self.ledger.finished_since(probe_at_7d)
 
-        # Use empirical 5h capacity when available, derive 7d from it.
-        # The direct 7d estimate is unreliable: the 7d fraction moves very
-        # slowly (~33.6x less per token than 5h), producing noisy samples
-        # that underestimate capacity by ~20x. Deriving from 5h × the known
-        # period ratio gives a consistent, accurate result.
+        # Use empirical 5h capacity, derive 7d from it via the known period
+        # ratio.  The direct 7d estimate is fundamentally noisy: hunter's
+        # spend is a tiny fraction of total account activity on the 7d
+        # timescale, so every calibration sample's implied capacity is
+        # dragged down by concurrent human usage — even p95 is ~7x too low.
+        # The 5h estimate has much better signal (hunter is a larger share
+        # of each 5h cycle) and the p75 handles concurrent activity well.
         cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
         cap_7d = cap_5h / _5H_7D_RATIO  # 5h capacity × 33.6
 
