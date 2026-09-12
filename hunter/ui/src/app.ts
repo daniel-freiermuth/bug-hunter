@@ -132,6 +132,7 @@ const NextCandidateSchema = z.object({
   budget_state: z.string(), // "allowed" | "denied" | "exempt"
   budget_reason: z.string(),
   budget_retry_at: z.number().nullable(),
+  is_prioritized: z.boolean().optional().default(false),
 });
 type NextCandidate = z.infer<typeof NextCandidateSchema>;
 

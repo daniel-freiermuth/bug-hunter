@@ -19,12 +19,12 @@ import pytest
 
 from hunter.server import _wake, make_server
 from hunter.store import Store
+from hunter.backend import Denied, Outlook
 from hunter.types import Config
 
 
 class _FakeBackend:
     def decide(self, *, anticipated_tokens: int = 0):
-        from hunter.backend import Denied, Outlook
         d = Denied("test")
         return Outlook(normal=d, prioritized=d)
     def run(self, cwd, prompt, *, cap_tokens, max_wall_s, job_class):

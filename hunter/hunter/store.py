@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import sqlite3
+import threading
 from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
@@ -1071,7 +1072,7 @@ class ThreadLocalLedger:
 
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
-        self._local = __import__("threading").local()
+        self._local = threading.local()
 
     def _store(self) -> Store:
         s = getattr(self._local, "store", None)

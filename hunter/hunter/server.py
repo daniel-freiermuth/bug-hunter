@@ -407,6 +407,11 @@ class Handler(BaseHTTPRequestHandler):
     # -- POST -------------------------------------------------------------
 
     def do_POST(self) -> None:
+        # Require application/json content-type to block simple cross-origin requests
+        ctype = self.headers.get('Content-Type', '')
+        if not ctype.startswith('application/json'):
+            self._error(415, 'Content-Type must be application/json')
+            return
         url = urlparse(self.path)
         try:
             if url.path == "/api/verdict":
@@ -606,13 +611,13 @@ class Handler(BaseHTTPRequestHandler):
         from .forge import FORGE_NAMES, detect_forge
 
         body = self._body_json()
-        name = (body.get("name") or "").strip() if isinstance(body.get("name"), str) else ""
+        name = body.get('name', '').strip()
         url = (body.get("url") or "").strip() if isinstance(body.get("url"), str) else ""
-        if not name or not url:
-            self._error(400, "name and url are required")
+        if not name or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.\-]*', name):
+            self._error(400, 'invalid repo name')
             return
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
-            self._error(400, f"invalid repo name {name!r}")
+        if not url:
+            self._error(400, "name and url are required")
             return
         branch = body.get("branch")
         branch = branch.strip() if isinstance(branch, str) and branch.strip() else "main"
@@ -626,15 +631,12 @@ class Handler(BaseHTTPRequestHandler):
         if store.get_repo(name) is not None:
             self._error(409, f"repo {name!r} already exists")
             return
-        repos_root = (self.cfg.work_root / "repos").resolve()
-        path = (repos_root / name).resolve()
-        try:
-            path.relative_to(repos_root)
-        except ValueError:
-            self._error(400, f"invalid repo name {name!r}")
+        repo_path = (self.cfg.work_root / 'repos' / name).resolve()
+        if not str(repo_path).startswith(str(self.cfg.work_root.resolve())):
+            self._error(400, 'invalid repo name')
             return
-        rid = store.add_repo(name, url, str(path), branch, forge=forge)
-        store.log_event("repo", f"added {name} ({forge}) -> {path}")
+        rid = store.add_repo(name, url, str(repo_path), branch, forge=forge)
+        store.log_event("repo", f"added {name} ({forge}) -> {repo_path}")
         self._json({"ok": True, "repo": store.get_repo(rid)}, 201)
 
     def _delete_repo(self) -> None:
@@ -709,11 +711,10 @@ def make_server(cfg: Config, backend: Backend, port: int | None = None) -> _Serv
 
 
 def serve(cfg: Config) -> None:
-    from .backends.omp_scavenge import OmpScavengeBackend
     from .store import ThreadLocalLedger
 
     _acquire_lockfile(cfg)
-    backend = OmpScavengeBackend(cfg=cfg, ledger=ThreadLocalLedger(cfg))
+    backend = cfg.make_backend(ThreadLocalLedger(cfg))
     httpd = make_server(cfg, backend)
     log.info("ui http://127.0.0.1:%d/", httpd.server_address[1])
     try:
@@ -1027,11 +1028,10 @@ def daemon(cfg: Config) -> None:
     """
     import signal as _signal
 
-    from .backends.omp_scavenge import OmpScavengeBackend
     from .store import Store, ThreadLocalLedger
 
     _acquire_lockfile(cfg)
-    backend = OmpScavengeBackend(cfg=cfg, ledger=ThreadLocalLedger(cfg))
+    backend = cfg.make_backend(ThreadLocalLedger(cfg))
 
     httpd = make_server(cfg, backend)
     threading.Thread(target=httpd.serve_forever, name="hunter-ui", daemon=True).start()

@@ -476,7 +476,7 @@ class TestAddRepoPathTraversal:
         assert errors
         status, message = errors[0]
         assert status == 400
-        assert bad_name in message
+        assert "invalid repo name" in message
         # Nothing should have been created outside work_root/repos either.
         assert not (cfg.work_root / "repos").exists() or not any(
             (cfg.work_root / "repos").iterdir()

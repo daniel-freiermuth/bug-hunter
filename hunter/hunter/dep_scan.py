@@ -20,7 +20,7 @@ from .util import run_cmd
 log = logging.getLogger(__name__)
 
 
-def scan_repo(repo_path: Path, repo_name: str, timeout: int = 120) -> list[dict[str, Any]]:
+def scan_repo(repo_path: Path, repo_name: str, timeout: int = 120) -> list[dict[str, Any]] | None:
     """Run Renovate in local dry-run mode and return update candidates.
 
     Each candidate is a dict matching the dep_update finding schema:
@@ -38,7 +38,7 @@ def scan_repo(repo_path: Path, repo_name: str, timeout: int = 120) -> list[dict[
 
     if rc != 0 and not output:
         log.warning("dep_scan: renovate failed (rc=%d) for %s", rc, repo_name)
-        return []
+        return None
 
     updates = _parse_renovate_output(output, repo_name)
     log.info("dep_scan: %s — %d update candidates from renovate", repo_name, len(updates))
@@ -90,7 +90,7 @@ def _parse_renovate_output(output: str, repo_name: str) -> list[dict[str, Any]]:
                             "file": pf.get("packageFile") or "",
                             "ecosystem": datasource,
                             "package": dep_name,
-                            "current_version": current.lstrip("^~>=<"),
+                        "current_version": str(current).lstrip("^~>=<"),
                             "latest_version": new_version,
                             "update_type": _normalize_update_type(update_type),
                             "severity": severity,
@@ -104,9 +104,9 @@ def _parse_renovate_output(output: str, repo_name: str) -> list[dict[str, Any]]:
 
 def _normalize_update_type(ut: str) -> str:
     """Map Renovate's updateType to our schema's update_type."""
-    if ut in ("major",):
+    if ut == "major":
         return "major"
-    if ut in ("minor",):
+    if ut == "minor":
         return "minor"
     if ut in ("patch", "pin", "digest", "pinDigest", "lockFileMaintenance"):
         return "patch"

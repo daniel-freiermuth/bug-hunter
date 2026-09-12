@@ -49,7 +49,7 @@ def anticipated_tokens(store: Store, cfg: Config, repo_id: int, kind: str) -> in
     If this exact (repo, kind) pair has finished within the configured
     cache TTL (cfg.cache_ttl_s, default 1h -- Anthropic's observed prompt-
     cache lifetime), its prompt cache is probably still warm -- anticipate
-    anticipate its historical p90: a cold cache-write is likely, and a
+    its historical p90: a cold cache-write is likely, and a
     handful of jobs having been merely cheap doesn't mean this one will be.
     No history for this kind yet -> nothing to anticipate beyond whatever
     cap_tokens/inflight accounting already covers.
@@ -719,7 +719,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row, backend: Backend) -> Ro
 
     candidates = scan_repo(rpath, rname)
 
-    if not candidates:
+    if candidates is None:
         # Renovate found nothing or failed — fall back to AI
         log.info("dep_update %s: renovate returned 0 candidates, falling back to AI", rname)
         return _run_analysis_job(store, cfg, repo, _DEP_UPDATE_SPEC, backend)

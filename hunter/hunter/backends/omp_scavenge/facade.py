@@ -133,7 +133,9 @@ class OmpScavengeBackend:
                     # Pacing waived: grant with headroom to hard limit
                     headroom_frac = max(0.0, 1.0 - effective_used)
                     cap = self._frac_to_tokens(headroom_frac, "7d")
-                    return Granted(cap_tokens=cap if cap > 0 else None, reason=f"prio override ({reason})")
+                    if cap <= 0:
+                        return Denied(reason, retry_at=retry)
+                    return Granted(cap_tokens=cap, reason=f"prio override ({reason})")
                 return Denied(reason, retry_at=retry)
 
         # -- 5h ramp ----------------------------------------------------------
@@ -157,7 +159,9 @@ class OmpScavengeBackend:
                     if prio and not is_exhausted:
                         headroom_frac = max(0.0, 1.0 - effective_used)
                         cap = self._frac_to_tokens(headroom_frac, "5h")
-                        return Granted(cap_tokens=cap if cap > 0 else None, reason=f"prio override ({reason})")
+                        if cap <= 0:
+                            return Denied(reason, retry_at=retry)
+                        return Granted(cap_tokens=cap, reason=f"prio override ({reason})")
                     return Denied(reason, retry_at=retry)
 
         # -- All checks passed ------------------------------------------------
@@ -387,7 +391,7 @@ class OmpScavengeBackend:
             ) if w.used_fraction is not None else ""
 
             # Determine tone
-            is_stale = w.age_s > 1800
+            is_stale = w.age_s > self.cfg.stale_after_s
             is_exhausted = w.status == "exhausted" or (w.used_fraction is not None and w.used_fraction >= 1.0)
             tone = "stale" if is_stale else ("bad" if is_exhausted else "ok")
 
