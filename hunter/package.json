@@ -20,6 +20,7 @@
     "esbuild@0.28.1": true
   },
   "dependencies": {
+    "renovate": "^44.82.3",
     "zod": "^4.5.4"
   }
 }

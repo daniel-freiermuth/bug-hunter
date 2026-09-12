@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -31,6 +32,8 @@ from .playbooks import (
 from .store import Store
 from .types import Config, Row, RunResult, now_ms
 from .util import run_cmd
+
+log = logging.getLogger(__name__)
 
 
 def anticipated_tokens(store: Store, cfg: Config, repo_id: int, kind: str) -> int:
@@ -683,8 +686,71 @@ def run_test_gap(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
 
 
 def run_dep_update(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
-    """Check for outdated dependencies."""
-    return _run_analysis_job(store, cfg, repo, _DEP_UPDATE_SPEC, backend)
+    """Check for outdated dependencies using Renovate's local scanner.
+
+    Zero AI tokens: Renovate handles ecosystem detection, registry queries,
+    and semver classification. Results are ingested as dep_update findings
+    for triage in the UI; the apply phase (when a user queues one) remains
+    AI-powered.
+
+    Falls back to the AI-based analysis job if Renovate fails (not installed,
+    timeout, etc.).
+    """
+    from .dep_scan import scan_repo
+
+    rid = repo["id"]
+    rname = repo["name"]
+    rpath = Path(repo["path"])
+
+    if not rpath.exists():
+        store.log_event("error", f"dep_update {rname}: repo not cloned")
+        return {"error": "repo not cloned"}
+
+    # Sync to latest default branch
+    for cmd in (
+        ["git", "fetch", "origin"],
+        ["git", "checkout", repo["default_branch"]],
+        ["git", "pull", "--ff-only"],
+    ):
+        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+        if rc != 0:
+            store.log_event("error", f"dep_update {rname}: {' '.join(cmd)} failed: {out[-300:]}")
+            return {"error": f"{' '.join(cmd)} failed"}
+
+    candidates = scan_repo(rpath, rname)
+
+    if not candidates:
+        # Renovate found nothing or failed — fall back to AI
+        log.info("dep_update %s: renovate returned 0 candidates, falling back to AI", rname)
+        return _run_analysis_job(store, cfg, repo, _DEP_UPDATE_SPEC, backend)
+
+    # Write candidates to a temp file and ingest via the standard path
+    out_path = cfg.work_root / "out" / f"dep_scan_{rid}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(candidates, indent=2))
+
+    counts = ingest_findings(store, rid, out_path, finding_type="dep_update")
+    store.log_event(
+        "dep_update",
+        f"{rname}: renovate scan"
+        f" +{counts['inserted']} new / {counts['duplicates']} dup"
+        f" / {counts['invalid']} invalid (0 tok)",
+    )
+
+    # Advance the rotation timestamp
+    store.db.execute(
+        "UPDATE repos SET last_dep_update_at = ? WHERE id = ?",
+        (now_ms(), rid),
+    )
+    store.db.commit()
+
+    return {
+        "kind": "dep_update",
+        "repo": rname,
+        "state": "done",
+        "tokens_new": 0,
+        "ingest": counts,
+    }
 
 
 def run_refactor(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
