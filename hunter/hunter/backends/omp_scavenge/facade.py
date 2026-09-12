@@ -346,9 +346,12 @@ class OmpScavengeBackend:
             return '<div class="scv-note">No window data available</div>'
 
         now_ms = time.time() * 1000
-        # Compute fresh: anticipated=0 because status shows current state,
-        # not the hypothetical reservation for a job that may have been denied.
-        res_5h, res_7d = self._unaccounted_fraction(windows, 0)
+        # Use hunt_cap_tokens as a conservative anticipated reservation so the
+        # "avail" display reflects what decide() would actually grant, not a
+        # more optimistic probe-only view. Without this, the bars can show
+        # "13% avail" while decide() denies because it accounts for anticipated
+        # + finished-since-probe tokens the bar didn't include.
+        res_5h, res_7d = self._unaccounted_fraction(windows, self.cfg.hunt_cap_tokens)
         parts: list[str] = []
 
         for lid, w in sorted(windows.items(), key=lambda kv: kv[0]):
