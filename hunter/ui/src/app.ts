@@ -346,13 +346,15 @@ function getChecked(id: string): Set<string> | null {
   return isFilterAll(id) ? null : filterState.get(id)!;
 }
 
-/** Summary label for a collapsed dropdown: "all", "none", or "3 of 15". */
+/** Summary label: "all", "none", names when ≤3, or "3 of 15". */
 function filterSummary(id: string): string {
   if (isFilterAll(id)) return "all";
   const s = filterState.get(id);
   if (!s || s.has("__none__")) return "none";
   const total = filterTotals.get(id) ?? 0;
-  return `${s.size} of ${total}`;
+  const items = [...s].filter(v => v !== "__none__");
+  if (items.length <= 3) return items.join(", ");
+  return `${items.length} of ${total}`;
 }
 
 /** Update the "All" checkbox's tri-state and the summary text. */
