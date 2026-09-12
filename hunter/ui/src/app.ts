@@ -321,13 +321,15 @@ function dur(j: Job): string {
 }
 
 // ---------------------------------------------------------------------------
-// Filter checkbox management
+// Filter checkbox management — collapsible dropdown panels with tri-state All
 // ---------------------------------------------------------------------------
 
 // Module-level state: which values are checked per filter group.
 // Key = DOM id (e.g. "fRepo", "pfType"). Value = set of checked values.
 // Empty set = "all" (nothing excluded). Survives DOM rebuilds.
 const filterState = new Map<string, Set<string>>();
+// Total available options per group (for summary text).
+const filterTotals = new Map<string, number>();
 
 function getFilterSet(id: string): Set<string> {
   let s = filterState.get(id);
@@ -335,116 +337,178 @@ function getFilterSet(id: string): Set<string> {
   return s;
 }
 
-/** Is the filter in "all" mode? (empty set = nothing excluded = all) */
 function isFilterAll(id: string): boolean {
   const s = filterState.get(id);
   return !s || s.size === 0;
 }
 
-/** Get the set of checked values, or null if "all". */
 function getChecked(id: string): Set<string> | null {
   return isFilterAll(id) ? null : filterState.get(id)!;
 }
 
-/** Build a checkbox group's inner HTML. Static options (like type) pass
- *  fixedOptions; dynamic ones (repo, class) pass nothing and populate later. */
+/** Summary label for a collapsed dropdown: "all", "none", or "3 of 15". */
+function filterSummary(id: string): string {
+  if (isFilterAll(id)) return "all";
+  const s = filterState.get(id);
+  if (!s || s.has("__none__")) return "none";
+  const total = filterTotals.get(id) ?? 0;
+  return `${s.size} of ${total}`;
+}
+
+/** Update the "All" checkbox's tri-state and the summary text. */
+function syncAllBox(id: string): void {
+  const grp = document.querySelector(`[data-filter-id="${id}"]`);
+  if (!grp) return;
+  const allBox = grp.querySelector<HTMLInputElement>('input[value="__all__"]');
+  const summary = grp.querySelector<HTMLElement>('.fd-summary');
+  const sel = getFilterSet(id);
+  if (allBox) {
+    if (sel.size === 0) {
+      // All mode
+      allBox.checked = true;
+      allBox.indeterminate = false;
+    } else if (sel.has("__none__")) {
+      // None mode
+      allBox.checked = false;
+      allBox.indeterminate = false;
+    } else {
+      // Some selected
+      allBox.checked = false;
+      allBox.indeterminate = true;
+    }
+  }
+  if (summary) summary.textContent = filterSummary(id);
+}
+
+/** Build a dropdown filter group. Closed by default, opens on click. */
 function checkboxGroupHtml(
   id: string,
   label: string,
   options: { value: string; label: string }[],
 ): string {
   const sel = getFilterSet(id);
-  const allChecked = sel.size === 0;
+  const allMode = sel.size === 0;
+  filterTotals.set(id, options.length);
   const items = options.map((o) => {
-    const checked = allChecked || sel.has(o.value) ? "checked" : "";
+    const checked = allMode || sel.has(o.value) ? "checked" : "";
     return `<label class="cb-item"><input type="checkbox" value="${esc(o.value)}" ${checked}>${esc(o.label)}</label>`;
   }).join("");
-  return `<div class="filter-group" data-filter-id="${esc(id)}">
-    <span class="fg-label">${esc(label)}</span>
-    <div class="fg-body">
-      <label class="cb-item cb-all"><input type="checkbox" value="__all__" ${allChecked ? "checked" : ""}>All</label>
+  return `<div class="filter-drop" data-filter-id="${esc(id)}">
+    <button type="button" class="fd-toggle">
+      <span class="fd-label">${esc(label)}</span>
+      <span class="fd-summary">${esc(filterSummary(id))}</span>
+      <span class="fd-arrow">\u25be</span>
+    </button>
+    <div class="fd-panel">
+      <label class="cb-item cb-all"><input type="checkbox" value="__all__" ${allMode ? "checked" : ""}>All</label>
       ${items}
     </div>
   </div>`;
 }
 
-/** Populate a dynamic checkbox group (repo, class) with new values,
- *  preserving checked state. */
+/** Populate a dynamic dropdown (repo, class) with new values. */
 function populateCheckboxGroup(id: string, values: string[]): void {
-  const container = document.querySelector(`[data-filter-id="${id}"] .fg-body`);
-  if (!container) return;
+  const grp = document.querySelector(`[data-filter-id="${id}"]`);
+  const panel = grp?.querySelector('.fd-panel');
+  if (!panel) return;
   const sel = getFilterSet(id);
-  const allChecked = sel.size === 0;
-  // Keep "All" checkbox, rebuild the rest
-  const allCb = container.querySelector('.cb-all');
+  const allMode = sel.size === 0;
+  filterTotals.set(id, values.length);
   const existing = new Map<string, HTMLLabelElement>();
-  for (const lbl of container.querySelectorAll<HTMLLabelElement>('.cb-item:not(.cb-all)')) {
+  for (const lbl of panel.querySelectorAll<HTMLLabelElement>('.cb-item:not(.cb-all)')) {
     const v = lbl.querySelector('input')?.value;
     if (v) existing.set(v, lbl);
   }
   const wanted = new Set(values);
-  // Remove stale
   for (const [v, lbl] of existing) {
     if (!wanted.has(v)) { lbl.remove(); sel.delete(v); }
   }
-  // Add new
   for (const v of values) {
     if (!existing.has(v)) {
       const lbl = document.createElement('label');
       lbl.className = 'cb-item';
-      const checked = allChecked || sel.has(v);
+      const checked = allMode || sel.has(v);
       lbl.innerHTML = `<input type="checkbox" value="${esc(v)}" ${checked ? "checked" : ""}>${esc(v)}`;
-      container.appendChild(lbl);
+      panel.appendChild(lbl);
     }
   }
+  syncAllBox(id);
 }
 
-/** Wire checkbox change events for a filter group. */
+/** Wire checkbox change events + toggle open/close. */
 function wireCheckboxGroup(id: string, onChange: () => void): void {
-  const container = document.querySelector(`[data-filter-id="${id}"] .fg-body`);
-  if (!container) return;
-  container.addEventListener("change", (e) => {
+  const grp = document.querySelector(`[data-filter-id="${id}"]`);
+  if (!grp) return;
+  const toggle = grp.querySelector<HTMLButtonElement>('.fd-toggle');
+  const panel = grp.querySelector<HTMLElement>('.fd-panel');
+  if (toggle && panel) {
+    toggle.addEventListener("click", () => {
+      // Close any other open panels first
+      for (const other of document.querySelectorAll<HTMLElement>('.fd-panel.open')) {
+        if (other !== panel) other.classList.remove('open');
+      }
+      panel.classList.toggle('open');
+    });
+  }
+  // Close on outside click
+  document.addEventListener("click", (e) => {
+    if (!grp.contains(e.target as Node)) {
+      panel?.classList.remove('open');
+    }
+  });
+  // Checkbox logic
+  panel?.addEventListener("change", (e) => {
     const input = e.target as HTMLInputElement;
     if (!input?.matches('input[type="checkbox"]')) return;
     const sel = getFilterSet(id);
+    const allCbs = panel.querySelectorAll<HTMLInputElement>('input:not([value="__all__"])');
     if (input.value === "__all__") {
-      // "All" toggled: if checked, clear the set (= all selected);
-      // if unchecked, do nothing (can't have nothing selected)
       if (input.checked) {
+        // Check all -> clear set (= all mode)
         sel.clear();
-        for (const cb of container.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')) {
-          cb.checked = true;
-        }
+        for (const cb of allCbs) cb.checked = true;
+      } else {
+        // Uncheck all -> empty selection (nothing passes filter)
+        sel.clear();
+        // Store a sentinel: explicitly-none. We use a special marker.
+        // Actually: just uncheck all items. getChecked returns the set,
+        // which is empty — but isFilterAll returns true for empty.
+        // We need to distinguish "all" from "none". Use a sentinel value.
+        sel.add("__none__");
+        for (const cb of allCbs) cb.checked = false;
       }
     } else {
+      // Individual checkbox toggled
+      const wasNone = sel.has("__none__");
+      sel.delete("__none__");
       if (input.checked) {
+        if (!wasNone && sel.size === 0) {
+          // Was in genuine "all" mode — checking one more is a no-op
+          return;
+        }
         sel.add(input.value);
       } else {
-        sel.delete(input.value);
-      }
-      // If all individual boxes are now checked, switch to "all" mode
-      const allCbs = container.querySelectorAll<HTMLInputElement>('input:not([value="__all__"])');
-      const allBox = container.querySelector<HTMLInputElement>('input[value="__all__"]');
-      const allIndividualChecked = [...allCbs].every(cb => cb.checked);
-      if (allIndividualChecked) {
-        sel.clear();
-        if (allBox) allBox.checked = true;
-      } else {
-        // If we're in "all" mode (empty set) but one was unchecked,
-        // switch to explicit mode: add all EXCEPT the unchecked one
-        if (sel.size === 0) {
+        // Uncheck: if was "all" mode, switch to explicit with all-except-this
+        if (!wasNone && sel.size === 0) {
           for (const cb of allCbs) {
-            if (cb.checked) sel.add(cb.value);
+            if (cb.value !== input.value) sel.add(cb.value);
           }
+        } else {
+          sel.delete(input.value);
+          if (sel.size === 0) sel.add("__none__");
         }
-        if (allBox) allBox.checked = false;
+      }
+      // If all individual boxes checked, switch back to "all" mode
+      if ([...allCbs].every(cb => cb.checked)) {
+        sel.clear();
       }
     }
+    syncAllBox(id);
     onChange();
   });
 }
 
-// Type options are static (known at build time)
+// Type options are static
 const TYPE_OPTIONS = [
   { value: "bug", label: "\ud83d\udc1b Bug" },
   { value: "dep_update", label: "\ud83d\udce6 Dep" },
@@ -464,27 +528,28 @@ const STATUS_OPTIONS = [
 
 function filterBarHtml(p: string, includeStatus: boolean): string {
   const statusHtml = includeStatus
-    ? checkboxGroupHtml(`${p}Status`, "status", STATUS_OPTIONS.map(s => ({ value: s, label: s }))) +
-      '<div class="sep"></div>'
+    ? checkboxGroupHtml(`${p}Status`, "status", STATUS_OPTIONS.map(s => ({ value: s, label: s })))
     : "";
-  return `${statusHtml}
+  return `<div class="filter-row">
+    ${statusHtml}
     ${checkboxGroupHtml(`${p}Repo`, "repo", [])}
-    <div class="sep"></div>
     ${checkboxGroupHtml(`${p}Type`, "type", TYPE_OPTIONS)}
     ${checkboxGroupHtml(`${p}Class`, "class", [])}
-    <div class="sep"></div>
-    ${checkboxGroupHtml(`${p}Sev`, "min severity", SEV_OPTIONS)}
-    <div class="sep"></div>
-    <label>min confidence</label>
-    <input type="range" id="${p}Conf" min="0" max="100" value="0" step="5">
-    <span id="${p}ConfVal">0%</span>
-    <div class="sep"></div>
-    <label>sort</label><select id="${p}Sort">
-      <option value="score">severity \u00d7 confidence</option>
-      <option value="newest">newest first</option>
-      <option value="oldest">oldest first</option>
-      <option value="repo">by repo</option>
-    </select>`;
+    ${checkboxGroupHtml(`${p}Sev`, "severity", SEV_OPTIONS)}
+    <div class="filter-ctrl">
+      <label>confidence \u2265 <span id="${p}ConfVal">0%</span></label>
+      <input type="range" id="${p}Conf" min="0" max="100" value="0" step="5">
+    </div>
+    <div class="filter-ctrl">
+      <label>sort</label>
+      <select id="${p}Sort">
+        <option value="score">severity \u00d7 confidence</option>
+        <option value="newest">newest first</option>
+        <option value="oldest">oldest first</option>
+        <option value="repo">by repo</option>
+      </select>
+    </div>
+  </div>`;
 }
 function applyFindingFilters(findings: Finding[], p: string): Finding[] {
   const fStatus = getChecked(`${p}Status`);
@@ -495,21 +560,23 @@ function applyFindingFilters(findings: Finding[], p: string): Finding[] {
   const fConf = parseInt($input(`${p}Conf`).value, 10) / 100;
   const fSort = $select(`${p}Sort`).value;
 
+  // Sentinel "__none__" means explicitly nothing selected
+  const isNone = (s: Set<string> | null) => s?.has("__none__") ?? false;
+
   const filtered = findings.filter((f) => {
-    if (fStatus && !fStatus.has(f.status)) return false;
+    if (fStatus && (isNone(fStatus) || !fStatus.has(f.status))) return false;
     if (fRepo) {
+      if (isNone(fRepo)) return false;
       const repo = f.fingerprint.split(":")[0];
       if (!fRepo.has(repo)) return false;
     }
-    if (fType && !fType.has(f.type)) return false;
+    if (fType && (isNone(fType) || !fType.has(f.type))) return false;
     if (fClass) {
+      if (isNone(fClass)) return false;
       const cls = f.category || f.bug_class || "";
       if (!fClass.has(cls)) return false;
     }
-    if (fSev) {
-      // "min severity" with checkboxes: include if finding's severity is in the checked set
-      if (!fSev.has(f.severity)) return false;
-    }
+    if (fSev && (isNone(fSev) || !fSev.has(f.severity))) return false;
     if ((f.confidence || 0) < fConf) return false;
     return true;
   });
