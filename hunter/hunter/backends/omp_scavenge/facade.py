@@ -62,6 +62,10 @@ class OmpScavengeBackend:
 
     cfg: Config
     ledger: SpendLedger
+    # Last decide()'s per-window reservations — used by status() so the
+    # bar's unaccounted segment matches what the decision-maker last saw,
+    # rather than recomputing with anticipated=0 and a possibly-fresher probe.
+    _last_res: tuple[float, float] = (0.0, 0.0)
 
     # -- decide --------------------------------------------------------------
 
@@ -213,6 +217,7 @@ class OmpScavengeBackend:
         """May background work spend now?  Returns paired verdicts."""
         windows = capacity.read_windows()
         res_5h, res_7d = self._unaccounted_fraction(windows, anticipated_tokens)
+        self._last_res = (res_5h, res_7d)
 
         normal = self._decide_inner(windows, res_5h, res_7d, prio=False)
         # Monotonicity: if normal is granted, prioritized is at least as permissive.
@@ -342,7 +347,10 @@ class OmpScavengeBackend:
             return '<div class="scv-note">No window data available</div>'
 
         now_ms = time.time() * 1000
-        res_5h, res_7d = self._unaccounted_fraction(windows, 0)
+        # Use cached reservations from last decide() so the bar matches
+        # the deny reason the user sees, rather than recomputing with
+        # anticipated=0 and a possibly-fresher probe.
+        res_5h, res_7d = self._last_res
         parts: list[str] = []
 
         for lid, w in sorted(windows.items(), key=lambda kv: kv[0]):
@@ -355,12 +363,19 @@ class OmpScavengeBackend:
             if ":5h" in lid:
                 unacct = res_5h
                 ramp = capacity.ramp_5h(w.resets_at, now_ms)
+                # Window elapsed fraction (independent of ramp/headroom)
+                if w.resets_at and w.resets_at > now_ms:
+                    elapsed_frac = (capacity._5H_MS - (w.resets_at - now_ms)) / capacity._5H_MS
+                else:
+                    elapsed_frac = None
             elif ":7d" in lid:
                 unacct = res_7d
                 ramp = capacity.ramp_7d(w.resets_at, now_ms)
+                elapsed_frac = None  # 7d doesn't have headroom
             else:
                 unacct = 0.0
                 ramp = None
+                elapsed_frac = None
 
             fill_pct = min(100, round((w.used_fraction or 0) * 100))
             soft_pct = min(100 - fill_pct, max(0, round(unacct * 100)))
@@ -398,13 +413,22 @@ class OmpScavengeBackend:
             else:
                 reset_str = "reset unknown"
 
+            # Headroom indicator for 5h window
+            headroom_str = ""
+            if elapsed_frac is not None and ramp is not None and ramp == 0.0 and elapsed_frac > 0:
+                headroom_remain_ms = capacity.HEADROOM_MS - (elapsed_frac * capacity._5H_MS)
+                if headroom_remain_ms > 0:
+                    hm = int(headroom_remain_ms / 60_000)
+                    headroom_str = f" \u00b7 headroom {hm}m"
+
             # Unaccounted display
             unacct_str = f" +{unacct * 100:.0f}% in flight" if unacct > 0.005 else ""
 
-            # Build the bar
+            # Build the bar -- hide ramp marker when at 0% (headroom period:
+            # marker would sit behind the fill bar, invisible and confusing)
             marker = (
                 f'<i class="scv-ramp" style="left:{ramp_pct}%"></i>'
-                if ramp_pct is not None
+                if ramp_pct is not None and ramp_pct > 0
                 else ""
             )
             parts.append(
@@ -416,7 +440,7 @@ class OmpScavengeBackend:
                 f'<i class="scv-fill scv-{tone}" style="width:{fill_pct}%"></i>'
                 f'<i class="scv-soft" style="width:{soft_pct}%"></i>'
                 f"{marker}</div>"
-                f'<div class="scv-sub">{_esc(reset_str)} \u00b7 probed {_esc(probe_age)}</div>'
+                f'<div class="scv-sub">{_esc(reset_str)}{_esc(headroom_str)} \u00b7 probed {_esc(probe_age)}</div>'
                 f"</div>"
             )
 
