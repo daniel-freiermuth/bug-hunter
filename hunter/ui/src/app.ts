@@ -1111,7 +1111,7 @@ function findingCard(f: Finding, withActions: boolean): string {
       ? `<div class="loc">${esc(f.current_approach || "?")} \u2192 ${esc(f.proposed_approach || "?")}</div>`
       : "";
 
-  return `<div class="card">
+  return `<div class="card" id="finding-${f.id}">
     <div class="top">
       <span class="badge type-${esc(f.type) || "bug"}">${esc(typeLabel)}</span>
       <span class="badge sev-${sev}">${sev} \u00b7 ${conf}</span>
@@ -1245,17 +1245,43 @@ function renderJobs(jobs: Job[]): void {
 }
 
 function renderEvents(events: Event[]): void {
-  const evs = events.slice(0, 30);
+  const evs = events.slice(0, 50);
   if (!evs.length) {
     $("events").innerHTML = '<div class="empty">quiet</div>';
     return;
   }
   $("events").innerHTML = evs
-    .map(
-      (e) =>
-        `<div class="ev"><span class="t">${ts(e.at)}</span> <span class="k">${esc(e.kind)}</span> ${esc(e.message)}</div>`,
-    )
+    .map((e) => {
+      const links: string[] = [];
+      if (e.finding_id != null) {
+        links.push(
+          `<a href="#findings" class="ev-link" data-finding="${e.finding_id}">#${e.finding_id}</a>`
+        );
+      }
+      if (e.job_id != null) {
+        links.push(`<span class="ev-job">job ${e.job_id}</span>`);
+      }
+      const suffix = links.length ? ` ${links.join(" ")}` : "";
+      return `<div class="ev"><span class="t">${datetime(e.at)}</span> <span class="k">${esc(e.kind)}</span> ${esc(e.message)}${suffix}</div>`;
+    })
     .join("");
+  // Wire finding links: navigate to All Findings and scroll to the card
+  for (const a of document.querySelectorAll<HTMLAnchorElement>("#events .ev-link")) {
+    a.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      const fid = a.dataset.finding;
+      showPage("findings");
+      // Wait a tick for the page to become visible, then scroll
+      requestAnimationFrame(() => {
+        const card = document.getElementById(`finding-${fid}`);
+        if (card) {
+          card.scrollIntoView({ behavior: "smooth", block: "center" });
+          card.classList.add("highlight");
+          setTimeout(() => card.classList.remove("highlight"), 2000);
+        }
+      });
+    });
+  }
   const last = evs[0];
   $("lastEvent").textContent = `${ts(last.at)} ${last.kind}: ${last.message}`;
 }
