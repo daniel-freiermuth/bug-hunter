@@ -169,15 +169,34 @@
 
   /* filter bar */
   .filters {
-    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap;
     margin-bottom: 10px; font-size: 12px;
   }
   .filters select, .filters input[type=range] {
     background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
     border-radius: 3px; font: inherit; font-size: 12px; padding: 2px 6px;
   }
-  .filters label { color: var(--dim); font-size: 11px; }
-  .filters .sep { border-left: 1px solid var(--line); height: 20px; }
+  .filters > label { color: var(--dim); font-size: 11px; align-self: center; }
+  .filters .sep { border-left: 1px solid var(--line); height: 20px; align-self: center; }
+  .filter-group {
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .fg-label { color: var(--dim); font-size: 11px; margin-bottom: 1px; }
+  .fg-body {
+    display: flex; flex-direction: column; gap: 1px;
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 3px;
+    padding: 4px 8px; max-height: 140px; overflow-y: auto;
+    min-width: 100px;
+  }
+  .cb-item {
+    display: flex; align-items: center; gap: 5px;
+    color: var(--fg); font-size: 12px; cursor: pointer;
+    white-space: nowrap; padding: 1px 0;
+  }
+  .cb-item input[type=checkbox] {
+    accent-color: var(--green); margin: 0; cursor: pointer;
+  }
+  .cb-all { color: var(--dim); border-bottom: 1px solid var(--line); padding-bottom: 3px; margin-bottom: 2px; }
 
   /* add-repo dialog */
   dialog {
