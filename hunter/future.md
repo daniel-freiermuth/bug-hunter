@@ -290,6 +290,48 @@ The bwrap approach hides all of these. The podman endgame adds network
 isolation (deny all except git+LLM endpoints) and per-repo credential
 injection via GitHub App installation tokens.
 
+**System-package installation under bwrap — the `/usr` tension.**
+bwrap bind-mounts `/usr` read-only from the host, so the worker gets
+the host's toolchains (JDK, Node, Python, Rust, etc.) for free. But
+`apt install` / `dnf install` / `pacman -S` need root and a writable
+`/usr` — neither available in a rootless bwrap sandbox.
+
+Three tiers, in order of complexity:
+
+1. **Don't (covers ~95% of repos).** Most projects don't need system
+   packages installed — they need their own build tool's dependency
+   manager (`npm install`, `pip install -r`, `./gradlew`, `cargo build`),
+   which all install into the worktree or `$HOME` (userspace). The host
+   already has the language runtimes; the project-level deps are what
+   the persistent env caches. If a repo genuinely needs a system package
+   the host doesn't have, install it on the host (single-user scenario)
+   — this is the same thing you'd do for your own dev work.
+
+2. **Per-project overlay (rootless overlayfs).** Layer a writable overlay
+   on top of the read-only `/usr` via fuse-overlayfs. The worker sees a
+   writable `/usr/bin` but writes actually go to
+   `data/envs/<slug>/overlay/`. Persists across runs, per-project, host
+   untouched. bwrap supports this with `--overlay-src /usr --overlay
+   data/envs/<slug>/usr-overlay --tmp-overlay /usr`. More complex but
+   gives full `apt install` capability without root or containers.
+   Trade-off: the overlay accumulates drift from the host's base — an
+   `apt upgrade` on the host doesn't propagate into existing overlays.
+
+3. **Podman with persistent volumes (the endgame).** A rootless container
+   with a base image providing the OS + system packages, and a persistent
+   named volume for the project home. Workers can `apt install` freely
+   inside the container — it's an ephemeral filesystem layer. The project
+   home volume persists; the system-package layer is cheap to rebuild from
+   the base image. This is heavier but is the multi-tenant endgame anyway.
+   The base image can be thin (debian-slim + git + common runtimes) since
+   the worker self-provisions the rest.
+
+Recommendation: start with tier 1 (host tools + userspace deps). Move
+individual repos to tier 3 (podman) when they genuinely need system
+packages the host doesn't have or when multi-tenancy requires full
+isolation. Tier 2 (overlay) is a niche middle ground — worth knowing
+about but probably not worth the complexity if podman is the endgame.
+
 ### 5.4 Harness coupling (the most fragile dependency, in any language)
 Session-JSONL format, `agent.db:usage_history` schema, session-file reuse
 behavior — a harness update breaks metering and the budget gate silently, and
