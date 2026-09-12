@@ -62,10 +62,6 @@ class OmpScavengeBackend:
 
     cfg: Config
     ledger: SpendLedger
-    # Last decide()'s per-window reservations — used by status() so the
-    # bar's unaccounted segment matches what the decision-maker last saw,
-    # rather than recomputing with anticipated=0 and a possibly-fresher probe.
-    _last_res: tuple[float, float] = (0.0, 0.0)
 
     # -- decide --------------------------------------------------------------
 
@@ -217,7 +213,6 @@ class OmpScavengeBackend:
         """May background work spend now?  Returns paired verdicts."""
         windows = capacity.read_windows()
         res_5h, res_7d = self._unaccounted_fraction(windows, anticipated_tokens)
-        self._last_res = (res_5h, res_7d)
 
         normal = self._decide_inner(windows, res_5h, res_7d, prio=False)
         # Monotonicity: if normal is granted, prioritized is at least as permissive.
@@ -347,10 +342,9 @@ class OmpScavengeBackend:
             return '<div class="scv-note">No window data available</div>'
 
         now_ms = time.time() * 1000
-        # Use cached reservations from last decide() so the bar matches
-        # the deny reason the user sees, rather than recomputing with
-        # anticipated=0 and a possibly-fresher probe.
-        res_5h, res_7d = self._last_res
+        # Compute fresh: anticipated=0 because status shows current state,
+        # not the hypothetical reservation for a job that may have been denied.
+        res_5h, res_7d = self._unaccounted_fraction(windows, 0)
         parts: list[str] = []
 
         for lid, w in sorted(windows.items(), key=lambda kv: kv[0]):
