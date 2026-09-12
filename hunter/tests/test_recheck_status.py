@@ -1,15 +1,48 @@
-"""Regression: run_recheck must reset status to 'new' on error paths."""
+"""Regression: run_recheck must leave status at 'rechecking' on infra/execution
+failures (repo missing, git sync failure, inconclusive verdict) so the next
+run_cycle's priority scan retries it automatically -- exactly like a killed
+run_fix leaves a finding at 'queued'. Resetting to 'new' on these paths was
+itself a bug: a finding that comes back into the inbox as 'new' reads as
+"still relevant, recheck confirmed it" when in fact the recheck never
+actually completed.
+"""
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from hunter import scheduler
 from hunter.scheduler import run_recheck
 from hunter.store import Store
-from hunter.types import Config
+from hunter.types import Config, RunResult
+from hunter.backend import Granted, Outlook
+
+
+class _FakeBackend:
+    """Minimal Backend for tests: always grants, delegates run() to a worker fn."""
+
+    def __init__(self, worker_fn: object) -> None:
+        self._fn = worker_fn
+
+    def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
+        return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
+
+    def run(self, cwd: object, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+        return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
+
+    def keep_fresh(self) -> bool:
+        return False
+
+    def status(self) -> str:
+        return ""
+
+
+# Dummy backend for tests that fail before reaching the worker call.
+_DUMMY = _FakeBackend(lambda *a, **kw: None)
 
 
 @pytest.fixture
@@ -41,11 +74,12 @@ def _make_finding(**overrides: Any) -> dict[str, Any]:
     return base
 
 
-class TestRunRecheckResetsStatus:
-    """Finding must not stay stuck in 'rechecking' when run_recheck fails."""
+class TestRunRecheckStaysRecheckingOnFailure:
+    """A recheck that didn't reach a real verdict must stay retryable, not
+    silently look like a fresh 'new' finding."""
 
-    def test_repo_missing_resets_to_new(self, store: Store, cfg: Config) -> None:
-        """When get_repo() returns None the finding must go back to 'new'."""
+    def test_repo_missing_stays_rechecking(self, store: Store, cfg: Config) -> None:
+        """When get_repo() returns None the finding must stay 'rechecking'."""
         repo_id = store.add_repo("r", "https://example.com/r.git", "/nonexistent")
         fid, _ = store.upsert_finding(repo_id, _make_finding())
         store.set_status(fid, "rechecking")
@@ -57,19 +91,20 @@ class TestRunRecheckResetsStatus:
         # Point the finding dict at a repo_id that doesn't exist.
         finding["repo_id"] = 9999
 
-        result = run_recheck(store, cfg, finding)
+        result = run_recheck(store, cfg, finding, _DUMMY)
         assert "error" in result
 
         after = store.get_finding(fid)
         assert after is not None
-        assert after["status"] == "new", (
-            f"finding stuck in {after['status']!r}, expected 'new'"
+        assert after["status"] == "rechecking", (
+            f"finding reset to {after['status']!r}, expected to stay 'rechecking' for retry"
         )
-    def test_clone_failure_resets_to_new(
+
+    def test_clone_failure_stays_rechecking(
         self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
-        """When git clone fails the finding must go back to 'new'."""
-        # Path that doesn't exist yet → triggers the clone branch.
+        """When git clone fails the finding must stay 'rechecking'."""
+        # Path that doesn't exist yet -> triggers the clone branch.
         clone_dest = str(tmp_path / "repos" / "will-fail")
         repo_id = store.add_repo(
             "bad-clone", str(tmp_path / "nonexistent-source"), clone_dest
@@ -81,20 +116,20 @@ class TestRunRecheckResetsStatus:
 
         finding = store.get_finding(fid)
         assert finding is not None
-        result = run_recheck(store, cfg, finding)
+        result = run_recheck(store, cfg, finding, _DUMMY)
         assert "error" in result
 
         after = store.get_finding(fid)
         assert after is not None
-        assert after["status"] == "new", (
-            f"finding stuck in {after['status']!r}, expected 'new'"
+        assert after["status"] == "rechecking", (
+            f"finding reset to {after['status']!r}, expected to stay 'rechecking' for retry"
         )
 
-    def test_git_sync_failure_resets_to_new(
+    def test_git_sync_failure_stays_rechecking(
         self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
-        """When git fetch/checkout/pull fails the finding must go back to 'new'."""
-        # Path exists but is not a git repo → git commands fail.
+        """When git fetch/checkout/pull fails the finding must stay 'rechecking'."""
+        # Path exists but is not a git repo -> git commands fail.
         not_a_repo = tmp_path / "repos" / "not-git"
         not_a_repo.mkdir(parents=True)
         repo_id = store.add_repo(
@@ -107,11 +142,137 @@ class TestRunRecheckResetsStatus:
 
         finding = store.get_finding(fid)
         assert finding is not None
-        result = run_recheck(store, cfg, finding)
+        result = run_recheck(store, cfg, finding, _DUMMY)
         assert "error" in result
 
         after = store.get_finding(fid)
         assert after is not None
-        assert after["status"] == "new", (
-            f"finding stuck in {after['status']!r}, expected 'new'"
+        assert after["status"] == "rechecking", (
+            f"finding reset to {after['status']!r}, expected to stay 'rechecking' for retry"
         )
+
+    def test_killed_worker_stays_rechecking(
+        self, store: Store, cfg: Config, tmp_path: Path
+    ) -> None:
+        """When the worker is killed mid-investigation (no valid verdict
+        written), the finding must stay 'rechecking' for automatic retry --
+        it must NOT look like a finding that was reviewed and is still
+        relevant. This is the exact scenario reported in production: a
+        recheck hit its token cap, got SIGTERM'd, and silently reappeared
+        as 'new' with no indication the recheck never actually completed."""
+
+        # Minimal real git repo so fetch/checkout/pull succeed.
+        repo_path = tmp_path / "repos" / "real-repo"
+        repo_path.mkdir(parents=True)
+
+        def run(*a: str) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(a, cwd=repo_path, check=True, capture_output=True)
+
+        run("git", "init", "-b", "main")
+        run("git", "config", "user.email", "t@t.com")
+        run("git", "config", "user.name", "t")
+        (repo_path / "f.py").write_text("pass\n")
+        run("git", "add", ".")
+        run("git", "commit", "-m", "init")
+        run("git", "remote", "add", "origin", str(repo_path))
+        run("git", "fetch", "origin")
+        run("git", "branch", "--set-upstream-to=origin/main", "main")
+
+        repo_id = store.add_repo("real-repo", str(repo_path), str(repo_path), default_branch="main")
+        fid, _ = store.upsert_finding(repo_id, _make_finding(fingerprint="repo:f.py:fn:killed"))
+        store.set_status(fid, "rechecking")
+
+        finding = store.get_finding(fid)
+        assert finding is not None
+        finding["budget_override"] = "exempt"  # bypass "no window data" denial in tests
+
+        def fake_run_worker(*_args: object, **_kwargs: object) -> RunResult:
+            return RunResult(
+                exit_code=-15,
+                killed_reason="cap",
+                tokens_new=200_000,
+                calls=10,
+                session_file=None,
+                duration_s=30.0,
+                stdout_tail="investigating...",
+            )
+
+        result = run_recheck(store, cfg, finding, _FakeBackend(fake_run_worker))
+        assert result.get("outcome") == "requeued"
+
+        after = store.get_finding(fid)
+        assert after is not None
+        assert after["status"] == "rechecking", (
+            f"finding reset to {after['status']!r} after a killed worker, "
+            "expected to stay 'rechecking'"
+        )
+
+
+class TestRecheckGiveUp:
+    """The other half of the fix: a recheck that fails the SAME way over
+    and over must eventually stop -- 'stays rechecking forever' is itself
+    a starvation bug (see hunter.scheduler.MAX_CONSECUTIVE_SAME_FAILURE),
+    since pick_next always retries the oldest 'rechecking' item first."""
+
+    def test_gives_up_after_consecutive_identical_failures(
+        self, store: Store, cfg: Config, tmp_path: Path
+    ) -> None:
+        repo_path = tmp_path / "repos" / "real-repo"
+        repo_path.mkdir(parents=True)
+
+        def run(*a: str) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(a, cwd=repo_path, check=True, capture_output=True)
+
+        run("git", "init", "-b", "main")
+        run("git", "config", "user.email", "t@t.com")
+        run("git", "config", "user.name", "t")
+        (repo_path / "f.py").write_text("pass\n")
+        run("git", "add", ".")
+        run("git", "commit", "-m", "init")
+        run("git", "remote", "add", "origin", str(repo_path))
+        run("git", "fetch", "origin")
+        run("git", "branch", "--set-upstream-to=origin/main", "main")
+
+        repo_id = store.add_repo(
+            "real-repo", str(repo_path), str(repo_path), default_branch="main"
+        )
+        fid, _ = store.upsert_finding(repo_id, _make_finding(fingerprint="repo:f.py:fn:give-up"))
+        store.set_status(fid, "rechecking")
+
+        def fake_run_worker(*_args: object, **_kwargs: object) -> RunResult:
+            return RunResult(
+                exit_code=-15,
+                killed_reason="cap",
+                tokens_new=200_000,
+                calls=10,
+                session_file=None,
+                duration_s=30.0,
+                stdout_tail="investigating...",
+            )
+
+        backend = _FakeBackend(fake_run_worker)
+
+        finding = store.get_finding(fid)
+        assert finding is not None
+        finding["budget_override"] = "exempt"
+
+        for attempt in range(1, scheduler.MAX_CONSECUTIVE_SAME_FAILURE):
+            result = run_recheck(store, cfg, finding, backend)
+            assert result.get("outcome") == "requeued", (attempt, result)
+            after = store.get_finding(fid)
+            assert after is not None
+            assert after["status"] == "rechecking"
+            assert after["recheck_attempts"] == attempt
+            finding = after
+            finding["budget_override"] = "exempt"
+
+        result = run_recheck(store, cfg, finding, backend)
+        assert result.get("outcome") == "stuck", result
+
+        after = store.get_finding(fid)
+        assert after is not None
+        assert after["status"] == "new", (
+            f"expected the finding back in the inbox as 'new' after giving up on a"
+            f" stuck recheck, got {after['status']!r}"
+        )
+        assert after["recheck_attempts"] == 0

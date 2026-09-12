@@ -18,7 +18,10 @@ import tempfile
 import time
 from pathlib import Path
 
-from .types import OMP_SESSIONS_DIR, Config, RunResult
+from hunter.types import Config, RunResult
+
+# omp-specific path; lives here rather than in core types.
+OMP_SESSIONS_DIR = Path.home() / ".omp/agent/sessions"
 
 
 def ledger_usage(session_file: Path, since_iso: str = "") -> tuple[int, int]:

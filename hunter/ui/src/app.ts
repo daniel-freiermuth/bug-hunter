@@ -1,31 +1,50 @@
 // Idle-Token Bug Hunter — triage dashboard
 
+import { z } from "zod";
+
 // ---------------------------------------------------------------------------
 // API types (mirror hunter.types / hunter.store)
 // ---------------------------------------------------------------------------
 
-interface WindowInfo {
-  used_fraction: number | null;
-  status: string | null;
-  resets_at: number | null;
-  age_s: number;
-  stale: boolean;
-}
+// Zod schemas double as the runtime-validated wire contract AND (via
+// z.infer) the compile-time type -- one definition, not two that can
+// silently drift. Only the /api/summary boundary is validated this way
+// (see refresh() below); Finding/Job/Event/Repo below it stay plain
+// interfaces for the OTHER endpoints (findings/jobs/events/repos) that
+// aren't in scope here, though Job/Event/Repo/CurrentJob/NextCandidate/
+// SchedulerState/ActivityStatus/Summary further down ARE zod-derived,
+// since /api/summary embeds all of them.
 
 interface Finding {
+  type: string;  // 'bug' | 'dep_update' | 'test_gap' | 'refactor' | 'modernization'
   id: number;
   repo_id: number;
   fingerprint: string;
   file: string;
   symbol: string | null;
   line: number | null;
-  bug_class: string;
+  category: string;  // bug_class | update_type | 'coverage' | smell_type | modernization_class
+  bug_class?: string;  // legacy field for bugs
   severity: string;
   confidence: number;
   summary: string;
   detail: string | null;
   evidence_plan: string | null;
   introduced_by: string | null;
+  // Type-specific fields
+  ecosystem?: string | null;
+  package?: string | null;
+  current_version?: string | null;
+  latest_version?: string | null;
+  update_type?: string | null;
+  security_advisory?: string | null;
+  missing_tests?: string | null;
+  smell_type?: string | null;
+  suggested_refactor?: string | null;
+  modernization_class?: string | null;
+  current_approach?: string | null;
+  proposed_approach?: string | null;
+  // Common status fields
   status: string;
   verdict_reason: string | null;
   pr_url: string | null;
@@ -36,50 +55,130 @@ interface Finding {
   needs_attention: string | null;
 }
 
-interface Job {
-  id: number;
-  kind: string;
-  repo_id: number;
-  repo_name: string;
-  finding_id: number | null;
-  state: string;
-  tokens_new: number | null;
-  calls: number | null;
-  exit_code: number | null;
-  killed_reason: string | null;
-  started_at: number | null;
-  finished_at: number | null;
+const JobSchema = z.object({
+  id: z.number(),
+  kind: z.string(),
+  repo_id: z.number(),
+  repo_name: z.string(),
+  finding_id: z.number().nullable(),
+  state: z.string(),
+  tokens_new: z.number().nullable(),
+  calls: z.number().nullable(),
+  exit_code: z.number().nullable(),
+  killed_reason: z.string().nullable(),
+  started_at: z.number().nullable(),
+  finished_at: z.number().nullable(),
+});
+type Job = z.infer<typeof JobSchema>;
+
+const EventSchema = z.object({
+  id: z.number(),
+  at: z.number(),
+  kind: z.string(),
+  message: z.string(),
+  job_id: z.number().nullable(),
+  finding_id: z.number().nullable(),
+});
+type Event = z.infer<typeof EventSchema>;
+
+// pr_state table row -- see schema.sql. Only ever fetched on demand via
+// /api/finding (toggleFindingDetail below), never part of the 5s poll.
+interface PrState {
+  pr_number: number | null;
+  state: string | null;
+  mergeable: string | null;
+  checks: string | null;
+  head_ref: string | null;
+  last_activity_at: number | null;
+  last_engaged_activity_at: number | null;
+  needs_attention: string | null;
+  synced_at: number | null;
 }
 
-interface Event {
-  id: number;
-  at: number;
-  kind: string;
-  message: string;
-  job_id: number | null;
-  finding_id: number | null;
+// /api/finding?id=<id> response: everything about one finding NOT
+// already on its list-view card -- see hunter.server._finding_detail's
+// docstring for why (list_jobs()'s /api/jobs feed is capped at 50 and
+// list_findings() only ever embeds needs_attention for pr_open).
+interface FindingDetail {
+  jobs: Job[];
+  pr_state: PrState | null;
 }
 
-interface Repo {
-  id: number;
-  name: string;
-  url: string;
-  path: string;
-  forge: string;
-  default_branch: string;
-  last_hunt_sha: string | null;
-  last_hunt_at: number | null;
-  enabled: number;
-  added_at: number;
-}
+const RepoSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  url: z.string(),
+  path: z.string(),
+  forge: z.string(),
+  default_branch: z.string(),
+  last_hunt_sha: z.string().nullable(),
+  last_hunt_at: z.number().nullable(),
+  enabled: z.number(),
+  added_at: z.number(),
+});
+type Repo = z.infer<typeof RepoSchema>;
 
-interface Summary {
-  windows: Record<string, WindowInfo>;
-  counts: Record<string, number>;
-  repos: Repo[];
-  last_cycle: Event | null;
-  cycle_running: boolean;
-}
+const CurrentJobSchema = JobSchema.extend({
+  finding_summary: z.string().nullable().optional(),
+  finding_fingerprint: z.string().nullable().optional(),
+});
+type CurrentJob = z.infer<typeof CurrentJobSchema>;
+
+const NextCandidateSchema = z.object({
+  kind: z.string(),
+  id: z.number(),
+  label: z.string().nullable(),
+  is_finding: z.boolean(),
+  budget_state: z.string(), // "allowed" | "denied" | "exempt"
+  budget_reason: z.string(),
+  budget_retry_at: z.number().nullable(),
+});
+type NextCandidate = z.infer<typeof NextCandidateSchema>;
+
+const SchedulerStateSchema = z.object({
+  state: z.string(), // "idle" | "denied" | "error"
+  detail: z.string(),
+  next_wake_at: z.number().nullable(),
+  updated_at: z.number(),
+});
+type SchedulerState = z.infer<typeof SchedulerStateSchema>;
+
+// The single, canonical answer to "what is hunter doing right now" --
+// computed once server-side (see hunter.server._activity_status, whose
+// docstring names the four incidents this replaced) so this panel and
+// the manual-run button can never independently disagree about it
+// again. A real discriminated union, mirroring the Python TypedDict
+// union exactly (one variant per kind, only the fields that kind
+// actually has -- no "job: null" on a variant that was never running):
+// renderActivity's switch below is checked exhaustively against this
+// by assertNever, so adding a kind here without a case there is a
+// compile error, not a silent gap. z.discriminatedUnion also means a
+// malformed or unrecognized "kind" value from the wire is rejected at
+// parse time, before renderActivity ever sees it.
+const ActivityStatusSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("running"), job: CurrentJobSchema }),
+  z.object({ kind: z.literal("working") }),
+  z.object({ kind: z.literal("error"), detail: z.string() }),
+  z.object({ kind: z.literal("paused"), candidate: NextCandidateSchema }),
+  z.object({ kind: z.literal("ready"), candidate: NextCandidateSchema }),
+  z.object({ kind: z.literal("idle") }),
+  z.object({ kind: z.literal("warming_up") }),
+]);
+type ActivityStatus = z.infer<typeof ActivityStatusSchema>;
+
+const SummarySchema = z.object({
+  backend_status_html: z.string(),
+  counts: z.record(z.string(), z.number()),
+  type_counts: z.record(z.string(), z.number()),
+  repos: z.array(RepoSchema),
+  last_cycle: EventSchema.nullable(),
+  cycle_running: z.boolean(),
+  current_job: CurrentJobSchema.nullable(),
+  next_candidate: NextCandidateSchema.nullable(),
+  scheduler_state: SchedulerStateSchema.nullable(),
+  activity_status: ActivityStatusSchema,
+});
+type Summary = z.infer<typeof SummarySchema>;
 
 interface ApiResult<T> {
   status: number;
@@ -164,6 +263,16 @@ function esc(s: unknown): string {
   return String(s ?? "").replace(/[&<>"']/g, (c) => ESC_MAP[c] ?? c);
 }
 
+// Exhaustiveness check for discriminated unions (the TS analog of
+// Rust's "match must cover every enum variant, or it's a compile
+// error") -- calling this with a value TypeScript hasn't already
+// narrowed to `never` is itself a compile error, so a switch that
+// forgets a case fails to build instead of silently falling through
+// at runtime.
+function assertNever(x: never): never {
+  throw new Error(`unreachable: unhandled variant ${JSON.stringify(x)}`);
+}
+
 // ---------------------------------------------------------------------------
 // Formatting
 // ---------------------------------------------------------------------------
@@ -199,6 +308,12 @@ function countdown(ms: number | null): string {
   return sign + (h ? h + "h" + String(m).padStart(2, "0") + "m" : m + "m");
 }
 
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 1_000) return Math.round(n / 1_000) + "k";
+  return String(Math.round(n));
+}
+
 function dur(j: Job): string {
   if (!j.started_at) return "\u2013";
   const end = j.finished_at || Date.now();
@@ -206,27 +321,282 @@ function dur(j: Job): string {
 }
 
 // ---------------------------------------------------------------------------
-// Filter dropdown management
+// Filter checkbox management — collapsible dropdown panels with tri-state All
 // ---------------------------------------------------------------------------
 
-function populateSelect(id: string, values: string[]): void {
-  const el = $select(id);
-  const prev = el.value;
-  const existing = new Set(
-    [...el.options].slice(1).map((o) => o.value),
-  );
-  const wanted = new Set(values);
-  for (const v of values) {
-    if (!existing.has(v)) {
-      const o = document.createElement("option");
-      o.value = o.textContent = v;
-      el.appendChild(o);
+// Module-level state: which values are checked per filter group.
+// Key = DOM id (e.g. "fRepo", "pfType"). Value = set of checked values.
+// Empty set = "all" (nothing excluded). Survives DOM rebuilds.
+const filterState = new Map<string, Set<string>>();
+// Total available options per group (for summary text).
+const filterTotals = new Map<string, number>();
+
+function getFilterSet(id: string): Set<string> {
+  let s = filterState.get(id);
+  if (!s) { s = new Set(); filterState.set(id, s); }
+  return s;
+}
+
+function isFilterAll(id: string): boolean {
+  const s = filterState.get(id);
+  return !s || s.size === 0;
+}
+
+function getChecked(id: string): Set<string> | null {
+  return isFilterAll(id) ? null : filterState.get(id)!;
+}
+
+/** Summary label: "all", "none", names when ≤3, or "3 of 15". */
+function filterSummary(id: string): string {
+  if (isFilterAll(id)) return "all";
+  const s = filterState.get(id);
+  if (!s || s.has("__none__")) return "none";
+  const total = filterTotals.get(id) ?? 0;
+  const items = [...s].filter(v => v !== "__none__");
+  if (items.length <= 3) return items.join(", ");
+  return `${items.length} of ${total}`;
+}
+
+/** Update the "All" checkbox's tri-state and the summary text. */
+function syncAllBox(id: string): void {
+  const grp = document.querySelector(`[data-filter-id="${id}"]`);
+  if (!grp) return;
+  const allBox = grp.querySelector<HTMLInputElement>('input[value="__all__"]');
+  const summary = grp.querySelector<HTMLElement>('.fd-summary');
+  const sel = getFilterSet(id);
+  if (allBox) {
+    if (sel.size === 0) {
+      // All mode
+      allBox.checked = true;
+      allBox.indeterminate = false;
+    } else if (sel.has("__none__")) {
+      // None mode
+      allBox.checked = false;
+      allBox.indeterminate = false;
+    } else {
+      // Some selected
+      allBox.checked = false;
+      allBox.indeterminate = true;
     }
   }
-  for (const o of [...el.options].slice(1)) {
-    if (!wanted.has(o.value)) o.remove();
+  if (summary) summary.textContent = filterSummary(id);
+}
+
+/** Build a dropdown filter group. Closed by default, opens on click. */
+function checkboxGroupHtml(
+  id: string,
+  label: string,
+  options: { value: string; label: string }[],
+): string {
+  const sel = getFilterSet(id);
+  const allMode = sel.size === 0;
+  filterTotals.set(id, options.length);
+  const items = options.map((o) => {
+    const checked = allMode || sel.has(o.value) ? "checked" : "";
+    return `<label class="cb-item"><input type="checkbox" value="${esc(o.value)}" ${checked}>${esc(o.label)}</label>`;
+  }).join("");
+  return `<div class="filter-drop" data-filter-id="${esc(id)}">
+    <button type="button" class="fd-toggle">
+      <span class="fd-label">${esc(label)}</span>
+      <span class="fd-summary">${esc(filterSummary(id))}</span>
+      <span class="fd-arrow">\u25be</span>
+    </button>
+    <div class="fd-panel">
+      <label class="cb-item cb-all"><input type="checkbox" value="__all__" ${allMode ? "checked" : ""}>All</label>
+      ${items}
+    </div>
+  </div>`;
+}
+
+/** Populate a dynamic dropdown (repo, class) with new values. */
+function populateCheckboxGroup(id: string, values: string[]): void {
+  const grp = document.querySelector(`[data-filter-id="${id}"]`);
+  const panel = grp?.querySelector('.fd-panel');
+  if (!panel) return;
+  const sel = getFilterSet(id);
+  const allMode = sel.size === 0;
+  filterTotals.set(id, values.length);
+  const existing = new Map<string, HTMLLabelElement>();
+  for (const lbl of panel.querySelectorAll<HTMLLabelElement>('.cb-item:not(.cb-all)')) {
+    const v = lbl.querySelector('input')?.value;
+    if (v) existing.set(v, lbl);
   }
-  el.value = wanted.has(prev) ? prev : "";
+  const wanted = new Set(values);
+  for (const [v, lbl] of existing) {
+    if (!wanted.has(v)) { lbl.remove(); sel.delete(v); }
+  }
+  for (const v of values) {
+    if (!existing.has(v)) {
+      const lbl = document.createElement('label');
+      lbl.className = 'cb-item';
+      const checked = allMode || sel.has(v);
+      lbl.innerHTML = `<input type="checkbox" value="${esc(v)}" ${checked ? "checked" : ""}>${esc(v)}`;
+      panel.appendChild(lbl);
+    }
+  }
+  syncAllBox(id);
+}
+
+/** Wire checkbox change events + toggle open/close. */
+function wireCheckboxGroup(id: string, onChange: () => void): void {
+  const grp = document.querySelector(`[data-filter-id="${id}"]`);
+  if (!grp) return;
+  const toggle = grp.querySelector<HTMLButtonElement>('.fd-toggle');
+  const panel = grp.querySelector<HTMLElement>('.fd-panel');
+  if (toggle && panel) {
+    toggle.addEventListener("click", () => {
+      // Close any other open panels first
+      for (const other of document.querySelectorAll<HTMLElement>('.fd-panel.open')) {
+        if (other !== panel) other.classList.remove('open');
+      }
+      panel.classList.toggle('open');
+    });
+  }
+  // Close on outside click
+  document.addEventListener("click", (e) => {
+    if (!grp.contains(e.target as Node)) {
+      panel?.classList.remove('open');
+    }
+  });
+  // Checkbox logic
+  panel?.addEventListener("change", (e) => {
+    const input = e.target as HTMLInputElement;
+    if (!input?.matches('input[type="checkbox"]')) return;
+    const sel = getFilterSet(id);
+    const allCbs = panel.querySelectorAll<HTMLInputElement>('input:not([value="__all__"])');
+    if (input.value === "__all__") {
+      if (input.checked) {
+        // Check all -> clear set (= all mode)
+        sel.clear();
+        for (const cb of allCbs) cb.checked = true;
+      } else {
+        // Uncheck all -> empty selection (nothing passes filter)
+        sel.clear();
+        // Store a sentinel: explicitly-none. We use a special marker.
+        // Actually: just uncheck all items. getChecked returns the set,
+        // which is empty — but isFilterAll returns true for empty.
+        // We need to distinguish "all" from "none". Use a sentinel value.
+        sel.add("__none__");
+        for (const cb of allCbs) cb.checked = false;
+      }
+    } else {
+      // Individual checkbox toggled
+      const wasNone = sel.has("__none__");
+      sel.delete("__none__");
+      if (input.checked) {
+        if (!wasNone && sel.size === 0) {
+          // Was in genuine "all" mode — checking one more is a no-op
+          return;
+        }
+        sel.add(input.value);
+      } else {
+        // Uncheck: if was "all" mode, switch to explicit with all-except-this
+        if (!wasNone && sel.size === 0) {
+          for (const cb of allCbs) {
+            if (cb.value !== input.value) sel.add(cb.value);
+          }
+        } else {
+          sel.delete(input.value);
+          if (sel.size === 0) sel.add("__none__");
+        }
+      }
+      // If all individual boxes checked, switch back to "all" mode
+      if ([...allCbs].every(cb => cb.checked)) {
+        sel.clear();
+      }
+    }
+    syncAllBox(id);
+    onChange();
+  });
+}
+
+// Type options are static
+const TYPE_OPTIONS = [
+  { value: "bug", label: "\ud83d\udc1b Bug" },
+  { value: "dep_update", label: "\ud83d\udce6 Dep" },
+  { value: "test_gap", label: "\ud83e\uddea Test" },
+  { value: "refactor", label: "\u267b\ufe0f Refactor" },
+  { value: "modernization", label: "\ud83d\udd2c Modern" },
+];
+const SEV_OPTIONS = [
+  { value: "high", label: "high" },
+  { value: "medium", label: "medium" },
+  { value: "low", label: "low" },
+];
+const STATUS_OPTIONS = [
+  "new", "rechecking", "queued", "fixing", "pr_open",
+  "merged", "rejected", "wontfix", "note",
+];
+
+function filterBarHtml(p: string, includeStatus: boolean): string {
+  const statusHtml = includeStatus
+    ? checkboxGroupHtml(`${p}Status`, "status", STATUS_OPTIONS.map(s => ({ value: s, label: s })))
+    : "";
+  return `<div class="filter-row">
+    ${statusHtml}
+    ${checkboxGroupHtml(`${p}Repo`, "repo", [])}
+    ${checkboxGroupHtml(`${p}Type`, "type", TYPE_OPTIONS)}
+    ${checkboxGroupHtml(`${p}Class`, "class", [])}
+    ${checkboxGroupHtml(`${p}Sev`, "severity", SEV_OPTIONS)}
+    <div class="filter-ctrl">
+      <label>confidence \u2265 <span id="${p}ConfVal">0%</span></label>
+      <input type="range" id="${p}Conf" min="0" max="100" value="0" step="5">
+    </div>
+    <div class="filter-ctrl">
+      <label>sort</label>
+      <select id="${p}Sort">
+        <option value="score">severity \u00d7 confidence</option>
+        <option value="newest">newest first</option>
+        <option value="oldest">oldest first</option>
+        <option value="repo">by repo</option>
+      </select>
+    </div>
+  </div>`;
+}
+function applyFindingFilters(findings: Finding[], p: string): Finding[] {
+  const fStatus = getChecked(`${p}Status`);
+  const fRepo = getChecked(`${p}Repo`);
+  const fType = getChecked(`${p}Type`);
+  const fClass = getChecked(`${p}Class`);
+  const fSev = getChecked(`${p}Sev`);
+  const fConf = parseInt($input(`${p}Conf`).value, 10) / 100;
+  const fSort = $select(`${p}Sort`).value;
+
+  // Sentinel "__none__" means explicitly nothing selected
+  const isNone = (s: Set<string> | null) => s?.has("__none__") ?? false;
+
+  const filtered = findings.filter((f) => {
+    if (fStatus && (isNone(fStatus) || !fStatus.has(f.status))) return false;
+    if (fRepo) {
+      if (isNone(fRepo)) return false;
+      const repo = f.fingerprint.split(":")[0];
+      if (!fRepo.has(repo)) return false;
+    }
+    if (fType && (isNone(fType) || !fType.has(f.type))) return false;
+    if (fClass) {
+      if (isNone(fClass)) return false;
+      const cls = f.category || f.bug_class || "";
+      if (!fClass.has(cls)) return false;
+    }
+    if (fSev && (isNone(fSev) || !fSev.has(f.severity))) return false;
+    if ((f.confidence || 0) < fConf) return false;
+    return true;
+  });
+
+  if (fSort === "score") {
+    filtered.sort(
+      (a, b) =>
+        (SEV_RANK[b.severity] || 0) * (b.confidence || 0) -
+        (SEV_RANK[a.severity] || 0) * (a.confidence || 0),
+    );
+  } else if (fSort === "newest") {
+    filtered.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+  } else if (fSort === "oldest") {
+    filtered.sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+  } else if (fSort === "repo") {
+    filtered.sort((a, b) => a.fingerprint.localeCompare(b.fingerprint));
+  }
+  return filtered;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,40 +753,324 @@ async function toggleRepo(id: number, enabled: boolean): Promise<void> {
   refresh();
 }
 
+function toast(message: string, isError = true): void {
+  const el = document.createElement("div");
+  el.className = "msg" + (isError ? " err" : "");
+  el.textContent = message;
+  $("toast").appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+async function addRepo(): Promise<void> {
+  const name = $input("arName").value.trim();
+  const url = $input("arUrl").value.trim();
+  const branch = $input("arBranch").value.trim() || "main";
+  const forge = $select("arForge").value || undefined;
+  if (!name || !url) {
+    toast("name and url are required");
+    return;
+  }
+  const r = await api<{ error?: string }>("/api/repos", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, url, branch, forge }),
+  });
+  if (r.status !== 201) {
+    toast("add repo failed: " + (r.body?.error || r.status));
+    return;
+  }
+  $input("arName").value = "";
+  $input("arUrl").value = "";
+  $input("arBranch").value = "main";
+  $select("arForge").value = "";
+  ($("addRepoDialog") as HTMLDialogElement).close();
+  toast(`repo "${name}" added`, false);
+  refresh();
+}
+
+async function removeRepo(id: number, name: string): Promise<void> {
+  if (!confirm(`Remove repo "${name}"? Only works if it has no findings or jobs yet.`)) {
+    return;
+  }
+  const r = await api<{ error?: string }>("/api/repo/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id }),
+  });
+  if (r.status !== 200) {
+    toast("remove repo failed: " + (r.body?.error || r.status));
+    return;
+  }
+  toast(`repo "${name}" removed`, false);
+  refresh();
+}
+
+// ---------------------------------------------------------------------------
+// Inline repo notes -- a <details> per row. Fetched content and in-progress
+// draft text live in module-level maps (not the DOM) so the 5s refresh()
+// rebuild of #repos never loses them; see the ontoggle/restore wiring below.
+// ---------------------------------------------------------------------------
+
+const repoNotesCache = new Map<number, string>();
+const repoNotesDraft = new Map<number, { category: string; note: string }>();
+
+async function toggleRepoNotes(id: number, opened: boolean): Promise<void> {
+  if (!opened) return;
+  if (!repoNotesCache.has(id)) {
+    const r = await api<{ notes: string; error?: string }>(`/api/repo/notes?id=${id}`);
+    if (r.status !== 200) {
+      toast("load notes failed: " + (r.body?.error || r.status));
+      return;
+    }
+    repoNotesCache.set(id, r.body?.notes || "");
+  }
+  renderRepoNotesBody(id);
+}
+
+function renderRepoNotesBody(id: number): void {
+  const body = document.getElementById(`rn-body-${id}`);
+  if (!body) return;
+  const content = repoNotesCache.get(id) || "";
+  const draft = repoNotesDraft.get(id);
+  body.innerHTML = `
+    <pre>${esc(content) || "(no notes yet)"}</pre>
+    <div class="rn-form">
+      <input type="text" class="rn-category" placeholder="category (optional)" value="${esc(draft?.category || "")}">
+      <textarea class="rn-note" rows="2" placeholder="note text">${esc(draft?.note || "")}</textarea>
+      <button onclick="addRepoNote(${id})">Add Note</button>
+    </div>`;
+  const catInput = body.querySelector<HTMLInputElement>(".rn-category")!;
+  const noteInput = body.querySelector<HTMLTextAreaElement>(".rn-note")!;
+  const saveDraft = () => repoNotesDraft.set(id, { category: catInput.value, note: noteInput.value });
+  catInput.oninput = saveDraft;
+  noteInput.oninput = saveDraft;
+}
+
+async function addRepoNote(id: number): Promise<void> {
+  const body = document.getElementById(`rn-body-${id}`);
+  const note = body?.querySelector<HTMLTextAreaElement>(".rn-note")?.value.trim() || "";
+  const category = body?.querySelector<HTMLInputElement>(".rn-category")?.value.trim() || undefined;
+  if (!note) {
+    toast("note text is required");
+    return;
+  }
+  const r = await api<{ notes: string; error?: string }>("/api/repo/notes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, note, category }),
+  });
+  if (r.status !== 201) {
+    toast("add note failed: " + (r.body?.error || r.status));
+    return;
+  }
+  repoNotesCache.set(id, r.body?.notes || "");
+  repoNotesDraft.delete(id);
+  renderRepoNotesBody(id);
+  toast("note added", false);
+}
+
+// ---------------------------------------------------------------------------
+// Finding detail -- a <details> per card (findingCard below), lazily
+// fetching /api/finding on first open. Same caching pattern as repo
+// notes above: fetched content lives in a module-level map, not the
+// DOM, so the 5s refresh() rebuild of #inbox/#allFindings never loses
+// it or re-fetches it.
+// ---------------------------------------------------------------------------
+
+const findingDetailCache = new Map<number, FindingDetail | "loading">();
+
+async function toggleFindingDetail(id: number, opened: boolean): Promise<void> {
+  if (!opened) return;
+  if (!findingDetailCache.has(id)) {
+    findingDetailCache.set(id, "loading");
+    renderFindingDetailBody(id);
+    const r = await api<FindingDetail>(`/api/finding?id=${id}`);
+    if (r.status === 200 && r.body) {
+      findingDetailCache.set(id, r.body);
+    } else {
+      // Don't pin the failure in the cache -- a transient error would
+      // otherwise permanently block retrying (has() stays true forever).
+      // Show the failure for this one render pass via the `failed` flag,
+      // then leave the cache empty so the next toggle re-fetches.
+      findingDetailCache.delete(id);
+      renderFindingDetailBody(id, true);
+      return;
+    }
+  }
+  renderFindingDetailBody(id);
+}
+
+function renderFindingDetailBody(id: number, failed = false): void {
+  const el = document.getElementById(`fd-body-${id}`);
+  if (!el) return;
+  const state = findingDetailCache.get(id);
+  if (state === undefined) {
+    el.innerHTML = failed
+      ? '<div class="empty">failed to load</div>'
+      : '<div class="empty">loading\u2026</div>';
+    return;
+  }
+  if (state === "loading") {
+    el.innerHTML = '<div class="empty">loading\u2026</div>';
+    return;
+  }
+  const { jobs, pr_state } = state;
+  const jobsHtml = jobs.length
+    ? `<table>
+        <tr><th>id</th><th>kind</th><th>state</th><th class="num">tokens</th>
+            <th class="num">calls</th><th class="num">dur</th><th>killed</th><th>when</th></tr>
+        ${jobs
+          .map(
+            (j) => `<tr>
+          <td>${j.id}</td><td>${esc(j.kind)}</td>
+          <td class="state-${esc(j.state)}">${esc(j.state)}</td>
+          <td class="num">${ktok(j.tokens_new)}</td>
+          <td class="num">${j.calls ?? "\u2013"}</td>
+          <td class="num">${dur(j)}</td>
+          <td>${esc(j.killed_reason || "")}</td>
+          <td>${datetime(j.started_at)}</td>
+        </tr>`,
+          )
+          .join("")}
+      </table>`
+    : '<div class="empty">no jobs recorded for this finding</div>';
+  const prHtml = pr_state
+    ? `<div class="loc">PR #${pr_state.pr_number ?? "?"} \u00b7 ${esc(pr_state.state || "?")}` +
+      `${pr_state.mergeable ? " \u00b7 " + esc(pr_state.mergeable) : ""}` +
+      `${pr_state.checks ? " \u00b7 " + esc(pr_state.checks) : ""}` +
+      `${pr_state.head_ref ? " \u00b7 " + esc(pr_state.head_ref) : ""}</div>
+       <div class="loc">last activity ${datetime(pr_state.last_activity_at)} \u00b7 ` +
+      `we engaged ${datetime(pr_state.last_engaged_activity_at)} \u00b7 ` +
+      `synced ${datetime(pr_state.synced_at)}` +
+      `${pr_state.needs_attention ? " \u00b7 \u26a0 " + esc(pr_state.needs_attention) : ""}</div>`
+    : '<div class="empty">no PR opened yet</div>';
+  el.innerHTML = `<div class="fd-section"><b>Jobs (${jobs.length})</b>${jobsHtml}</div>
+    <div class="fd-section"><b>PR state</b>${prHtml}</div>`;
+}
+
 // Expose to onclick handlers in rendered HTML
-Object.assign(window, { verdict, recheck, unqueue, budgetOverride, clearOverride, clearAllOverrides, toggleRepo });
+Object.assign(window, {
+  verdict,
+  recheck,
+  unqueue,
+  budgetOverride,
+  clearOverride,
+  clearAllOverrides,
+  toggleRepo,
+  addRepo,
+  removeRepo,
+  toggleRepoNotes,
+  addRepoNote,
+  toggleFindingDetail,
+});
 
 // ---------------------------------------------------------------------------
 // Renderers
 // ---------------------------------------------------------------------------
 
-function renderWindows(windows: Record<string, WindowInfo>): void {
-  const keys = Object.keys(windows).sort();
-  if (!keys.length) {
-    $("windows").innerHTML =
-      '<span class="empty">no window data</span>';
-    return;
+function renderWindows(html: string): void {
+  const winEl = $("windows");
+  if (winEl) winEl.innerHTML = html;
+}
+
+function renderActivity(s: Summary): void {
+  const a: ActivityStatus = s.activity_status;
+  const ss: SchedulerState | null = s.scheduler_state;
+  const rows: string[] = [];
+
+  // Every branch below renders a.kind, computed once server-side by
+  // hunter.server._activity_status and covered by its own test suite --
+  // this function does formatting only, never re-derives "what's
+  // happening" from current_job/next_candidate/cycle_running itself.
+  // See _activity_status's docstring for why that split matters.
+  switch (a.kind) {
+    case "running": {
+      const cj: CurrentJob = a.job;
+      const label =
+        cj.finding_id != null
+          ? `#${cj.finding_id} ${esc(cj.finding_summary || cj.finding_fingerprint || "")}`
+          : esc(cj.repo_name);
+      rows.push(
+        `<div class="row"><b class="running">\u25b6 running</b> ${esc(cj.kind)}: ${label}` +
+          ` <span class="dim">(${dur(cj)}, job #${cj.id})</span></div>`,
+      );
+      break;
+    }
+    case "working":
+      rows.push(
+        '<div class="row"><b class="running">\u25b6 running</b> cycle in progress\u2026</div>',
+      );
+      break;
+    case "error":
+      rows.push(`<div class="row"><b class="error">\u26a0 error</b> ${esc(a.detail)}</div>`);
+      break;
+    case "paused": {
+      const nc: NextCandidate = a.candidate;
+      const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
+      rows.push(
+        `<div class="row"><b class="paused">\u23f8 paused</b> next up: ${esc(nc.kind)} ${label}` +
+          ` \u00b7 budget: <span class="b-denied">denied</span> (${esc(nc.budget_reason)})</div>`,
+      );
+      if (nc.budget_retry_at) {
+        rows.push(
+          `<div class="row dim">budget available ~${countdown(nc.budget_retry_at)} (${ts(nc.budget_retry_at)})</div>`,
+        );
+      }
+      if (ss?.next_wake_at) {
+        // "next check" only means "the daemon loop wakes up again" --
+        // with sync_prs running nearly every cycle to never delay
+        // noticing PR feedback, that wake is often just a cheap
+        // heartbeat, not a real chance to start a job while the budget
+        // gate is still shut.
+        const heartbeatOnly = nc.budget_retry_at != null && ss.next_wake_at < nc.budget_retry_at;
+        const label2 = heartbeatOnly ? "next sync check" : "next check";
+        const note = heartbeatOnly ? " \u2014 budget still closed" : "";
+        rows.push(
+          `<div class="row dim">${label2} ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})${note}</div>`,
+        );
+      }
+      break;
+    }
+    case "ready": {
+      const nc: NextCandidate = a.candidate;
+      const label = nc.is_finding ? `#${nc.id} ${esc(nc.label || "")}` : esc(nc.label || "");
+      rows.push(
+        `<div class="row"><b class="ready">\u25b7 ready</b> next up: ${esc(nc.kind)} ${label}` +
+          ` \u00b7 budget: <span class="b-${esc(nc.budget_state)}">${esc(nc.budget_state)}</span></div>`,
+      );
+      if (ss?.next_wake_at) {
+        // No heartbeat-vs-real-check ambiguity here -- budget already
+        // allows it, so the next wake IS the start.
+        rows.push(
+          `<div class="row dim">starting ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})</div>`,
+        );
+      }
+      break;
+    }
+    case "idle":
+      rows.push('<div class="row"><b class="idle">\u25cf idle</b> nothing to do</div>');
+      if (ss?.next_wake_at) {
+        rows.push(
+          `<div class="row dim">next check ~${countdown(ss.next_wake_at)} (${ts(ss.next_wake_at)})</div>`,
+        );
+      }
+      break;
+    case "warming_up":
+      rows.push('<div class="row dim">warming up \u2014 no cycle has run yet</div>');
+      break;
+    default:
+      assertNever(a);
   }
-  $("windows").innerHTML = keys
-    .map((k) => {
-      const w = windows[k];
-      const pct =
-        w.used_fraction == null
-          ? null
-          : Math.min(100, Math.round(w.used_fraction * 100));
-      const cls = w.stale
-        ? "stale"
-        : w.status === "exhausted" || (pct !== null && pct >= 100)
-          ? "bad"
-          : "ok";
-      const label = k.replace(/^anthropic:/, "");
-      return `<div class="win">
-      <div class="lab"><b>${esc(label)}</b><span>${pct == null ? "?" : pct + "%"}${w.stale ? " \u26a0stale" : ""}</span></div>
-      <div class="bar"><i class="${cls}" style="width:${pct ?? 0}%"></i></div>
-      <div class="sub">resets ${ts(w.resets_at)}${w.resets_at ? " (" + countdown(w.resets_at) + ")" : ""} \u00b7 probed ${Math.round(w.age_s / 60)}m ago</div>
-    </div>`;
-    })
-    .join("");
+
+  // Last log -- what the most recently COMPLETED cycle actually did.
+  // Occasionally interesting, but it's history, not current state --
+  // kept visually secondary (small, faint) and last, below everything
+  // that describes right now.
+  if (ss) {
+    rows.push(`<div class="row last-log">${esc(ss.detail)}</div>`);
+  }
+
+  $("activity").innerHTML = rows.join("");
 }
 
 function findingCard(f: Finding, withActions: boolean): string {
@@ -429,6 +1083,10 @@ function findingCard(f: Finding, withActions: boolean): string {
   const detail = (f.detail || "").trim();
   const plan = (f.evidence_plan || "").trim();
   const tl = f.timeline || [];
+  const detailBlock = `<details ontoggle="toggleFindingDetail(${f.id}, this.open)">
+    <summary>full history (jobs \u00b7 PR)</summary>
+    <div id="fd-body-${f.id}"></div>
+  </details>`;
   const timeline = tl.length
     ? `<details><summary>timeline (${tl.length})</summary>
       <div class="timeline">${tl
@@ -439,14 +1097,31 @@ function findingCard(f: Finding, withActions: boolean): string {
         .join("")}</div>
     </details>`
     : "";
-  return `<div class="card">
+  const typeLabels: Record<string, string> = {
+    bug: "🐛 Bug",
+    dep_update: "📦 Dep",
+    test_gap: "🧪 Test",
+    refactor: "♻️ Refactor",
+    modernization: "🔬 Modern",
+  };
+  const typeLabel = typeLabels[f.type] || esc(f.type) || "?";
+  const category = f.category || f.bug_class || "";
+  const approach =
+    f.current_approach || f.proposed_approach
+      ? `<div class="loc">${esc(f.current_approach || "?")} \u2192 ${esc(f.proposed_approach || "?")}</div>`
+      : "";
+
+  return `<div class="card" id="finding-${f.id}">
     <div class="top">
+      <span class="badge type-${esc(f.type) || "bug"}">${esc(typeLabel)}</span>
       <span class="badge sev-${sev}">${sev} \u00b7 ${conf}</span>
-      <span class="badge">${esc(f.bug_class || "")}</span>
+      <span class="badge">${esc(category)}</span>
+      <span class="badge status-${esc(f.status)}">${esc(f.status)}</span>
       <span class="fp">#${f.id} ${esc(f.fingerprint)}</span>
     </div>
     <div class="sum">${esc(f.summary)}</div>
     <div class="loc">${loc}${f.introduced_by ? " \u00b7 introduced by " + esc(f.introduced_by) : ""}</div>
+    ${approach}
     ${
       detail || plan
         ? `<details><summary>detail + evidence plan</summary>
@@ -456,6 +1131,7 @@ function findingCard(f: Finding, withActions: boolean): string {
         : ""
     }
     ${timeline}
+    ${detailBlock}
     ${
       withActions
         ? `<div class="acts">
@@ -514,6 +1190,15 @@ function renderPipeline(findings: Finding[]): void {
     .join("");
 }
 
+function renderAllFindings(all: Finding[], filtered: Finding[]): void {
+  $("nFindings").textContent = `(${filtered.length}/${all.length})`;
+  $("allFindings").innerHTML = filtered.length
+    ? filtered.map((f) => findingCard(f, false)).join("")
+    : '<div class="empty">' +
+      (all.length ? "all filtered out" : "no findings yet") +
+      "</div>";
+}
+
 function renderRepos(repos: Repo[]): void {
   if (!repos.length) {
     $("repos").innerHTML = '<div class="empty">no repos configured</div>';
@@ -526,6 +1211,11 @@ function renderRepos(repos: Repo[]): void {
       <span class="url"><a href="${esc(r.url)}" target="_blank">${esc(r.url)}</a></span>
       <span class="meta">${esc(r.forge)} \u00b7 ${esc(r.default_branch)}${r.last_hunt_at ? " \u00b7 hunted " + ts(r.last_hunt_at) : ""}</span>
       <button class="${r.enabled ? "uq" : "q"}" onclick="toggleRepo(${r.id},${r.enabled ? "false" : "true"})">${r.enabled ? "Pause" : "Resume"}</button>
+      <button class="r" data-name="${esc(r.name)}" onclick="removeRepo(${r.id},this.dataset.name)">Remove</button>
+      <details class="repo-notes" id="rn-${r.id}" ontoggle="toggleRepoNotes(${r.id},this.open)">
+        <summary>Notes</summary>
+        <div class="repo-notes-body" id="rn-body-${r.id}"></div>
+      </details>
     </div>`,
     )
     .join("");
@@ -537,35 +1227,84 @@ function renderJobs(jobs: Job[]): void {
     return;
   }
   $("jobs").innerHTML = `<table>
-    <tr><th>id</th><th>kind</th><th>repo</th><th>state</th>
+    <tr><th>id</th><th>time</th><th>kind</th><th>repo</th><th>finding</th><th>state</th>
         <th class="num">tokens</th><th class="num">calls</th><th class="num">dur</th><th>killed</th></tr>
     ${jobs
       .map(
-        (j) => `<tr>
-      <td>${j.id}</td><td>${esc(j.kind)}</td><td>${esc(j.repo_name)}</td>
+        (j) => {
+          const time = datetime(j.started_at || j.finished_at);
+          const finding = j.finding_id != null
+            ? `<a href="#findings" class="ev-link" data-finding="${j.finding_id}">#${j.finding_id}</a>`
+            : "\u2013";
+          return `<tr>
+      <td>${j.id}</td><td class="t">${time}</td><td>${esc(j.kind)}</td><td>${esc(j.repo_name)}</td>
+      <td>${finding}</td>
       <td class="state-${esc(j.state)}">${esc(j.state)}</td>
       <td class="num">${ktok(j.tokens_new)}</td>
       <td class="num">${j.calls ?? "\u2013"}</td>
       <td class="num">${dur(j)}</td>
       <td>${esc(j.killed_reason || "")}</td>
-    </tr>`,
+    </tr>`;
+        },
       )
       .join("")}
   </table>`;
+  // Wire finding links in jobs table (same behavior as events)
+  for (const a of document.querySelectorAll<HTMLAnchorElement>("#jobs .ev-link")) {
+    a.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      const fid = a.dataset.finding;
+      showPage("findings");
+      requestAnimationFrame(() => {
+        const card = document.getElementById(`finding-${fid}`);
+        if (card) {
+          card.scrollIntoView({ behavior: "smooth", block: "center" });
+          card.classList.add("highlight");
+          setTimeout(() => card.classList.remove("highlight"), 2000);
+        }
+      });
+    });
+  }
 }
 
 function renderEvents(events: Event[]): void {
-  const evs = events.slice(0, 30);
+  const evs = events.slice(0, 50);
   if (!evs.length) {
     $("events").innerHTML = '<div class="empty">quiet</div>';
     return;
   }
   $("events").innerHTML = evs
-    .map(
-      (e) =>
-        `<div class="ev"><span class="t">${ts(e.at)}</span> <span class="k">${esc(e.kind)}</span> ${esc(e.message)}</div>`,
-    )
+    .map((e) => {
+      const links: string[] = [];
+      if (e.finding_id != null) {
+        links.push(
+          `<a href="#findings" class="ev-link" data-finding="${e.finding_id}">#${e.finding_id}</a>`
+        );
+      }
+      if (e.job_id != null) {
+        links.push(`<span class="ev-job">job ${e.job_id}</span>`);
+      }
+      const suffix = links.length ? ` ${links.join(" ")}` : "";
+      return `<div class="ev"><span class="t">${datetime(e.at)}</span> <span class="k">${esc(e.kind)}</span> ${esc(e.message)}${suffix}</div>`;
+    })
     .join("");
+  // Wire finding links: navigate to All Findings and scroll to the card
+  for (const a of document.querySelectorAll<HTMLAnchorElement>("#events .ev-link")) {
+    a.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      const fid = a.dataset.finding;
+      showPage("findings");
+      // Wait a tick for the page to become visible, then scroll
+      requestAnimationFrame(() => {
+        const card = document.getElementById(`finding-${fid}`);
+        if (card) {
+          card.scrollIntoView({ behavior: "smooth", block: "center" });
+          card.classList.add("highlight");
+          setTimeout(() => card.classList.remove("highlight"), 2000);
+        }
+      });
+    });
+  }
   const last = evs[0];
   $("lastEvent").textContent = `${ts(last.at)} ${last.kind}: ${last.message}`;
 }
@@ -647,70 +1386,47 @@ async function refresh(): Promise<void> {
     ) {
       throw new Error("api error");
     }
-    const s = summary.body!;
+    // Re-verify the actual bytes that came back against SummarySchema --
+    // TypeScript's `api<Summary>(...)` cast above is compile-time only
+    // and trusts the wire unconditionally; this is the runtime half,
+    // mirroring hunter.server._validate_summary on the Python side.
+    // Throws (caught below) on any mismatch instead of silently
+    // rendering whatever shape came back -- e.g. a wrong-typed field
+    // that used to just print "NaNs" with no error at all.
+    const s = SummarySchema.parse(summary.body);
     const all = findings.body!;
 
     // Snapshot open <details> elements before DOM rebuild.
     const openDetails = new Set<string>();
     for (const d of document.querySelectorAll("details[open]")) {
-      const card = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.parentElement?.id ?? "";
+      const card = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.id ?? d.parentElement?.id ?? "";
       const label = d.querySelector("summary")?.textContent ?? "";
       if (card) openDetails.add(card + "|" + label);
     }
 
-    renderWindows(s.windows || {});
+    renderWindows(s.backend_status_html);
+    renderActivity(s);
 
     // ---- populate filter dropdowns (preserve selection) ----
     const inbox = all.filter((f) => f.status === "new");
     const repos = [
       ...new Set(all.map((f) => f.fingerprint.split(":")[0])),
     ].sort();
-    const classes = [
-      ...new Set(inbox.map((f) => f.bug_class).filter(Boolean)),
-    ].sort();
-    populateSelect("fRepo", repos);
-    populateSelect("fClass", classes);
+    const inboxClasses = ([
+      ...new Set(inbox.map((f) => f.category || f.bug_class).filter(c => c != null && c !== "")),
+    ] as string[]).sort();
+    const allClasses = ([
+      ...new Set(all.map((f) => f.category || f.bug_class).filter(c => c != null && c !== "")),
+    ] as string[]).sort();
+    populateCheckboxGroup("fRepo", repos);
+    populateCheckboxGroup("fClass", inboxClasses);
+    populateCheckboxGroup("pfRepo", repos);
+    populateCheckboxGroup("pfClass", allClasses);
+    populateCheckboxGroup("afRepo", repos);
+    populateCheckboxGroup("afClass", allClasses);
 
-    // ---- apply filters ----
-    const fRepo = $select("fRepo").value;
-    const fClass = $select("fClass").value;
-    const fSev = $select("fSev").value;
-    const fConf = parseInt($input("fConf").value, 10) / 100;
-    const fSort = $select("fSort").value;
-
-    let filtered = inbox.filter((f) => {
-      if (fRepo && !f.fingerprint.startsWith(fRepo + ":"))
-        return false;
-      if (fClass && f.bug_class !== fClass) return false;
-      if (
-        fSev &&
-        (SEV_RANK[f.severity] || 0) < (SEV_RANK[fSev] || 0)
-      )
-        return false;
-      if ((f.confidence || 0) < fConf) return false;
-      return true;
-    });
-
-    if (fSort === "score") {
-      filtered.sort(
-        (a, b) =>
-          (SEV_RANK[b.severity] || 0) * (b.confidence || 0) -
-          (SEV_RANK[a.severity] || 0) * (a.confidence || 0),
-      );
-    } else if (fSort === "newest") {
-      filtered.sort(
-        (a, b) => (b.created_at || 0) - (a.created_at || 0),
-      );
-    } else if (fSort === "oldest") {
-      filtered.sort(
-        (a, b) => (a.created_at || 0) - (b.created_at || 0),
-      );
-    } else if (fSort === "repo") {
-      filtered.sort((a, b) =>
-        a.fingerprint.localeCompare(b.fingerprint),
-      );
-    }
-
+    // ---- apply filters (same filter bar, three independent instances) ----
+    const filtered = applyFindingFilters(inbox, "f");
     $("nInbox").textContent = `(${filtered.length}/${inbox.length})`;
     $("inbox").innerHTML = filtered.length
       ? filtered.map((f) => findingCard(f, true)).join("")
@@ -718,7 +1434,8 @@ async function refresh(): Promise<void> {
         (inbox.length ? "all filtered out" : "inbox zero") +
         "</div>";
 
-    renderPipeline(all);
+    renderPipeline(applyFindingFilters(all, "pf"));
+    renderAllFindings(all, applyFindingFilters(all, "af"));
     renderRepos(s.repos || []);
 
     const supp = all.filter(
@@ -763,7 +1480,7 @@ async function refresh(): Promise<void> {
 
     // Restore open <details> elements after DOM rebuild.
     for (const d of document.querySelectorAll("details")) {
-      const card = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.parentElement?.id ?? "";
+      const card = d.closest(".card")?.querySelector(".fp")?.textContent ?? d.id ?? d.parentElement?.id ?? "";
       const label = d.querySelector("summary")?.textContent ?? "";
       if (card && openDetails.has(card + "|" + label)) d.open = true;
     }
@@ -784,19 +1501,59 @@ async function refresh(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Left nav / page routing
+// ---------------------------------------------------------------------------
+
+const NAV_PAGES = ["status", "inbox", "pipeline", "findings", "repos", "stats", "log"];
+
+function showPage(name: string): void {
+  const page = NAV_PAGES.includes(name) ? name : "inbox";
+  for (const el of document.querySelectorAll<HTMLElement>(".page")) {
+    el.classList.toggle("active", el.id === `page-${page}`);
+  }
+  for (const el of document.querySelectorAll<HTMLElement>("#nav .nav-item")) {
+    el.classList.toggle("active", el.dataset.page === page);
+  }
+  if (location.hash.slice(1) !== page) location.hash = page;
+}
+
+for (const el of document.querySelectorAll<HTMLElement>("#nav .nav-item")) {
+  el.onclick = () => showPage(el.dataset.page ?? "inbox");
+}
+window.addEventListener("hashchange", () => showPage(location.hash.slice(1)));
+showPage(location.hash.slice(1));
+
+// ---------------------------------------------------------------------------
 // Bootstrap
 // ---------------------------------------------------------------------------
 
 $button("runCycle").addEventListener("click", runCycle);
 
-for (const id of ["fRepo", "fClass", "fSev", "fSort"]) {
-  $(id).onchange = refresh;
+// Mount the three filter bars (Inbox reproduces its original "f" ids
+// byte-for-byte -- see filterBarHtml's comment), then wire every
+// select/range in each to trigger a refresh on change.
+$("filters-inbox").innerHTML = filterBarHtml("f", false);
+$("filters-pipeline").innerHTML = filterBarHtml("pf", false);
+$("filters-findings").innerHTML = filterBarHtml("af", true);
+
+for (const p of ["f", "pf", "af"]) {
+  // Wire checkbox groups
+  for (const suffix of ["Status", "Repo", "Type", "Class", "Sev"]) {
+    wireCheckboxGroup(`${p}${suffix}`, refresh);
+  }
+  // Sort stays a <select>
+  const sortEl = document.getElementById(`${p}Sort`);
+  if (sortEl) (sortEl as HTMLSelectElement).onchange = refresh;
+  // Confidence slider
+  const confInput = document.getElementById(`${p}Conf`) as HTMLInputElement | null;
+  if (confInput) {
+    confInput.oninput = () => {
+      const label = document.getElementById(`${p}ConfVal`);
+      if (label) label.textContent = confInput.value + "%";
+      refresh();
+    };
+  }
 }
-const confInput = $input("fConf");
-confInput.oninput = () => {
-  $("fConfVal").textContent = confInput.value + "%";
-  refresh();
-};
 
 refresh();
 setInterval(refresh, 5000);

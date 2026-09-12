@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import sqlite3
-from typing import Any
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
 
 from .types import (
     ACTIVE_STATUSES,
@@ -11,11 +17,22 @@ from .types import (
     SCHEMA_PATH,
     SUPPRESSED_STATUSES,
     Config,
+    EventDict,
+    JobDict,
     Row,
+    SchedulerStateDict,
     Severity,
-    WindowState,
     now_ms,
 )
+
+# The value types SQLite actually stores for every column these dynamic
+# setters (update_repo/update_job/upsert_pr_state) and query-parameter
+# builders (list_findings/list_all_findings/set_status/
+# update_finding_analysis) touch -- str/int/float per schema.sql, plus
+# None for nullable columns. Precise enough to catch a real type error
+# (e.g. passing a dict or a list by mistake) while still fitting every
+# legitimate column value, without Any's "stop checking entirely."
+SqlParam = str | int | float | None
 
 _JOB_COLUMNS = {
     "state",
@@ -43,7 +60,15 @@ _PR_STATE_COLUMNS = {
     "last_activity_at",
     "last_engaged_activity_at",
     "needs_attention",
+    "attention_since",
+    "attention_fingerprint",
+    "addressed_fingerprint",
+    "head_sha",
+    "addressed_head_sha",
     "synced_at",
+    "harvested_at",
+    "harvest_attempts",
+    "last_harvest_failure",
 }
 
 _FINDING_KEYS = (
@@ -65,8 +90,28 @@ def _rows(cur: sqlite3.Cursor) -> list[Row]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def _require_keys[T](row: Row, *required: str, shape: type[T]) -> T:
+    """Verify a raw SQLite row has every key a TypedDict declares before
+    asserting that type onto it. This is the one runtime check standing
+    between "the SQL query's actual columns" (a fact only the database
+    knows) and "the Python type system's belief about that shape" (a
+    fact only the TypedDict declares) -- the seam neither mypy nor any
+    static checker can verify on its own, since a query's result shape
+    isn't visible to the type checker. A schema/query drift now fails
+    loudly, here, with the exact missing key and what was actually
+    present, on the very first call that hits it -- not as a KeyError
+    deep inside unrelated code far from the real defect.
+    """
+    missing = [k for k in required if k not in row]
+    if missing:
+        msg = f"row missing required keys {missing} for {shape.__name__}: got {sorted(row)}"
+        raise ValueError(msg)
+    return cast("T", row)
+
+
 class Store:
     def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(cfg.db_path)
         self.db.row_factory = sqlite3.Row
@@ -78,12 +123,80 @@ class Store:
             ("model", "jobs", "ALTER TABLE jobs ADD COLUMN model TEXT"),
             ("usage_delta", "jobs", "ALTER TABLE jobs ADD COLUMN usage_delta REAL"),
             ("budget_override", "findings", "ALTER TABLE findings ADD COLUMN budget_override TEXT"),
+            ("last_full_hunt_at", "repos", "ALTER TABLE repos ADD COLUMN last_full_hunt_at INTEGER"),
+            ("last_test_gap_at", "repos", "ALTER TABLE repos ADD COLUMN last_test_gap_at INTEGER"),
+            ("last_dep_update_at", "repos", "ALTER TABLE repos ADD COLUMN last_dep_update_at INTEGER"),
+            ("last_refactor_at", "repos", "ALTER TABLE repos ADD COLUMN last_refactor_at INTEGER"),
+            ("last_modernization_at", "repos", "ALTER TABLE repos ADD COLUMN last_modernization_at INTEGER"),
+            ("modernization_class", "findings", "ALTER TABLE findings ADD COLUMN modernization_class TEXT"),
+            ("current_approach", "findings", "ALTER TABLE findings ADD COLUMN current_approach TEXT"),
+            ("proposed_approach", "findings", "ALTER TABLE findings ADD COLUMN proposed_approach TEXT"),
+            ("harvested_at", "pr_state", "ALTER TABLE pr_state ADD COLUMN harvested_at INTEGER"),
+            (
+                "attention_since",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN attention_since INTEGER",
+            ),
+            (
+                "attention_fingerprint",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN attention_fingerprint TEXT",
+            ),
+            (
+                "addressed_fingerprint",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN addressed_fingerprint TEXT",
+            ),
+            (
+                "fix_attempts",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN fix_attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_fix_failure",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN last_fix_failure TEXT",
+            ),
+            (
+                "recheck_attempts",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN recheck_attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_recheck_failure",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN last_recheck_failure TEXT",
+            ),
+            (
+                "harvest_attempts",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN harvest_attempts INTEGER NOT NULL DEFAULT 0",
+            ),
+            (
+                "last_harvest_failure",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN last_harvest_failure TEXT",
+            ),
+            ("head_sha", "pr_state", "ALTER TABLE pr_state ADD COLUMN head_sha TEXT"),
+            (
+                "addressed_head_sha",
+                "pr_state",
+                "ALTER TABLE pr_state ADD COLUMN addressed_head_sha TEXT",
+            ),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
             except sqlite3.OperationalError:
                 self.db.execute(sql)
                 self.db.commit()
+
+        # One-time cleanup: `findings.fingerprint` already has an inline
+        # UNIQUE constraint (SQLite backs it with an implicit index), so
+        # the explicit `findings_fingerprint` index schema.sql used to
+        # also create was a fully redundant duplicate. DROP INDEX IF
+        # EXISTS is itself idempotent, so this needs no try/except probe.
+        self.db.execute("DROP INDEX IF EXISTS findings_fingerprint")
+        self.db.commit()
 
     # -- repos ---------------------------------------------------------
     def add_repo(
@@ -119,7 +232,7 @@ class Store:
         )
         self.db.commit()
 
-    def update_repo(self, repo_id: int, **fields: Any) -> None:
+    def update_repo(self, repo_id: int, **fields: str | int) -> None:
         allowed = {"name", "url", "default_branch", "forge", "enabled"}
         bad = set(fields) - allowed
         if bad:
@@ -134,31 +247,102 @@ class Store:
         )
         self.db.commit()
 
+    def delete_repo(self, repo_id: int) -> None:
+        """Remove a repo record. Refuses if findings or jobs still reference
+        it -- delete their history first, or use update_repo(enabled=False)
+        to pause scheduling without losing data."""
+        n_findings = self.db.execute(
+            "SELECT COUNT(*) AS n FROM findings WHERE repo_id = ?", (repo_id,)
+        ).fetchone()["n"]
+        n_jobs = self.db.execute("SELECT COUNT(*) AS n FROM jobs WHERE repo_id = ?", (repo_id,)).fetchone()["n"]
+        if n_findings or n_jobs:
+            msg = (
+                f"repo {repo_id} has {n_findings} finding(s) and {n_jobs} job(s) -- "
+                "cannot delete without losing history; pause it instead"
+            )
+            raise ValueError(msg)
+        self.db.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
+        self.db.commit()
+
+    # -- repo notes ----------------------------------------------------
+    def repo_notes_path(self, repo_id: int) -> Path:
+        """Return path to repo's NOTES.md file (ID-based for stability)."""
+        repo = self.get_repo(repo_id)
+        if not repo:
+            msg = f"repo {repo_id} not found"
+            raise ValueError(msg)
+        # Use repo_id for path stability (survives renames)
+        return self.cfg.work_root / "repos" / f"repo-{repo_id}" / "NOTES.md"
+
+    def repo_notes(self, repo_id: int) -> str:
+        """Read repo notes, or empty string if none exist."""
+        p = self.repo_notes_path(repo_id)
+        return p.read_text() if p.exists() else ""
+
+    def append_repo_note(self, repo_id: int, note: str, category: str | None = None) -> None:
+        """Append timestamped note to repo's NOTES.md."""
+        from datetime import datetime
+
+        p = self.repo_notes_path(repo_id)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        
+        # If file doesn't exist, create with header
+        if not p.exists():
+            repo = self.get_repo(repo_id)
+            p.write_text(f"# Notes: {repo['name']}\n\nLast updated: {datetime.now().date()}\n\n")
+        
+        # Append note
+        with p.open("a") as f:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            if category:
+                f.write(f"## {category}\n")
+            f.write(f"- [{ts}] {note}\n\n")
+
     # -- findings ------------------------------------------------------
-    def upsert_finding(self, repo_id: int, f: Row) -> tuple[int, bool]:
+    def upsert_finding(self, repo_id: int, f: Row, finding_type: str = "bug") -> tuple[int, bool]:
         cur = self.db.execute("SELECT id FROM findings WHERE fingerprint = ?", (f["fingerprint"],))
         row = cur.fetchone()
         if row:
             return int(row["id"]), False
         t = now_ms()
+        missing_tests = f.get("missing_tests")
+        if isinstance(missing_tests, list):
+            missing_tests = json.dumps(missing_tests)
         cur = self.db.execute(
-            "INSERT INTO findings (repo_id, fingerprint, file, symbol, line, bug_class,"
+            "INSERT INTO findings (type, repo_id, fingerprint, file, symbol, line, bug_class,"
             " severity, confidence, summary, detail, evidence_plan, introduced_by,"
+            " ecosystem, package, current_version, latest_version, update_type, security_advisory,"
+            " missing_tests, test_file, smell_type, suggested_refactor,"
+            " modernization_class, current_approach, proposed_approach,"
             " status, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)",
             (
+                finding_type,
                 repo_id,
                 f["fingerprint"],
                 f.get("file", ""),
                 f.get("symbol"),
                 f.get("line"),
-                f["bug_class"],
-                f["severity"],
+                f.get("bug_class"),
+                f.get("severity", "medium"),
                 float(f.get("confidence", 0.0)),
                 f.get("summary", ""),
                 f.get("detail"),
                 f.get("evidence_plan"),
                 f.get("introduced_by"),
+                f.get("ecosystem"),
+                f.get("package"),
+                f.get("current_version"),
+                f.get("latest_version"),
+                f.get("update_type"),
+                f.get("security_advisory"),
+                missing_tests,
+                f.get("test_file"),
+                f.get("smell_type"),
+                f.get("suggested_refactor"),
+                f.get("modernization_class"),
+                f.get("current_approach"),
+                f.get("proposed_approach"),
                 t,
                 t,
             ),
@@ -178,7 +362,7 @@ class Store:
         min_severity: str | None = None,
     ) -> list[Row]:
         q = "SELECT * FROM findings"
-        args: list[Any] = []
+        args: list[SqlParam] = []
         conds: list[str] = []
         if status:
             conds.append("status = ?")
@@ -196,6 +380,52 @@ class Store:
         q += " ORDER BY id DESC"
         return _rows(self.db.execute(q, args))
 
+    def list_all_findings(
+        self,
+        status: str | None = None,
+        repo_id: int | None = None,
+        min_severity: str | None = None,
+        finding_type: str | None = None,
+    ) -> list[Row]:
+        """
+        Query findings across all types (bug, dep_update, test_gap, refactor).
+        Each result has a 'type' field and a computed 'category' field for UI
+        display (bug_class | update_type | 'coverage' | smell_type).
+        """
+        conds: list[str] = []
+        args: list[SqlParam] = []
+        if status:
+            conds.append("status = ?")
+            args.append(status)
+        if repo_id:
+            conds.append("repo_id = ?")
+            args.append(repo_id)
+        if finding_type:
+            conds.append("type = ?")
+            args.append(finding_type)
+        if min_severity:
+            allowed = Severity.at_or_above(Severity.from_str(min_severity))
+            ph = ",".join("?" * len(allowed))
+            conds.append(f"severity IN ({ph})")
+            args.extend(allowed)
+        q = "SELECT * FROM findings"
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY id DESC"
+        rows = _rows(self.db.execute(q, args))
+        for r in rows:
+            if r["type"] == "bug":
+                r["category"] = r.get("bug_class")
+            elif r["type"] == "dep_update":
+                r["category"] = r.get("update_type")
+            elif r["type"] == "test_gap":
+                r["category"] = "coverage"
+            elif r["type"] == "refactor":
+                r["category"] = r.get("smell_type")
+            elif r["type"] == "modernization":
+                r["category"] = r.get("modernization_class")
+        return rows
+
     def set_status(
         self,
         fid: int,
@@ -208,7 +438,7 @@ class Store:
             msg = f"invalid status: {status}"
             raise ValueError(msg)
         sets: list[str] = ["status = ?", "updated_at = ?"]
-        args: list[Any] = [status, now_ms()]
+        args: list[SqlParam] = [status, now_ms()]
         if verdict_reason is not None:
             sets.append("verdict_reason = ?")
             args.append(verdict_reason)
@@ -222,6 +452,39 @@ class Store:
         self.db.execute(f"UPDATE findings SET {', '.join(sets)} WHERE id = ?", args)
         self.db.commit()
 
+    @contextlib.contextmanager
+    def in_progress(self, fid: int, status: str, fallback: str) -> Iterator[None]:
+        """Structural guard for a status that must never be observed
+        outside the dynamic extent of the wrapped block (e.g. 'fixing' --
+        the normal work queue never scans for it, so leaving a finding
+        there is a silent, indefinite disappearance).
+
+        Sets `status` on entry. On exit -- normal return, early return,
+        OR an exception raised anywhere in the block -- checks whether
+        anything already moved the finding to a DIFFERENT status; if
+        not, forces it to `fallback`. This makes "the function raised
+        before reaching its own terminal set_status call" structurally
+        indistinguishable, in effect on the finding, from "the function
+        finished and explicitly chose to requeue" -- there is no code
+        path left that both (a) leaves `status` set and (b) exits the
+        block, because Python guarantees `finally` runs on every exit
+        including via exception or `return`.
+
+        Does NOT cover the process itself being killed (SIGKILL, a hard
+        crash) -- `finally` cannot run then. That residual case is what
+        Store.reconcile_orphaned_jobs() exists for; this context manager
+        is what makes everything short of total process death (which is
+        the common case: any exception in git/network/file-IO code)
+        impossible to get wrong, rather than merely repaired after.
+        """
+        self.set_status(fid, status)
+        try:
+            yield
+        finally:
+            current = self.get_finding(fid)
+            if current is not None and current["status"] == status:
+                self.set_status(fid, fallback)
+
     def set_budget_override(self, fid: int, mode: str | None) -> None:
         """Set budget override: 'once', 'exempt', or None to clear."""
         if mode not in (None, "once", "exempt"):
@@ -233,6 +496,77 @@ class Store:
         )
         self.db.commit()
 
+    def record_fix_attempt(self, fid: int, failure: str) -> int:
+        """Track consecutive run_fix attempts that hit the SAME failure
+        reason for this finding. A genuinely different failure resets the
+        streak to 1 (new information, worth an immediate retry); the SAME
+        reason recurring means nothing changed and retrying again right
+        now would just re-burn tokens for the identical outcome. Returns
+        the new streak count.
+        """
+        current = self.get_finding(fid)
+        prev_failure = current.get("last_fix_failure") if current else None
+        prev_attempts = (current.get("fix_attempts") or 0) if current else 0
+        attempts = prev_attempts + 1 if failure == prev_failure else 1
+        self.db.execute(
+            "UPDATE findings SET fix_attempts = ?, last_fix_failure = ?, updated_at = ?"
+            " WHERE id = ?",
+            (attempts, failure, now_ms(), fid),
+        )
+        self.db.commit()
+        return attempts
+
+    def clear_fix_attempts(self, fid: int) -> None:
+        """Reset the fix-retry streak once a finding leaves the retry loop
+        (shipped, rejected, blocked) so a future manual re-queue starts
+        fresh rather than inheriting a stale streak."""
+        self.db.execute(
+            "UPDATE findings SET fix_attempts = 0, last_fix_failure = NULL, updated_at = ?"
+            " WHERE id = ?",
+            (now_ms(), fid),
+        )
+        self.db.commit()
+
+    def record_recheck_attempt(self, fid: int, failure: str) -> int:
+        """Same streak tracking as record_fix_attempt, scoped to run_recheck
+        attempts that end without a parseable confirmed/stale/invalid
+        verdict (killed, failed, or a missing/unparseable verdict file)."""
+        current = self.get_finding(fid)
+        prev_failure = current.get("last_recheck_failure") if current else None
+        prev_attempts = (current.get("recheck_attempts") or 0) if current else 0
+        attempts = prev_attempts + 1 if failure == prev_failure else 1
+        self.db.execute(
+            "UPDATE findings SET recheck_attempts = ?, last_recheck_failure = ?, updated_at = ?"
+            " WHERE id = ?",
+            (attempts, failure, now_ms(), fid),
+        )
+        self.db.commit()
+        return attempts
+
+    def clear_recheck_attempts(self, fid: int) -> None:
+        """Reset the recheck-retry streak once a recheck reaches a real
+        verdict (or the finding otherwise leaves the retry loop)."""
+        self.db.execute(
+            "UPDATE findings SET recheck_attempts = 0, last_recheck_failure = NULL, updated_at = ?"
+            " WHERE id = ?",
+            (now_ms(), fid),
+        )
+        self.db.commit()
+
+    def record_harvest_attempt(self, fid: int, failure: str) -> int:
+        """Same streak tracking as record_fix_attempt, scoped to run_harvest
+        attempts that don't reach a successful worker completion."""
+        current = self.get_pr_state(fid)
+        prev_failure = current.get("last_harvest_failure") if current else None
+        prev_attempts = (current.get("harvest_attempts") or 0) if current else 0
+        attempts = prev_attempts + 1 if failure == prev_failure else 1
+        self.upsert_pr_state(fid, harvest_attempts=attempts, last_harvest_failure=failure)
+        return attempts
+
+    def clear_harvest_attempts(self, fid: int) -> None:
+        """Reset the harvest-retry streak once a harvest attempt succeeds."""
+        self.upsert_pr_state(fid, harvest_attempts=0, last_harvest_failure=None)
+
     def clear_all_overrides(self) -> int:
         """Clear all budget overrides. Returns count of affected rows."""
         cur = self.db.execute(
@@ -243,21 +577,21 @@ class Store:
         self.db.commit()
         return cur.rowcount
 
-    def suppressions(self, repo_id: int) -> list[Row]:
+    def suppressions(self, repo_id: int, finding_type: str = "bug") -> list[Row]:
         ph = ",".join("?" * len(SUPPRESSED_STATUSES))
         return _rows(
             self.db.execute(
-                f"SELECT * FROM findings WHERE repo_id = ? AND status IN ({ph}) ORDER BY id",
-                (repo_id, *SUPPRESSED_STATUSES),
+                f"SELECT * FROM findings WHERE repo_id = ? AND type = ? AND status IN ({ph}) ORDER BY id",
+                (repo_id, finding_type, *SUPPRESSED_STATUSES),
             )
         )
 
-    def known_active(self, repo_id: int) -> list[Row]:
+    def known_active(self, repo_id: int, finding_type: str = "bug") -> list[Row]:
         ph = ",".join("?" * len(ACTIVE_STATUSES))
         return _rows(
             self.db.execute(
-                f"SELECT * FROM findings WHERE repo_id = ? AND status IN ({ph}) ORDER BY id",
-                (repo_id, *ACTIVE_STATUSES),
+                f"SELECT * FROM findings WHERE repo_id = ? AND type = ? AND status IN ({ph}) ORDER BY id",
+                (repo_id, finding_type, *ACTIVE_STATUSES),
             )
         )
 
@@ -266,7 +600,7 @@ class Store:
         r = self.db.execute("SELECT * FROM pr_state WHERE finding_id = ?", (fid,)).fetchone()
         return dict(r) if r else None
 
-    def upsert_pr_state(self, fid: int, **fields: Any) -> None:
+    def upsert_pr_state(self, fid: int, **fields: SqlParam) -> None:
         bad = set(fields) - _PR_STATE_COLUMNS
         if bad:
             msg = f"invalid pr_state fields: {bad}"
@@ -282,12 +616,44 @@ class Store:
         self.db.commit()
 
     def list_attention(self) -> list[Row]:
-        """pr_open findings whose PR needs a response, stalest sync first."""
+        """pr_open findings whose PR needs a response, ordered by how long
+        the CURRENT reason has been outstanding (oldest first) -- NOT by
+        synced_at, which sync_prs bulk-refreshes for every pr_open
+        finding every single cycle in a fixed id-DESC order, making it
+        reflect loop iteration order rather than genuine wait time
+        (regression this fixes, observed live: a higher-id finding won
+        every tie-break for 5 straight cycles while another finding sat
+        flagged and unaddressed for ~10 minutes, purely because it
+        happened to sync later each pass).
+
+        Findings whose static (non-comment) reason is state-identical to
+        one an engage reply already declined never make it into
+        needs_attention at all -- see sync_prs's addressed_fingerprint
+        comparison -- so there is nothing to filter out here; a row
+        appears in this list only when there is genuinely something new
+        or still-unaddressed to look at."""
         return _rows(
             self.db.execute(
-                "SELECT f.*, p.pr_number, p.head_ref, p.needs_attention, p.synced_at"
+                "SELECT f.*, p.pr_number, p.head_ref, p.needs_attention,"
+                " p.attention_since, p.synced_at"
                 " FROM findings f JOIN pr_state p ON p.finding_id = f.id"
                 " WHERE p.needs_attention IS NOT NULL AND f.status = 'pr_open'"
+                " ORDER BY COALESCE(p.attention_since, p.synced_at)"
+            )
+        )
+
+    def list_pending_harvest(self) -> list[Row]:
+        """Merged findings whose PR hasn't yet been reviewed for follow-up
+        work, oldest merge first -- run_harvest's queue. A PR's true final
+        scope is only known once merged (see run_harvest's docstring for
+        why this is a separate pass from run_fix's ship-time snapshot and
+        run_engage's withdraw-time one), so this stays open until that
+        review actually happens, however long after the merge that is."""
+        return _rows(
+            self.db.execute(
+                "SELECT f.*, p.pr_number, p.head_ref, p.synced_at"
+                " FROM findings f JOIN pr_state p ON p.finding_id = f.id"
+                " WHERE f.status = 'merged' AND p.harvested_at IS NULL"
                 " ORDER BY p.synced_at"
             )
         )
@@ -299,17 +665,29 @@ class Store:
         repo_id: int,
         finding_id: int | None = None,
         cap_tokens: int | None = None,
+        state: str = "queued",
     ) -> int:
+        """'queued' is a transient default a caller immediately overwrites
+        (via update_job) with the real outcome -- nothing ever reads a job
+        row while it's actually 'queued'. Pass state="running" directly
+        for jobs that are about to run: current_job() (the Status page's
+        "what's happening" panel) filters on state='running', and leaving
+        a row at the 'queued' default during the real prep work between
+        create_job and the old separate update_job(state="running") call
+        (prompt building, git operations, worktree setup) opened a real
+        window where _cycle_lock was already held (the UI's "cycle
+        running" indicator) but current_job() found nothing yet, showing
+        stale last-cycle text instead."""
         cur = self.db.execute(
             "INSERT INTO jobs (kind, repo_id, finding_id, cap_tokens, state, started_at)"
-            " VALUES (?,?,?,?, 'queued', ?)",
-            (kind, repo_id, finding_id, cap_tokens, now_ms()),
+            " VALUES (?,?,?,?,?,?)",
+            (kind, repo_id, finding_id, cap_tokens, state, now_ms()),
         )
         self.db.commit()
         assert cur.lastrowid is not None
         return cur.lastrowid
 
-    def update_job(self, job_id: int, **fields: Any) -> None:
+    def update_job(self, job_id: int, **fields: SqlParam) -> None:
         bad = set(fields) - _JOB_COLUMNS
         if bad:
             msg = f"invalid job fields: {bad}"
@@ -328,6 +706,121 @@ class Store:
             )
         )
 
+    def jobs_by_finding(self, fid: int) -> list[Row]:
+        """Every job ever run against this finding, newest first -- unlike
+        list_jobs()'s recent-50 window, this is the complete history for
+        one finding (a finding fixed weeks ago can have jobs long since
+        pushed off that global feed). Powers the /api/finding detail
+        view's "all measurements" panel."""
+        return _rows(
+            self.db.execute(
+                "SELECT j.*, r.name AS repo_name FROM jobs j"
+                " JOIN repos r ON r.id = j.repo_id"
+                " WHERE j.finding_id = ? ORDER BY j.id DESC",
+                (fid,),
+            )
+        )
+
+    def current_job(self) -> JobDict | None:
+        """The job currently in flight, if any -- at most one, given
+        _cycle_lock serializes the daemon loop and POST /api/cycle."""
+        r = self.db.execute(
+            "SELECT j.*, r.name AS repo_name FROM jobs j"
+            " JOIN repos r ON r.id = j.repo_id"
+            " WHERE j.state = 'running' ORDER BY j.id DESC LIMIT 1"
+        ).fetchone()
+        if r is None:
+            return None
+        row = dict(r)
+        if row.get("finding_id"):
+            f = self.get_finding(row["finding_id"])
+            if f is not None:
+                row["finding_summary"] = f.get("summary")
+                row["finding_fingerprint"] = f.get("fingerprint")
+        return _require_keys(
+            row,
+            "id", "kind", "repo_id", "repo_name", "finding_id", "state", "pid",
+            "session_file", "cap_tokens", "tokens_new", "calls", "exit_code",
+            "killed_reason", "notes", "started_at", "finished_at", "model", "usage_delta",
+            shape=JobDict,
+        )
+
+    def set_scheduler_state(self, state: str, detail: str, next_wake_at: int | None) -> None:
+        """Persist the daemon loop's own read of "what am I doing and
+        why" -- see schema.sql's scheduler_state comment. Informational
+        only; never consulted by any scheduling decision."""
+        self.db.execute(
+            "INSERT INTO scheduler_state (id, state, detail, next_wake_at, updated_at)"
+            " VALUES (1, ?, ?, ?, ?)"
+            " ON CONFLICT(id) DO UPDATE SET state=excluded.state, detail=excluded.detail,"
+            " next_wake_at=excluded.next_wake_at, updated_at=excluded.updated_at",
+            (state, detail, next_wake_at, now_ms()),
+        )
+        self.db.commit()
+
+    def get_scheduler_state(self) -> SchedulerStateDict | None:
+        r = self.db.execute("SELECT * FROM scheduler_state WHERE id = 1").fetchone()
+        if r is None:
+            return None
+        return _require_keys(
+            dict(r), "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
+        )
+
+    def reconcile_orphaned_jobs(self) -> dict[str, list[Row]]:
+        """Last-resort net for total process death (crash, systemctl
+        restart, host reboot -- SIGKILL, or any signal that doesn't let
+        Python's `finally` run). Any plain exception mid-run_fix is
+        already handled structurally by `in_progress()`'s try/finally;
+        this exists only for the residual case where the process itself
+        stops executing, not just one function call.
+
+        Safe to call unconditionally at the top of every cycle attempt:
+        a single daemon process owns the job lifecycle exclusively (the
+        systemd unit runs exactly one `hunter daemon`, and _cycle_lock
+        serializes the loop against POST /api/cycle within that
+        process), so at the moment THIS call runs -- before this process
+        has started any new job this cycle -- nothing can legitimately
+        still be mid-fix. Any finding found at 'fixing' here was
+        orphaned by a process that died before `in_progress()`'s
+        `finally` could run at all.
+
+        Keys off findings.status directly, not jobs.state, for the same
+        reason `in_progress()` does: a job row can already be terminal
+        (written by _record_job) while the finding is still 'fixing' if
+        the process died in the stretch after that but before
+        `in_progress()`'s cleanup ran. 'fixing' is never scanned by the
+        normal work queue (only queued/rechecking/pr_open-with-attention
+        are), so without this it sits invisible and unretried
+        indefinitely (observed in production: finding #57 sat stuck for
+        a month after an old crash, before either mechanism existed).
+
+        Job rows still 'running' are handled separately and marked
+        'killed' so they stop inflating _unaccounted_tokens's running-job sum
+        forever -- that's a real but lower-stakes leak (only makes the
+        budget more conservative, doesn't strand any finding), so it is
+        not required for the finding-status recovery above to work.
+
+        Returns {"findings": [...], "jobs": [...]} -- the rows touched.
+        """
+        stuck_findings = _rows(
+            self.db.execute("SELECT * FROM findings WHERE status = 'fixing'")
+        )
+        for f in stuck_findings:
+            self.set_status(f["id"], "queued")
+
+        orphaned_jobs = _rows(
+            self.db.execute("SELECT * FROM jobs WHERE state = 'running'")
+        )
+        for r in orphaned_jobs:
+            self.update_job(
+                r["id"],
+                state="killed",
+                killed_reason="orphaned",
+                finished_at=now_ms(),
+                notes="reconciled at cycle startup -- prior process died mid-job",
+            )
+        return {"findings": stuck_findings, "jobs": orphaned_jobs}
+
     # -- events / window log -------------------------------------------
     def log_event(
         self,
@@ -342,8 +835,14 @@ class Store:
         )
         self.db.commit()
 
-    def recent_events(self, limit: int = 100) -> list[Row]:
-        return _rows(self.db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)))
+    def recent_events(self, limit: int = 100) -> list[EventDict]:
+        rows = _rows(
+            self.db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))
+        )
+        return [
+            _require_keys(r, "id", "at", "kind", "message", "job_id", "finding_id", shape=EventDict)
+            for r in rows
+        ]
 
     def events_by_finding(self, fids: list[int]) -> dict[int, list[Row]]:
         """Return events grouped by finding_id for the given IDs."""
@@ -361,14 +860,107 @@ class Store:
             out.setdefault(r["finding_id"], []).append(r)
         return out
 
-    def log_window(self, states: list[WindowState]) -> None:
-        t = now_ms()
-        for w in states:
-            self.db.execute(
-                "INSERT INTO window_log (observed_at, limit_id, used_fraction,"
-                " status, resets_at, source_age_s) VALUES (?,?,?,?,?,?)",
-                (t, w.limit_id, w.used_fraction, w.status, w.resets_at, int(w.age_s)),
-            )
+
+    def estimate_capacity(
+        self, limit_id: str, min_delta: float = 0.02, sample_limit: int = 200
+    ) -> float | None:
+        """Empirical estimate of this window's total token capacity, from
+        accumulated calibration_samples -- tokens hunter itself spent
+        divided by how much used_fraction moved in that same gap.
+
+        Informational only (see calibration_samples in schema.sql): any
+        concurrent non-hunter account activity inflates the observed
+        used_fraction move without showing up in hunter_tokens, which can
+        only push a sample's implied capacity DOWN, never up -- so the
+        75th percentile across samples is a better estimate of the true
+        capacity than the median, which is dragged down by however many
+        samples happened to overlap other activity. min_delta discards
+        tiny deltas dominated by Anthropic's own ~1%-quantized reporting.
+        None if there isn't enough data yet to say anything.
+        """
+        rows = self.db.execute(
+            "SELECT used_fraction_delta, hunter_tokens FROM calibration_samples"
+            " WHERE limit_id = ? AND used_fraction_delta >= ?"
+            " ORDER BY observed_at DESC LIMIT ?",
+            (limit_id, min_delta, sample_limit),
+        ).fetchall()
+        ratios = sorted(float(r["hunter_tokens"]) / float(r["used_fraction_delta"]) for r in rows)
+        if not ratios:
+            return None
+        return ratios[min(int(len(ratios) * 0.75), len(ratios) - 1)]
+
+    def running_estimate(self) -> int:
+        """SUM(cap_tokens) of jobs currently in state='running'."""
+        r = self.db.execute(
+            "SELECT COALESCE(SUM(cap_tokens), 0) AS total FROM jobs WHERE state = 'running'"
+        ).fetchone()
+        return int(r["total"])
+
+    def finished_since(self, ts_ms: int) -> int:
+        """SUM(tokens_new) of jobs that finished after ts_ms."""
+        r = self.db.execute(
+            "SELECT COALESCE(SUM(tokens_new), 0) AS total FROM jobs"
+            " WHERE state != 'running' AND finished_at > ?",
+            (ts_ms,),
+        ).fetchone()
+        return int(r["total"])
+
+    def finished_between(self, start_ms: int, end_ms: int) -> int:
+        """SUM(tokens_new) of jobs that finished in (start_ms, end_ms]."""
+        r = self.db.execute(
+            "SELECT COALESCE(SUM(tokens_new), 0) AS total FROM jobs"
+            " WHERE state != 'running' AND finished_at > ? AND finished_at <= ?",
+            (start_ms, end_ms),
+        ).fetchone()
+        return int(r["total"])
+
+    def log_window_observation(
+        self,
+        limit_id: str,
+        used_fraction: float | None,
+        status: str | None,
+        resets_at: int | None,
+        age_s: float,
+    ) -> None:
+        """Record a single window observation to window_log."""
+        self.db.execute(
+            "INSERT INTO window_log (observed_at, limit_id, used_fraction,"
+            " status, resets_at, source_age_s) VALUES (?,?,?,?,?,?)",
+            (now_ms(), limit_id, used_fraction, status, resets_at, int(age_s)),
+        )
+        self.db.commit()
+
+    def last_window_observation(
+        self, limit_id: str, resets_at: int
+    ) -> tuple[int, float] | None:
+        """Most recent (observed_at, used_fraction) for this limit_id
+        and resets_at cycle.  None if no prior observation."""
+        row = self.db.execute(
+            "SELECT observed_at, used_fraction FROM window_log"
+            " WHERE limit_id = ? AND resets_at BETWEEN ? AND ?"
+            " ORDER BY observed_at DESC LIMIT 1",
+            (limit_id, resets_at - 5000, resets_at + 5000),
+        ).fetchone()
+        if row is None or row["used_fraction"] is None:
+            return None
+        return (int(row["observed_at"]), float(row["used_fraction"]))
+
+    def record_calibration_sample(
+        self,
+        limit_id: str,
+        window_resets_at: int,
+        used_fraction_delta: float,
+        hunter_tokens: int,
+    ) -> None:
+        """Record a calibration sample correlating token spend with
+        fraction movement."""
+        self.db.execute(
+            "INSERT INTO calibration_samples"
+            " (observed_at, limit_id, window_resets_at,"
+            " used_fraction_delta, hunter_tokens)"
+            " VALUES (?,?,?,?,?)",
+            (now_ms(), limit_id, window_resets_at, used_fraction_delta, hunter_tokens),
+        )
         self.db.commit()
 
     def update_finding_analysis(
@@ -384,7 +976,7 @@ class Store:
         Never touches status or verdict_reason.
         """
         sets: list[str] = ["updated_at = ?"]
-        args: list[Any] = [now_ms()]
+        args: list[SqlParam] = [now_ms()]
         if summary is not None:
             sets.append("summary = ?")
             args.append(summary)
@@ -450,3 +1042,67 @@ class Store:
             )
         )
         return rows[0] if rows else {}
+
+
+class ThreadLocalLedger:
+    """Thread-safe SpendLedger: one Store (one SQLite connection) per thread.
+
+    SQLite connections must not be shared across threads (check_same_thread
+    enforces this by default).  The daemon has three threads hitting the
+    backend's ledger (scheduler loop, prober, HTTP handlers), so the
+    backend needs per-thread connections.
+
+    Each thread gets its own Store on first access, cached in a
+    threading.local for reuse within that thread's lifetime.
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._local = __import__("threading").local()
+
+    def _store(self) -> Store:
+        s = getattr(self._local, "store", None)
+        if s is None:
+            s = Store(self._cfg)
+            self._local.store = s
+        return s
+
+    # -- SpendLedger protocol -------------------------------------------------
+
+    def running_estimate(self) -> int:
+        return self._store().running_estimate()
+
+    def finished_since(self, ts_ms: int) -> int:
+        return self._store().finished_since(ts_ms)
+
+    def finished_between(self, start_ms: int, end_ms: int) -> int:
+        return self._store().finished_between(start_ms, end_ms)
+
+    def log_window_observation(
+        self,
+        limit_id: str,
+        used_fraction: float | None,
+        status: str | None,
+        resets_at: int | None,
+        age_s: float,
+    ) -> None:
+        self._store().log_window_observation(limit_id, used_fraction, status, resets_at, age_s)
+
+    def last_window_observation(
+        self, limit_id: str, resets_at: int
+    ) -> tuple[int, float] | None:
+        return self._store().last_window_observation(limit_id, resets_at)
+
+    def record_calibration_sample(
+        self,
+        limit_id: str,
+        window_resets_at: int,
+        used_fraction_delta: float,
+        hunter_tokens: int,
+    ) -> None:
+        self._store().record_calibration_sample(limit_id, window_resets_at, used_fraction_delta, hunter_tokens)
+
+    def estimate_capacity(
+        self, limit_id: str, min_delta: float = 0.02, sample_limit: int = 200
+    ) -> float | None:
+        return self._store().estimate_capacity(limit_id, min_delta, sample_limit)

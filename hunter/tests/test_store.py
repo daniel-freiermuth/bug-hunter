@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from hunter.store import Store
-from hunter.types import Config, WindowState
+from hunter.store import Store, _require_keys
+from hunter.backends.omp_scavenge.capacity import WindowState
+from hunter.types import Config, SchedulerStateDict, now_ms
 
 
 @pytest.fixture
@@ -79,6 +81,28 @@ class TestRepos:
         assert row is not None
         assert row["last_hunt_sha"] == "deadbeef"
         assert row["last_hunt_at"] is not None
+
+    def test_delete_repo_with_no_history(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.delete_repo(rid)
+        assert store.get_repo(rid) is None
+
+    def test_delete_repo_refuses_with_findings(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.upsert_finding(rid, _make_finding())
+        with pytest.raises(ValueError, match="finding"):
+            store.delete_repo(rid)
+        assert store.get_repo(rid) is not None
+
+    def test_delete_repo_refuses_with_jobs(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.create_job("hunt", rid)
+        with pytest.raises(ValueError, match="job"):
+            store.delete_repo(rid)
+        assert store.get_repo(rid) is not None
+
+    def test_delete_repo_missing_is_noop(self, store: Store) -> None:
+        store.delete_repo(999)  # no rows affected, does not raise
 
 
 # -- findings --------------------------------------------------------------
@@ -231,6 +255,27 @@ class TestSuppressions:
         assert len(store.known_active(r1)) == 1
         assert len(store.known_active(r2)) == 0
 
+    def test_filters_by_finding_type(self, store: Store) -> None:
+        """Bug-hunt suppression/known corpora must not leak dep_update/test_gap/
+        refactor findings sharing the same repo -- they use separate playbooks
+        and a mixed-type corpus would confuse the bug hunter."""
+        rid = store.add_repo("r", "https://r", "/r")
+        bug_fid, _ = store.upsert_finding(
+            rid, _make_finding(fingerprint="fp-bug"), finding_type="bug"
+        )
+        dep_fid, _ = store.upsert_finding(
+            rid, {"fingerprint": "fp-dep", "package": "foo"}, finding_type="dep_update"
+        )
+        store.set_status(bug_fid, "rejected", verdict_reason="bad")
+        store.set_status(dep_fid, "rejected", verdict_reason="also bad")
+        assert [s["id"] for s in store.suppressions(rid)] == [bug_fid]
+        assert [s["id"] for s in store.suppressions(rid, finding_type="dep_update")] == [dep_fid]
+
+        other_fid, _ = store.upsert_finding(
+            rid, _make_finding(fingerprint="fp-bug-2"), finding_type="bug"
+        )
+        assert [a["id"] for a in store.known_active(rid)] == [other_fid]
+
 
 # -- jobs ------------------------------------------------------------------
 
@@ -306,31 +351,143 @@ class TestEvents:
 
 
 class TestWindowLog:
-    def test_log_window(self, store: Store) -> None:
-        states = [
-            WindowState(
-                limit_id="anthropic:5h",
-                used_fraction=0.3,
-                status="ok",
-                resets_at=9999999,
-                recorded_at=1000000,
-                age_s=5.0,
-            ),
-            WindowState(
-                limit_id="anthropic:7d",
-                used_fraction=0.1,
-                status="ok",
-                resets_at=9999999,
-                recorded_at=1000000,
-                age_s=10.0,
-            ),
-        ]
-        store.log_window(states)
+    def test_log_window_observation(self, store: Store) -> None:
+        store.log_window_observation(
+            "anthropic:5h", 0.3, "ok", 9999999, 5.0,
+        )
+        store.log_window_observation(
+            "anthropic:7d", 0.1, "ok", 9999999, 10.0,
+        )
         rows = store.db.execute("SELECT * FROM window_log ORDER BY id").fetchall()
         assert len(rows) == 2
         assert dict(rows[0])["limit_id"] == "anthropic:5h"
         assert dict(rows[1])["limit_id"] == "anthropic:7d"
         assert dict(rows[0])["source_age_s"] == 5
+
+# -- calibration -------------------------------------------------------
+
+
+class TestCalibration:
+    """Backend._observe calibration side effect and estimate_capacity."""
+
+    _RESETS_AT = 99_999_999_999
+
+    def _probe(self, used_fraction: float) -> WindowState:
+        return WindowState(
+            limit_id="anthropic:5h",
+            used_fraction=used_fraction,
+            status="ok",
+            resets_at=self._RESETS_AT,
+            recorded_at=1,
+            age_s=1.0,
+        )
+
+    def _observe(self, store: Store, probe: WindowState) -> None:
+        """Simulate backend._observe for a single probe."""
+        from hunter.backends.omp_scavenge.facade import OmpScavengeBackend
+        cfg = Config(work_root=Path("/tmp"), db_path=Path("/tmp/test.db"))
+        backend = OmpScavengeBackend(cfg=cfg, ledger=store)
+        backend._observe({"anthropic:5h": probe})
+
+    def test_first_probe_records_no_sample(self, store: Store) -> None:
+        """Nothing to compare against yet -- no prior row for this window."""
+        self._observe(store, self._probe(0.10))
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_fresh_probe_with_hunter_spend_records_a_sample(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        self._observe(store, self._probe(0.10))
+        time.sleep(0.02)
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
+        time.sleep(0.02)
+        self._observe(store, self._probe(0.20))
+
+        rows = store.db.execute("SELECT * FROM calibration_samples").fetchall()
+        assert len(rows) == 1
+        row = dict(rows[0])
+        assert row["limit_id"] == "anthropic:5h"
+        assert row["hunter_tokens"] == 500_000
+        assert row["used_fraction_delta"] == pytest.approx(0.10)
+        assert row["window_resets_at"] == self._RESETS_AT
+
+    def test_unchanged_used_fraction_records_no_sample(self, store: Store) -> None:
+        """A re-read of the same stale probe (used_fraction didn't move)
+        must not fabricate a sample out of noise."""
+        rid = store.add_repo("r", "https://r", "/r")
+        self._observe(store, self._probe(0.10))
+        time.sleep(0.02)
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
+        time.sleep(0.02)
+        self._observe(store, self._probe(0.10))  # same fraction -- no fresh probe
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_no_hunter_spend_records_no_sample(self, store: Store) -> None:
+        """used_fraction moved but hunter didn't run anything in the gap
+        (e.g. a human's own interactive usage) -- nothing attributable."""
+        self._observe(store, self._probe(0.10))
+        time.sleep(0.02)
+        self._observe(store, self._probe(0.20))
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_different_window_instance_not_compared(self, store: Store) -> None:
+        """A genuinely new window (different resets_at) must not be
+        diffed against the previous instance's used_fraction."""
+        rid = store.add_repo("r", "https://r", "/r")
+        self._observe(store, self._probe(0.90))  # old window, nearly full
+        time.sleep(0.02)
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
+        time.sleep(0.02)
+        fresh = WindowState(
+            limit_id="anthropic:5h", used_fraction=0.05, status="ok",
+            resets_at=self._RESETS_AT + 6 * 3600 * 1000, recorded_at=1, age_s=1.0,
+        )
+        self._observe(store, fresh)
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_estimate_capacity_no_data_returns_none(self, store: Store) -> None:
+        assert store.estimate_capacity("anthropic:5h") is None
+
+    def test_estimate_capacity_uses_75th_percentile(self, store: Store) -> None:
+        """Confounded samples can only understate capacity (concurrent
+        non-hunter spend inflates the delta without showing up in
+        hunter_tokens), never overstate it -- so the estimate should sit
+        near the top of the observed distribution, not the median."""
+        ratios = [1_000_000, 2_000_000, 3_000_000, 4_000_000, 10_000_000]
+        for i, r in enumerate(ratios):
+            store.db.execute(
+                "INSERT INTO calibration_samples"
+                " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
+                " VALUES (?, 'anthropic:5h', 1, 0.10, ?)",
+                (i, r * 0.10),
+            )
+        store.db.commit()
+        estimate = store.estimate_capacity("anthropic:5h")
+        # int(5 * 0.75) = 3 (0-indexed) -> the 4th of 5 sorted ratios, well
+        # above the median (3,000,000) but not simply the single max either.
+        assert estimate == 4_000_000
+
+    def test_estimate_capacity_filters_tiny_deltas(self, store: Store) -> None:
+        """A delta smaller than min_delta is dominated by Anthropic's own
+        ~1%-quantized reporting and must not pollute the estimate."""
+        store.db.execute(
+            "INSERT INTO calibration_samples"
+            " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
+            " VALUES (1, 'anthropic:5h', 1, 0.01, 50000)"
+        )
+        store.db.commit()
+        assert store.estimate_capacity("anthropic:5h", min_delta=0.02) is None
+
+    def test_estimate_capacity_scoped_by_limit_id(self, store: Store) -> None:
+        store.db.execute(
+            "INSERT INTO calibration_samples"
+            " (observed_at, limit_id, window_resets_at, used_fraction_delta, hunter_tokens)"
+            " VALUES (1, 'anthropic:7d', 1, 0.10, 5000000)"
+        )
+        store.db.commit()
+        assert store.estimate_capacity("anthropic:5h") is None
 
 
 # -- update_finding_analysis -----------------------------------------------
@@ -433,3 +590,296 @@ class TestPrState:
         # Stalest sync first
         assert attn[0]["id"] == fid2
         assert attn[1]["id"] == fid1
+
+    def test_list_attention_prefers_attention_since_over_synced_at(self, store: Store) -> None:
+        """Regression: sync_prs bulk-refreshes synced_at for EVERY pr_open
+        finding every cycle in a fixed order, so it reflects loop
+        iteration order, not genuine wait time (observed live: a
+        higher-id finding won 5 straight tie-breaks over one that had
+        actually been waiting far longer). attention_since is the real
+        fairness key and must win whenever both are present."""
+        rid = store.add_repo("r", "https://r", "/r")
+        fid1, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp1"))
+        fid2, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp2"))
+
+        store.set_status(fid1, "pr_open")
+        store.set_status(fid2, "pr_open")
+
+        # fid1 has been flagged since T=1 (long-waiting) but was JUST
+        # resynced (synced_at=999, looks fresh by the old key).
+        store.upsert_pr_state(
+            fid1, pr_number=1, needs_attention="checks_failing", attention_since=1, synced_at=999
+        )
+        # fid2 was flagged much more recently (T=500) but happened to
+        # sync a moment earlier in this cycle's pass (synced_at=100).
+        store.upsert_pr_state(
+            fid2, pr_number=2, needs_attention="checks_failing", attention_since=500, synced_at=100
+        )
+
+        attn = store.list_attention()
+        assert len(attn) == 2
+        assert attn[0]["id"] == fid1  # genuinely longest-waiting, despite the fresher synced_at
+        assert attn[1]["id"] == fid2
+
+    def test_list_pending_harvest(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        fid1, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp1"))
+        fid2, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp2"))
+        fid3, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp3"))
+
+        store.set_status(fid1, "merged")
+        store.set_status(fid2, "merged")
+        store.set_status(fid3, "pr_open")  # not merged yet
+
+        store.upsert_pr_state(fid1, pr_number=1, state="MERGED", synced_at=100)
+        store.upsert_pr_state(fid2, pr_number=2, state="MERGED", synced_at=200, harvested_at=999)
+        store.upsert_pr_state(fid3, pr_number=3, state="OPEN", synced_at=50)
+
+        pending = store.list_pending_harvest()
+        # fid1: merged + harvested_at NULL → included
+        # fid2: merged but already harvested → excluded
+        # fid3: not merged → excluded
+        assert len(pending) == 1
+        assert pending[0]["id"] == fid1
+
+    def test_list_pending_harvest_sorted_by_synced_at(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        fid1, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp1"))
+        fid2, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp2"))
+
+        store.set_status(fid1, "merged")
+        store.set_status(fid2, "merged")
+
+        store.upsert_pr_state(fid1, pr_number=1, state="MERGED", synced_at=200)
+        store.upsert_pr_state(fid2, pr_number=2, state="MERGED", synced_at=100)
+
+        pending = store.list_pending_harvest()
+        assert len(pending) == 2
+        # Oldest merge first
+        assert pending[0]["id"] == fid2
+        assert pending[1]["id"] == fid1
+
+
+# -- reconcile_orphaned_jobs -------------------------------------------------
+
+
+class TestReconcileOrphanedJobs:
+    """Regression: a daemon that dies mid-run_fix (crash, systemctl
+    restart, or an in-process exception run_cycle's catch-all swallowed)
+    must not leave a job stuck 'running' forever and its finding stuck
+    'fixing' forever -- 'fixing' is never scanned by the normal work
+    queue, so without reconciliation it vanishes indefinitely (observed
+    in production: a job sat 'running' for a month after an old crash)."""
+
+    def test_orphaned_fix_job_resets_finding_to_queued(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        fid, _ = store.upsert_finding(rid, _make_finding())
+        store.set_status(fid, "fixing")
+        jid = store.create_job("fix", rid, finding_id=fid, cap_tokens=150_000)
+        store.update_job(jid, state="running")
+
+        result = store.reconcile_orphaned_jobs()
+
+        assert [f["id"] for f in result["findings"]] == [fid]
+        assert [j["id"] for j in result["jobs"]] == [jid]
+        job = store.list_jobs()[0]
+        assert job["state"] == "killed"
+        assert job["killed_reason"] == "orphaned"
+        finding = store.get_finding(fid)
+        assert finding is not None
+        assert finding["status"] == "queued"
+
+    def test_finding_stuck_fixing_with_already_terminal_job_is_still_recovered(
+        self, store: Store
+    ) -> None:
+        """run_fix records the job's terminal state (_record_job) BEFORE
+        the git-push/PR-create/salvage code that follows it -- an
+        exception anywhere in that later stretch leaves the job row
+        already terminal while the finding is still stuck 'fixing'. A
+        job-state-based check alone would miss this; reconciliation must
+        key off findings.status directly."""
+        rid = store.add_repo("r", "https://r", "/r")
+        fid, _ = store.upsert_finding(rid, _make_finding())
+        store.set_status(fid, "fixing")
+        jid = store.create_job("fix", rid, finding_id=fid, cap_tokens=150_000)
+        store.update_job(jid, state="done")  # _record_job already ran fine
+
+
+        result = store.reconcile_orphaned_jobs()
+
+        assert [f["id"] for f in result["findings"]] == [fid]
+        assert result["jobs"] == []  # nothing 'running' -- job row untouched
+        assert store.list_jobs()[0]["state"] == "done"
+        finding = store.get_finding(fid)
+        assert finding is not None
+        assert finding["status"] == "queued"
+
+    def test_fixing_finding_recovered_regardless_of_orphaned_jobs_kind(
+        self, store: Store
+    ) -> None:
+        """reconcile_orphaned_jobs recovers findings.status == 'fixing' by
+        querying findings directly -- it never joins through jobs.kind or
+        jobs.finding_id. A concurrently orphaned 'hunt' job (which never
+        carries a finding_id) must not suppress recovery of an unrelated
+        finding stuck at 'fixing' in the same pass."""
+        rid = store.add_repo("r", "https://r", "/r")
+        fid, _ = store.upsert_finding(rid, _make_finding())
+        store.set_status(fid, "fixing")
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="running")
+
+        result = store.reconcile_orphaned_jobs()
+
+        assert [f["id"] for f in result["findings"]] == [fid]
+        assert [j["id"] for j in result["jobs"]] == [jid]
+        finding = store.get_finding(fid)
+        assert finding is not None
+        assert finding["status"] == "queued"
+        assert store.list_jobs()[0]["state"] == "killed"
+
+    def test_finding_already_resolved_is_left_alone(self, store: Store) -> None:
+        """A finding no longer at 'fixing' (resolved via a later, separate
+        attempt) must never be touched, even if a stale job row for it is
+        still 'running'."""
+        rid = store.add_repo("r", "https://r", "/r")
+        fid, _ = store.upsert_finding(rid, _make_finding())
+        jid = store.create_job("fix", rid, finding_id=fid, cap_tokens=150_000)
+        store.update_job(jid, state="running")
+        store.set_status(fid, "merged")  # resolved independently in the meantime
+
+        result = store.reconcile_orphaned_jobs()
+
+        assert result["findings"] == []
+        finding = store.get_finding(fid)
+        assert finding is not None
+        assert finding["status"] == "merged"
+
+    def test_nothing_stuck_is_a_noop(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done")
+
+        result = store.reconcile_orphaned_jobs()
+
+        assert result == {"findings": [], "jobs": []}
+        assert store.list_jobs()[0]["state"] == "done"
+
+
+# -- current_job / scheduler_state -------------------------------------------
+
+
+class TestCurrentJob:
+    def test_none_when_nothing_running(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.create_job("hunt", rid)  # queued, not running
+        assert store.current_job() is None
+
+    def test_create_job_with_state_running_is_visible_immediately(
+        self, store: Store
+    ) -> None:
+        """Regression: run_* functions used to create a job at the
+        'queued' default, do real prep work (prompt building, git
+        operations), and only THEN call update_job(state="running").
+        During that gap, _cycle_lock was already held (the UI's "cycle
+        running" indicator) but current_job() found nothing, showing
+        stale last-cycle text at the same time as a "running" badge.
+        Passing state="running" to create_job closes the gap entirely --
+        no separate update_job call needed, and never a window."""
+        rid = store.add_repo("r", "https://r", "/r")
+        jid = store.create_job("hunt", rid, cap_tokens=200_000, state="running")
+        job = store.current_job()
+        assert job is not None
+        assert job["id"] == jid
+        assert job["state"] == "running"
+
+    def test_returns_the_running_job_with_repo_and_finding_context(
+        self, store: Store
+    ) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        fid, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-1"))
+        jid = store.create_job("fix", rid, finding_id=fid, cap_tokens=150_000)
+        store.update_job(jid, state="running")
+        job = store.current_job()
+        assert job is not None
+        assert job["id"] == jid
+        assert job["repo_name"] == "r"
+        assert job["finding_fingerprint"] == "fp-1"
+        assert job["finding_summary"] == "Bug found"
+
+    def test_only_the_most_recent_running_job_is_returned(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        j1 = store.create_job("hunt", rid)
+        store.update_job(j1, state="done")
+        j2 = store.create_job("hunt", rid)
+        store.update_job(j2, state="running")
+        job = store.current_job()
+        assert job is not None
+        assert job["id"] == j2
+
+
+class TestSchedulerState:
+    def test_none_before_ever_set(self, store: Store) -> None:
+        assert store.get_scheduler_state() is None
+
+    def test_set_and_get_roundtrip(self, store: Store) -> None:
+        store.set_scheduler_state("idle", "no work", 12345)
+        state = store.get_scheduler_state()
+        assert state is not None
+        assert state["state"] == "idle"
+        assert state["detail"] == "no work"
+        assert state["next_wake_at"] == 12345
+
+    def test_set_overwrites_previous_value(self, store: Store) -> None:
+        store.set_scheduler_state("idle", "no work", 100)
+        store.set_scheduler_state("denied", "5h ramp", 200)
+        state = store.get_scheduler_state()
+        assert state is not None
+        assert state["state"] == "denied"
+        assert state["detail"] == "5h ramp"
+        assert state["next_wake_at"] == 200
+
+
+# ---------------------------------------------------------------------------
+# _require_keys: the one runtime check at the SQL-row-to-TypedDict seam
+# ---------------------------------------------------------------------------
+
+
+class TestRequireKeys:
+    """No static type checker can verify a SQL query's actual result
+    columns match a declared TypedDict -- that's a runtime fact about
+    the database, not something mypy parses. _require_keys is the one
+    deliberate runtime check standing at that exact seam, so a
+    schema/query drift fails immediately and clearly, in the store
+    layer where the row was actually built, rather than as a confusing
+    KeyError far downstream in unrelated consuming code."""
+
+    def test_passes_through_when_all_keys_present(self) -> None:
+        row = {"id": 1, "state": "idle", "detail": "d", "next_wake_at": None, "updated_at": 0}
+        result = _require_keys(
+            row, "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
+        )
+        assert result == row
+
+    def test_raises_with_exact_missing_keys_and_actual_shape(self) -> None:
+        row = {"id": 1, "state": "error"}  # simulates a schema/query drift
+        with pytest.raises(ValueError, match=r"detail.*next_wake_at.*updated_at") as exc_info:
+            _require_keys(
+                row, "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
+            )
+        assert "SchedulerStateDict" in str(exc_info.value)
+        assert "['id', 'state']" in str(exc_info.value), (
+            "must name what WAS present, not just what's missing"
+        )
+
+    def test_extra_unexpected_keys_do_not_fail(self) -> None:
+        """Not every column needs a home in the TypedDict -- current_job()
+        deliberately carries DB columns the frontend never reads. Only
+        missing REQUIRED keys are an error."""
+        row = {
+            "id": 1, "state": "idle", "detail": "d", "next_wake_at": None,
+            "updated_at": 0, "some_future_column": "unexpected but harmless",
+        }
+        result = _require_keys(
+            row, "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
+        )
+        assert result["some_future_column"] == "unexpected but harmless"  # type: ignore[typeddict-item]

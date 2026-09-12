@@ -199,3 +199,407 @@ def test_empty_list(env: tuple[Store, int, Path]) -> None:
     store, repo_id, fdir = env
     result = ingest_findings(store, repo_id, _write_findings(fdir, []))
     assert result == {"inserted": 0, "duplicates": 0, "invalid": 0}
+
+
+# ── non-bug finding types (unified findings table) ─────────────────────
+
+
+def test_dep_update_ingested_with_type_columns(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:npm:foo:1.0.0->2.0.0",
+            "ecosystem": "npm",
+            "package": "foo",
+            "current_version": "1.0.0",
+            "latest_version": "2.0.0",
+            "update_type": "major",
+            "severity": "medium",
+            "confidence": 0.8,
+            "summary": "foo 2.0.0 breaking changes",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="dep_update"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+    rows = store.list_all_findings(finding_type="dep_update")
+    assert len(rows) == 1
+    assert rows[0]["type"] == "dep_update"
+    assert rows[0]["package"] == "foo"
+    assert rows[0]["current_version"] == "1.0.0"
+    assert rows[0]["category"] == "major"
+    # bug_class must stay unset for non-bug findings
+    assert rows[0]["bug_class"] is None
+
+
+def test_dep_update_missing_bug_class_is_not_invalid(env: tuple[Store, int, Path]) -> None:
+    """dep_update/test_gap/refactor findings never carry bug_class -- only
+    bug findings require it."""
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:npm:foo:1.0.0->2.0.0",
+            "ecosystem": "npm",
+            "package": "foo",
+            "current_version": "1.0.0",
+            "latest_version": "2.0.0",
+            "update_type": "major",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="dep_update"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+
+
+def test_test_gap_ingested_with_missing_tests_list(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:foo.py:bar:test-gap",
+            "file": "foo.py",
+            "symbol": "bar",
+            "severity": "medium",
+            "confidence": 0.7,
+            "summary": "bar has no test for empty input",
+            "missing_tests": ["empty input", "negative numbers"],
+            "test_file": "test_foo.py",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="test_gap"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+    rows = store.list_all_findings(finding_type="test_gap")
+    assert rows[0]["type"] == "test_gap"
+    assert rows[0]["category"] == "coverage"
+    assert json.loads(rows[0]["missing_tests"]) == ["empty input", "negative numbers"]
+
+
+def test_refactor_ingested_with_type_columns(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:foo.py:bar:duplication",
+            "file": "foo.py",
+            "symbol": "bar",
+            "smell_type": "duplication",
+            "severity": "low",
+            "confidence": 0.6,
+            "summary": "bar duplicates baz",
+            "suggested_refactor": "extract shared helper",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="refactor"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+    rows = store.list_all_findings(finding_type="refactor")
+    assert rows[0]["type"] == "refactor"
+    assert rows[0]["category"] == "duplication"
+    assert rows[0]["suggested_refactor"] == "extract shared helper"
+
+
+def test_modernization_ingested_with_type_columns(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:tiles:format-or-protocol-shift",
+            "file": "src/tiles.py",
+            "modernization_class": "format-or-protocol-shift",
+            "severity": "medium",
+            "confidence": 0.7,
+            "summary": "MVT is stale, MLT is now the SOTA vector tile format",
+            "current_approach": "MVT (Mapbox Vector Tile)",
+            "proposed_approach": "MLT (Mapbox Vector Tile, v2)",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+    rows = store.list_all_findings(finding_type="modernization")
+    assert rows[0]["type"] == "modernization"
+    assert rows[0]["category"] == "format-or-protocol-shift"
+    assert rows[0]["current_approach"] == "MVT (Mapbox Vector Tile)"
+    assert rows[0]["proposed_approach"] == "MLT (Mapbox Vector Tile, v2)"
+    # bug_class must stay unset for non-bug findings
+    assert rows[0]["bug_class"] is None
+
+
+def test_modernization_bug_class_is_optional_when_required_fields_present(
+    env: tuple[Store, int, Path],
+) -> None:
+    """modernization findings never carry bug_class -- only a generic
+    severity/confidence check plus its own required fields apply, same as
+    dep_update/test_gap/refactor."""
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:x",
+            "severity": "low",
+            "confidence": 0.5,
+            "summary": "x",
+            "modernization_class": "language-feature-gap",
+            "current_approach": "old approach",
+            "proposed_approach": "new approach",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+
+
+def test_modernization_missing_class_is_invalid(env: tuple[Store, int, Path]) -> None:
+    """Unlike bug_class, modernization_class IS a required field for this
+    type -- omitting it must reject the entry, not silently insert it."""
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:x",
+            "severity": "low",
+            "confidence": 0.5,
+            "summary": "x",
+            # modernization_class omitted
+            "current_approach": "old approach",
+            "proposed_approach": "new approach",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
+    )
+    assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
+    assert store.list_all_findings(finding_type="modernization") == []
+
+
+def test_different_types_do_not_leak_into_each_others_known_list(
+    env: tuple[Store, int, Path],
+) -> None:
+    """A bug and a dep_update finding sharing a repo must not cross-contaminate
+    type-filtered queries -- this was the root cause of dep_update hunts
+    re-filing already-rejected findings."""
+    store, repo_id, fdir = env
+    ingest_findings(store, repo_id, _write_findings(fdir, [_make_finding()]), finding_type="bug")
+    ingest_findings(
+        store,
+        repo_id,
+        _write_findings(
+            fdir,
+            [
+                {
+                    "fingerprint": "repo:npm:foo:1.0.0->2.0.0",
+                    "ecosystem": "npm",
+                    "package": "foo",
+                    "current_version": "1.0.0",
+                    "latest_version": "2.0.0",
+                    "update_type": "major",
+                }
+            ],
+        ),
+        finding_type="dep_update",
+    )
+    assert len(store.list_all_findings(finding_type="bug")) == 1
+    assert len(store.list_all_findings(finding_type="dep_update")) == 1
+    assert len(store.list_all_findings()) == 2
+
+
+# ── type-specific required fields (dep_update/test_gap/refactor/modernization) ──
+
+
+def test_dep_update_missing_required_field_is_invalid(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:npm:foo:1.0.0->2.0.0",
+            "ecosystem": "npm",
+            "package": "foo",
+            "current_version": "1.0.0",
+            # latest_version and update_type omitted
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="dep_update"
+    )
+    assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
+    assert store.list_all_findings(finding_type="dep_update") == []
+
+
+def test_dep_update_all_required_fields_ingests(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:npm:foo:1.0.0->2.0.0",
+            "ecosystem": "npm",
+            "package": "foo",
+            "current_version": "1.0.0",
+            "latest_version": "2.0.0",
+            "update_type": "major",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="dep_update"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+
+
+def test_test_gap_missing_required_field_is_invalid(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:foo.py:bar:test-gap",
+            "file": "foo.py",
+            "symbol": "bar",
+            "summary": "bar has no test for empty input",
+            "missing_tests": ["empty input"],
+            # test_file omitted
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="test_gap"
+    )
+    assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
+    assert store.list_all_findings(finding_type="test_gap") == []
+
+
+def test_test_gap_malformed_missing_tests_shape_is_invalid_not_a_crash(
+    env: tuple[Store, int, Path],
+) -> None:
+    """missing_tests must be a list (store.upsert_finding only json.dumps()s
+    it when isinstance(..., list)) -- a truthy-but-wrong-shaped value (e.g.
+    a dict) previously passed the old truthy-only check, then reached
+    SQLite unconverted and raised, aborting every LATER entry in the same
+    findings.json batch rather than just this one invalid entry."""
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:foo.py:bar:test-gap-malformed",
+            "file": "foo.py",
+            "symbol": "bar",
+            "summary": "bar has no test for empty input",
+            "missing_tests": {"not": "a list"},
+            "test_file": "test_foo.py",
+        },
+        {
+            "fingerprint": "repo:foo.py:baz:test-gap-after",
+            "file": "foo.py",
+            "symbol": "baz",
+            "summary": "baz has no test for negative input",
+            "missing_tests": ["negative input"],
+            "test_file": "test_foo.py",
+        },
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="test_gap"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 1}, (
+        "the malformed entry must be skipped as invalid, and the LATER valid"
+        " entry must still be processed, not lost to an aborted batch"
+    )
+    rows = store.list_all_findings(finding_type="test_gap")
+    assert len(rows) == 1
+    assert rows[0]["fingerprint"] == "repo:foo.py:baz:test-gap-after"
+
+
+def test_test_gap_all_required_fields_ingests(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:foo.py:bar:test-gap",
+            "file": "foo.py",
+            "symbol": "bar",
+            "summary": "bar has no test for empty input",
+            "missing_tests": ["empty input"],
+            "test_file": "test_foo.py",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="test_gap"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+
+
+def test_refactor_missing_required_field_is_invalid(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:foo.py:bar:duplication",
+            "file": "foo.py",
+            "symbol": "bar",
+            "smell_type": "duplication",
+            "summary": "bar duplicates baz",
+            # suggested_refactor omitted
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="refactor"
+    )
+    assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
+    assert store.list_all_findings(finding_type="refactor") == []
+
+
+def test_refactor_all_required_fields_ingests(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:foo.py:bar:duplication",
+            "file": "foo.py",
+            "symbol": "bar",
+            "smell_type": "duplication",
+            "summary": "bar duplicates baz",
+            "suggested_refactor": "extract shared helper",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="refactor"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+
+
+def test_modernization_missing_required_field_is_invalid(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:tiles:format-or-protocol-shift",
+            "file": "src/tiles.py",
+            "modernization_class": "format-or-protocol-shift",
+            "summary": "MVT is stale",
+            "current_approach": "MVT",
+            # proposed_approach omitted
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
+    )
+    assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
+    assert store.list_all_findings(finding_type="modernization") == []
+
+
+def test_modernization_all_required_fields_ingests(env: tuple[Store, int, Path]) -> None:
+    store, repo_id, fdir = env
+    entries = [
+        {
+            "fingerprint": "repo:tiles:format-or-protocol-shift",
+            "file": "src/tiles.py",
+            "modernization_class": "format-or-protocol-shift",
+            "summary": "MVT is stale",
+            "current_approach": "MVT",
+            "proposed_approach": "MLT",
+        }
+    ]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+
+
+def test_bug_type_does_not_require_type_specific_fields(env: tuple[Store, int, Path]) -> None:
+    """The 'bug' type's existing validation (bug_class/severity/confidence)
+    is untouched by the new per-type required-fields check."""
+    store, repo_id, fdir = env
+    entries = [_make_finding()]
+    result = ingest_findings(
+        store, repo_id, _write_findings(fdir, entries), finding_type="bug"
+    )
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}

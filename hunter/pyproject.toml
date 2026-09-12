@@ -3,6 +3,9 @@ name = "hunter"
 version = "0.1.0"
 description = "Idle-Token Bug Hunter -- automated code review orchestrator"
 requires-python = ">=3.13"
+dependencies = [
+    "pydantic>=2.13.5",
+]
 
 [tool.mypy]
 python_version = "3.13"
@@ -123,6 +126,11 @@ ignore = [
 "hunter/runner.py" = [
     "TC003",    # Path used at runtime for file operations
 ]
+# Validator checks fingerprint/type/severity/confidence plus a per-type
+# required-fields list, each as its own early-return reason string.
+"hunter/ingest.py" = [
+    "PLR0911",  # too many return statements (one per validation reason)
+]
 "hunter/playbooks.py" = [
     "TC003",    # Path used at runtime for file I/O
 ]
@@ -135,3 +143,10 @@ line-ending = "lf"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.6",
+]

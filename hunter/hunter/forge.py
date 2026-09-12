@@ -60,7 +60,10 @@ class Forge:
 
         Returns (rc, normalised_dict | None, raw_output).
         Normalised keys: state, mergedAt, mergeable, reviewDecision,
-        statusCheckRollup, comments, reviews, updatedAt, headRefName.
+        statusCheckRollup, comments, reviews, updatedAt, headRefName,
+        headRefOid (the PR/MR's current head commit SHA -- used to detect
+        when a suppressed static reason's underlying code has actually
+        moved, distinct from the reason string coincidentally re-matching).
         """
         raise NotImplementedError
 
@@ -147,7 +150,7 @@ class GitHubForge(Forge):
     ) -> tuple[int, Row | None, str]:
         fields = (
             "state,mergedAt,mergeable,reviewDecision,"
-            "statusCheckRollup,comments,reviews,updatedAt,headRefName"
+            "statusCheckRollup,comments,reviews,updatedAt,headRefName,headRefOid"
         )
         rc, out = run_cmd(
             ["gh", "pr", "view", str(number), "-R", slug, "--json", fields],
@@ -423,6 +426,7 @@ class GitLabForge(Forge):
                 "reviews": reviews,
                 "updatedAt": mr.get("updated_at", ""),
                 "headRefName": mr.get("source_branch", ""),
+                "headRefOid": mr.get("sha"),
             },
             raw,
         )
