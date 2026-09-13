@@ -150,11 +150,13 @@ class TestComputeSleepS:
     def test_unrecognized_shape_uses_default(self, store: Store) -> None:
         assert _compute_sleep_s(store, {"idle": "nothing to do"}) == 15 * 60
 
-    def test_sync_caps_a_long_denial_backoff(self, store: Store) -> None:
-        """The whole point: a multi-hour 7d-ramp denial must not also
-        delay noticing PR feedback, which costs nothing to check."""
+    def test_sync_does_not_cap_denial_backoff(self, store: Store) -> None:
+        """A multi-hour budget denial must sleep until retry_at, not wake
+        every 5 minutes just because PR sync also ran. The old behavior
+        created 30+ identical denied job rows per hour."""
         summary = {"denied": "x", "retry_at": None, "sync": {"synced": 1}}
-        assert _compute_sleep_s(store, summary) == PR_SYNC_INTERVAL_S
+        # Without retry_at, denied sleep = 30min; sync must NOT cap it to 5min
+        assert _compute_sleep_s(store, summary) == 30 * 60
 
     def test_sync_does_not_lengthen_an_already_short_sleep(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")

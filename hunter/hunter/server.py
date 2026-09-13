@@ -986,7 +986,11 @@ def _compute_sleep_s(store: Store, summary: Row) -> float:
             sleep_s = 30 * 60
     else:
         sleep_s = 15 * 60
-    if "sync" in summary:
+    # PR sync (free: gh reads only) should run periodically, but must NOT
+    # override a budget-denial backoff. Without this guard, every denied
+    # cycle was capped to 5 minutes, creating 30+ identical denied job
+    # rows per hour during a multi-hour denial.
+    if "sync" in summary and not summary.get("denied"):
         sleep_s = min(sleep_s, PR_SYNC_INTERVAL_S)
     return sleep_s
 

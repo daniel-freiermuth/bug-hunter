@@ -279,10 +279,8 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
     verdict = outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
-            job = store.create_job("hunt", rid)
-            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
-            store.log_event("deny", f"hunt {rname}: {reason}", job_id=job)
-            return {"denied": reason, "retry_at": retry_at, "job": job}
+            store.log_event("deny", f"hunt {rname}: {reason}")
+            return {"denied": reason, "retry_at": retry_at}
         case Granted(cap_tokens=backend_cap):
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
@@ -406,15 +404,8 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
-            job = store.create_job("recheck", repo["id"], finding_id=fid)
-            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
-            store.log_event(
-                "deny",
-                f"recheck #{fid}: {reason}",
-                job_id=job,
-                finding_id=fid,
-            )
-            return {"denied": reason, "retry_at": retry_at, "job": job}
+            store.log_event("deny", f"recheck #{fid}: {reason}", finding_id=fid)
+            return {"denied": reason, "retry_at": retry_at}
         case Granted(cap_tokens=backend_cap):
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
@@ -585,10 +576,8 @@ def _run_analysis_job(store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec,
     verdict = outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
-            job = store.create_job(kind, rid)
-            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
-            store.log_event("deny", f"{kind} {rname}: {reason}", job_id=job)
-            return {"denied": reason, "retry_at": retry_at, "job": job}
+            store.log_event("deny", f"{kind} {rname}: {reason}")
+            return {"denied": reason, "retry_at": retry_at}
         case Granted(cap_tokens=backend_cap):
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
@@ -887,15 +876,8 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
             _drop_worktree(delete_branch=True)
-            job = store.create_job("fix", repo["id"], finding_id=fid)
-            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
-            store.log_event(
-                "deny",
-                f"fix #{fid}: {reason}",
-                job_id=job,
-                finding_id=fid,
-            )
-            return {"denied": reason, "retry_at": retry_at, "job": job}
+            store.log_event("deny", f"fix #{fid}: {reason}", finding_id=fid)
+            return {"denied": reason, "retry_at": retry_at}
         case Granted(cap_tokens=backend_cap):
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
@@ -1438,15 +1420,8 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
             _drop_worktree()
-            job = store.create_job("engage", repo["id"], finding_id=fid)
-            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
-            store.log_event(
-                "deny",
-                f"engage #{fid}: {reason}",
-                job_id=job,
-                finding_id=fid,
-            )
-            return {"denied": reason, "retry_at": retry_at, "job": job}
+            store.log_event("deny", f"engage #{fid}: {reason}", finding_id=fid)
+            return {"denied": reason, "retry_at": retry_at}
         case Granted(cap_tokens=backend_cap):
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
@@ -1722,10 +1697,8 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
             _drop_worktree()
-            job = store.create_job("harvest", repo["id"], finding_id=fid)
-            store.update_job(job, state="denied", notes=reason, finished_at=now_ms())
-            store.log_event("deny", f"harvest #{fid}: {reason}", job_id=job, finding_id=fid)
-            return {"denied": reason, "retry_at": retry_at, "job": job}
+            store.log_event("deny", f"harvest #{fid}: {reason}", finding_id=fid)
+            return {"denied": reason, "retry_at": retry_at}
         case Granted(cap_tokens=backend_cap):
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
