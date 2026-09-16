@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Python hunter (hunter/) ────────────────────────────────────
+  python:
+    name: Python — lint + typecheck + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install deps
+        run: pip install ruff mypy pydantic pytest
+
+      - name: Format check
+        run: ruff format --check hunter/ tests/
+
+      - name: Lint
+        run: ruff check hunter/ tests/
+
+      - name: Typecheck
+        run: mypy --strict hunter/
+
+      - name: Test
+        run: pytest tests/ -q
