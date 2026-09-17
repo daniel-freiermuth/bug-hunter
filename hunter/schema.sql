@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS findings (
   id            INTEGER PRIMARY KEY,
   type          TEXT NOT NULL,             -- bug | dep_update | test_gap | refactor
   repo_id       INTEGER NOT NULL REFERENCES repos(id),
-  fingerprint   TEXT NOT NULL UNIQUE,
+  fingerprint   TEXT NOT NULL,
   file          TEXT,
   symbol        TEXT,
   line          INTEGER,
@@ -61,7 +61,13 @@ CREATE TABLE IF NOT EXISTS findings (
   
   -- Refactoring fields (nullable for other types)
   smell_type    TEXT,
-  suggested_refactor TEXT
+  suggested_refactor TEXT,
+
+  -- Modernization / standards fields (nullable for other types)
+  modernization_class TEXT,
+  current_approach TEXT,
+  proposed_approach TEXT,
+  UNIQUE(type, fingerprint)
 );
 CREATE INDEX IF NOT EXISTS findings_status ON findings(status);
 CREATE INDEX IF NOT EXISTS findings_repo ON findings(repo_id, status);
