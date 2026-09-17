@@ -239,7 +239,7 @@ class Config:
         if self.backend_type == "omp-scavenge":
             from .backends.omp_scavenge import OmpScavengeBackend  # noqa: PLC0415
 
-            return OmpScavengeBackend(cfg=self, ledger=ledger)
+            return OmpScavengeBackend(cfg=self, ledger=ledger)  # type: ignore[arg-type]
         raise ValueError(f"unknown backend_type: {self.backend_type!r}")
 
 

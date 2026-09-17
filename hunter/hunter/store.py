@@ -383,8 +383,9 @@ class Store:
         # If file doesn't exist, create with header
         if not p.exists():
             repo = self.get_repo(repo_id)
+            name = repo["name"] if repo else f"repo-{repo_id}"
             today = datetime.now(tz=UTC).date()
-            header = f"# Notes: {repo['name']}\n\nLast updated: {today}\n\n"
+            header = f"# Notes: {name}\n\nLast updated: {today}\n\n"
             p.write_text(header)
 
         # Append note

@@ -23,6 +23,7 @@ from hunter.backend import (
     JobClass,
     Outlook,
     SpendLedger,
+    Verdict,
 )
 
 from . import capacity
@@ -220,9 +221,7 @@ class OmpScavengeBackend:
         cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
         if dim == "5h" or ":5h" in dim:
             return int(frac * cap_5h)
-        cap_7d = self.ledger.estimate_capacity("anthropic:7d") or (
-            cap_5h / _5H_7D_RATIO
-        )
+        cap_7d = self.ledger.estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)
         return int(frac * cap_7d)
 
     def decide(self, *, anticipated_tokens: int) -> Outlook:
@@ -233,7 +232,7 @@ class OmpScavengeBackend:
         normal = self._decide_inner(windows, res_5h, res_7d, prio=False)
         # Monotonicity: if normal is granted, prioritized is at least as permissive.
         if isinstance(normal, Granted):
-            prioritized = normal
+            prioritized: Verdict = normal
             # But recompute with prio headroom if normal passed
             prio_headroom = self._compute_headroom(windows, res_5h, res_7d, prio=True)
             if prio_headroom is not None and (

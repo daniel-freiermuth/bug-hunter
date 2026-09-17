@@ -722,7 +722,7 @@ def serve(cfg: Config) -> None:
     from .store import ThreadLocalLedger
 
     _acquire_lockfile(cfg)
-    backend = cfg.make_backend(ThreadLocalLedger(cfg))
+    backend = cast("Backend", cfg.make_backend(ThreadLocalLedger(cfg)))
     httpd = make_server(cfg, backend)
     log.info("ui http://127.0.0.1:%d/", httpd.server_address[1])
     try:
@@ -1044,7 +1044,7 @@ def daemon(cfg: Config) -> None:
     from .store import Store, ThreadLocalLedger
 
     _acquire_lockfile(cfg)
-    backend = cfg.make_backend(ThreadLocalLedger(cfg))
+    backend = cast("Backend", cfg.make_backend(ThreadLocalLedger(cfg)))
 
     httpd = make_server(cfg, backend)
     threading.Thread(target=httpd.serve_forever, name="hunter-ui", daemon=True).start()

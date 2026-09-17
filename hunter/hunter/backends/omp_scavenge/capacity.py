@@ -205,5 +205,10 @@ def effective_used(w: WindowState, inflight_reservation: float) -> float:
     under 1.0 be second-guessed by ramp catch-up before the window is
     actually over, or push a ramp-derived retry_at past the real reset.
     """
-    used = 1.0 if w.status == "exhausted" else w.used_fraction
+    if w.status == "exhausted":
+        used = 1.0
+    elif w.used_fraction is not None:
+        used = w.used_fraction
+    else:
+        used = 0.0  # unreachable when caller obeys contract; safe floor
     return used + inflight_reservation

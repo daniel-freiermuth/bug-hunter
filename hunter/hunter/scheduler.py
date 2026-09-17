@@ -80,7 +80,7 @@ def anticipated_tokens(store: Store, cfg: Config, repo_id: int, kind: str) -> in
     if not history:
         return 0
     idx = min(int(len(history) * (0.5 if warm else 0.9)), len(history) - 1)
-    return history[idx]
+    return int(history[idx])
 
 
 def _job_state(rr: RunResult) -> str:
@@ -435,23 +435,23 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     }
 
     # Post-process verdict file.
-    verdict: Row | None = None
+    raw_verdict: Row | None = None
     if out_path.exists():
         try:
-            verdict = json.loads(out_path.read_text())
+            raw_verdict = json.loads(out_path.read_text())
         except (OSError, json.JSONDecodeError):
-            verdict = None
+            raw_verdict = None
 
-    if not isinstance(verdict, dict) or verdict.get("verdict") not in (
+    if not isinstance(raw_verdict, dict) or raw_verdict.get("verdict") not in (
         "confirmed",
         "stale",
         "invalid",
     ):
         if state != "done":
             failure = f"worker {state}"
-        elif verdict is None and not out_path.exists():
+        elif raw_verdict is None and not out_path.exists():
             failure = "no verdict file"
-        elif verdict is None:
+        elif raw_verdict is None:
             failure = "unparseable verdict file"
         else:
             failure = "invalid verdict value"
@@ -490,16 +490,16 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
             store.set_budget_override(fid, None)
         return summary
 
-    v: str = verdict["verdict"]
-    reason = (verdict.get("reason") or "")[:500]
+    v: str = raw_verdict["verdict"]
+    reason = (raw_verdict.get("reason") or "")[:500]
 
     if v == "confirmed":
         store.update_finding_analysis(
             fid,
-            summary=verdict.get("updated_summary"),
-            detail=verdict.get("updated_detail"),
-            confidence=verdict.get("updated_confidence"),
-            severity=verdict.get("updated_severity"),
+            summary=raw_verdict.get("updated_summary"),
+            detail=raw_verdict.get("updated_detail"),
+            confidence=raw_verdict.get("updated_confidence"),
+            severity=raw_verdict.get("updated_severity"),
         )
         store.set_status(fid, "new")  # back to inbox with improved analysis
         store.clear_recheck_attempts(fid)
@@ -1873,10 +1873,11 @@ def pick_next(
 
     repos = [r for r in store.list_repos() if r["enabled"]]
     if force_repo:
-        candidates = [store.get_repo(force_repo)]
-        if candidates[0] is None:
+        repo = store.get_repo(force_repo)
+        if repo is None:
             msg = f"unknown repo {force_repo!r}"
             raise ValueError(msg)
+        candidates = [repo]
     else:
         # Try repos in staleness order (least-recently-hunted first)
         candidates = (
@@ -1919,7 +1920,7 @@ def pick_next(
         job_type = (
             next(k for k in _JOB_TYPE_PRIORITY if k in never_run)
             if never_run
-            else min(job_times, key=job_times.get)
+            else min(job_times, key=lambda k: job_times[k])
         )
         return job_type, target
 
