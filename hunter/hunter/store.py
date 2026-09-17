@@ -366,8 +366,14 @@ class Store:
                 "cannot delete without losing history; pause it instead"
             )
             raise ValueError(msg)
+        # Capture notes path before deleting the row (repo_notes_path needs
+        # the row to exist). SQLite can reuse INTEGER PRIMARY KEY ids, so a
+        # new repo could inherit stale notes if we don't clean up.
+        notes_path = self.cfg.work_root / "repos" / f"repo-{repo_id}" / "NOTES.md"
         self.db.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
         self.db.commit()
+        if notes_path.exists():
+            notes_path.unlink()
 
     # -- repo notes ----------------------------------------------------
     def repo_notes_path(self, repo_id: int) -> Path:
