@@ -8,12 +8,12 @@ import contextlib
 import json
 import logging
 import re
-from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from .backend import Backend, Denied, Granted, JobClass, Outlook
+from .backend import Backend, Denied, Granted, JobClass
 from .forge import forge_for
 from .ingest import ingest_findings
 from .playbooks import (
@@ -33,7 +33,13 @@ from .store import Store
 from .types import Config, Row, RunResult, now_ms
 from .util import run_cmd
 
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
 log = logging.getLogger(__name__)
+# The empty-tree SHA is the implicit parent of all root commits --
+# used in diff_range for full-history re-hunts.
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
 def anticipated_tokens(store: Store, cfg: Config, repo_id: int, kind: str) -> int:
@@ -81,7 +87,6 @@ def _job_state(rr: RunResult) -> str:
     if rr.killed_reason:
         return "killed"
     return "done" if rr.exit_code == 0 else "failed"
-
 
 
 def _record_job(
@@ -183,7 +188,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
     # Only trigger re-hunt if we've completed at least one hunt before
     rehunt_due = last_full and (now_ms() - last_full) > rehunt_interval_ms
     full_rehunt_triggered = False
-    
+
     if rehunt_due and not force:
         # Clear watermark → triggers full-history hunt below
         store.db.execute(
@@ -225,11 +230,10 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         if rc != 0 or not roots:
             store.log_event("error", f"hunt {rname}: failed to find repository root")
             return {"error": "failed to find repository root"}
-        
+
         root = roots.splitlines()[-1]
         # Use git's empty tree to include the root commit itself
         # The empty tree SHA is the implicit parent of all root commits
-        EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
         diff_range = f"{EMPTY_TREE}..{head}"
         scope_note = f"Periodic full re-hunt: complete history including root {root[:12]}."
     else:
@@ -298,7 +302,9 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         store.repo_notes(rid),
     )
     model = cfg.model_for("hunt")
-    rr = backend.run(rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT)
+    rr = backend.run(
+        rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT
+    )
     state = _record_job(store, job, rr, model=model)
 
     summary: Row = {
@@ -400,7 +406,9 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     # Budget gate -- recheck is investigative, like hunt.
     override = finding.get("budget_override")
     cfg_cap = cfg.hunt_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "recheck"))
+    outlook = backend.decide(
+        anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "recheck")
+    )
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -414,7 +422,9 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prompt = build_recheck_prompt(finding, repo, out_path, store.repo_notes(repo["id"]))
     model = cfg.model_for("hunt")
-    rr = backend.run(rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT)
+    rr = backend.run(
+        rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT
+    )
     state = _record_job(store, job, rr, model=model)
     summary: Row = {
         "kind": "recheck",
@@ -540,12 +550,12 @@ class _AnalysisSpec:
     out_plural: str  # output filename plural, e.g. job{N}.<out_plural>.json
     no_output_noun: str  # "no <noun> file" log wording when out_path is missing
     scope_note: str
-    prompt_builder: Callable[
-        [Row, str, list[Row], list[Row], Path, int, str], str
-    ]
+    prompt_builder: Callable[[Row, str, list[Row], list[Row], Path, int, str], str]
 
 
-def _run_analysis_job(store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec, backend: Backend) -> Row:
+def _run_analysis_job(
+    store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec, backend: Backend
+) -> Row:
     """Shared body for the four repo-level analysis job types: sync the repo
     to its default branch, budget-gate, run the worker, ingest output, and
     advance the rotation timestamp on success. The only per-kind variation
@@ -598,7 +608,9 @@ def _run_analysis_job(store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec,
     )
 
     model = cfg.model_for("hunt")
-    rr = backend.run(rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT)
+    rr = backend.run(
+        rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT
+    )
     state = _record_job(store, job, rr, model=model)
 
     summary: Row = {
@@ -652,8 +664,7 @@ _REFACTOR_SPEC = _AnalysisSpec(
     out_plural="refactorings",
     no_output_noun="refactorings",
     scope_note=(
-        "Scan for safe, mechanical refactoring opportunities"
-        " (duplication, dead code, complexity)."
+        "Scan for safe, mechanical refactoring opportunities (duplication, dead code, complexity)."
     ),
     prompt_builder=build_refactor_prompt,
 )
@@ -685,7 +696,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row, backend: Backend) -> Ro
     Falls back to the AI-based analysis job if Renovate fails (not installed,
     timeout, etc.).
     """
-    from .dep_scan import scan_repo
+    from .dep_scan import scan_repo  # noqa: PLC0415
 
     rid = repo["id"]
     rname = repo["name"]
@@ -892,7 +903,9 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
         )
         prompt = build_prompt(finding, worktree, branch, repo, store.repo_notes(repo["id"]))
         model = cfg.model_for("fix")
-        rr = backend.run(worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX)
+        rr = backend.run(
+            worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX
+        )
         state = _record_job(store, job, rr, model=model)
         summary: Row = {
             "kind": "fix",
@@ -906,7 +919,11 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
         # (a) Worker declined this finding, or hit a blocker.
         decline_file = worktree / ("NOT-A-BUG.md" if is_bug else "DECLINED.md")
         blocked_file = worktree / "BLOCKED.md"
-        outcome_file = decline_file if decline_file.exists() else (blocked_file if blocked_file.exists() else None)
+        outcome_file = (
+            decline_file
+            if decline_file.exists()
+            else (blocked_file if blocked_file.exists() else None)
+        )
         if outcome_file is not None:
             reason = outcome_file.read_text()[:500]
             store.set_status(fid, "rejected", verdict_reason=reason)
@@ -1018,8 +1035,7 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
                 fid,
                 "rejected",
                 verdict_reason=(
-                    f"stuck: {streak} consecutive fix attempts hit the same"
-                    f" failure: {failure}"
+                    f"stuck: {streak} consecutive fix attempts hit the same failure: {failure}"
                 ),
             )
             store.clear_fix_attempts(fid)
@@ -1415,7 +1431,9 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
 
     override = finding.get("budget_override")
     cfg_cap = cfg.fix_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "engage"))
+    outlook = backend.decide(
+        anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "engage")
+    )
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -1452,7 +1470,9 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
         store.repo_notes(repo["id"]),
     )
     model = cfg.model_for("fix")
-    rr = backend.run(worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX)
+    rr = backend.run(
+        worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX
+    )
     state = _record_job(store, job, rr, model=model)
     summary: Row = {
         "kind": "engage",
@@ -1692,7 +1712,9 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
 
     override = finding.get("budget_override")
     cfg_cap = cfg.fix_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "harvest"))
+    outlook = backend.decide(
+        anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "harvest")
+    )
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -1713,12 +1735,12 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
         _drop_worktree()
         return {"error": "PR/MR view failed"}
 
-    job = store.create_job(
-        "harvest", repo["id"], finding_id=fid, cap_tokens=cap, state="running"
-    )
+    job = store.create_job("harvest", repo["id"], finding_id=fid, cap_tokens=cap, state="running")
     prompt = build_harvest_prompt(finding, worktree, repo, pr, num, store.repo_notes(repo["id"]))
     model = cfg.model_for("fix")
-    rr = backend.run(worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX)
+    rr = backend.run(
+        worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX
+    )
     state = _record_job(store, job, rr, model=model)
 
     # Read before _drop_worktree below removes the file.
@@ -1795,7 +1817,9 @@ _JOB_TYPE_PRIORITY = ("hunt", "test_gap", "dep_update", "refactor", "modernizati
 
 
 def pick_next(
-    store: Store, cfg: Config, force_repo: str | None = None  # noqa: ARG001
+    store: Store,
+    cfg: Config,
+    force_repo: str | None = None,
 ) -> tuple[str, Row] | None:
     """Pure selection: what run_cycle would act on right now, if invoked --
     no side effects, no budget check (each run_* function evaluates its
@@ -1855,10 +1879,14 @@ def pick_next(
             raise ValueError(msg)
     else:
         # Try repos in staleness order (least-recently-hunted first)
-        candidates = sorted(
-            repos,
-            key=lambda r: (r["last_hunt_at"] is not None, r["last_hunt_at"] or 0),
-        ) if repos else []
+        candidates = (
+            sorted(
+                repos,
+                key=lambda r: (r["last_hunt_at"] is not None, r["last_hunt_at"] or 0),
+            )
+            if repos
+            else []
+        )
 
     scan_interval_ms = int(cfg.scan_interval_days * 86_400_000)
     mod_interval_ms = cfg.modernization_interval_days * 86_400_000
@@ -1987,4 +2015,3 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None, *, backe
         with contextlib.suppress(Exception):
             store.log_event("error", f"cycle crashed: {e!r}")
         return {"error": str(e)}
-

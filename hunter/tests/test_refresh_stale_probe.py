@@ -19,7 +19,6 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 if TYPE_CHECKING:
     import pytest
@@ -63,7 +62,7 @@ def _make_backend(cfg: Config, tmp_path: Path) -> OmpScavengeBackend:
 
 
 def _patched_run_cmd_and_windows(
-    monkeypatch: "pytest.MonkeyPatch",
+    monkeypatch: pytest.MonkeyPatch,
     windows: dict[str, WindowState] | None = None,
     rc: int = 0,
 ) -> list[list[str]]:
@@ -83,7 +82,8 @@ def _patched_run_cmd_and_windows(
 
 
 def test_no_windows_at_all_forces_a_probe(
-    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     cfg = _cfg()
     calls = _patched_run_cmd_and_windows(monkeypatch, windows={})
@@ -93,7 +93,8 @@ def test_no_windows_at_all_forces_a_probe(
 
 
 def test_fresh_window_does_not_force_a_probe(
-    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     cfg = _cfg(stale_after_s=1800)
     ws = _ws(age_s=60.0)
@@ -104,7 +105,8 @@ def test_fresh_window_does_not_force_a_probe(
 
 
 def test_stale_window_forces_a_probe(
-    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     cfg = _cfg(stale_after_s=1800)
     ws = _ws(age_s=2000.0)
@@ -115,7 +117,8 @@ def test_stale_window_forces_a_probe(
 
 
 def test_exactly_at_threshold_does_not_force(
-    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """age_s == stale_after_s is still "fresh enough" -- only strictly
     older forces a probe, matching WindowState.stale's own > comparison
@@ -129,7 +132,8 @@ def test_exactly_at_threshold_does_not_force(
 
 
 def test_respects_configured_stale_after_s(
-    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """cfg.stale_after_s was loaded from config.json but never actually
     consulted anywhere before this fix -- prove it now has a real
@@ -146,7 +150,8 @@ def test_respects_configured_stale_after_s(
 
 
 def test_invalidates_before_reading_so_the_read_cannot_serve_a_stale_cache(
-    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Ordering matters: invalidate must run BEFORE the read, or the
     read could serve omp's own internal cache instead of a fresh
@@ -162,7 +167,8 @@ def test_invalidates_before_reading_so_the_read_cannot_serve_a_stale_cache(
 
 
 def test_uses_configured_omp_bin(
-    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     cfg = _cfg(omp_bin="/custom/path/omp")
     calls = _patched_run_cmd_and_windows(monkeypatch, windows={})
@@ -175,7 +181,8 @@ def test_uses_configured_omp_bin(
 
 
 def test_failed_probe_returns_false(
-    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """run_cmd never raises (see util.run_cmd) -- a failed/timed-out
     probe just reports False, leaving windows exactly as stale as they
@@ -187,7 +194,8 @@ def test_failed_probe_returns_false(
 
 
 def test_failed_invalidate_does_not_block_the_read_attempt(
-    monkeypatch: "pytest.MonkeyPatch", tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The invalidate step is best-effort like everything else here --
     if it fails, still attempt the read (which may just serve a cache
@@ -201,7 +209,8 @@ def test_failed_invalidate_does_not_block_the_read_attempt(
 
     monkeypatch.setattr("hunter.util.run_cmd", fake_run_cmd)
     monkeypatch.setattr(
-        "hunter.backends.omp_scavenge.capacity.read_windows", lambda: {},
+        "hunter.backends.omp_scavenge.capacity.read_windows",
+        dict,
     )
     cfg = _cfg()
     backend = _make_backend(cfg, tmp_path)

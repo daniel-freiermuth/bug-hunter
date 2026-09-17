@@ -15,7 +15,7 @@ import html
 import logging
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from hunter.backend import (
     Denied,
@@ -24,10 +24,14 @@ from hunter.backend import (
     Outlook,
     SpendLedger,
 )
-from hunter.types import Config, RunResult
 
 from . import capacity
 from .harness import run_worker
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from hunter.types import Config, RunResult
 
 log = logging.getLogger("hunter.backend")
 
@@ -35,7 +39,7 @@ log = logging.getLogger("hunter.backend")
 # 200k tokens ≈ 10% of a 5h window's capacity.
 # The 7d window is ~33.6x larger (168h / 5h).
 _TOK_PER_FRAC_5H = 200_000 / 0.10  # 2M tokens = 100% of 5h
-_5H_7D_RATIO = capacity._5H_MS / capacity._WEEK_MS  # ≈ 0.0298
+_5H_7D_RATIO = capacity.FIVE_HOUR_MS / capacity.WEEK_MS  # ~0.0298
 
 
 def _esc(s: object) -> str:
@@ -48,8 +52,8 @@ def _esc(s: object) -> str:
 # but owned by the backend now (it's Anthropic window knowledge).
 # ---------------------------------------------------------------------------
 _CALIBRATION_DURATIONS_MS: dict[str, int] = {
-    "5h": capacity._5H_MS,
-    "7d": capacity._WEEK_MS,
+    "5h": capacity.FIVE_HOUR_MS,
+    "7d": capacity.WEEK_MS,
 }
 
 
@@ -97,7 +101,7 @@ class OmpScavengeBackend:
         reservation_7d = unaccounted_7d / cap_7d if cap_7d else 0.0
         return reservation_5h, reservation_7d
 
-    def _decide_inner(
+    def _decide_inner(  # noqa: PLR0911
         self,
         windows: dict[str, capacity.WindowState],
         reservation_5h: float,
@@ -122,7 +126,7 @@ class OmpScavengeBackend:
             if w.resets_at and w.resets_at <= now_ms:
                 continue  # expired cycle -- skip (see capacity.read_windows)
             elapsed_frac = capacity.ramp_7d(w.resets_at, now_ms)
-            effective_used = capacity._effective_used(w, reservation_7d)
+            effective_used = capacity.effective_used(w, reservation_7d)
             if effective_used >= elapsed_frac:
                 is_exhausted = w.status == "exhausted"
                 retry = (
@@ -149,7 +153,7 @@ class OmpScavengeBackend:
         if w5 is not None and (w5.status == "exhausted" or w5.used_fraction is not None):
             allowed = capacity.ramp_5h(w5.resets_at, now_ms)
             if allowed is not None:
-                effective_used = capacity._effective_used(w5, reservation_5h)
+                effective_used = capacity.effective_used(w5, reservation_5h)
                 if effective_used >= allowed:
                     is_exhausted = w5.status == "exhausted"
                     retry = (
@@ -196,7 +200,7 @@ class OmpScavengeBackend:
                 continue
             if ":7d" in lid:
                 ceiling = 1.0 if prio else capacity.ramp_7d(w.resets_at, now_ms)
-                eff = capacity._effective_used(w, res_7d)
+                eff = capacity.effective_used(w, res_7d)
                 frac = max(0.0, ceiling - eff)
                 tok = self._frac_to_tokens(frac, "7d")
                 caps.append(tok)
@@ -204,7 +208,7 @@ class OmpScavengeBackend:
                 allowed = capacity.ramp_5h(w.resets_at, now_ms)
                 if allowed is not None:
                     ceiling = 1.0 if prio else allowed
-                    eff = capacity._effective_used(w, res_5h)
+                    eff = capacity.effective_used(w, res_5h)
                     frac = max(0.0, ceiling - eff)
                     tok = self._frac_to_tokens(frac, "5h")
                     caps.append(tok)
@@ -216,7 +220,7 @@ class OmpScavengeBackend:
         cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
         if dim == "5h" or ":5h" in dim:
             return int(frac * cap_5h)
-        # 7d derived from 5h × period ratio
+        # 7d derived from 5h x period ratio
         return int(frac * cap_5h / _5H_7D_RATIO)
 
     def decide(self, *, anticipated_tokens: int) -> Outlook:
@@ -262,9 +266,7 @@ class OmpScavengeBackend:
             model=model,
         )
         post = self._usage_snapshot()
-        rr.usage_delta = (
-            (post - pre) if pre is not None and post is not None else None
-        )
+        rr.usage_delta = (post - pre) if pre is not None and post is not None else None
         return rr
 
     def _usage_snapshot(self) -> float | None:
@@ -291,7 +293,7 @@ class OmpScavengeBackend:
         if w5 is not None and w5.age_s <= self.cfg.stale_after_s:
             return False
 
-        from hunter.util import run_cmd
+        from hunter.util import run_cmd  # noqa: PLC0415
 
         run_cmd(
             [self.cfg.omp_bin, "usage", "invalidate", "--provider", "anthropic"],
@@ -318,11 +320,7 @@ class OmpScavengeBackend:
                 (h for h in _CALIBRATION_DURATIONS_MS if f":{h}" in w.limit_id),
                 None,
             )
-            if (
-                horizon
-                and w.resets_at
-                and w.used_fraction is not None
-            ):
+            if horizon and w.resets_at and w.used_fraction is not None:
                 prev = self.ledger.last_window_observation(w.limit_id, w.resets_at)
                 if (
                     prev is not None
@@ -340,12 +338,16 @@ class OmpScavengeBackend:
 
             # Always log the observation
             self.ledger.log_window_observation(
-                w.limit_id, w.used_fraction, w.status, w.resets_at, w.age_s,
+                w.limit_id,
+                w.used_fraction,
+                w.status,
+                w.resets_at,
+                w.age_s,
             )
 
     # -- status --------------------------------------------------------------
 
-    def status(self) -> str:
+    def status(self) -> str:  # noqa: PLR0912, PLR0915
         """Render the backend's status panel as an HTML fragment."""
         windows = capacity.read_windows()
         if not windows:
@@ -361,9 +363,7 @@ class OmpScavengeBackend:
 
         for lid, w in sorted(windows.items(), key=lambda kv: kv[0]):
             label = lid.replace("anthropic:", "") + " window"
-            used_pct = (
-                f"{w.used_fraction * 100:.0f}%" if w.used_fraction is not None else "?"
-            )
+            used_pct = f"{w.used_fraction * 100:.0f}%" if w.used_fraction is not None else "?"
 
             # Unaccounted fraction for this dimension
             if ":5h" in lid:
@@ -371,7 +371,8 @@ class OmpScavengeBackend:
                 ramp = capacity.ramp_5h(w.resets_at, now_ms)
                 # Window elapsed fraction (independent of ramp/headroom)
                 if w.resets_at and w.resets_at > now_ms:
-                    elapsed_frac = (capacity._5H_MS - (w.resets_at - now_ms)) / capacity._5H_MS
+                    remaining_ms = w.resets_at - now_ms
+                    elapsed_frac = (capacity.FIVE_HOUR_MS - remaining_ms) / capacity.FIVE_HOUR_MS
                 else:
                     elapsed_frac = None
             elif ":7d" in lid:
@@ -388,19 +389,27 @@ class OmpScavengeBackend:
             ramp_pct = min(100, round(ramp * 100)) if ramp is not None else None
 
             # Available headroom
-            avail_frac = max(0.0, (ramp if ramp is not None else 1.0) - (w.used_fraction or 0) - unacct)
+            avail_frac = max(
+                0.0, (ramp if ramp is not None else 1.0) - (w.used_fraction or 0) - unacct
+            )
             avail_pct = f"{avail_frac * 100:.0f}%"
             cap = self.ledger.estimate_capacity(lid)
             avail_tok = avail_frac * cap if cap is not None else None
             avail_str = (
-                f" \u00b7 {avail_pct} avail (~{self._fmt_tokens(avail_tok)} tok)"
-                if avail_tok is not None
-                else f" \u00b7 {avail_pct} avail"
-            ) if w.used_fraction is not None else ""
+                (
+                    f" \u00b7 {avail_pct} avail (~{self._fmt_tokens(avail_tok)} tok)"
+                    if avail_tok is not None
+                    else f" \u00b7 {avail_pct} avail"
+                )
+                if w.used_fraction is not None
+                else ""
+            )
 
             # Determine tone
             is_stale = w.age_s > self.cfg.stale_after_s
-            is_exhausted = w.status == "exhausted" or (w.used_fraction is not None and w.used_fraction >= 1.0)
+            is_exhausted = w.status == "exhausted" or (
+                w.used_fraction is not None and w.used_fraction >= 1.0
+            )
             tone = "stale" if is_stale else ("bad" if is_exhausted else "ok")
 
             # Probe age
@@ -409,7 +418,9 @@ class OmpScavengeBackend:
             # Reset countdown + absolute time
             if w.resets_at:
                 remain_s = (w.resets_at - now_ms) / 1000
-                reset_abs = time.strftime("%I:%M %p", time.localtime(w.resets_at / 1000)).lstrip("0")
+                reset_abs = time.strftime("%I:%M %p", time.localtime(w.resets_at / 1000)).lstrip(
+                    "0"
+                )
                 if remain_s > 0:
                     h, m = int(remain_s // 3600), int((remain_s % 3600) // 60)
                     countdown = f"{h}h{m:02d}m" if h else f"{m}m"
@@ -422,7 +433,7 @@ class OmpScavengeBackend:
             # Headroom indicator for 5h window
             headroom_str = ""
             if elapsed_frac is not None and ramp is not None and ramp == 0.0 and elapsed_frac > 0:
-                headroom_remain_ms = capacity.HEADROOM_MS - (elapsed_frac * capacity._5H_MS)
+                headroom_remain_ms = capacity.HEADROOM_MS - (elapsed_frac * capacity.FIVE_HOUR_MS)
                 if headroom_remain_ms > 0:
                     hm = int(headroom_remain_ms / 60_000)
                     headroom_str = f" \u00b7 headroom {hm}m"
@@ -440,13 +451,17 @@ class OmpScavengeBackend:
             parts.append(
                 f'<div class="scv-win">'
                 f'<div class="scv-lab"><b>{_esc(label)}</b>'
-                f"<span>{_esc(used_pct)} used{_esc(unacct_str)}{_esc(avail_str)}"
-                f'{" \u26a0\ufe0fstale" if is_stale else ""}</span></div>'
+                f"<span>{_esc(used_pct)} used{_esc(unacct_str)}"
+                f"{_esc(avail_str)}"
+                f"{' \u26a0\ufe0fstale' if is_stale else ''}"
+                f"</span></div>"
                 f'<div class="scv-bar">'
                 f'<i class="scv-fill scv-{tone}" style="width:{fill_pct}%"></i>'
                 f'<i class="scv-soft" style="width:{soft_pct}%"></i>'
                 f"{marker}</div>"
-                f'<div class="scv-sub">{_esc(reset_str)}{_esc(headroom_str)} \u00b7 probed {_esc(probe_age)}</div>'
+                f'<div class="scv-sub">'
+                f"{_esc(reset_str)}{_esc(headroom_str)}"
+                f" \u00b7 probed {_esc(probe_age)}</div>"
                 f"</div>"
             )
 

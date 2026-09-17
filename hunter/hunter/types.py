@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
@@ -237,7 +237,7 @@ class Config:
         module free of backend-package knowledge beyond the discriminator.
         """
         if self.backend_type == "omp-scavenge":
-            from .backends.omp_scavenge import OmpScavengeBackend
+            from .backends.omp_scavenge import OmpScavengeBackend  # noqa: PLC0415
 
             return OmpScavengeBackend(cfg=self, ledger=ledger)
         raise ValueError(f"unknown backend_type: {self.backend_type!r}")
@@ -255,5 +255,3 @@ class RunResult:
     duration_s: float
     stdout_tail: str = ""
     usage_delta: float | None = None  # provider-level used_fraction change during this job
-
-

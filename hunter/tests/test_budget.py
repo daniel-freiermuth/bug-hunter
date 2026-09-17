@@ -9,10 +9,16 @@ from pathlib import Path
 import pytest
 
 import hunter.backends.omp_scavenge.capacity as budget_module
-from hunter.backends.omp_scavenge.capacity import ramp_5h, ramp_7d, read_windows, retry_at_5h, retry_at_7d
-from hunter.backends.omp_scavenge.capacity import WindowState
+from hunter.backend import Denied, Granted
+from hunter.backends.omp_scavenge.capacity import (
+    WindowState,
+    ramp_5h,
+    ramp_7d,
+    read_windows,
+    retry_at_5h,
+    retry_at_7d,
+)
 from hunter.backends.omp_scavenge.facade import OmpScavengeBackend
-from hunter.backend import Granted, Denied
 from hunter.types import Config
 
 # ---------------------------------------------------------------------------
@@ -77,20 +83,35 @@ class _FakeLedger:
     def __init__(self, running=0, finished=0):
         self._running = running
         self._finished = finished
-    def running_estimate(self): return self._running
-    def finished_since(self, ts_ms): return self._finished
-    def finished_between(self, start, end): return 0
-    def log_window_observation(self, *a, **kw): pass
-    def last_window_observation(self, *a): return None
-    def record_calibration_sample(self, *a, **kw): pass
-    def estimate_capacity(self, *a, **kw): return None
+
+    def running_estimate(self):
+        return self._running
+
+    def finished_since(self, ts_ms):
+        return self._finished
+
+    def finished_between(self, start, end):
+        return 0
+
+    def log_window_observation(self, *a, **kw):
+        pass
+
+    def last_window_observation(self, *a):
+        return None
+
+    def record_calibration_sample(self, *a, **kw):
+        pass
+
+    def estimate_capacity(self, *a, **kw):
+        return None
 
 
 def _backend(windows=None, ledger=None, monkeypatch=None, **cfg_kw):
     """Create an OmpScavengeBackend with controlled state."""
-    import hunter.backends.omp_scavenge.capacity as cap
+    import hunter.backends.omp_scavenge.capacity as cap  # noqa: PLC0415
+
     if windows is not None and monkeypatch is not None:
-        monkeypatch.setattr(cap, 'read_windows', lambda: windows)
+        monkeypatch.setattr(cap, "read_windows", lambda: windows)
     return OmpScavengeBackend(cfg=_cfg(**cfg_kw), ledger=ledger or _FakeLedger())
 
 
@@ -114,7 +135,9 @@ def test_stale_5h_low_usage_allows_via_ramp_not_bypass(monkeypatch):
     stale_age = 3600.0  # 1h old, well above default stale_after_s=1800
     resets_at = _NOW_MS + int(1.0 * 3600 * 1000)  # 4h into a live 5h window
     windows = {
-        "anthropic:5h": _ws("anthropic:5h", used_fraction=0.10, resets_at=resets_at, age_s=stale_age),
+        "anthropic:5h": _ws(
+            "anthropic:5h", used_fraction=0.10, resets_at=resets_at, age_s=stale_age
+        ),
         "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10, age_s=stale_age),
     }
     outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
@@ -128,7 +151,9 @@ def test_stale_5h_high_usage_still_denies(monkeypatch):
     stale_age = 3600.0
     resets_at = _NOW_MS + int(1.0 * 3600 * 1000)  # 4h elapsed -> ramp ~0.778
     windows = {
-        "anthropic:5h": _ws("anthropic:5h", used_fraction=0.90, resets_at=resets_at, age_s=stale_age),
+        "anthropic:5h": _ws(
+            "anthropic:5h", used_fraction=0.90, resets_at=resets_at, age_s=stale_age
+        ),
         "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10, age_s=stale_age),
     }
     outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
@@ -147,7 +172,9 @@ def test_stale_5h_own_finished_jobs_count_toward_effective_used(monkeypatch):
     }
     # 1.6M unaccounted tokens -> 1.6M/200k * 10% = 0.80 additional effective usage.
     ledger = _FakeLedger(finished=1_600_000)
-    outlook = _backend(windows=windows, ledger=ledger, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
+    outlook = _backend(windows=windows, ledger=ledger, monkeypatch=monkeypatch).decide(
+        anticipated_tokens=0
+    )
     assert isinstance(outlook.normal, Denied)
     assert "5h" in outlook.normal.reason
 
@@ -158,7 +185,9 @@ def test_stale_5h_denied_by_7d_ramp(monkeypatch):
     resets_at = _NOW_MS + int(_WEEK_MS * 0.95)  # 5% elapsed
     windows = {
         "anthropic:5h": _ws("anthropic:5h", age_s=stale_age),
-        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.30, resets_at=resets_at, age_s=stale_age),
+        "anthropic:7d": _ws(
+            "anthropic:7d", used_fraction=0.30, resets_at=resets_at, age_s=stale_age
+        ),
     }
     outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
     assert isinstance(outlook.normal, Denied)
@@ -177,14 +206,18 @@ def test_5h_and_7d_unaccounted_reservations_are_independent(monkeypatch):
     windows = _healthy_windows(w5_used=0.0, w5_elapsed_h=4.5)
     windows["anthropic:7d"] = _ws("anthropic:7d", used_fraction=0.02, resets_at=resets_7d)
     ledger = _FakeLedger(finished=20_000_000)
-    outlook = _backend(windows=windows, ledger=ledger, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
+    outlook = _backend(windows=windows, ledger=ledger, monkeypatch=monkeypatch).decide(
+        anticipated_tokens=0
+    )
     assert isinstance(outlook.normal, Denied)
     assert "7d" in outlook.normal.reason
 
     # Big finished amount -> 5h denial (5h is mid-harvest, ramp ~0.556).
     windows2 = _healthy_windows(w5_used=0.0, w5_elapsed_h=3.0)
     ledger2 = _FakeLedger(finished=5_000_000)
-    outlook2 = _backend(windows=windows2, ledger=ledger2, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
+    outlook2 = _backend(windows=windows2, ledger=ledger2, monkeypatch=monkeypatch).decide(
+        anticipated_tokens=0
+    )
     assert isinstance(outlook2.normal, Denied)
     assert "5h" in outlook2.normal.reason
 
@@ -199,7 +232,9 @@ def test_7d_used_above_ramp_deny(monkeypatch):
     resets_at = _NOW_MS + int(_WEEK_MS * 0.90)  # 10% elapsed
     windows = _healthy_windows(w5_elapsed_h=4.5)
     windows["anthropic:7d"] = _ws(
-        "anthropic:7d", used_fraction=0.30, resets_at=resets_at,
+        "anthropic:7d",
+        used_fraction=0.30,
+        resets_at=resets_at,
     )
     outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
     assert isinstance(outlook.normal, Denied)
@@ -212,7 +247,9 @@ def test_7d_used_below_ramp_allow(monkeypatch):
     resets_at = _NOW_MS + int(_WEEK_MS * 0.50)  # 50% elapsed
     windows = _healthy_windows(w5_elapsed_h=4.5)
     windows["anthropic:7d"] = _ws(
-        "anthropic:7d", used_fraction=0.30, resets_at=resets_at,
+        "anthropic:7d",
+        used_fraction=0.30,
+        resets_at=resets_at,
     )
     outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
     assert isinstance(outlook.normal, Granted)
@@ -245,6 +282,7 @@ def test_5h_harvest_halfway_low_usage_allow(monkeypatch):
     outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
     assert isinstance(outlook.normal, Granted)
 
+
 def test_5h_harvest_halfway_high_usage_deny(monkeypatch):
     """2.75h elapsed → ramp = 0.5; usage 0.60 ≥ 0.5 → deny."""
     windows = _healthy_windows(w5_used=0.60, w5_elapsed_h=2.75)
@@ -253,6 +291,7 @@ def test_5h_harvest_halfway_high_usage_deny(monkeypatch):
     assert "5h" in outlook.normal.reason
     assert "ramp" in outlook.normal.reason
     assert outlook.normal.retry_at == pytest.approx(_NOW_MS + 0.45 * 3600 * 1000, abs=2000)
+
 
 def test_5h_harvest_end_high_usage_allow(monkeypatch):
     """4.95h elapsed → ramp ≈ 0.989; usage 0.90 < 0.989 → allow."""
@@ -266,7 +305,10 @@ def test_5h_exhausted_deny(monkeypatch):
     windows = _healthy_windows(w5_elapsed_h=4.5)
     resets_at = _NOW_MS + _WEEK_MS // 2
     windows["anthropic:5h"] = _ws(
-        "anthropic:5h", used_fraction=1.0, status="exhausted", resets_at=resets_at,
+        "anthropic:5h",
+        used_fraction=1.0,
+        status="exhausted",
+        resets_at=resets_at,
     )
     outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
     assert isinstance(outlook.normal, Denied)
@@ -281,8 +323,11 @@ def test_5h_exhausted_but_stale_still_denies(monkeypatch):
     resets_at = _NOW_MS + 4 * 60 * 1000  # reset is still 4 minutes away
     windows = {
         "anthropic:5h": _ws(
-            "anthropic:5h", used_fraction=1.0, status="exhausted",
-            resets_at=resets_at, age_s=stale_age,
+            "anthropic:5h",
+            used_fraction=1.0,
+            status="exhausted",
+            resets_at=resets_at,
+            age_s=stale_age,
         ),
         "anthropic:7d": _ws("anthropic:7d", used_fraction=0.10, age_s=stale_age),
     }
@@ -319,7 +364,8 @@ def test_no_5h_window_allow(monkeypatch):
     }
     outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
     assert isinstance(outlook.normal, Granted)
-    assert outlook.normal.cap_tokens is not None and outlook.normal.cap_tokens > 0
+    assert outlook.normal.cap_tokens is not None
+    assert outlook.normal.cap_tokens > 0
 
 
 def test_no_5h_window_but_7d_over_deny(monkeypatch):
@@ -361,11 +407,14 @@ def test_active_model_class_window_still_gates(monkeypatch):
     resets_at = _NOW_MS + int(_WEEK_MS * 0.95)  # 5% elapsed
     windows = _healthy_windows(w5_elapsed_h=4.5)
     windows["anthropic:7d:active-model"] = _ws(
-        "anthropic:7d:active-model", used_fraction=0.30, resets_at=resets_at,
+        "anthropic:7d:active-model",
+        used_fraction=0.30,
+        resets_at=resets_at,
     )
     outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
     assert isinstance(outlook.normal, Denied)
     assert "7d" in outlook.normal.reason
+
 
 # ---------------------------------------------------------------------------
 # Healthy → allow, correct cap
@@ -374,9 +423,12 @@ def test_active_model_class_window_still_gates(monkeypatch):
 
 def test_healthy_allow(monkeypatch):
     """Healthy windows → Granted with positive cap_tokens."""
-    outlook = _backend(windows=_healthy_windows(), monkeypatch=monkeypatch).decide(anticipated_tokens=0)
+    outlook = _backend(windows=_healthy_windows(), monkeypatch=monkeypatch).decide(
+        anticipated_tokens=0
+    )
     assert isinstance(outlook.normal, Granted)
-    assert outlook.normal.cap_tokens is not None and outlook.normal.cap_tokens > 0
+    assert outlook.normal.cap_tokens is not None
+    assert outlook.normal.cap_tokens > 0
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +455,8 @@ def _make_agent_db(path: Path, rows: list[tuple[str, float, str, int, int]]) -> 
     for limit_id, used_fraction, status, resets_at, recorded_at in rows:
         db.execute(
             "INSERT INTO usage_history"
-            " (recorded_at, provider, account_key, limit_id, label, used_fraction, status, resets_at)"
+            " (recorded_at, provider, account_key, limit_id, label,"
+            " used_fraction, status, resets_at)"
             " VALUES (?, 'anthropic', 'acct', ?, ?, ?, ?, ?)",
             (recorded_at, limit_id, limit_id, used_fraction, status, resets_at),
         )
@@ -545,7 +598,9 @@ def test_decide_denies_on_unaccounted_alone_through_a_fresh_rollover(monkeypatch
     }
     # ~2.9M tokens finished since the rollover.
     ledger = _FakeLedger(finished=2_900_000)
-    outlook = _backend(windows=windows, ledger=ledger, monkeypatch=monkeypatch).decide(anticipated_tokens=0)
+    outlook = _backend(windows=windows, ledger=ledger, monkeypatch=monkeypatch).decide(
+        anticipated_tokens=0
+    )
     assert isinstance(outlook.normal, Denied)
     assert "5h" in outlook.normal.reason
 
@@ -586,7 +641,7 @@ class TestRamp5h:
         assert ramp_5h(_NOW_MS - 1000, _NOW_MS) is None
 
     def test_within_headroom_is_zero(self):
-        resets_at = _NOW_MS + (_5H_MS - int(15 * 60 * 1000))  # 15min elapsed
+        resets_at = _NOW_MS + (_5H_MS - (15 * 60 * 1000))  # 15min elapsed
         assert ramp_5h(resets_at, _NOW_MS) == 0.0
 
     def test_halfway_through_harvest_ramp(self):
@@ -626,7 +681,7 @@ class TestRetryAt5h:
             assert ramp_5h(resets_at, t) == pytest.approx(u, abs=1e-9)
 
     def test_zero_used_lands_at_headroom_end(self):
-        resets_at = _NOW_MS + int(4 * 3600 * 1000)  # window started 1h ago
+        resets_at = _NOW_MS + (4 * 3600 * 1000)  # window started 1h ago
         window_start = resets_at - _5H_MS
         t = retry_at_5h(resets_at, 0.0)
         assert t == pytest.approx(window_start + 30 * 60 * 1000)

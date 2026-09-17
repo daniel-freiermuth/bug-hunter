@@ -9,7 +9,7 @@
 
 Both horizons reduce to one comparison: allowed = ramp(...) > effective_used.
 "exhausted" is folded into effective_used (clamped to exactly 1.0, see
-_effective_used) rather than special-cased -- since both ramps are
+effective_used) rather than special-cased -- since both ramps are
 themselves capped at 1.0 (reached only exactly at resets_at), an exhausted
 window denies for its whole remaining duration for free, with no
 ramp-catchup-before-reset risk.
@@ -37,8 +37,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from hunter.types import Config
-
 # ---------------------------------------------------------------------------
 # Locally-defined constants and types (decoupled from hunter.types)
 # ---------------------------------------------------------------------------
@@ -60,7 +58,6 @@ class WindowState:
         return self.age_s > 1800
 
 
-
 # =============================================================================
 # Configuration: To adjust when hunter can start using the 5h window,
 #                change HEADROOM_MS below (e.g., 15min, 1h, 2h).
@@ -68,9 +65,9 @@ class WindowState:
 # =============================================================================
 HEADROOM_MS = 30 * 60 * 1000  # Human headroom before harvest window opens
 
-_WEEK_MS = 7 * 24 * 3600 * 1000
-_5H_MS = 5 * 3600 * 1000
-_RAMP_MS = _5H_MS - HEADROOM_MS  # Harvest window duration (4.5h at 30min headroom)
+WEEK_MS = 7 * 24 * 3600 * 1000
+FIVE_HOUR_MS = 5 * 3600 * 1000
+_RAMP_MS = FIVE_HOUR_MS - HEADROOM_MS  # Harvest window duration (4.5h at 30min headroom)
 
 
 def read_windows() -> dict[str, WindowState]:
@@ -130,7 +127,7 @@ def read_windows() -> dict[str, WindowState]:
             # (config stopped routing there) and must stay dropped, both to
             # avoid decide() noise and to keep the Status page from showing
             # a synthesized "fresh" window for a dimension nothing uses.
-            period = {"anthropic:5h": _5H_MS, "anthropic:7d": _WEEK_MS}.get(r["limit_id"])
+            period = {"anthropic:5h": FIVE_HOUR_MS, "anthropic:7d": WEEK_MS}.get(r["limit_id"])
             if period is None:
                 continue  # per-model-class or unrecognized -- keep the old, safe drop
             new_resets_at = resets_at
@@ -161,8 +158,8 @@ def ramp_7d(resets_at: int | None, now_ms: float) -> float:
     with stale data)."""
     if not resets_at or resets_at <= now_ms:
         return 1.0
-    started_ms = resets_at - _WEEK_MS
-    return min((now_ms - started_ms) / _WEEK_MS, 1.0)
+    started_ms = resets_at - WEEK_MS
+    return min((now_ms - started_ms) / WEEK_MS, 1.0)
 
 
 def ramp_5h(resets_at: int | None, now_ms: float) -> float | None:
@@ -172,7 +169,7 @@ def ramp_5h(resets_at: int | None, now_ms: float) -> float | None:
     window as an opener -- always-allow)."""
     if not resets_at or resets_at <= now_ms:
         return None
-    elapsed_ms = _5H_MS - (resets_at - now_ms)
+    elapsed_ms = FIVE_HOUR_MS - (resets_at - now_ms)
     return max(0.0, (elapsed_ms - HEADROOM_MS) / _RAMP_MS)
 
 
@@ -184,8 +181,8 @@ def retry_at_7d(resets_at: int | None, effective_used: float) -> float | None:
     a value that looks precise but isn't."""
     if not resets_at:
         return None
-    started_ms = resets_at - _WEEK_MS
-    return started_ms + effective_used * _WEEK_MS
+    started_ms = resets_at - WEEK_MS
+    return started_ms + effective_used * WEEK_MS
 
 
 def retry_at_5h(resets_at: int | None, effective_used: float) -> float | None:
@@ -193,11 +190,11 @@ def retry_at_5h(resets_at: int | None, effective_used: float) -> float | None:
     (assuming no further spend). None if resets_at is unknown."""
     if not resets_at:
         return None
-    window_start_ms = resets_at - _5H_MS
+    window_start_ms = resets_at - FIVE_HOUR_MS
     return window_start_ms + HEADROOM_MS + effective_used * _RAMP_MS
 
 
-def _effective_used(w: WindowState, inflight_reservation: float) -> float:
+def effective_used(w: WindowState, inflight_reservation: float) -> float:
     """used_fraction, adjusted for spend the probe can't see yet.
 
     "exhausted" is clamped to exactly 1.0 rather than trusting the raw
@@ -210,4 +207,3 @@ def _effective_used(w: WindowState, inflight_reservation: float) -> float:
     """
     used = 1.0 if w.status == "exhausted" else w.used_fraction
     return used + inflight_reservation
-

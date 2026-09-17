@@ -16,10 +16,10 @@ from typing import Any
 import pytest
 
 from hunter import scheduler
+from hunter.backend import Granted, Outlook
 from hunter.scheduler import run_recheck
 from hunter.store import Store
 from hunter.types import Config, RunResult
-from hunter.backend import Granted, Outlook
 
 
 class _FakeBackend:
@@ -31,7 +31,9 @@ class _FakeBackend:
     def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
         return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
 
-    def run(self, cwd: object, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+    def run(
+        self, cwd: object, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object
+    ) -> RunResult:
         return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
 
     def keep_fresh(self) -> bool:
@@ -106,12 +108,13 @@ class TestRunRecheckStaysRecheckingOnFailure:
         """When git clone fails the finding must stay 'rechecking'."""
         # Path that doesn't exist yet -> triggers the clone branch.
         clone_dest = str(tmp_path / "repos" / "will-fail")
-        repo_id = store.add_repo(
-            "bad-clone", str(tmp_path / "nonexistent-source"), clone_dest
+        repo_id = store.add_repo("bad-clone", str(tmp_path / "nonexistent-source"), clone_dest)
+        fid, _ = store.upsert_finding(
+            repo_id,
+            _make_finding(
+                fingerprint="repo:f.py:fn:clone-fail",
+            ),
         )
-        fid, _ = store.upsert_finding(repo_id, _make_finding(
-            fingerprint="repo:f.py:fn:clone-fail",
-        ))
         store.set_status(fid, "rechecking")
 
         finding = store.get_finding(fid)
@@ -132,12 +135,13 @@ class TestRunRecheckStaysRecheckingOnFailure:
         # Path exists but is not a git repo -> git commands fail.
         not_a_repo = tmp_path / "repos" / "not-git"
         not_a_repo.mkdir(parents=True)
-        repo_id = store.add_repo(
-            "bad-sync", "https://example.com/r.git", str(not_a_repo)
+        repo_id = store.add_repo("bad-sync", "https://example.com/r.git", str(not_a_repo))
+        fid, _ = store.upsert_finding(
+            repo_id,
+            _make_finding(
+                fingerprint="repo:f.py:fn:sync-fail",
+            ),
         )
-        fid, _ = store.upsert_finding(repo_id, _make_finding(
-            fingerprint="repo:f.py:fn:sync-fail",
-        ))
         store.set_status(fid, "rechecking")
 
         finding = store.get_finding(fid)
@@ -233,9 +237,7 @@ class TestRecheckGiveUp:
         run("git", "fetch", "origin")
         run("git", "branch", "--set-upstream-to=origin/main", "main")
 
-        repo_id = store.add_repo(
-            "real-repo", str(repo_path), str(repo_path), default_branch="main"
-        )
+        repo_id = store.add_repo("real-repo", str(repo_path), str(repo_path), default_branch="main")
         fid, _ = store.upsert_finding(repo_id, _make_finding(fingerprint="repo:f.py:fn:give-up"))
         store.set_status(fid, "rechecking")
 

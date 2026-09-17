@@ -178,9 +178,7 @@ class TestAttentionSinceTracking:
             needs_attention="checks_failing",
             addressed_fingerprint="checks:CI",
         )
-        monkeypatch.setattr(
-            scheduler, "forge_for", lambda repo: _FakeForge(_pr(conflicting=True))
-        )
+        monkeypatch.setattr(scheduler, "forge_for", lambda repo: _FakeForge(_pr(conflicting=True)))
 
         sync_prs(store, cfg)
 

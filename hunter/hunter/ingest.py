@@ -56,8 +56,10 @@ def ingest_findings(
         return result
 
     for i, f in enumerate(entries):
-        entry_type = finding_type if finding_type is not None else (
-            f.get("type") if isinstance(f, dict) else None
+        entry_type = (
+            finding_type
+            if finding_type is not None
+            else (f.get("type") if isinstance(f, dict) else None)
         )
         if entry_type not in _KNOWN_FINDING_TYPES:
             result["invalid"] += 1
@@ -110,8 +112,7 @@ def _validate(f: Any, finding_type: str) -> str | None:
                     )
             elif not isinstance(value, str) or not value:
                 return (
-                    f"required field {field!r} for type {finding_type!r}"
-                    " must be a non-empty string"
+                    f"required field {field!r} for type {finding_type!r} must be a non-empty string"
                 )
     try:
         float(f.get("confidence", 0.0))

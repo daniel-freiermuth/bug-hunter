@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import json
 import logging
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .util import run_cmd
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 log = logging.getLogger(__name__)
 
@@ -85,19 +87,23 @@ def _parse_renovate_output(output: str, repo_name: str) -> list[dict[str, Any]]:
                         severity = _severity(update_type, u)
                         confidence = _confidence(update_type)
 
-                        candidates.append({
-                            "fingerprint": fp,
-                            "file": pf.get("packageFile") or "",
-                            "ecosystem": datasource,
-                            "package": dep_name,
-                        "current_version": str(current).lstrip("^~>=<"),
-                            "latest_version": new_version,
-                            "update_type": _normalize_update_type(update_type),
-                            "severity": severity,
-                            "confidence": confidence,
-                            "summary": _summary(dep_name, current, new_version, update_type),
-                            "detail": _detail(dep_name, current, new_version, update_type, manager),
-                        })
+                        candidates.append(
+                            {
+                                "fingerprint": fp,
+                                "file": pf.get("packageFile") or "",
+                                "ecosystem": datasource,
+                                "package": dep_name,
+                                "current_version": str(current).lstrip("^~>=<"),
+                                "latest_version": new_version,
+                                "update_type": _normalize_update_type(update_type),
+                                "severity": severity,
+                                "confidence": confidence,
+                                "summary": _summary(dep_name, current, new_version, update_type),
+                                "detail": _detail(
+                                    dep_name, current, new_version, update_type, manager
+                                ),
+                            }
+                        )
 
     return candidates
 
@@ -147,5 +153,7 @@ def _detail(name: str, current: str, new: str, update_type: str, manager: str) -
         f"Type: {update_type}",
     ]
     if update_type == "major":
-        lines.append("Note: major update — may contain breaking changes. Review changelog before applying.")
+        lines.append(
+            "Note: major update — may contain breaking changes. Review changelog before applying."
+        )
     return "\n".join(lines)

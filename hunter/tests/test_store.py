@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
-from hunter.store import Store, _require_keys
 from hunter.backends.omp_scavenge.capacity import WindowState
+from hunter.store import Store, _require_keys
 from hunter.types import Config, SchedulerStateDict, now_ms
 
 
@@ -353,16 +353,25 @@ class TestEvents:
 class TestWindowLog:
     def test_log_window_observation(self, store: Store) -> None:
         store.log_window_observation(
-            "anthropic:5h", 0.3, "ok", 9999999, 5.0,
+            "anthropic:5h",
+            0.3,
+            "ok",
+            9999999,
+            5.0,
         )
         store.log_window_observation(
-            "anthropic:7d", 0.1, "ok", 9999999, 10.0,
+            "anthropic:7d",
+            0.1,
+            "ok",
+            9999999,
+            10.0,
         )
         rows = store.db.execute("SELECT * FROM window_log ORDER BY id").fetchall()
         assert len(rows) == 2
         assert dict(rows[0])["limit_id"] == "anthropic:5h"
         assert dict(rows[1])["limit_id"] == "anthropic:7d"
         assert dict(rows[0])["source_age_s"] == 5
+
 
 # -- calibration -------------------------------------------------------
 
@@ -384,7 +393,8 @@ class TestCalibration:
 
     def _observe(self, store: Store, probe: WindowState) -> None:
         """Simulate backend._observe for a single probe."""
-        from hunter.backends.omp_scavenge.facade import OmpScavengeBackend
+        from hunter.backends.omp_scavenge.facade import OmpScavengeBackend  # noqa: PLC0415
+
         cfg = Config(work_root=Path("/tmp"), db_path=Path("/tmp/test.db"))
         backend = OmpScavengeBackend(cfg=cfg, ledger=store)
         backend._observe({"anthropic:5h": probe})
@@ -441,8 +451,12 @@ class TestCalibration:
         store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
         time.sleep(0.02)
         fresh = WindowState(
-            limit_id="anthropic:5h", used_fraction=0.05, status="ok",
-            resets_at=self._RESETS_AT + 6 * 3600 * 1000, recorded_at=1, age_s=1.0,
+            limit_id="anthropic:5h",
+            used_fraction=0.05,
+            status="ok",
+            resets_at=self._RESETS_AT + 6 * 3600 * 1000,
+            recorded_at=1,
+            age_s=1.0,
         )
         self._observe(store, fresh)
         assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
@@ -454,13 +468,14 @@ class TestCalibration:
         """Capacity = max tokens hunter spent in any single window cycle."""
         now = now_ms()
         rid = store.add_repo("r", "https://r", "/r")
-        _5H = 5 * 3600 * 1000
+        five_h = 5 * 3600 * 1000
         # Two completed 5h cycles with different spend levels
-        resets1 = now - _5H  # one cycle ago
-        resets2 = now - 2 * _5H  # two cycles ago
+        resets1 = now - five_h  # one cycle ago
+        resets2 = now - 2 * five_h  # two cycles ago
         for ra in (resets1, resets2):
             store.db.execute(
-                "INSERT INTO window_log (observed_at, limit_id, used_fraction, status, resets_at, source_age_s)"
+                "INSERT INTO window_log (observed_at, limit_id,"
+                " used_fraction, status, resets_at, source_age_s)"
                 " VALUES (?, 'anthropic:5h', 0.5, 'ok', ?, 60)",
                 (ra - 1000, ra),
             )
@@ -481,7 +496,8 @@ class TestCalibration:
         rid = store.add_repo("r", "https://r", "/r")
         resets = now - 7 * 24 * 3600 * 1000
         store.db.execute(
-            "INSERT INTO window_log (observed_at, limit_id, used_fraction, status, resets_at, source_age_s)"
+            "INSERT INTO window_log (observed_at, limit_id,"
+            " used_fraction, status, resets_at, source_age_s)"
             " VALUES (?, 'anthropic:7d', 0.5, 'ok', ?, 60)",
             (resets - 1000, resets),
         )
@@ -491,6 +507,7 @@ class TestCalibration:
 
         assert store.estimate_capacity("anthropic:5h") is None  # no 5h cycles
         assert store.estimate_capacity("anthropic:7d") == 1_000_000
+
 
 # -- update_finding_analysis -----------------------------------------------
 
@@ -706,7 +723,6 @@ class TestReconcileOrphanedJobs:
         jid = store.create_job("fix", rid, finding_id=fid, cap_tokens=150_000)
         store.update_job(jid, state="done")  # _record_job already ran fine
 
-
         result = store.reconcile_orphaned_jobs()
 
         assert [f["id"] for f in result["findings"]] == [fid]
@@ -716,9 +732,7 @@ class TestReconcileOrphanedJobs:
         assert finding is not None
         assert finding["status"] == "queued"
 
-    def test_fixing_finding_recovered_regardless_of_orphaned_jobs_kind(
-        self, store: Store
-    ) -> None:
+    def test_fixing_finding_recovered_regardless_of_orphaned_jobs_kind(self, store: Store) -> None:
         """reconcile_orphaned_jobs recovers findings.status == 'fixing' by
         querying findings directly -- it never joins through jobs.kind or
         jobs.finding_id. A concurrently orphaned 'hunt' job (which never
@@ -776,9 +790,7 @@ class TestCurrentJob:
         store.create_job("hunt", rid)  # queued, not running
         assert store.current_job() is None
 
-    def test_create_job_with_state_running_is_visible_immediately(
-        self, store: Store
-    ) -> None:
+    def test_create_job_with_state_running_is_visible_immediately(self, store: Store) -> None:
         """Regression: run_* functions used to create a job at the
         'queued' default, do real prep work (prompt building, git
         operations), and only THEN call update_job(state="running").
@@ -794,9 +806,7 @@ class TestCurrentJob:
         assert job["id"] == jid
         assert job["state"] == "running"
 
-    def test_returns_the_running_job_with_repo_and_finding_context(
-        self, store: Store
-    ) -> None:
+    def test_returns_the_running_job_with_repo_and_finding_context(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
         fid, _ = store.upsert_finding(rid, _make_finding(fingerprint="fp-1"))
         jid = store.create_job("fix", rid, finding_id=fid, cap_tokens=150_000)
@@ -878,8 +888,12 @@ class TestRequireKeys:
         deliberately carries DB columns the frontend never reads. Only
         missing REQUIRED keys are an error."""
         row = {
-            "id": 1, "state": "idle", "detail": "d", "next_wake_at": None,
-            "updated_at": 0, "some_future_column": "unexpected but harmless",
+            "id": 1,
+            "state": "idle",
+            "detail": "d",
+            "next_wake_at": None,
+            "updated_at": 0,
+            "some_future_column": "unexpected but harmless",
         }
         result = _require_keys(
             row, "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict

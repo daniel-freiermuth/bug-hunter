@@ -37,9 +37,7 @@ class TestRecordJobNotes:
         assert state == "failed"
         jobs = store.list_jobs()
         job = jobs[0]
-        assert job["notes"] == long_tail[-500:], (
-            "notes must be the last 500 chars of stdout_tail"
-        )
+        assert job["notes"] == long_tail[-500:], "notes must be the last 500 chars of stdout_tail"
         assert "MARKER" in job["notes"]
         assert len(job["notes"]) == 500
 

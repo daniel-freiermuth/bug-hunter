@@ -303,5 +303,3 @@ class TestRunResult:
         assert rr.exit_code is None
         assert rr.killed_reason == "cap"
         assert rr.stdout_tail == "last output"
-
-

@@ -15,11 +15,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-import pytest
-
+from hunter.backend import Denied, Outlook
 from hunter.server import _wake, make_server
 from hunter.store import Store
-from hunter.backend import Denied, Outlook
 from hunter.types import Config
 
 
@@ -27,10 +25,13 @@ class _FakeBackend:
     def decide(self, *, anticipated_tokens: int = 0):
         d = Denied("test")
         return Outlook(normal=d, prioritized=d)
+
     def run(self, cwd, prompt, *, cap_tokens, max_wall_s, job_class):
         pass
+
     def keep_fresh(self):
         return False
+
     def status(self):
         return ""
 
@@ -75,9 +76,7 @@ class TestOverrideWakesLoop:
     def _post(self, port: int, path: str, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         try:
-            conn.request(
-                "POST", path, json.dumps(body), {"Content-Type": "application/json"}
-            )
+            conn.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
             resp = conn.getresponse()
             raw = resp.read()
             return resp.status, json.loads(raw) if raw else {}

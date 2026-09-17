@@ -57,7 +57,7 @@ if TYPE_CHECKING:
 _lockfile_fd: int | None = None
 
 
-def _acquire_lockfile(cfg: "Config") -> None:
+def _acquire_lockfile(cfg: Config) -> None:
     """Acquire an exclusive flock on <work_root>/hunter.lock.
 
     Fails fast with a clear error if another process already holds it.
@@ -135,7 +135,7 @@ def _reconcile_and_log(store: Store) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
-    cfg: Config      # set by make_server()
+    cfg: Config  # set by make_server()
     backend: Backend  # set by make_server()
     server_version = "hunter/1"
     protocol_version = "HTTP/1.1"
@@ -188,7 +188,7 @@ class Handler(BaseHTTPRequestHandler):
         ".map": "application/json",
     }
 
-    def do_GET(self) -> None:
+    def do_GET(self) -> None:  # noqa: PLR0912
         url = urlparse(self.path)
         qs = parse_qs(url.query)
         try:
@@ -292,7 +292,9 @@ class Handler(BaseHTTPRequestHandler):
                 next_candidate = {
                     "kind": kind,
                     "id": target["id"],
-                    "label": target.get("summary") or target.get("name") or target.get("fingerprint"),
+                    "label": target.get("summary")
+                    or target.get("name")
+                    or target.get("fingerprint"),
                     "is_finding": is_finding,
                     "is_prioritized": bool(override),
                     "budget_state": budget_state,
@@ -352,7 +354,7 @@ class Handler(BaseHTTPRequestHandler):
                 msg = f"unknown repo {repo_key!r}"
                 raise ValueError(msg)
             repo_id = repo["id"]
-        
+
         if unified:
             findings: list[Row] = store.list_all_findings(
                 status=status,
@@ -408,9 +410,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         # Require application/json content-type to block simple cross-origin requests
-        ctype = self.headers.get('Content-Type', '')
-        if not ctype.startswith('application/json'):
-            self._error(415, 'Content-Type must be application/json')
+        ctype = self.headers.get("Content-Type", "")
+        if not ctype.startswith("application/json"):
+            self._error(415, "Content-Type must be application/json")
             return
         url = urlparse(self.path)
         try:
@@ -595,7 +597,11 @@ class Handler(BaseHTTPRequestHandler):
             fields["enabled"] = 1 if body["enabled"] else 0
         if "url" in body and isinstance(body["url"], str) and body["url"].strip():
             fields["url"] = body["url"].strip()
-        if "default_branch" in body and isinstance(body["default_branch"], str) and body["default_branch"].strip():
+        if (
+            "default_branch" in body
+            and isinstance(body["default_branch"], str)
+            and body["default_branch"].strip()
+        ):
             fields["default_branch"] = body["default_branch"].strip()
         if "forge" in body and body["forge"] in ("github", "gitlab"):
             fields["forge"] = body["forge"]
@@ -611,10 +617,10 @@ class Handler(BaseHTTPRequestHandler):
         from .forge import FORGE_NAMES, detect_forge
 
         body = self._body_json()
-        name = body.get('name', '').strip()
+        name = body.get("name", "").strip()
         url = (body.get("url") or "").strip() if isinstance(body.get("url"), str) else ""
-        if not name or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.\-]*', name):
-            self._error(400, 'invalid repo name')
+        if not name or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*", name):
+            self._error(400, "invalid repo name")
             return
         if not url:
             self._error(400, "name and url are required")
@@ -631,9 +637,9 @@ class Handler(BaseHTTPRequestHandler):
         if store.get_repo(name) is not None:
             self._error(409, f"repo {name!r} already exists")
             return
-        repo_path = (self.cfg.work_root / 'repos' / name).resolve()
+        repo_path = (self.cfg.work_root / "repos" / name).resolve()
         if not str(repo_path).startswith(str(self.cfg.work_root.resolve())):
-            self._error(400, 'invalid repo name')
+            self._error(400, "invalid repo name")
             return
         rid = store.add_repo(name, url, str(repo_path), branch, forge=forge)
         store.log_event("repo", f"added {name} ({forge}) -> {repo_path}")
@@ -675,7 +681,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         category = category.strip() or None if category else None
         store.append_repo_note(rid, note.strip(), category=category)
-        store.log_event("repo", f"note added to {repo['name']}" + (f" [{category}]" if category else ""))
+        store.log_event(
+            "repo", f"note added to {repo['name']}" + (f" [{category}]" if category else "")
+        )
         self._json({"ok": True, "notes": store.repo_notes(rid)}, 201)
 
 
@@ -766,6 +774,7 @@ class NextCandidateDict(TypedDict):
     the "what's next" preview built fresh in _summary(), never a raw DB
     row (no SQL boundary here, so no runtime check needed: mypy alone
     is sufficient since the construction code below is fully typed)."""
+
     kind: str
     id: int
     label: str | None
@@ -959,9 +968,9 @@ def _compute_sleep_s(store: Store, summary: Row) -> float:
             "SELECT COUNT(*) FROM findings WHERE status = 'queued'"
         ).fetchone()[0]
         job_produced_findings = summary.get("ingest", {}).get("inserted", 0) > 0
-        enabled_repos = store.db.execute(
-            "SELECT COUNT(*) FROM repos WHERE enabled = 1"
-        ).fetchone()[0]
+        enabled_repos = store.db.execute("SELECT COUNT(*) FROM repos WHERE enabled = 1").fetchone()[
+            0
+        ]
         if queued_fixes > 0:
             sleep_s = 0
         elif job_produced_findings:

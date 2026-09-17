@@ -12,17 +12,19 @@ Decisions cross this boundary as *data* (Outlook); diagnostics cross as
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from .types import RunResult
+if TYPE_CHECKING:
+    from pathlib import Path
 
+    from .types import RunResult
 
 # ---------------------------------------------------------------------------
 # Budget-decision types
 # ---------------------------------------------------------------------------
+
 
 class JobClass(StrEnum):
     """The two budget/model classes the scheduler collapses all job kinds
@@ -30,6 +32,7 @@ class JobClass(StrEnum):
     recheck, test_gap, ...) are core vocabulary; only the two *classes*
     cross into the backend -- one for exploratory/analysis work, one for
     patch/fix work."""
+
     HUNT = "hunt"
     FIX = "fix"
 
@@ -46,6 +49,7 @@ class Granted:
 
     reason: prose, flows into job notes and the UI.  Never machine-matched.
     """
+
     cap_tokens: int | None = None
     reason: str = "ok"
 
@@ -58,6 +62,7 @@ class Denied:
     retry_at: epoch ms -- best-known time this denial would resolve.
     Drives _compute_sleep_s in the daemon loop.  None = no informed estimate.
     """
+
     reason: str
     retry_at: float | None = None
 
@@ -76,6 +81,7 @@ class Outlook:
         verdict = outlook.prioritized if override else outlook.normal
     and never tells the backend which it wanted.
     """
+
     normal: Verdict
     prioritized: Verdict
 
@@ -83,6 +89,7 @@ class Outlook:
 # ---------------------------------------------------------------------------
 # Spend ledger -- narrow port from store into the backend
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class SpendLedger(Protocol):
@@ -118,9 +125,7 @@ class SpendLedger(Protocol):
         """Record a single window observation to window_log."""
         ...
 
-    def last_window_observation(
-        self, limit_id: str, resets_at: int
-    ) -> tuple[int, float] | None:
+    def last_window_observation(self, limit_id: str, resets_at: int) -> tuple[int, float] | None:
         """Most recent (observed_at, used_fraction) for this limit_id
         and resets_at cycle.  None if no prior observation."""
         ...
@@ -146,6 +151,7 @@ class SpendLedger(Protocol):
 # ---------------------------------------------------------------------------
 # Backend protocol
 # ---------------------------------------------------------------------------
+
 
 @runtime_checkable
 class Backend(Protocol):

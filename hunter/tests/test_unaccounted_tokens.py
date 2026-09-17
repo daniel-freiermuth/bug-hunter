@@ -19,9 +19,9 @@ import pytest
 
 from hunter.backends.omp_scavenge.capacity import WindowState
 from hunter.backends.omp_scavenge.facade import (
-    OmpScavengeBackend,
     _5H_7D_RATIO,
     _TOK_PER_FRAC_5H,
+    OmpScavengeBackend,
 )
 from hunter.store import Store
 from hunter.types import Config, now_ms
@@ -81,7 +81,8 @@ def test_no_jobs_returns_zero(store: Store, backend: OmpScavengeBackend) -> None
 
 
 def test_running_job_counted_via_cap_tokens_in_both_fields(
-    store: Store, backend: OmpScavengeBackend,
+    store: Store,
+    backend: OmpScavengeBackend,
 ) -> None:
     """A still-running job's estimated cost is unaccounted-for from
     EITHER window's perspective equally -- it hasn't finished, so no
@@ -98,7 +99,8 @@ def test_running_job_counted_via_cap_tokens_in_both_fields(
 
 
 def test_anticipated_added_to_both_fields(
-    store: Store, backend: OmpScavengeBackend,
+    store: Store,
+    backend: OmpScavengeBackend,
 ) -> None:
     """The about-to-run job's own anticipated cost applies identically
     to both windows -- it doesn't depend on any probe baseline."""
@@ -112,7 +114,8 @@ def test_anticipated_added_to_both_fields(
 
 
 def test_finished_job_scoped_to_each_windows_own_probe(
-    store: Store, backend: OmpScavengeBackend,
+    store: Store,
+    backend: OmpScavengeBackend,
 ) -> None:
     """A job that finished after BOTH windows' probes counts toward
     both; a job finished before either window's own probe does not
@@ -131,7 +134,8 @@ def test_finished_job_scoped_to_each_windows_own_probe(
 
 
 def test_stale_7d_probe_no_longer_drags_the_5h_baseline_back(
-    store: Store, backend: OmpScavengeBackend,
+    store: Store,
+    backend: OmpScavengeBackend,
 ) -> None:
     """Reproduces a real production regression, caught live the same day
     the 5h-rollover fix shipped: immediately before and immediately after
@@ -176,7 +180,8 @@ def test_stale_7d_probe_no_longer_drags_the_5h_baseline_back(
 
 
 def test_falls_back_to_min_when_window_missing(
-    store: Store, backend: OmpScavengeBackend,
+    store: Store,
+    backend: OmpScavengeBackend,
 ) -> None:
     """No anthropic:5h (or anthropic:7d) entry at all -> that field falls
     back to min() across whatever IS present, rather than crashing or

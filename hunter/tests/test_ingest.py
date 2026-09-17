@@ -599,7 +599,5 @@ def test_bug_type_does_not_require_type_specific_fields(env: tuple[Store, int, P
     is untouched by the new per-type required-fields check."""
     store, repo_id, fdir = env
     entries = [_make_finding()]
-    result = ingest_findings(
-        store, repo_id, _write_findings(fdir, entries), finding_type="bug"
-    )
+    result = ingest_findings(store, repo_id, _write_findings(fdir, entries), finding_type="bug")
     assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}

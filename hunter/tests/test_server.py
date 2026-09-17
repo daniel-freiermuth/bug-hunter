@@ -31,7 +31,6 @@ from pydantic import ValidationError
 
 from hunter import server
 from hunter.server import (
-    PR_SYNC_INTERVAL_S,
     USAGE_PROBE_TICK_S,
     _activity_status,
     _compute_sleep_s,
@@ -60,7 +59,7 @@ class TestDescribeCycle:
         assert "not queued" in detail
 
     def test_denied(self) -> None:
-        """"last:" makes clear this describes the last completed cycle,
+        """ "last:" makes clear this describes the last completed cycle,
         not the current instant -- it can sit unchanged for the whole
         sleep interval while a fresh preview elsewhere already differs."""
         state, detail = _describe_cycle({"denied": "5h window exhausted", "job": 3})
@@ -102,13 +101,9 @@ def cfg(tmp_path: Path) -> Config:
     return Config(work_root=tmp_path, db_path=tmp_path / "test.db")
 
 
-
-
 @pytest.fixture
 def store(cfg: Config) -> Store:
     return Store(cfg)
-
-
 
 
 class TestComputeSleepS:
@@ -120,9 +115,17 @@ class TestComputeSleepS:
         fid, _ = store.upsert_finding(
             rid,
             {
-                "fingerprint": "fp", "file": "f.py", "symbol": "fn", "line": 1,
-                "bug_class": "logic", "severity": "high", "confidence": 0.9,
-                "summary": "s", "detail": "d", "evidence_plan": "p", "introduced_by": "x",
+                "fingerprint": "fp",
+                "file": "f.py",
+                "symbol": "fn",
+                "line": 1,
+                "bug_class": "logic",
+                "severity": "high",
+                "confidence": 0.9,
+                "summary": "s",
+                "detail": "d",
+                "evidence_plan": "p",
+                "introduced_by": "x",
             },
         )
         store.set_status(fid, "queued")
@@ -163,9 +166,17 @@ class TestComputeSleepS:
         fid, _ = store.upsert_finding(
             rid,
             {
-                "fingerprint": "fp2", "file": "f.py", "symbol": "fn", "line": 1,
-                "bug_class": "logic", "severity": "high", "confidence": 0.9,
-                "summary": "s", "detail": "d", "evidence_plan": "p", "introduced_by": "x",
+                "fingerprint": "fp2",
+                "file": "f.py",
+                "symbol": "fn",
+                "line": 1,
+                "bug_class": "logic",
+                "severity": "high",
+                "confidence": 0.9,
+                "summary": "s",
+                "detail": "d",
+                "evidence_plan": "p",
+                "introduced_by": "x",
             },
         )
         store.set_status(fid, "queued")
@@ -180,22 +191,37 @@ class TestComputeSleepS:
 
 _JOB = {"id": 1, "kind": "hunt", "repo_name": "r", "finding_id": None}
 _ALLOWED = {
-    "kind": "hunt", "id": 12, "label": "r", "is_finding": False,
-    "budget_state": "allowed", "budget_reason": "ok", "budget_retry_at": None,
+    "kind": "hunt",
+    "id": 12,
+    "label": "r",
+    "is_finding": False,
+    "budget_state": "allowed",
+    "budget_reason": "ok",
+    "budget_retry_at": None,
 }
 _EXEMPT = {**_ALLOWED, "budget_state": "exempt", "budget_reason": "override: x"}
 _DENIED = {
-    "kind": "hunt", "id": 12, "label": "r", "is_finding": False,
-    "budget_state": "denied", "budget_reason": "5h: used 0.5 >= ramp 0.4",
+    "kind": "hunt",
+    "id": 12,
+    "label": "r",
+    "is_finding": False,
+    "budget_state": "denied",
+    "budget_reason": "5h: used 0.5 >= ramp 0.4",
     "budget_retry_at": 999,
 }
 _ERROR_STATE = {
-    "id": 1, "state": "error", "detail": "daemon loop crashed: boom",
-    "next_wake_at": None, "updated_at": 0,
+    "id": 1,
+    "state": "error",
+    "detail": "daemon loop crashed: boom",
+    "next_wake_at": None,
+    "updated_at": 0,
 }
 _IDLE_STATE = {
-    "id": 1, "state": "idle", "detail": "last: nothing to do",
-    "next_wake_at": None, "updated_at": 0,
+    "id": 1,
+    "state": "idle",
+    "detail": "last: nothing to do",
+    "next_wake_at": None,
+    "updated_at": 0,
 }
 
 
@@ -268,9 +294,16 @@ def _valid_summary() -> dict:
         "type_counts": {"bug": 1},
         "repos": [
             {
-                "id": 1, "name": "r", "url": "https://r", "path": "/r", "forge": "github",
-                "default_branch": "main", "last_hunt_sha": None, "last_hunt_at": None,
-                "enabled": 1, "added_at": 0,
+                "id": 1,
+                "name": "r",
+                "url": "https://r",
+                "path": "/r",
+                "forge": "github",
+                "default_branch": "main",
+                "last_hunt_sha": None,
+                "last_hunt_at": None,
+                "enabled": 1,
+                "added_at": 0,
             },
         ],
         "last_cycle": None,
@@ -389,9 +422,7 @@ class TestUsageProberLoop:
         t.join(timeout=2)
         assert not t.is_alive()
 
-    def test_a_failed_tick_does_not_crash_the_loop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_a_failed_tick_does_not_crash_the_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Root incident this whole mechanism exists to prevent involved
         silent, hours-long gaps -- the prober itself must never go
         silent because one tick raised."""
@@ -505,4 +536,3 @@ class TestAddRepoPathTraversal:
         name, _url, path_str, _branch = add_repo_calls[0][:4]
         assert name == "my-repo_1.0"
         assert Path(path_str) == (cfg.work_root / "repos" / "my-repo_1.0").resolve()  # type: ignore[arg-type]
-

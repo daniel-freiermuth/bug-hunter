@@ -6,7 +6,7 @@ import contextlib
 import json
 import sqlite3
 import threading
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, ClassVar, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -124,14 +124,38 @@ class Store:
             ("model", "jobs", "ALTER TABLE jobs ADD COLUMN model TEXT"),
             ("usage_delta", "jobs", "ALTER TABLE jobs ADD COLUMN usage_delta REAL"),
             ("budget_override", "findings", "ALTER TABLE findings ADD COLUMN budget_override TEXT"),
-            ("last_full_hunt_at", "repos", "ALTER TABLE repos ADD COLUMN last_full_hunt_at INTEGER"),
+            (
+                "last_full_hunt_at",
+                "repos",
+                "ALTER TABLE repos ADD COLUMN last_full_hunt_at INTEGER",
+            ),
             ("last_test_gap_at", "repos", "ALTER TABLE repos ADD COLUMN last_test_gap_at INTEGER"),
-            ("last_dep_update_at", "repos", "ALTER TABLE repos ADD COLUMN last_dep_update_at INTEGER"),
+            (
+                "last_dep_update_at",
+                "repos",
+                "ALTER TABLE repos ADD COLUMN last_dep_update_at INTEGER",
+            ),
             ("last_refactor_at", "repos", "ALTER TABLE repos ADD COLUMN last_refactor_at INTEGER"),
-            ("last_modernization_at", "repos", "ALTER TABLE repos ADD COLUMN last_modernization_at INTEGER"),
-            ("modernization_class", "findings", "ALTER TABLE findings ADD COLUMN modernization_class TEXT"),
-            ("current_approach", "findings", "ALTER TABLE findings ADD COLUMN current_approach TEXT"),
-            ("proposed_approach", "findings", "ALTER TABLE findings ADD COLUMN proposed_approach TEXT"),
+            (
+                "last_modernization_at",
+                "repos",
+                "ALTER TABLE repos ADD COLUMN last_modernization_at INTEGER",
+            ),
+            (
+                "modernization_class",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN modernization_class TEXT",
+            ),
+            (
+                "current_approach",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN current_approach TEXT",
+            ),
+            (
+                "proposed_approach",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN proposed_approach TEXT",
+            ),
             ("harvested_at", "pr_state", "ALTER TABLE pr_state ADD COLUMN harvested_at INTEGER"),
             (
                 "attention_since",
@@ -184,7 +208,11 @@ class Store:
                 "pr_state",
                 "ALTER TABLE pr_state ADD COLUMN addressed_head_sha TEXT",
             ),
-            ("last_standards_at", "repos", "ALTER TABLE repos ADD COLUMN last_standards_at INTEGER"),
+            (
+                "last_standards_at",
+                "repos",
+                "ALTER TABLE repos ADD COLUMN last_standards_at INTEGER",
+            ),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
@@ -256,7 +284,9 @@ class Store:
         n_findings = self.db.execute(
             "SELECT COUNT(*) AS n FROM findings WHERE repo_id = ?", (repo_id,)
         ).fetchone()["n"]
-        n_jobs = self.db.execute("SELECT COUNT(*) AS n FROM jobs WHERE repo_id = ?", (repo_id,)).fetchone()["n"]
+        n_jobs = self.db.execute(
+            "SELECT COUNT(*) AS n FROM jobs WHERE repo_id = ?", (repo_id,)
+        ).fetchone()["n"]
         if n_findings or n_jobs:
             msg = (
                 f"repo {repo_id} has {n_findings} finding(s) and {n_jobs} job(s) -- "
@@ -292,23 +322,25 @@ class Store:
         if len(text) <= self._MAX_NOTES_CHARS:
             return text
         # Keep the tail (newest entries), prepend a truncation marker
-        return "...(older notes truncated)...\n" + text[-self._MAX_NOTES_CHARS:]
+        return "...(older notes truncated)...\n" + text[-self._MAX_NOTES_CHARS :]
 
     def append_repo_note(self, repo_id: int, note: str, category: str | None = None) -> None:
         """Append timestamped note to repo's NOTES.md."""
-        from datetime import datetime
+        from datetime import UTC, datetime  # noqa: PLC0415
 
         p = self.repo_notes_path(repo_id)
         p.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # If file doesn't exist, create with header
         if not p.exists():
             repo = self.get_repo(repo_id)
-            p.write_text(f"# Notes: {repo['name']}\n\nLast updated: {datetime.now().date()}\n\n")
-        
+            today = datetime.now(tz=UTC).date()
+            header = f"# Notes: {repo['name']}\n\nLast updated: {today}\n\n"
+            p.write_text(header)
+
         # Append note
         with p.open("a") as f:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            ts = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M")
             if category:
                 f.write(f"## {category}\n")
             f.write(f"- [{ts}] {note}\n\n")
@@ -596,7 +628,8 @@ class Store:
         ph = ",".join("?" * len(SUPPRESSED_STATUSES))
         return _rows(
             self.db.execute(
-                f"SELECT * FROM findings WHERE repo_id = ? AND type = ? AND status IN ({ph}) ORDER BY id",
+                f"SELECT * FROM findings WHERE repo_id = ? AND type = ?"
+                f" AND status IN ({ph}) ORDER BY id",
                 (repo_id, finding_type, *SUPPRESSED_STATUSES),
             )
         )
@@ -605,7 +638,8 @@ class Store:
         ph = ",".join("?" * len(ACTIVE_STATUSES))
         return _rows(
             self.db.execute(
-                f"SELECT * FROM findings WHERE repo_id = ? AND type = ? AND status IN ({ph}) ORDER BY id",
+                f"SELECT * FROM findings WHERE repo_id = ? AND type = ?"
+                f" AND status IN ({ph}) ORDER BY id",
                 (repo_id, finding_type, *ACTIVE_STATUSES),
             )
         )
@@ -754,9 +788,24 @@ class Store:
                 row["finding_fingerprint"] = f.get("fingerprint")
         return _require_keys(
             row,
-            "id", "kind", "repo_id", "repo_name", "finding_id", "state", "pid",
-            "session_file", "cap_tokens", "tokens_new", "calls", "exit_code",
-            "killed_reason", "notes", "started_at", "finished_at", "model", "usage_delta",
+            "id",
+            "kind",
+            "repo_id",
+            "repo_name",
+            "finding_id",
+            "state",
+            "pid",
+            "session_file",
+            "cap_tokens",
+            "tokens_new",
+            "calls",
+            "exit_code",
+            "killed_reason",
+            "notes",
+            "started_at",
+            "finished_at",
+            "model",
+            "usage_delta",
             shape=JobDict,
         )
 
@@ -817,15 +866,11 @@ class Store:
 
         Returns {"findings": [...], "jobs": [...]} -- the rows touched.
         """
-        stuck_findings = _rows(
-            self.db.execute("SELECT * FROM findings WHERE status = 'fixing'")
-        )
+        stuck_findings = _rows(self.db.execute("SELECT * FROM findings WHERE status = 'fixing'"))
         for f in stuck_findings:
             self.set_status(f["id"], "queued")
 
-        orphaned_jobs = _rows(
-            self.db.execute("SELECT * FROM jobs WHERE state = 'running'")
-        )
+        orphaned_jobs = _rows(self.db.execute("SELECT * FROM jobs WHERE state = 'running'"))
         for r in orphaned_jobs:
             self.update_job(
                 r["id"],
@@ -851,9 +896,7 @@ class Store:
         self.db.commit()
 
     def recent_events(self, limit: int = 100) -> list[EventDict]:
-        rows = _rows(
-            self.db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,))
-        )
+        rows = _rows(self.db.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)))
         return [
             _require_keys(r, "id", "at", "kind", "message", "job_id", "finding_id", shape=EventDict)
             for r in rows
@@ -875,15 +918,14 @@ class Store:
             out.setdefault(r["finding_id"], []).append(r)
         return out
 
-
     # Period durations for capacity estimation.
-    _PERIOD_MS: dict[str, int] = {
+    _PERIOD_MS: ClassVar[dict[str, int]] = {
         "anthropic:5h": 5 * 3600 * 1000,
         "anthropic:7d": 7 * 24 * 3600 * 1000,
     }
 
     def estimate_capacity(
-        self, limit_id: str, min_delta: float = 0.02, sample_limit: int = 200
+        self, limit_id: str, _min_delta: float = 0.02, sample_limit: int = 200
     ) -> float | None:
         """Max tokens hunter has ever spent in one window cycle.
 
@@ -917,8 +959,7 @@ class Store:
                 " AND finished_at > ? AND finished_at <= ?",
                 (start, end),
             ).fetchone()["t"]
-            if tok > max_tok:
-                max_tok = tok
+            max_tok = max(max_tok, tok)
         return max_tok if max_tok > 0 else None
 
     def running_estimate(self) -> int:
@@ -962,9 +1003,7 @@ class Store:
         )
         self.db.commit()
 
-    def last_window_observation(
-        self, limit_id: str, resets_at: int
-    ) -> tuple[int, float] | None:
+    def last_window_observation(self, limit_id: str, resets_at: int) -> tuple[int, float] | None:
         """Most recent (observed_at, used_fraction) for this limit_id
         and resets_at cycle.  None if no prior observation."""
         row = self.db.execute(
@@ -1120,9 +1159,7 @@ class ThreadLocalLedger:
     ) -> None:
         self._store().log_window_observation(limit_id, used_fraction, status, resets_at, age_s)
 
-    def last_window_observation(
-        self, limit_id: str, resets_at: int
-    ) -> tuple[int, float] | None:
+    def last_window_observation(self, limit_id: str, resets_at: int) -> tuple[int, float] | None:
         return self._store().last_window_observation(limit_id, resets_at)
 
     def record_calibration_sample(
@@ -1132,7 +1169,9 @@ class ThreadLocalLedger:
         used_fraction_delta: float,
         hunter_tokens: int,
     ) -> None:
-        self._store().record_calibration_sample(limit_id, window_resets_at, used_fraction_delta, hunter_tokens)
+        self._store().record_calibration_sample(
+            limit_id, window_resets_at, used_fraction_delta, hunter_tokens
+        )
 
     def estimate_capacity(
         self, limit_id: str, min_delta: float = 0.02, sample_limit: int = 200

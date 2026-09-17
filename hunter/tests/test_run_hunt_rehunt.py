@@ -85,7 +85,9 @@ class _FakeBackend:
     def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
         return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
 
-    def run(self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+    def run(
+        self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object
+    ) -> RunResult:
         return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
 
     def keep_fresh(self) -> bool:

@@ -22,10 +22,10 @@ from typing import Any
 import pytest
 
 from hunter import scheduler
+from hunter.backend import Granted, Outlook
 from hunter.scheduler import MAX_CONSECUTIVE_SAME_FAILURE, run_fix
 from hunter.store import Store
 from hunter.types import Config, RunResult
-from hunter.backend import Granted, Outlook
 
 
 class _FakeBackend:
@@ -37,7 +37,9 @@ class _FakeBackend:
     def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
         return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
 
-    def run(self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+    def run(
+        self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object
+    ) -> RunResult:
         return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
 
     def keep_fresh(self) -> bool:
@@ -187,7 +189,9 @@ class TestFixRetryGiveUp:
         finding = after
         finding["budget_override"] = "exempt"
 
-        result = run_fix(store, cfg, finding, _FakeBackend(_worker_that_commits_without_pr_description))
+        result = run_fix(
+            store, cfg, finding, _FakeBackend(_worker_that_commits_without_pr_description)
+        )
         assert result.get("failure") == "no PR-DESCRIPTION.md"
         after = store.get_finding(fid)
         assert after is not None

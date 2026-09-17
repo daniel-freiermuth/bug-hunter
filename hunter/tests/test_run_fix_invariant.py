@@ -23,10 +23,10 @@ from typing import Any
 import pytest
 
 from hunter import scheduler
+from hunter.backend import Granted, Outlook
 from hunter.scheduler import run_fix
 from hunter.store import Store
 from hunter.types import Config, RunResult
-from hunter.backend import Granted, Outlook
 
 
 class _FakeBackend:
@@ -38,7 +38,9 @@ class _FakeBackend:
     def decide(self, *, anticipated_tokens: int = 0) -> Outlook:
         return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
 
-    def run(self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object) -> RunResult:
+    def run(
+        self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object
+    ) -> RunResult:
         return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
 
     def keep_fresh(self) -> bool:
@@ -103,9 +105,7 @@ def _make_repo(tmp_path: Path) -> tuple[Path, Path]:
 
 def _setup(store: Store, tmp_path: Path) -> dict[str, Any]:
     upstream_path, repo_path = _make_repo(tmp_path)
-    repo_id = store.add_repo(
-        "repo", str(upstream_path), str(repo_path), default_branch="main"
-    )
+    repo_id = store.add_repo("repo", str(upstream_path), str(repo_path), default_branch="main")
     fid, _ = store.upsert_finding(repo_id, _make_finding())
     store.set_status(fid, "queued")
     finding = store.get_finding(fid)
@@ -114,7 +114,9 @@ def _setup(store: Store, tmp_path: Path) -> dict[str, Any]:
     return finding
 
 
-def _worker_that_ships_a_commit(_cfg: Config, worktree: Path, *_a: object, **_kw: object) -> RunResult:
+def _worker_that_ships_a_commit(
+    _cfg: Config, worktree: Path, *_a: object, **_kw: object
+) -> RunResult:
     (worktree / "f.py").write_text("pass\nfixed\n")
     _run("git", "add", "-A", cwd=worktree)
     _run("git", "commit", "-m", "fix the bug", cwd=worktree)

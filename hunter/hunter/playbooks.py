@@ -59,7 +59,8 @@ def _suppressions_block(suppressions: list[Row]) -> str:
     still-applicable verdict instead of re-filing the same non-issue."""
     return (
         "\n".join(
-            f"- {_escape_braces(s['fingerprint'])} -- {_escape_braces(s.get('verdict_reason') or '(no reason recorded)')}"
+            f"- {_escape_braces(s['fingerprint'])} -- "
+            f"{_escape_braces(s.get('verdict_reason') or '(no reason recorded)')}"
             for s in suppressions
         )
         or "(none yet)"
@@ -69,7 +70,11 @@ def _suppressions_block(suppressions: list[Row]) -> str:
 def _known_block(known: list[Row]) -> str:
     """Active (non-terminal) findings, for novelty comparison."""
     return (
-        "\n".join(f"- {_escape_braces(k['fingerprint'])} [{k['status']}] -- {_escape_braces(k.get('summary', ''))}" for k in known)
+        "\n".join(
+            f"- {_escape_braces(k['fingerprint'])} [{k['status']}] -- "
+            f"{_escape_braces(k.get('summary', ''))}"
+            for k in known
+        )
         or "(none yet)"
     )
 
@@ -84,7 +89,12 @@ def build_hunt_prompt(
     max_findings: int,
     repo_notes: str = "",
 ) -> str:
-    notes = _escape_braces(repo_notes) if repo_notes else "(No notes yet — consider adding conventions/architecture/gotchas as you discover them)"
+    notes = (
+        _escape_braces(repo_notes)
+        if repo_notes
+        else "(No notes yet — consider adding conventions/"
+        "architecture/gotchas as you discover them)"
+    )
     return _render(
         (PLAYBOOK_DIR / "hunt.md").read_text(),
         {
@@ -107,7 +117,9 @@ def _finding_subset(finding: Row) -> dict[str, object]:
     return {k: v for k in _FINDING_PROMPT_KEYS if (v := finding.get(k)) is not None}
 
 
-def build_fix_prompt(finding: Row, worktree: Path, branch: str, repo: Row, repo_notes: str = "") -> str:
+def build_fix_prompt(
+    finding: Row, worktree: Path, branch: str, repo: Row, repo_notes: str = ""
+) -> str:
     subset = _finding_subset(finding)
     notes = _escape_braces(repo_notes) if repo_notes else "(No notes yet)"
     return _render(
@@ -197,6 +209,8 @@ def _checks_lines(rollup: list[Row] | None) -> str:
         f"{c.get('conclusion') or c.get('state') or 'PENDING'}"
         for c in rollup[:30]
     )
+
+
 def build_engage_prompt(
     worktree: Path,
     head_ref: str,
