@@ -239,43 +239,48 @@ class Store:
         except sqlite3.OperationalError:
             pass  # table might not exist yet (fresh DB)
         if needs_rebuild:
+            self.db.commit()  # PRAGMA foreign_keys cannot run inside a transaction
             self.db.execute("PRAGMA foreign_keys = OFF")
-            self.db.execute("ALTER TABLE findings RENAME TO _findings_old")
-            self.db.execute(
-                "CREATE TABLE findings ("
-                "  id INTEGER PRIMARY KEY,"
-                "  type TEXT NOT NULL,"
-                "  repo_id INTEGER NOT NULL REFERENCES repos(id),"
-                "  fingerprint TEXT NOT NULL,"
-                "  file TEXT, symbol TEXT, line INTEGER,"
-                "  severity TEXT NOT NULL, confidence REAL NOT NULL,"
-                "  summary TEXT NOT NULL, detail TEXT,"
-                "  status TEXT NOT NULL DEFAULT 'new',"
-                "  pr_url TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,"
-                "  bug_class TEXT, evidence_plan TEXT, introduced_by TEXT,"
-                "  rung_achieved INTEGER, verdict_reason TEXT, budget_override TEXT,"
-                "  fix_attempts INTEGER NOT NULL DEFAULT 0, last_fix_failure TEXT,"
-                "  recheck_attempts INTEGER NOT NULL DEFAULT 0, last_recheck_failure TEXT,"
-                "  ecosystem TEXT, package TEXT, current_version TEXT, latest_version TEXT,"
-                "  update_type TEXT, security_advisory TEXT,"
-                "  missing_tests TEXT, test_file TEXT,"
-                "  smell_type TEXT, suggested_refactor TEXT,"
-                "  modernization_class TEXT, current_approach TEXT, proposed_approach TEXT,"
-                "  UNIQUE(type, fingerprint))"
-            )
-            self.db.execute("INSERT INTO findings SELECT * FROM _findings_old")
-            self.db.execute("DROP TABLE _findings_old")
-            # Recreate indexes
-            for idx_sql in [
-                "CREATE INDEX IF NOT EXISTS findings_status ON findings(status)",
-                "CREATE INDEX IF NOT EXISTS findings_repo ON findings(repo_id, status)",
-                "CREATE INDEX IF NOT EXISTS findings_type ON findings(type)",
-                "CREATE INDEX IF NOT EXISTS findings_repo_type ON findings(repo_id, type)",
-                "CREATE INDEX IF NOT EXISTS findings_type_status ON findings(type, status)",
-            ]:
-                self.db.execute(idx_sql)
-            self.db.execute("PRAGMA foreign_keys = ON")
-            self.db.commit()
+            try:
+                self.db.execute("ALTER TABLE findings RENAME TO _findings_old")
+                self.db.execute(
+                    "CREATE TABLE findings ("
+                    "  id INTEGER PRIMARY KEY,"
+                    "  type TEXT NOT NULL,"
+                    "  repo_id INTEGER NOT NULL REFERENCES repos(id),"
+                    "  fingerprint TEXT NOT NULL,"
+                    "  file TEXT, symbol TEXT, line INTEGER,"
+                    "  severity TEXT NOT NULL, confidence REAL NOT NULL,"
+                    "  summary TEXT NOT NULL, detail TEXT,"
+                    "  status TEXT NOT NULL DEFAULT 'new',"
+                    "  pr_url TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,"
+                    "  bug_class TEXT, evidence_plan TEXT, introduced_by TEXT,"
+                    "  rung_achieved INTEGER, verdict_reason TEXT, budget_override TEXT,"
+                    "  fix_attempts INTEGER NOT NULL DEFAULT 0, last_fix_failure TEXT,"
+                    "  recheck_attempts INTEGER NOT NULL DEFAULT 0, last_recheck_failure TEXT,"
+                    "  ecosystem TEXT, package TEXT, current_version TEXT, latest_version TEXT,"
+                    "  update_type TEXT, security_advisory TEXT,"
+                    "  missing_tests TEXT, test_file TEXT,"
+                    "  smell_type TEXT, suggested_refactor TEXT,"
+                    "  modernization_class TEXT, current_approach TEXT, proposed_approach TEXT,"
+                    "  UNIQUE(type, fingerprint))"
+                )
+                self.db.execute("INSERT INTO findings SELECT * FROM _findings_old")
+                self.db.execute("DROP TABLE _findings_old")
+                for idx_sql in [
+                    "CREATE INDEX IF NOT EXISTS findings_status ON findings(status)",
+                    "CREATE INDEX IF NOT EXISTS findings_repo ON findings(repo_id, status)",
+                    "CREATE INDEX IF NOT EXISTS findings_type ON findings(type)",
+                    "CREATE INDEX IF NOT EXISTS findings_repo_type ON findings(repo_id, type)",
+                    "CREATE INDEX IF NOT EXISTS findings_type_status ON findings(type, status)",
+                ]:
+                    self.db.execute(idx_sql)
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            finally:
+                self.db.execute("PRAGMA foreign_keys = ON")
 
     # -- repos ---------------------------------------------------------
     def add_repo(
