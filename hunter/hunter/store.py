@@ -184,6 +184,7 @@ class Store:
                 "pr_state",
                 "ALTER TABLE pr_state ADD COLUMN addressed_head_sha TEXT",
             ),
+            ("last_standards_at", "repos", "ALTER TABLE repos ADD COLUMN last_standards_at INTEGER"),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
