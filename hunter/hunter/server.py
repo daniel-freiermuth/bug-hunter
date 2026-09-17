@@ -408,11 +408,20 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- POST -------------------------------------------------------------
 
-    def do_POST(self) -> None:
-        # Require application/json content-type to block simple cross-origin requests
+    def _check_post_preconditions(self) -> bool:
+        """Validate Content-Type and local-origin; return True if OK."""
         ctype = self.headers.get("Content-Type", "")
         if not ctype.startswith("application/json"):
             self._error(415, "Content-Type must be application/json")
+            return False
+        host = (self.headers.get("Host") or "").split(":")[0]
+        if host not in ("localhost", "127.0.0.1", "::1"):
+            self._error(403, "forbidden: non-local origin")
+            return False
+        return True
+
+    def do_POST(self) -> None:
+        if not self._check_post_preconditions():
             return
         url = urlparse(self.path)
         try:
@@ -617,7 +626,8 @@ class Handler(BaseHTTPRequestHandler):
         from .forge import FORGE_NAMES, detect_forge
 
         body = self._body_json()
-        name = body.get("name", "").strip()
+        raw = body.get("name")
+        name = raw.strip() if isinstance(raw, str) else ""
         url = (body.get("url") or "").strip() if isinstance(body.get("url"), str) else ""
         if not name or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.\-]*", name):
             self._error(400, "invalid repo name")
