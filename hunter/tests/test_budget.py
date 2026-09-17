@@ -80,14 +80,17 @@ def _healthy_windows(
 
 
 class _FakeLedger:
-    def __init__(self, running=0, finished=0):
+    def __init__(self, running=0, finished=0, finished_map=None):
         self._running = running
         self._finished = finished
+        self._finished_map: dict[int, int] = finished_map or {}
 
     def running_estimate(self):
         return self._running
 
     def finished_since(self, ts_ms):
+        if self._finished_map:
+            return self._finished_map.get(ts_ms, self._finished)
         return self._finished
 
     def finished_between(self, start, end):
