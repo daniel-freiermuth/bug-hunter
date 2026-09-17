@@ -420,6 +420,8 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     job = store.create_job("recheck", repo["id"], finding_id=fid, cap_tokens=cap, state="running")
     out_path = cfg.work_root / "out" / f"recheck{fid}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if out_path.exists():
+        out_path.unlink()
     prompt = build_recheck_prompt(finding, repo, out_path, store.repo_notes(repo["id"]))
     model = cfg.model_for("hunt")
     rr = backend.run(
@@ -436,7 +438,7 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
 
     # Post-process verdict file.
     raw_verdict: Row | None = None
-    if out_path.exists():
+    if state == "done" and out_path.exists():
         try:
             raw_verdict = json.loads(out_path.read_text())
         except (OSError, json.JSONDecodeError):
