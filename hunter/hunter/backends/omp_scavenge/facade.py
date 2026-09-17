@@ -220,8 +220,10 @@ class OmpScavengeBackend:
         cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
         if dim == "5h" or ":5h" in dim:
             return int(frac * cap_5h)
-        # 7d derived from 5h x period ratio
-        return int(frac * cap_5h / _5H_7D_RATIO)
+        cap_7d = self.ledger.estimate_capacity("anthropic:7d") or (
+            cap_5h / _5H_7D_RATIO
+        )
+        return int(frac * cap_7d)
 
     def decide(self, *, anticipated_tokens: int) -> Outlook:
         """May background work spend now?  Returns paired verdicts."""
