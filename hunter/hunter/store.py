@@ -265,7 +265,26 @@ class Store:
                     "  modernization_class TEXT, current_approach TEXT, proposed_approach TEXT,"
                     "  UNIQUE(type, fingerprint))"
                 )
-                self.db.execute("INSERT INTO findings SELECT * FROM _findings_old")
+                # Explicit column list — ALTER TABLE appends columns in migration
+                # order which may differ from the new table's declaration order.
+                # SELECT * would silently shuffle values into wrong columns.
+                cols = (
+                    "id, type, repo_id, fingerprint, file, symbol, line,"
+                    " severity, confidence, summary, detail, status, pr_url,"
+                    " created_at, updated_at, bug_class, evidence_plan,"
+                    " introduced_by, rung_achieved, verdict_reason,"
+                    " budget_override, fix_attempts, last_fix_failure,"
+                    " recheck_attempts, last_recheck_failure,"
+                    " ecosystem, package, current_version, latest_version,"
+                    " update_type, security_advisory,"
+                    " missing_tests, test_file,"
+                    " smell_type, suggested_refactor,"
+                    " modernization_class, current_approach, proposed_approach"
+                )
+                self.db.execute(
+                    f"INSERT INTO findings ({cols})"
+                    f" SELECT {cols} FROM _findings_old"
+                )
                 self.db.execute("DROP TABLE _findings_old")
                 for idx_sql in [
                     "CREATE INDEX IF NOT EXISTS findings_status ON findings(status)",
