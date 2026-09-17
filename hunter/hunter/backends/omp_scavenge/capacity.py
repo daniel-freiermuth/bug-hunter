@@ -182,7 +182,7 @@ def retry_at_7d(resets_at: int | None, effective_used: float) -> float | None:
     if not resets_at:
         return None
     started_ms = resets_at - WEEK_MS
-    return started_ms + effective_used * WEEK_MS
+    return min(started_ms + effective_used * WEEK_MS, resets_at)
 
 
 def retry_at_5h(resets_at: int | None, effective_used: float) -> float | None:
@@ -191,7 +191,7 @@ def retry_at_5h(resets_at: int | None, effective_used: float) -> float | None:
     if not resets_at:
         return None
     window_start_ms = resets_at - FIVE_HOUR_MS
-    return window_start_ms + HEADROOM_MS + effective_used * _RAMP_MS
+    return min(window_start_ms + HEADROOM_MS + effective_used * _RAMP_MS, resets_at)
 
 
 def effective_used(w: WindowState, inflight_reservation: float) -> float:
