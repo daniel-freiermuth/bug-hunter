@@ -131,7 +131,7 @@ def run_worker(
         "TMP",
         "SSH_AUTH_SOCK",
     }
-    prefixes = ("OMP_", "ANTHROPIC_", "XDG_")
+    prefixes = ("OMP_", "XDG_")
     worker_env = {k: v for k, v in os.environ.items() if k in allowlist or k.startswith(prefixes)}
 
     proc = subprocess.Popen(

@@ -428,6 +428,7 @@ class Store:
         try:
             self.db.commit()
         except Exception:
+            self.db.rollback()
             # Restore notes file if commit fails
             if notes_backup is not None:
                 notes_path.parent.mkdir(parents=True, exist_ok=True)
