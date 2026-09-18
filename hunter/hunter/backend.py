@@ -144,7 +144,7 @@ class SpendLedger(Protocol):
     def estimate_capacity(
         self, limit_id: str, min_delta: float = 0.02, sample_limit: int = 200
     ) -> float | None:
-        """Empirical p75 estimate of this window's total token capacity."""
+        """Max observed tokens spent in one window cycle (capacity estimate)."""
         ...
 
 

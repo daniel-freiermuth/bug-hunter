@@ -111,7 +111,7 @@ def _require_keys[T](row: Row, *required: str, shape: type[T]) -> T:
 
 
 class Store:
-    def __init__(self, cfg: Config) -> None:
+    def __init__(self, cfg: Config) -> None:  # noqa: PLR0915 (migration code)
         self.cfg = cfg
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(cfg.db_path)
@@ -265,26 +265,70 @@ class Store:
                     "  modernization_class TEXT, current_approach TEXT, proposed_approach TEXT,"
                     "  UNIQUE(type, fingerprint))"
                 )
-                # Explicit column list — ALTER TABLE appends columns in migration
-                # order which may differ from the new table's declaration order.
-                # SELECT * would silently shuffle values into wrong columns.
-                cols = (
-                    "id, type, repo_id, fingerprint, file, symbol, line,"
-                    " severity, confidence, summary, detail, status, pr_url,"
-                    " created_at, updated_at, bug_class, evidence_plan,"
-                    " introduced_by, rung_achieved, verdict_reason,"
-                    " budget_override, fix_attempts, last_fix_failure,"
-                    " recheck_attempts, last_recheck_failure,"
-                    " ecosystem, package, current_version, latest_version,"
-                    " update_type, security_advisory,"
-                    " missing_tests, test_file,"
-                    " smell_type, suggested_refactor,"
-                    " modernization_class, current_approach, proposed_approach"
-                )
-                self.db.execute(
-                    f"INSERT INTO findings ({cols})"
-                    f" SELECT {cols} FROM _findings_old"
-                )
+                # Build column list dynamically: old tables may not have every
+                # column (e.g. type, retry counters, modernization fields).
+                # Provide safe defaults for missing NOT NULL columns.
+                all_cols = [
+                    "id",
+                    "type",
+                    "repo_id",
+                    "fingerprint",
+                    "file",
+                    "symbol",
+                    "line",
+                    "severity",
+                    "confidence",
+                    "summary",
+                    "detail",
+                    "status",
+                    "pr_url",
+                    "created_at",
+                    "updated_at",
+                    "bug_class",
+                    "evidence_plan",
+                    "introduced_by",
+                    "rung_achieved",
+                    "verdict_reason",
+                    "budget_override",
+                    "fix_attempts",
+                    "last_fix_failure",
+                    "recheck_attempts",
+                    "last_recheck_failure",
+                    "ecosystem",
+                    "package",
+                    "current_version",
+                    "latest_version",
+                    "update_type",
+                    "security_advisory",
+                    "missing_tests",
+                    "test_file",
+                    "smell_type",
+                    "suggested_refactor",
+                    "modernization_class",
+                    "current_approach",
+                    "proposed_approach",
+                ]
+                # Defaults for NOT NULL columns that might be absent in the old table.
+                _defaults = {
+                    "type": "'bug'",
+                    "fix_attempts": "0",
+                    "recheck_attempts": "0",
+                }
+                old_cols_info = self.db.execute("PRAGMA table_info(_findings_old)").fetchall()
+                old_col_names = {r[1] for r in old_cols_info}
+                dst_parts = []
+                src_parts = []
+                for c in all_cols:
+                    dst_parts.append(c)
+                    if c in old_col_names:
+                        src_parts.append(c)
+                    elif c in _defaults:
+                        src_parts.append(f"{_defaults[c]} AS {c}")
+                    else:
+                        src_parts.append(f"NULL AS {c}")
+                dst = ", ".join(dst_parts)
+                src = ", ".join(src_parts)
+                self.db.execute(f"INSERT INTO findings ({dst}) SELECT {src} FROM _findings_old")
                 self.db.execute("DROP TABLE _findings_old")
                 for idx_sql in [
                     "CREATE INDEX IF NOT EXISTS findings_status ON findings(status)",
@@ -366,14 +410,19 @@ class Store:
                 "cannot delete without losing history; pause it instead"
             )
             raise ValueError(msg)
-        # Capture notes path before deleting the row (repo_notes_path needs
-        # the row to exist). SQLite can reuse INTEGER PRIMARY KEY ids, so a
-        # new repo could inherit stale notes if we don't clean up.
+        # Capture notes path before deleting the row.  SQLite can reuse
+        # INTEGER PRIMARY KEY ids, so a new repo could inherit stale notes.
+        # Delete the file while the DB row deletion is still uncommitted so
+        # we can rollback if file cleanup fails.
         notes_path = self.cfg.work_root / "repos" / f"repo-{repo_id}" / "NOTES.md"
         self.db.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
+        try:
+            if notes_path.exists():
+                notes_path.unlink()
+        except OSError:
+            self.db.rollback()
+            raise
         self.db.commit()
-        if notes_path.exists():
-            notes_path.unlink()
 
     # -- repo notes ----------------------------------------------------
     def repo_notes_path(self, repo_id: int) -> Path:
@@ -1014,7 +1063,8 @@ class Store:
 
         Uses the known reset boundaries from window_log to align cycles,
         then sums hunter's actual token spend per cycle and returns the max.
-        No fraction correlation — just observed throughput. None if no data.
+        Conservative upper bound — ensures budget decisions never
+        underestimate what the window can sustain.  None if no data.
         """
         period_ms = self._PERIOD_MS.get(limit_id)
         if not period_ms:
