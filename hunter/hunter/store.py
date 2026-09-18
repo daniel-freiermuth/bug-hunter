@@ -416,13 +416,23 @@ class Store:
         # we can rollback if file cleanup fails.
         notes_path = self.cfg.work_root / "repos" / f"repo-{repo_id}" / "NOTES.md"
         self.db.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
+        # Save notes content so we can restore if commit fails
+        notes_backup = None
         try:
             if notes_path.exists():
+                notes_backup = notes_path.read_bytes()
                 notes_path.unlink()
         except OSError:
             self.db.rollback()
             raise
-        self.db.commit()
+        try:
+            self.db.commit()
+        except Exception:
+            # Restore notes file if commit fails
+            if notes_backup is not None:
+                notes_path.parent.mkdir(parents=True, exist_ok=True)
+                notes_path.write_bytes(notes_backup)
+            raise
 
     # -- repo notes ----------------------------------------------------
     def repo_notes_path(self, repo_id: int) -> Path:

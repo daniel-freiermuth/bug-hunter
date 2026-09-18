@@ -331,6 +331,8 @@ function dur(j: Job): string {
 const filterState = new Map<string, Set<string>>();
 // Total available options per group (for summary text).
 const filterTotals = new Map<string, number>();
+// repo_id → repo name, populated from /api/summary response.
+const repoMap = new Map<number, string>();
 
 function getFilterSet(id: string): Set<string> {
   let s = filterState.get(id);
@@ -570,7 +572,7 @@ function applyFindingFilters(findings: Finding[], p: string): Finding[] {
     if (fStatus && (isNone(fStatus) || !fStatus.has(f.status))) return false;
     if (fRepo) {
       if (isNone(fRepo)) return false;
-      const repo = f.fingerprint.split(":")[0];
+      const repo = repoMap.get(f.repo_id) ?? String(f.repo_id);
       if (!fRepo.has(repo)) return false;
     }
     if (fType && (isNone(fType) || !fType.has(f.type))) return false;
@@ -1376,9 +1378,11 @@ async function refresh(): Promise<void> {
     renderActivity(s);
 
     // ---- populate filter dropdowns (preserve selection) ----
+    repoMap.clear();
+    for (const r of s.repos) repoMap.set(r.id, r.name);
     const inbox = all.filter((f) => f.status === "new");
     const repos = [
-      ...new Set(all.map((f) => f.fingerprint.split(":")[0])),
+      ...new Set(all.map((f) => repoMap.get(f.repo_id) ?? String(f.repo_id))),
     ].sort();
     const inboxClasses = ([
       ...new Set(inbox.map((f) => f.category || f.bug_class).filter(c => c != null && c !== "")),

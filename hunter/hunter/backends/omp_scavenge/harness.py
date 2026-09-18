@@ -117,12 +117,30 @@ def run_worker(
     if cfg.model_smol:
         cmd += [f"--smol={cfg.model_smol}"]
     out = tempfile.TemporaryFile(mode="w+")
+    # Build a minimal env so the worker doesn't inherit the full daemon env.
+    allowlist = {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SSH_AUTH_SOCK",
+    }
+    prefixes = ("OMP_", "ANTHROPIC_", "XDG_")
+    worker_env = {k: v for k, v in os.environ.items() if k in allowlist or k.startswith(prefixes)}
+
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
         stdout=out,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=worker_env,
     )
     session: Path | None = None
     tokens = calls = 0

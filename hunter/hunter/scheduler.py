@@ -1973,7 +1973,6 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None, *, backe
                 result.get("state") in ("killed", "failed")
                 or result.get("error")
                 or result.get("ingest_error")
-                or (result.get("state") == "done" and "ingest" not in result)
             )
             if failed:
                 sql = f"UPDATE repos SET last_{kind}_at = ? WHERE id = ?"  # noqa: S608
