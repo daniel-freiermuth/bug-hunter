@@ -739,12 +739,13 @@ def run_dep_update(store: Store, cfg: Config, repo: Row, backend: Backend) -> Ro
         f" / {counts['invalid']} invalid (0 tok)",
     )
 
-    # Advance the rotation timestamp
-    store.db.execute(
-        "UPDATE repos SET last_dep_update_at = ? WHERE id = ?",
-        (now_ms(), rid),
-    )
-    store.db.commit()
+    # Advance the rotation timestamp only after valid ingestion
+    if counts["invalid"] == 0:
+        store.db.execute(
+            "UPDATE repos SET last_dep_update_at = ? WHERE id = ?",
+            (now_ms(), rid),
+        )
+        store.db.commit()
 
     return {
         "kind": "dep_update",
@@ -1153,7 +1154,7 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
         "attention": 0,
         "errors": 0,
     }
-    for f in store.list_findings(status="pr_open"):
+    for f in store.list_all_findings(status="pr_open"):
         fid: int = f["id"]
         url: str = f.get("pr_url") or ""
         repo = store.get_repo(f["repo_id"])
@@ -1849,10 +1850,10 @@ def pick_next(
     to do (no queued/attention/pending-harvest/rechecking work and no
     enabled repos).
     """
-    rechecking = store.list_findings(status="rechecking")
+    rechecking = store.list_all_findings(status="rechecking")
     attention = store.list_attention()
     pending_harvest = store.list_pending_harvest()
-    queued = store.list_findings(status="queued")
+    queued = store.list_all_findings(status="queued")
 
     for kind, items in (
         ("engage", attention),
@@ -1944,8 +1945,9 @@ _RUNNERS: dict[str, Callable[[Store, Config, Row, Backend], Row]] = {
 
 def run_cycle(store: Store, cfg: Config, force_repo: str | None = None, *, backend: Backend) -> Row:
     try:
-        # (0) Cheap PR sync -- gh reads only, no tokens.
-        sync: Row | None = sync_prs(store, cfg) if store.list_findings(status="pr_open") else None
+        # (0) Cheap PR sync — gh reads only, no tokens.
+        has_pr_open = bool(store.list_all_findings(status="pr_open"))
+        sync: Row | None = sync_prs(store, cfg) if has_pr_open else None
 
         picked = pick_next(store, cfg, force_repo)
         if picked is None:

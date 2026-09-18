@@ -553,7 +553,7 @@ class Store:
     ) -> list[Row]:
         q = "SELECT * FROM findings"
         args: list[SqlParam] = []
-        conds: list[str] = []
+        conds: list[str] = ["type = 'bug'"]
         if status:
             conds.append("status = ?")
             args.append(status)
@@ -565,8 +565,7 @@ class Store:
             ph = ",".join("?" * len(allowed))
             conds.append(f"severity IN ({ph})")
             args.extend(allowed)
-        if conds:
-            q += " WHERE " + " AND ".join(conds)
+        q += " WHERE " + " AND ".join(conds)
         q += " ORDER BY id DESC"
         return _rows(self.db.execute(q, args))
 
