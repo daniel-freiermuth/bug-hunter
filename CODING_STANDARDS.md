@@ -191,8 +191,24 @@ required for that operation.
 ## Testing
 
 ### Philosophy
-- **Deterministic:** no flaky tests. Use simulation (turmoil) over
-  mocking. Fresh state per test (temp dirs, fresh DBs).
+- **Deterministic:** no flaky tests. Simulate the outside world rather
+  than mocking the code that reaches it. Fresh state per test (temp
+  dirs, fresh DBs).
+  - For this daemon that means *subprocess* simulation, not network
+    simulation. Every external boundary it crosses is a CLI —
+    `git` (34 call sites), `gh`, `glab`, `omp`, `npx` — and there is no
+    outbound network client in the crate at all. `FakeBins` scripts
+    those binaries so the real `Forge`/`dep_scan`/harness code runs and
+    builds real argv against a simulated world.
+  - Reach for `turmoil` only if that changes: it simulates a network
+    between hosts (partitions, latency, loss), so it earns its place
+    the day hunter talks to a forge REST API directly instead of
+    shelling out, or grows a second process. Today the sole
+    `tokio::net` call is the localhost listener, and the router tests
+    drive `router()` directly, which is both faster and simpler.
+  - For time, use `tokio::time` pause/advance rather than shortening
+    intervals. Sleeping less is still sleeping, and a 120 s grace
+    period cannot be shortened at all.
 - **Behavioral:** test what the code does, not how it's structured.
   Assert on domain types, not string representations.
 - **Coverage:** every changed line should be covered. Use `llvm-cov`
@@ -200,9 +216,120 @@ required for that operation.
 
 ### Patterns
 - Integration tests in `tests/` directory
-- Fresh isolated state per test: `fresh_db()`, `tempdir()`
 - `cargo nextest` for parallel execution and stress testing (libraries)
 - Compliance traceability where applicable (`covers!()` macro)
+
+### Shared test support (`hunter-rs/tests/support/mod.rs`)
+
+Each integration test is its own crate, so a test file opts in with `mod
+support;`. Reach for it before hand-rolling a fixture — every helper in
+there replaced something that was being reinvented per file, usually
+worse.
+
+- `TempDir` — scratch directory removed on drop, *including on panic*.
+  The `let _ = fs::remove_dir_all(..)` at the end of a test body leaks on
+  every failure, which is exactly when you least want it to.
+- `fresh_store` / `fresh_pool` — writable copy of the schema-only
+  `dev.db`. Never open `dev.db` itself.
+- `FakeBins` — scripted executables on `PATH` with an invocation log.
+  This is the only seam for forge behaviour: the runners build their
+  forge internally via `forge_for(repo.forge)`, so there is no trait to
+  inject, and intercepting the subprocess exercises the real argv too.
+  Match on the SUBCOMMAND (`ok_unless_action("gh", "pr comment", …)`) —
+  a substring match on `"comment"` also matches `gh pr view --json
+  ...,comments,...` and fails the wrong call.
+  - `isolate()` when a test's point is that a binary is ABSENT; the
+    default appends the real `PATH`, so a developer's own `npx` answers
+    and the test passes vacuously.
+  - `env(key, value)` for scoped environment variables, restored on
+    drop. Hangs off `FakeBins` so one assertion covers both, and keeps
+    every `unsafe` in the crate inside that one file.
+- `ScriptedBackend` — a `Backend` whose `run()` is a closure over the
+  worktree, so a test stages exactly what a worker would leave behind.
+  `decide()` always grants, so tests need not satisfy the budget gate.
+- `GitRepo::with_branch` — bare `origin` plus a clone with a published
+  branch, the minimum for anything that fetches or adds a worktree.
+
+The Rust suite is **nextest-only** (`cargo nextest run`, or `just
+test`). Not for speed: `FakeBins` scripts binaries on `PATH` and scopes
+environment variables, both process-global. Per-test process isolation
+makes that private, so the suite carries no locking to coordinate it —
+scaffolding you keep is scaffolding you maintain. `cargo test` would
+race silently, so `require_process_isolation` asserts on
+`NEXTEST_EXECUTION_MODE` and fails with an explanation instead.
+
+`tests/runner_engage_test.rs` is the worked example: a real git repo, a
+scripted `gh`, a scripted worker, the real `run_engage`, and assertions
+on what was persisted. Start from it.
+
+### Proof, not compilation
+
+`cargo check` is not evidence that a change works. Neither is a green
+suite that predates the change. A fix is verified when you have
+**observed the new behaviour**: a test seen failing before and passing
+after, or a command whose output demonstrates it.
+
+- **Red first.** Every new or changed assertion must be watched failing
+  against the pre-fix code. If you cannot make it fail, it is not
+  testing your change. Invert the condition, confirm exactly the
+  expected test breaks, revert.
+- **Test-driven, in the strict sense.** Not "write a test first" but
+  "write tests until the laziest implementation that passes them all is
+  the correct one." Assume an adversarial implementer: if
+  `render("{{A}} {{TYPO}}", …).is_err()` is the only test, `bail!()`
+  passes it. The pressure to defeat that laziness is what forces you to
+  enumerate the positive cases and the edge conditions — which is the
+  step our regressions actually skipped, every time.
+- Enumerate the **input domain**, not the requirement. A substitution
+  function takes values that may contain the delimiter. A pipe emits
+  bytes that may not be UTF-8. A worker either hangs or exits, with or
+  without a ledger — that is a 2x2, so write four tests. All three of
+  those were real regressions and all three are boring edge-case
+  enumeration.
+- **Do not test through a mock you invented.** A mocked 200 for an
+  endpoint that returns 201 enshrines the bug instead of catching it;
+  we shipped exactly that. Prefer the real collaborator or a
+  simulation of it.
+- The tests **stay around**, and that is most of the value. Every
+  invariant broken in review here was one no test encoded: `render`
+  had none, the whole Svelte UI had none. A suite is a ratchet against
+  the next person changing an assumption you did not write down.
+
+### Fixing a reported defect
+
+Measured on this repo: of six agents fixing a review round, the two
+that proved their fixes by *running* them introduced zero regressions;
+the three that proved theirs by compiling introduced five between
+them. Every one was a gap in what the author considered, not in what
+they implemented. So:
+
+- **Verify the report, then verify the fix.** Confirming the finding
+  is real says nothing about whether the repair is right. Check your
+  fix against inputs the report never mentioned.
+- **Enumerate the failure boundary.** Any change that adds or moves an
+  error, `bail!`, or terminal state must name the inputs that now land
+  on the new side. "Reject unfilled placeholders" silently became
+  "reject any PR body containing braces".
+- **Cover the sibling branch.** Handling one arm of a state machine is
+  an invitation to check the others. A worker that *hangs* unmetered
+  and one that *exits* unmetered are the same accounting hole.
+- **Read the contract before asserting about an interface.** Status
+  codes, JSON shapes and endpoint behaviour are specified in
+  `hunter-rs/API-CONTRACT*.md`. Cite the line; do not encode a belief.
+- **Changing an invariant means finding its dependents.** Run
+  `lsp references` (or grep) on the state you changed. Callers in other
+  files still assume what you just stopped guaranteeing.
+
+### Adversarial pass before shipping
+
+Green gates are necessary and not sufficient: an entire review round's
+regressions passed 187 tests, clippy, `svelte-check` and ESLint, and
+were caught by a human-grade reader looking at the diff. Before
+pushing a batch of fixes, run one reviewer over the diffs whose only
+question is *"what input class did the author not consider?"* — not
+*"is this correct?"*. That is the process that actually catches this
+class, so run it deliberately rather than waiting for it to arrive
+from outside.
 
 ---
 
