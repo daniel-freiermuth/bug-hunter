@@ -30,8 +30,8 @@ heavily. Bugs cluster: when you confirm one, inspect its siblings.
 # Known non-bugs (suppression corpus — do NOT re-file these or variants)
 {{SUPPRESSIONS}}
 
-# Already tracked (open findings — file only if yours is genuinely NOVEL;
-# refactors move code, so compare by mechanism, not location)
+# Already tracked (open findings — file only if yours is genuinely NOVEL)
+Code moves as the repo evolves, so compare by mechanism, not file:line location.
 {{KNOWN_FINDINGS}}
 
 # Output contract — INCREMENTAL, you may be killed at any moment

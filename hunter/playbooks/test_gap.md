@@ -21,7 +21,10 @@ Functions/methods with non-trivial contracts that lack tests for:
 
 NOT gaps: trivial getters/setters, pure plumbing (pass-through), thoroughly tested code, internal utilities already covered indirectly.
 
-# Known gaps already tracked
+# Known non-gaps (suppression corpus — do NOT re-file these or variants)
+{{SUPPRESSIONS}}
+
+# Already tracked (open gaps — file only if yours is genuinely NOVEL)
 {{KNOWN_GAPS}}
 
 # Output contract — INCREMENTAL, you may be killed at any moment
