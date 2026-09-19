@@ -37,32 +37,53 @@
 
   async function doVerdict(status: string, reason?: string) {
     busy = true;
-    await post("/api/verdict", { id: finding.id, status, reason: reason || undefined });
-    await store.refresh();
-    busy = false;
-    showReasonPrompt = null;
-    reasonText = "";
+    try {
+      await post("/api/verdict", { id: finding.id, status, reason: reason || undefined });
+      await store.refresh();
+      showReasonPrompt = null;
+      reasonText = "";
+    } catch (err) {
+      console.error(`verdict ${status} for finding ${finding.id} failed`, err);
+    } finally {
+      // Re-arm the buttons even if the request never reached the server.
+      busy = false;
+    }
   }
 
   async function doRecheck() {
     busy = true;
-    await post("/api/recheck", { id: finding.id });
-    await store.refresh();
-    busy = false;
+    try {
+      await post("/api/recheck", { id: finding.id });
+      await store.refresh();
+    } catch (err) {
+      console.error(`recheck finding ${finding.id} failed`, err);
+    } finally {
+      busy = false;
+    }
   }
 
   async function doUnqueue() {
     busy = true;
-    await post("/api/unqueue", { id: finding.id });
-    await store.refresh();
-    busy = false;
+    try {
+      await post("/api/unqueue", { id: finding.id });
+      await store.refresh();
+    } catch (err) {
+      console.error(`unqueue finding ${finding.id} failed`, err);
+    } finally {
+      busy = false;
+    }
   }
 
   async function doOverride(mode: string | null) {
     busy = true;
-    await post("/api/override", { id: finding.id, mode });
-    await store.refresh();
-    busy = false;
+    try {
+      await post("/api/override", { id: finding.id, mode });
+      await store.refresh();
+    } catch (err) {
+      console.error(`override ${mode} for finding ${finding.id} failed`, err);
+    } finally {
+      busy = false;
+    }
   }
 </script>
 

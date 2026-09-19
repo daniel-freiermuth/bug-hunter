@@ -44,6 +44,15 @@
   // Collapsible state for suppressed/notes — collapsed by default
   let suppressedOpen = $state(false);
   let notesOpen = $state(false);
+
+  async function verdict(id: number, status: string, reason?: string) {
+    try {
+      await post("/api/verdict", { id, status, ...(reason ? { reason } : {}) });
+      store.refresh();
+    } catch (err) {
+      console.error(`verdict ${status} for finding ${id} failed`, err);
+    }
+  }
 </script>
 
 <div class="page-enter">
@@ -131,13 +140,13 @@
               <div class="item-actions">
                 <button
                   class="action-btn queue-btn"
-                  onclick={async () => { await post("/api/verdict", { id: f.id, status: "queued" }); store.refresh(); }}
+                  onclick={() => verdict(f.id, "queued")}
                 >Queue fix</button>
                 <button
                   class="action-btn reject-btn"
-                  onclick={async () => {
+                  onclick={() => {
                     const reason = prompt("Rejection reason:");
-                    if (reason) { await post("/api/verdict", { id: f.id, status: "rejected", reason }); store.refresh(); }
+                    if (reason) verdict(f.id, "rejected", reason);
                   }}
                 >Reject</button>
               </div>

@@ -17,7 +17,12 @@
     const gen = ++generation;
     loading = true;
     error = false;
-    const d = await store.fetchFindingDetail(findingId);
+    let d: FindingDetail | null = null;
+    try {
+      d = await store.fetchFindingDetail(findingId);
+    } catch (err) {
+      console.error(`load detail for finding ${findingId} failed`, err);
+    }
     if (gen !== generation) return;
     if (d) {
       detail = d;
