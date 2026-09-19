@@ -2,7 +2,8 @@
 //! Round-2 write-path + `SpendLedger` behavior tests, run against a writable
 //! copy of dev.db (schema-complete, zero rows). Each test seeds its own
 //! fixture copy through a plain sqlx pool, then exercises the read-write
-//! Store (`Store::connect`) the serve process uses for POST handlers.
+//! Store behind the POST handlers via `Store::connect`, the binary's
+//! migrating opener.
 //!
 //! Deviation note (documented in store.rs too): `append_repo_note` stamps
 //! dates/times in UTC, while the Python store used `datetime.now()` (local

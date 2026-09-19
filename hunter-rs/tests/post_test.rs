@@ -1,8 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! POST endpoint tests (API-CONTRACT-WRITES.md): oneshot router with
-//! `NullBackend` over a WRITABLE tempdir copy of dev.db. The default state
-//! carries a scheduler handle (as `daemon` does); `test_state_serve` drops
-//! it to exercise the `serve` process, which runs no cycles.
+//! `NullBackend` over a WRITABLE tempdir copy of dev.db, with a scheduler
+//! handle standing in for the daemon's loop.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -101,18 +100,10 @@ async fn test_state() -> AppState {
         store: Arc::new(store),
         config: Arc::new(config),
         backend: Arc::new(hunter::backend::NullBackend),
-        scheduler: Some(hunter::server::SchedulerHandle {
+        scheduler: hunter::server::SchedulerHandle {
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             wake: Arc::new(tokio::sync::Notify::new()),
-        }),
-    }
-}
-
-/// A `serve`-mode state: no scheduler loop in this process.
-async fn test_state_serve() -> AppState {
-    AppState {
-        scheduler: None,
-        ..test_state().await
+        },
     }
 }
 
@@ -338,7 +329,7 @@ async fn unqueue_happy_path_and_precondition() {
 #[tokio::test]
 async fn override_set_once_row_updated_and_wakes_loop() {
     let state = test_state().await;
-    let wake = Arc::clone(&state.scheduler.as_ref().unwrap().wake);
+    let wake = Arc::clone(&state.scheduler.wake);
     let (status, body) = post(&state, "/api/override", json!({ "id": 1, "mode": "once" })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], json!(true));
@@ -613,7 +604,7 @@ async fn cycle_starts_returns_202() {
 #[tokio::test]
 async fn cycle_wakes_the_scheduler_loop() {
     let state = test_state().await;
-    let wake = Arc::clone(&state.scheduler.as_ref().unwrap().wake);
+    let wake = Arc::clone(&state.scheduler.wake);
     let (status, _) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::ACCEPTED);
     tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
@@ -625,26 +616,8 @@ async fn cycle_wakes_the_scheduler_loop() {
 #[tokio::test]
 async fn cycle_while_running_is_409_busy() {
     let state = test_state().await;
-    state
-        .scheduler
-        .as_ref()
-        .unwrap()
-        .running
-        .store(true, Ordering::SeqCst);
+    state.scheduler.running.store(true, Ordering::SeqCst);
     let (status, body) = post(&state, "/api/cycle", json!({})).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "busy");
-}
-
-/// `serve` runs no loop, so it must say so rather than report a start that
-/// will never happen.
-#[tokio::test]
-async fn cycle_without_scheduler_is_503() {
-    let state = test_state_serve().await;
-    let (status, body) = post(&state, "/api/cycle", json!({})).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(
-        body["error"],
-        "no scheduler in this process (started with serve, not daemon)"
-    );
 }

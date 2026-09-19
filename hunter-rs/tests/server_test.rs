@@ -97,7 +97,10 @@ async fn test_state() -> AppState {
         config: Arc::new(config),
         backend: Arc::new(hunter::backend::NullBackend),
         // Read-only GET tests; no cycle is triggered from here.
-        scheduler: None,
+        scheduler: hunter::server::SchedulerHandle {
+            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+        },
     }
 }
 

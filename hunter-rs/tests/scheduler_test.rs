@@ -375,7 +375,10 @@ async fn summary_paused_on_denied_candidate() {
         store: Arc::new(store),
         config: Arc::new(config),
         backend: Arc::new(hunter::backend::NullBackend),
-        scheduler: None,
+        scheduler: hunter::server::SchedulerHandle {
+            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+        },
     };
 
     let response = router(state)
