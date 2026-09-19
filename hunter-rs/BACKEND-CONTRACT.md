@@ -6,7 +6,7 @@ Sources of truth: `hunter/backend.py`; `hunter/backends/omp_scavenge/{__init__,f
 
 ---
 
-## 0. Where the backend touches `serve` (why round 2 needs it)
+## 0. Where the backend touches the HTTP layer
 
 | Touch point | Site | Needs |
 |---|---|---|
@@ -416,7 +416,7 @@ deliberately unimplemented, so this section is a map rather than a plan.
 
 **Callers**: `src/scheduler.rs` has `pick_next`, `anticipated_tokens`, `record_job`, `run_cycle` and every runner (`run_hunt`, `run_recheck`, `run_fix`, `run_engage`, `run_harvest`, plus the repo-level `run_test_gap`/`run_dep_update`/`run_refactor`/`run_modernize`/`run_standards`) and `sync_prs`. `src/daemon.rs` has `run_daemon` (UI server task + usage-prober task + scheduler loop in one process), `acquire_lockfile`, `reconcile_and_log`, `describe_cycle` and `compute_sleep_s`, with `USAGE_PROBE_TICK_S = 60` (daemon.rs:18) probing `keep_fresh()` at startup and each tick (daemon.rs:224-238).
 
-**Wake path**: the loop sleeps on `compute_sleep_s` but races that against its `Notify` and ctrl-c (daemon.rs:286-290), and sets the `cycle_running` flag around each cycle (daemon.rs:246-253). POST `/api/cycle` and a mode-setting POST `/api/override` notify it in-process — see API-CONTRACT-WRITES.md §§2,5. `serve` starts the UI alone: no scheduler, no prober, and `/api/cycle` answers 503 there.
+**Wake path**: the loop sleeps on `compute_sleep_s` but races that against its `Notify` and ctrl-c (daemon.rs:286-290), and sets the `cycle_running` flag around each cycle (daemon.rs:246-253). POST `/api/cycle` and a mode-setting POST `/api/override` notify it in-process — see API-CONTRACT-WRITES.md §§2,5.
 
 ---
 

@@ -22,6 +22,6 @@ check:
 test:
     cargo test
 
-# Side-by-side with the Python daemon (which owns :8377).
+# Run the daemon against the local hunter/ root.
 run:
-    cargo run -- serve --port 8378
+    cargo run -- --root ../hunter

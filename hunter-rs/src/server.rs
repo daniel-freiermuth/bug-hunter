@@ -33,10 +33,7 @@ use crate::types::{
     Stats, Summary,
 };
 
-/// Handle to the scheduler loop running in *this* process.
-///
-/// `serve` starts no loop, so its `AppState` holds `None` and the manual
-/// cycle trigger says so instead of pretending to have started something.
+/// Handle to this process's scheduler loop.
 #[derive(Clone)]
 pub struct SchedulerHandle {
     /// Set by the loop for the duration of a cycle. Drives `cycle_running`,
@@ -55,8 +52,8 @@ pub struct AppState {
     /// Budget/status brain. Summary reads `status_html()` and `decide()`;
     /// POST handlers never touch it directly.
     pub backend: Arc<dyn crate::backend::Backend>,
-    /// The in-process scheduler loop, if this process runs one.
-    pub scheduler: Option<SchedulerHandle>,
+    /// The scheduler loop this server fronts.
+    pub scheduler: SchedulerHandle,
 }
 
 /// Response shape for GET /api/repo/notes.
@@ -197,12 +194,8 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
     let scheduler_state = store.scheduler_state().await?;
 
     let backend_status_html = state.backend.status_html().await?;
-    // True only while this process's loop is inside a cycle. `serve` has no
-    // loop, so it reports false -- which is the truth there, not a stub.
-    let cycle_running = state
-        .scheduler
-        .as_ref()
-        .is_some_and(|s| s.running.load(Ordering::SeqCst));
+    // True only while the loop is inside a cycle.
+    let cycle_running = state.scheduler.running.load(Ordering::SeqCst);
 
     // "What's next" preview (server.py:272-301): only when nothing is
     // running, from the SAME pick_next/decide the scheduler itself uses.
@@ -629,16 +622,10 @@ async fn verdict(
 /// permit and runs on the following iteration rather than being dropped.
 async fn cycle(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     post_gate(&headers)?;
-    let Some(sched) = state.scheduler.as_ref() else {
-        return Ok(error_body(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "no scheduler in this process (started with serve, not daemon)",
-        ));
-    };
-    if sched.running.load(Ordering::SeqCst) {
+    if state.scheduler.running.load(Ordering::SeqCst) {
         return Ok(error_body(StatusCode::CONFLICT, "busy"));
     }
-    sched.wake.notify_one();
+    state.scheduler.wake.notify_one();
     Ok((StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response())
 }
 
@@ -767,10 +754,8 @@ async fn override_(
     let refreshed = fetch_finding(&state.store, fid).await?;
     // Setting an override should take effect now, not at the loop's next
     // natural wake (contract §5 -- otherwise up to ~60 min later).
-    if mode.is_some()
-        && let Some(sched) = state.scheduler.as_ref()
-    {
-        sched.wake.notify_one();
+    if mode.is_some() {
+        state.scheduler.wake.notify_one();
     }
     Ok(Json(json!({ "ok": true, "finding": refreshed })).into_response())
 }

@@ -28,13 +28,11 @@ The dev server proxies `/api` to the Rust daemon on `127.0.0.1:8377`
 (`vite.config.ts`), so start the backend alongside it:
 
 ```sh
-cd ../../hunter-rs && cargo run -- daemon --root ../hunter
+cd ../../hunter-rs && cargo run -- --root ../hunter
 ```
 
-Use `serve` instead of `daemon` for a UI-only backend that runs no
-scheduler cycles and takes no lockfile — it can run beside a live daemon
-on another port. Note that `POST /api/cycle` answers 503 under `serve`,
-since there is no loop to trigger.
+The binary has a single mode: it takes the lockfile, runs migrations and
+runs the scheduler loop, so only one instance can own a given `--root`.
 
 ## Validate
 

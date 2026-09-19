@@ -4,7 +4,7 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=<project-root>/hunter-rs
-ExecStart=<project-root>/hunter-rs/target/release/hunter daemon --root <project-root>/hunter
+ExecStart=<project-root>/hunter-rs/target/release/hunter --root <project-root>/hunter
 Restart=on-failure
 RestartSec=30
 
