@@ -49,6 +49,7 @@ export interface Finding {
   suggested_refactor?: string | null;
   modernization_class?: string | null;
   current_approach?: string | null;
+  standard_section?: string | null;
   proposed_approach?: string | null;
   // Embedded by /api/findings
   category?: string | null;

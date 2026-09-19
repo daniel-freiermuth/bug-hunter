@@ -546,5 +546,6 @@ pub fn sample_finding(kind: hunter::domain::FindingType) -> hunter::types::Findi
         modernization_class: Some("deprecated-api".to_owned()),
         current_approach: Some("the old way".to_owned()),
         proposed_approach: Some("the new way".to_owned()),
+        standard_section: Some("Type safety / Domain types over primitives".to_owned()),
     }
 }

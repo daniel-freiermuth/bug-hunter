@@ -125,6 +125,7 @@ pub struct Finding {
     pub modernization_class: Option<String>,
     pub current_approach: Option<String>,
     pub proposed_approach: Option<String>,
+    pub standard_section: Option<String>,
 }
 
 impl Finding {
@@ -139,7 +140,7 @@ impl Finding {
             FindingType::TestGap => Some(Some("coverage".to_owned())),
             FindingType::Refactor => Some(self.smell_type.clone()),
             FindingType::Modernization => Some(self.modernization_class.clone()),
-            FindingType::Standards => None,
+            FindingType::Standards => Some(self.standard_section.clone()),
         }
     }
 }

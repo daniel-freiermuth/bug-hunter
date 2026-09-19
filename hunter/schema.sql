@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS findings (
   modernization_class TEXT,
   current_approach TEXT,
   proposed_approach TEXT,
+  standard_section TEXT,
 
   UNIQUE(type, fingerprint)
 );

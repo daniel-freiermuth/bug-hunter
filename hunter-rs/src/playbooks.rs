@@ -112,6 +112,8 @@ const FINDING_PROMPT_KEYS: &[&str] = &[
     "modernization_class",
     "current_approach",
     "proposed_approach",
+    // standards fields
+    "standard_section",
 ];
 
 /// Prompt-relevant fields from a finding, dropping None values.

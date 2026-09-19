@@ -94,6 +94,7 @@ pub struct FindingInsert {
     pub modernization_class: Option<String>,
     pub current_approach: Option<String>,
     pub proposed_approach: Option<String>,
+    pub standard_section: Option<String>,
 }
 
 /// Typed update for finding analysis fields after worker recheck.
@@ -339,7 +340,7 @@ impl Store {
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
                    suggested_refactor, modernization_class, current_approach,
-                   proposed_approach
+                   proposed_approach, standard_section
             FROM findings
             WHERE id = ?1
             "#,
@@ -690,7 +691,7 @@ impl Store {
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
                    suggested_refactor, modernization_class, current_approach,
-                   proposed_approach
+                   proposed_approach, standard_section
             FROM findings
             WHERE (?1 IS NULL OR status = ?1)
               AND (?2 IS NULL OR repo_id = ?2)
@@ -1160,7 +1161,7 @@ impl Store {
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
                    suggested_refactor, modernization_class, current_approach,
-                   proposed_approach
+                   proposed_approach, standard_section
             FROM findings
             WHERE repo_id = ?1 AND type = ?2
               AND status IN (?3, ?4)
@@ -1195,7 +1196,7 @@ impl Store {
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
                    suggested_refactor, modernization_class, current_approach,
-                   proposed_approach
+                   proposed_approach, standard_section
             FROM findings
             WHERE repo_id = ?1 AND type = ?2
               AND status NOT IN (?3, ?4)
@@ -1253,20 +1254,21 @@ impl Store {
         let modernization_class = row.modernization_class.as_deref();
         let current_approach = row.current_approach.as_deref();
         let proposed_approach = row.proposed_approach.as_deref();
+        let standard_section = row.standard_section.as_deref();
         let new_status = FindingStatus::New;
         let result = sqlx::query!(
             "INSERT INTO findings (type, repo_id, fingerprint, file, symbol, line, bug_class, \
              severity, confidence, summary, detail, evidence_plan, introduced_by, \
              ecosystem, package, current_version, latest_version, update_type, security_advisory, \
              missing_tests, test_file, smell_type, suggested_refactor, \
-             modernization_class, current_approach, proposed_approach, \
+             modernization_class, current_approach, proposed_approach, standard_section, \
              status, created_at, updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26, ?27, ?28, ?29)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27, ?28, ?29, ?30)",
             finding_type, repo_id, fingerprint, file, symbol, line, bug_class,
             severity, confidence, summary, detail, evidence_plan, introduced_by,
             ecosystem, package, current_version, latest_version, update_type, security_advisory,
             missing_tests_ref, test_file, smell_type, suggested_refactor,
-            modernization_class, current_approach, proposed_approach,
+            modernization_class, current_approach, proposed_approach, standard_section,
             new_status, now, now
         )
         .execute(&self.pool)
@@ -1444,7 +1446,7 @@ impl Store {
                    f.current_version, f.latest_version, f.update_type,
                    f.security_advisory, f.missing_tests, f.test_file, f.smell_type,
                    f.suggested_refactor, f.modernization_class, f.current_approach,
-                   f.proposed_approach
+                   f.proposed_approach, f.standard_section
             FROM findings f
             JOIN pr_state p ON p.finding_id = f.id
             WHERE f.status = ?1 AND p.needs_attention IS NOT NULL
@@ -1471,7 +1473,7 @@ impl Store {
                    f.current_version, f.latest_version, f.update_type,
                    f.security_advisory, f.missing_tests, f.test_file, f.smell_type,
                    f.suggested_refactor, f.modernization_class, f.current_approach,
-                   f.proposed_approach
+                   f.proposed_approach, f.standard_section
             FROM findings f
             JOIN pr_state p ON p.finding_id = f.id
             WHERE f.status = ?1 AND p.harvested_at IS NULL

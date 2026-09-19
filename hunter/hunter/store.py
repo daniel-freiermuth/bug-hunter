@@ -164,6 +164,11 @@ class Store:
                 "findings",
                 "ALTER TABLE findings ADD COLUMN proposed_approach TEXT",
             ),
+            (
+                "standard_section",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN standard_section TEXT",
+            ),
             ("harvested_at", "pr_state", "ALTER TABLE pr_state ADD COLUMN harvested_at INTEGER"),
             (
                 "attention_since",
@@ -271,6 +276,7 @@ class Store:
                     "  missing_tests TEXT, test_file TEXT,"
                     "  smell_type TEXT, suggested_refactor TEXT,"
                     "  modernization_class TEXT, current_approach TEXT, proposed_approach TEXT,"
+                    "  standard_section TEXT,"
                     "  UNIQUE(type, fingerprint))"
                 )
                 # Build column list dynamically: old tables may not have every

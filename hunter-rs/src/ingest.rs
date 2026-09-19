@@ -33,7 +33,7 @@ pub fn type_required_fields(finding_type: FindingType) -> &'static [&'static str
             "current_approach",
             "proposed_approach",
         ],
-        FindingType::Standards => &["smell_type", "current_approach", "proposed_approach"],
+        FindingType::Standards => &["standard_section", "current_approach", "proposed_approach"],
         FindingType::Bug => &[],
     }
 }
@@ -243,6 +243,7 @@ pub async fn ingest_findings(
             modernization_class: opt_str("modernization_class"),
             current_approach: opt_str("current_approach"),
             proposed_approach: opt_str("proposed_approach"),
+            standard_section: opt_str("standard_section"),
         };
         match store
             .upsert_finding(repo_id, &insert, &entry_type_str)
