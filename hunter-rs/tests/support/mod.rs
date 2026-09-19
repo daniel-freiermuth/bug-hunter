@@ -472,3 +472,79 @@ impl Drop for EnvGuard {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Domain fixtures
+// ---------------------------------------------------------------------------
+
+/// A `Repo` with every field populated, for tests that need one but do
+/// not care what is in it. `Repo` has no `Default` in production and
+/// should not grow one just for tests.
+pub fn sample_repo() -> hunter::types::Repo {
+    hunter::types::Repo {
+        id: 1,
+        name: "widget".to_owned(),
+        url: "https://github.com/acme/widget".to_owned(),
+        path: "/tmp/widget".to_owned(),
+        forge: hunter::domain::ForgeName::Github,
+        default_branch: "main".to_owned(),
+        last_hunt_sha: Some("abc1234".to_owned()),
+        last_hunt_at: Some(1),
+        enabled: 1,
+        added_at: 0,
+        last_full_hunt_at: None,
+        last_test_gap_at: None,
+        last_dep_update_at: None,
+        last_refactor_at: None,
+        last_modernization_at: None,
+        last_standards_at: None,
+    }
+}
+
+/// A `Finding` of the given type with every optional field populated.
+///
+/// Populated rather than `None`-filled on purpose: a prompt builder that
+/// reads a field only when it is `Some` would otherwise never exercise
+/// that path, and the slot it fills would go unrendered.
+pub fn sample_finding(kind: hunter::domain::FindingType) -> hunter::types::Finding {
+    hunter::types::Finding {
+        id: 42,
+        kind,
+        repo_id: 1,
+        fingerprint: "fp-sample".to_owned(),
+        file: Some("src/lib.rs".to_owned()),
+        symbol: Some("do_thing".to_owned()),
+        line: Some(17),
+        severity: hunter::domain::Severity::Medium,
+        confidence: 0.8,
+        summary: "a summary".to_owned(),
+        detail: Some("a detail".to_owned()),
+        status: hunter::domain::FindingStatus::New,
+        pr_url: Some("https://github.com/acme/widget/pull/7".to_owned()),
+        created_at: 0,
+        updated_at: 0,
+        bug_class: Some(hunter::domain::BugClass::Logic),
+        evidence_plan: Some("a plan".to_owned()),
+        introduced_by: Some("deadbeef".to_owned()),
+        rung_achieved: Some(2),
+        verdict_reason: Some("a reason".to_owned()),
+        budget_override: None,
+        fix_attempts: 0,
+        last_fix_failure: None,
+        recheck_attempts: 0,
+        last_recheck_failure: None,
+        ecosystem: Some("npm".to_owned()),
+        package: Some("left-pad".to_owned()),
+        current_version: Some("1.2.0".to_owned()),
+        latest_version: Some("1.3.0".to_owned()),
+        update_type: Some("minor".to_owned()),
+        security_advisory: Some("CVE-0000-0000".to_owned()),
+        missing_tests: Some("[\"case a\"]".to_owned()),
+        test_file: Some("tests/lib_test.rs".to_owned()),
+        smell_type: Some("duplication".to_owned()),
+        suggested_refactor: Some("extract a helper".to_owned()),
+        modernization_class: Some("deprecated-api".to_owned()),
+        current_approach: Some("the old way".to_owned()),
+        proposed_approach: Some("the new way".to_owned()),
+    }
+}

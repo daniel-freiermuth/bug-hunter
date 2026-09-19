@@ -84,6 +84,43 @@ jobs:
       - name: Test
         run: cargo nextest run --profile ci
 
+  # ── Line coverage ─────────────────────────────────────────────
+  # A ratchet, not a target. The floor sits just under the current
+  # number so an unrelated change cannot drift it downward unnoticed;
+  # raise it when a module gets covered, never lower it to go green.
+  #
+  # Coverage and mutation testing answer different questions and are
+  # both needed: coverage says whether a line RUNS, mutants says whether
+  # anything NOTICES when it changes. A module can score 90% coverage
+  # and still lose every mutant. Coverage is also what says where
+  # running mutants is worthwhile at all — mutating code no test
+  # executes just reports "untested" slowly.
+  coverage:
+    name: Rust — line coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter-rs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: hunter-rs
+
+      - uses: taiki-e/install-action@e3bbdb61bd87a1c0f9a9e16d1ae3ee2ca24ff78e # v2
+        with:
+          tool: cargo-nextest,cargo-llvm-cov
+
+      - name: Coverage
+        run: cargo llvm-cov nextest --profile ci --summary-only --fail-under-lines 50
+
   # ── Mutation testing (pull requests only) ─────────────────────
   # A full run is ~1900 mutants and takes hours, so CI tests only the
   # mutants a change actually introduces. A survivor means the suite

@@ -16,6 +16,13 @@
 # usually to delete the redundant code that made it equivalent, not to
 # add a test that cannot exist. Both happened on the first run here.
 
+# `playbook_contract_test` renders the REAL playbooks in ../hunter, which
+# cargo-mutants does not copy (it takes the crate only). Left in, every
+# mutant run fails its baseline and tests nothing. It is a contract test
+# between two directories rather than a unit test, so excluding it here
+# costs no mutation signal.
+additional_cargo_test_args = ["-E", "not binary(playbook_contract_test)"]
+
 timeout_multiplier = 3.0
 minimum_test_timeout = 20
 
