@@ -1,7 +1,7 @@
 //! Window reading + pure ramp math (capacity.py, BACKEND-CONTRACT.md §2.1).
-//! Bodies implemented by the round-2 backend builder. Pure fns stay
-//! parameterized on `now_ms` (deterministic tests); `read_windows` takes the
-//! agent.db path explicitly (tests point it at a fixture).
+//! Pure fns stay parameterized on `now_ms` (deterministic tests);
+//! `read_windows` takes the agent.db path explicitly (tests point it at a
+//! fixture).
 
 use std::collections::BTreeMap;
 use std::path::Path;

@@ -1,7 +1,7 @@
-//! Axum router + handlers — the HTTP surface of the round-1 read-only
-//! serve. Parity contract: API-CONTRACT.md (JSON shapes in types.rs).
+//! Axum router + handlers — the service's HTTP surface.
+//! Parity contract: API-CONTRACT.md (JSON shapes in types.rs).
 //!
-//! Deliberate deviations from Python, all accepted for round 1:
+//! Deliberate deviations from the Python implementation it replaces:
 //! - Param validation failures return 400 {"error": ...} where Python
 //!   leaks a 500 via its `ValueError` catch-all (the UI only reads the
 //!   `error` key). EXCEPTION: /api/finding, where missing/non-numeric/

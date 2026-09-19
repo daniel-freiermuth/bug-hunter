@@ -1,6 +1,6 @@
 //! `OmpScavengeBackend` facade (facade.py, BACKEND-CONTRACT.md §2.2-2.3).
-//! Bodies implemented by the round-2 backend builder; the struct shape and
-//! constructor are frozen (main.rs wires them).
+//! Bundles the harness, the window accounting and the scavenging policy
+//! behind the single `Backend` the scheduler sees.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

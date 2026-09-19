@@ -1,8 +1,8 @@
-//! CLI entry point: `hunter serve [--root <path>] [--port <port>]`.
+//! CLI entry point: `hunter <serve|daemon> [--root <path>] [--port <port>]`.
 //!
-//! Hand-parsed args (no CLI dependency, per the round-1 scaffold rules).
-//! NO lockfile here: the Python daemon owns <`work_root>/hunter.lock`; the
-//! round-1 read-only serve runs beside it on its own port.
+//! Hand-parsed args -- two subcommands and two flags do not justify a CLI
+//! dependency. `daemon` takes an exclusive lock on <`work_root>/hunter.lock`;
+//! `serve` does not, so a read-only UI can run beside a running daemon.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
