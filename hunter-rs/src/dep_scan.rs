@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use crate::util::{drain_pipe, join_pipes};
+
 /// One update candidate, matching the `dep_update` finding schema.
 #[derive(Debug, Clone)]
 pub struct DepCandidate {
@@ -46,19 +48,20 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
         }
     };
 
+    // Renovate is extremely chatty at debug level; drain both pipes from a
+    // reader thread each or it wedges on a full pipe buffer mid-lookup.
+    let so = drain_pipe(child.stdout.take());
+    let se = drain_pipe(child.stderr.take());
+
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                use std::io::Read;
-                let mut output = String::new();
-                if let Some(mut so) = child.stdout.take() {
-                    let _ = so.read_to_string(&mut output);
-                }
-                if let Some(mut se) = child.stderr.take() {
-                    let _ = se.read_to_string(&mut output);
-                }
-                if !status.success() && output.is_empty() {
+                let output = join_pipes(so, se);
+                // A non-zero exit means the lookup is untrustworthy even when
+                // it logged plenty: fall back to the AI job. An empty Some()
+                // still means "renovate ran, nothing to update".
+                if !status.success() {
                     tracing::warn!(
                         "dep_scan: renovate failed (rc={:?}) for {repo_name}",
                         status.code()
@@ -76,12 +79,18 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = join_pipes(so, se);
                     tracing::warn!("dep_scan: renovate timeout for {repo_name}");
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_pipes(so, se);
+                return None;
+            }
         }
     }
 }
@@ -95,11 +104,10 @@ fn parse_renovate_output(output: &str, repo_name: &str) -> Vec<DepCandidate> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let config = match obj.get("config") {
-            Some(c) if c.is_object() => c,
-            _ => continue,
-        };
-        let Some(config_obj) = config.as_object() else {
+        // One check, not two: the `is_object()` guard this replaces was
+        // redundant with the `as_object()` below, so no input could tell
+        // them apart.
+        let Some(config_obj) = obj.get("config").and_then(serde_json::Value::as_object) else {
             continue;
         };
         for (manager, files) in config_obj {
@@ -143,10 +151,17 @@ fn parse_renovate_output(output: &str, repo_name: &str) -> Vec<DepCandidate> {
                             .or_else(|| u.get("newValue"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("?");
-                        let update_type = u
-                            .get("updateType")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
+                        // Normalise BEFORE grading. Renovate's
+                        // housekeeping types mean "this is a patch", and
+                        // the record says so — grading them off the raw
+                        // value gave two findings both labelled `patch`
+                        // different confidences, with pin/digest scored
+                        // 0.7, the same as a major bump.
+                        let update_type = normalize_update_type(
+                            u.get("updateType")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown"),
+                        );
 
                         let fp = format!(
                             "{repo_name}:{datasource}:{dep_name}:{current}\u{2192}{new_version}"
@@ -182,7 +197,7 @@ fn parse_renovate_output(output: &str, repo_name: &str) -> Vec<DepCandidate> {
                             package: dep_name.to_owned(),
                             current_version: current_clean.to_owned(),
                             latest_version: new_version.to_owned(),
-                            update_type: normalize_update_type(update_type).to_owned(),
+                            update_type: update_type.to_owned(),
                             severity: severity.to_owned(),
                             confidence,
                             summary: format!(
