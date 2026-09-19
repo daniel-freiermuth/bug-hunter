@@ -1,0 +1,4 @@
+# sqlx compile-time query checking runs against the schema-only dev DB.
+# Regenerate it after any schema change:  just dev-db   (see justfile)
+[env]
+DATABASE_URL = { value = "sqlite:dev.db", relative = false }
