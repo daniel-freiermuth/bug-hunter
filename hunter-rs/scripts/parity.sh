@@ -17,6 +17,11 @@ RS_PORT="${RS_PORT:-8378}"
 PY_BASE="http://127.0.0.1:${PY_PORT}"
 RS_BASE="http://127.0.0.1:${RS_PORT}"
 
+# Mismatched bodies go in a private scratch dir, not predictable /tmp paths
+# (symlink/TOCTOU). Removed on exit; the inline diff is the durable record.
+TMPDIR_PARITY="$(mktemp -d)" || exit 1
+trap 'rm -rf -- "$TMPDIR_PARITY"' EXIT
+
 fail_count=0
 pass_count=0
 skip_count=0
@@ -52,10 +57,10 @@ compare() {
     else
         echo "FAIL ${path}"
         fail_count=$((fail_count + 1))
-        printf '%s\n' "$py" > "/tmp/parity-${s}-py.json"
-        printf '%s\n' "$rs" > "/tmp/parity-${s}-rs.json"
-        echo "  bodies: /tmp/parity-${s}-{py,rs}.json"
-        diff -u "/tmp/parity-${s}-py.json" "/tmp/parity-${s}-rs.json" | head -n 40
+        printf '%s\n' "$py" > "${TMPDIR_PARITY}/parity-${s}-py.json"
+        printf '%s\n' "$rs" > "${TMPDIR_PARITY}/parity-${s}-rs.json"
+        echo "  bodies: ${TMPDIR_PARITY}/parity-${s}-{py,rs}.json"
+        diff -u "${TMPDIR_PARITY}/parity-${s}-py.json" "${TMPDIR_PARITY}/parity-${s}-rs.json" | head -n 40
     fi
 }
 

@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   tokens_new    INTEGER,                   -- input+output+cacheWrite, from ledger
   calls         INTEGER,
   exit_code     INTEGER,
-  killed_reason TEXT,                      -- cap | wallclock | NULL
+  killed_reason TEXT,                      -- cap | wallclock | unmetered | NULL
   notes         TEXT,
   model         TEXT,                      -- model used for this job
   usage_delta   REAL,                      -- 7d used_fraction increase observed during job

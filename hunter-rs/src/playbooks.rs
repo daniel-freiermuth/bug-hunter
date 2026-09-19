@@ -16,19 +16,19 @@ pub fn playbook_dir(root: &Path) -> std::path::PathBuf {
     root.join("playbooks")
 }
 
-/// Substitute {{KEY}} slots in a template. Panics if any {{...}} remain
+/// Substitute {{KEY}} slots in a template. Errors if any {{...}} remain
 /// after substitution (typo/missing slot detection, matching Python's
-/// assertion).
-pub fn render<S: BuildHasher>(template: &str, slots: &HashMap<&str, String, S>) -> String {
+/// assertion) — a half-rendered prompt must never reach a worker.
+pub fn render<S: BuildHasher>(template: &str, slots: &HashMap<&str, String, S>) -> Result<String> {
     let mut result = template.to_owned();
     for (k, v) in slots {
         result = result.replace(&format!("{{{{{k}}}}}"), v);
     }
     if let Some(idx) = result.find("{{") {
         let snippet: String = result[idx..].chars().take(60).collect();
-        tracing::error!("unfilled placeholder in playbook: {snippet}");
+        bail!("unfilled placeholder in playbook: {snippet}");
     }
-    result
+    Ok(result)
 }
 
 /// Escape {{ in user content so render's assertion doesn't fire.
@@ -255,7 +255,7 @@ pub fn build_hunt_prompt(
     slots.insert("OUT_PATH", out_path.display().to_string());
     slots.insert("MAX_FINDINGS", max_findings.to_string());
     slots.insert("REPO_NOTES", notes);
-    Ok(render(&template, &slots))
+    render(&template, &slots)
 }
 
 pub fn build_fix_prompt(
@@ -274,7 +274,7 @@ pub fn build_fix_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("REPO_NOTES", notes);
-    Ok(render(&template, &slots))
+    render(&template, &slots)
 }
 
 pub fn build_apply_improvement_prompt(
@@ -293,7 +293,7 @@ pub fn build_apply_improvement_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("REPO_NOTES", notes);
-    Ok(render(&template, &slots))
+    render(&template, &slots)
 }
 
 pub fn build_apply_modernization_prompt(
@@ -312,7 +312,7 @@ pub fn build_apply_modernization_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("REPO_NOTES", notes);
-    Ok(render(&template, &slots))
+    render(&template, &slots)
 }
 
 pub fn build_engage_prompt(
@@ -351,7 +351,7 @@ pub fn build_engage_prompt(
     slots.insert("CHECKS", escape_braces(&checks_lines(pr)));
     slots.insert("ATTENTION", attention);
     slots.insert("REPO_NOTES", notes);
-    Ok(render(&template, &slots))
+    render(&template, &slots)
 }
 
 pub fn build_harvest_prompt(
@@ -384,7 +384,7 @@ pub fn build_harvest_prompt(
     );
     slots.insert("FEEDBACK", escape_braces(&feedback_blocks(pr, 8000)));
     slots.insert("REPO_NOTES", notes);
-    Ok(render(&template, &slots))
+    render(&template, &slots)
 }
 
 pub fn build_recheck_prompt(
@@ -402,7 +402,7 @@ pub fn build_recheck_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("OUT_PATH", out_path.display().to_string());
     slots.insert("REPO_NOTES", notes);
-    Ok(render(&template, &slots))
+    render(&template, &slots)
 }
 
 /// Analysis-job prompt builders (`test_gap`, `dep_update`, refactor, modernization,
@@ -431,7 +431,7 @@ fn build_analysis_prompt(
     slots.insert("OUT_PATH", out_path.display().to_string());
     slots.insert(max_slot, max_items.to_string());
     slots.insert("REPO_NOTES", notes);
-    Ok(render(&template, &slots))
+    render(&template, &slots)
 }
 
 pub fn build_test_gap_prompt(
@@ -571,5 +571,5 @@ pub fn build_standards_prompt(
     slots.insert("OUT_PATH", out_path.display().to_string());
     slots.insert("MAX_FINDINGS", max_findings.to_string());
     slots.insert("REPO_NOTES", notes);
-    Ok(render(&template, &slots))
+    render(&template, &slots)
 }

@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use crate::util::{drain_pipe, join_pipes};
+
 /// One update candidate, matching the `dep_update` finding schema.
 #[derive(Debug, Clone)]
 pub struct DepCandidate {
@@ -46,19 +48,20 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
         }
     };
 
+    // Renovate is extremely chatty at debug level; drain both pipes from a
+    // reader thread each or it wedges on a full pipe buffer mid-lookup.
+    let so = drain_pipe(child.stdout.take());
+    let se = drain_pipe(child.stderr.take());
+
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                use std::io::Read;
-                let mut output = String::new();
-                if let Some(mut so) = child.stdout.take() {
-                    let _ = so.read_to_string(&mut output);
-                }
-                if let Some(mut se) = child.stderr.take() {
-                    let _ = se.read_to_string(&mut output);
-                }
-                if !status.success() && output.is_empty() {
+                let output = join_pipes(so, se);
+                // A non-zero exit means the lookup is untrustworthy even when
+                // it logged plenty: fall back to the AI job. An empty Some()
+                // still means "renovate ran, nothing to update".
+                if !status.success() {
                     tracing::warn!(
                         "dep_scan: renovate failed (rc={:?}) for {repo_name}",
                         status.code()
@@ -76,12 +79,18 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = join_pipes(so, se);
                     tracing::warn!("dep_scan: renovate timeout for {repo_name}");
                     return None;
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_pipes(so, se);
+                return None;
+            }
         }
     }
 }

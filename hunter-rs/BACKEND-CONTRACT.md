@@ -1,4 +1,4 @@
-# BACKEND-CONTRACT.md — Backend protocol + omp_scavenge for the Rust port (round 2)
+# BACKEND-CONTRACT.md — Backend protocol + omp_scavenge for the Rust port
 
 Extracted 2026-09-13 from the Python source at the paths cited below. Companion to `hunter-rs/API-CONTRACT.md` (round 1: error envelope, Row types, `/api/summary` shape — see its lines 66 and 338 for where `backend_status_html` crosses the HTTP boundary). Precision bar: a Rust developer should never need to open the Python source. Every claim carries `file:line` (paths relative to `hunter/`; `hunter/…` = `hunter/hunter/…`).
 
@@ -12,7 +12,7 @@ Sources of truth: `hunter/backend.py`; `hunter/backends/omp_scavenge/{__init__,f
 |---|---|---|
 | Construction | `serve()` server.py:713-725: `backend = cfg.make_backend(ThreadLocalLedger(cfg))` → `make_server(cfg, backend)`. Same in `daemon()` server.py:1034. Factory types.py:232-243. | `Config::make_backend` + `SpendLedger` impl |
 | GET `/api/summary` → `backend_status_html` | `self.backend.status()` server.py:256, emitted :306; typed field server.py:837; zod `z.string()` app.ts:170-171; `$("windows").innerHTML` app.ts:972-975, called app.ts:1375 (5 s poll) | `status()` |
-| GET `/api/summary` → next-candidate budget preview | server.py:272-301: when `current_job is None` and `scheduler.pick_next` yields, handler calls `self.backend.decide(anticipated_tokens=scheduler.anticipated_tokens(store, cfg, repo_id, kind))` (:283-285), indexes `outlook.prioritized if override else outlook.normal` (:287), maps to `budget_state: "denied"|"allowed"`, `budget_reason`, `budget_retry_at`, `is_prioritized: bool(override)` (:288-301). `override = target.get("budget_override")` only for kinds `engage|harvest|recheck|fix` (:280-281). | **`decide()` on the READ path — round-2 serve cannot stub it** |
+| GET `/api/summary` → next-candidate budget preview | server.py:272-301: when `current_job is None` and `scheduler.pick_next` yields, handler calls `self.backend.decide(anticipated_tokens=scheduler.anticipated_tokens(store, cfg, repo_id, kind))` (:283-285), indexes `outlook.prioritized if override else outlook.normal` (:287), maps to `budget_state: "denied"\|"allowed"`, `budget_reason`, `budget_retry_at`, `is_prioritized: bool(override)` (:288-301). `override = target.get("budget_override")` only for kinds `engage\|harvest\|recheck\|fix` (:280-281). | **`decide()` on the READ path — round-2 serve cannot stub it** |
 | POST `/api/cycle` | server.py:482-506: spawns `scheduler.run_cycle(store, cfg, backend=backend)` in a thread under `_cycle_lock` | full scheduler + `run()` → round 3 (§6) |
 | Usage prober thread | `_usage_prober_loop(backend, stop)` server.py:994-1014; tick `USAGE_PROBE_TICK_S = 60.0` server.py:111; started **only** by `daemon()` (server.py:1047-1049). `serve()` does NOT start it (server.py:713-725). CLI: `serve` = UI-only, `daemon` = UI+scheduler+prober (cli.py:3-6,22-35,54-63). | `keep_fresh()` (method is round 2; calling thread arrives with daemon) |
 | Denial → daemon sleep | `retry_at` flows through every scheduler `{"denied":…, "retry_at":…}` return into `_compute_sleep_s` server.py:934-992: truthy → `sleep = max(60.0, min(retry_at/1000 − time.time() + 30, 3600))` (:979-985); `None` → 30 min (:986-988) | `Denied.retry_at` semantics |
@@ -122,6 +122,8 @@ def status(self) -> str                                      # :194-206
 
 ### 1.8 `RunResult` (types.py:246-257)
 `exit_code: int|None`; `killed_reason: str|None` = `None|"cap"|"wallclock"`; `tokens_new: int` (input+output+cacheWrite from worker ledger); `calls: int`; `session_file: str|None`; `duration_s: float`; `stdout_tail: str = ""`; `usage_delta: float|None = None` (provider 7d used_fraction change during the job; set by facade's snapshot sandwich, facade.py:253-268). Consumed by scheduler `_record_job` (scheduler.py:88-116; state = "killed" if killed_reason else "done"/"failed" by exit_code==0, :81-84).
+
+**Rust addition:** `killed_reason` also takes `"unmetered"`, when the worker's session ledger never appears within the discovery grace period. Python carried on with `tokens_new = 0`, which silently disarms the token cap and books the job as free; the port kills the worker and records the run as killed instead.
 
 ### 1.9 What feeds `anticipated_tokens` (scheduler.py:39-77 — stays in core)
 Warm iff this exact `(repo_id, kind)` finished a non-denied job within `cfg.cache_ttl_s`: `SELECT 1 FROM jobs WHERE repo_id = ? AND kind = ? AND finished_at > ? AND state != 'denied' LIMIT 1` (:58-65, cutoff `now_ms() − cache_ttl_s*1000`). History = all `tokens_new` for the kind, ascending (:66-73). Empty → 0; else `history[min(int(len * (0.5 if warm else 0.9)), len−1)]` — warm p50, cold p90 (:74-77).
@@ -289,6 +291,7 @@ UI dependency map (class names are load-bearing): container `#windows` index.htm
 | `backend.type` | `backend_type` | `"omp-scavenge"` | `make_backend` discriminator types.py:238-243; unknown → `ValueError(f"unknown backend_type: {v!r}")` |
 | `hunt.capNewTokens` | `hunt_cap_tokens` | `200_000` | core cap min'd vs Granted.cap (scheduler.py:277,288, …) |
 | `fix.capNewTokens` | `fix_cap_tokens` | `150_000` | same for fix/engage/harvest |
+
 `model_for(kind)` (types.py:195-197): `(model_hunt if kind == "hunt" else model_fix) or model_default` — only `"hunt"` picks model_hunt; the only other JobClass value is `"fix"`. Load-mapping cites: types.py:200-229 (ompBin :207, staleAfterS :218, cacheTtlS :219, pollS :221, models.* :222-225, backend.type :226). `make_backend(ledger)` (types.py:232-243): deferred import of OmpScavengeBackend; returns `OmpScavengeBackend(cfg=self, ledger=ledger)`.
 
 ⚠️ **The task brief's `budget.deny5hAbove` and weekly-reserve keys DO NOT EXIST** (grep-verified: no `deny5h|reserve|weekly` identifiers under hunter/hunter). The old fixed-threshold+reserve design was superseded by the dual-ramp policy (capacity.py:1-32): the "7d interactive reserve" is structural (the 7d linear ramp never lets hunter get ahead of uniform pacing), and the human-headroom knob is `HEADROOM_MS = 30 min` (capacity.py:64-69), a code constant, not config.
@@ -382,6 +385,7 @@ Also relevant, NOT backend-behavior tests: scheduler tests each define a local F
 | `keep_fresh()` | `window_log` INSERT per window (always) + conditional `calibration_samples` INSERT — both via `_observe` (facade.py:287,306-346) | spawns `omp usage invalidate` then `omp usage` (facade.py:296-303); reads agent.db |
 | `status()` | **none** (reads ledger like decide + estimate_capacity per lid) | reads agent.db |
 | `run()` (r3) | none itself — scheduler's `_record_job` persists the RunResult (scheduler.py:88-116) | spawns omp worker; two read_windows snapshots; sets rr.usage_delta |
+
 No scheduler wake from the backend: `_wake` (server.py:90) is set by server POST handlers only. Denied-job rows + `deny` events are written by the scheduler callers, never by decide().
 
 Clock call sites (`time.time()`):
@@ -401,12 +405,18 @@ Rust recommendations:
 
 ---
 
-## 6. Round-3 boundary — stub exactly ONE seam
+## 6. Implementation scope — nothing in this contract is stubbed
 
-Round 2 implements completely: `JobClass`/`Granted`/`Denied`/`Verdict`/`Outlook`; `SpendLedger` on the Rust store (7 methods, SQL in §1.6); the whole `capacity` module; `OmpScavengeBackend::{decide, keep_fresh, status}` incl. `_observe` and the exact reason/HTML strings; `Config::make_backend`; tests 1-66 (67-71 come with the prober thread).
+The backend, the scheduler and the daemon all landed; there is no seam left
+deliberately unimplemented, so this section is a map rather than a plan.
 
-**The one stub: `Backend::run()`** (backend.py:166-181; facade.py:244-268) — and everything only it pulls in: all of `harness.py` (spawn/discover/meter/SIGTERM), `_usage_snapshot` (facade.py:270-280; run() is its only caller), the `poll_s`/`model_smol` consumers. Suggested: `fn run(&self, …) -> RunResult { unimplemented!("round 3: worker harness") }` (or a typed error) — nothing in `serve` reaches it: GET `/api/summary` needs decide()+status() only; the sole route into run() is POST `/api/cycle` → `scheduler::run_cycle` (WritesScout's contract governs what that endpoint does in round 2).
-Also round 3 (outside the trait): scheduler run_*/run_cycle/pick_next execution, `daemon()` (server.py:1017-1099), `_compute_sleep_s` (server.py:934-992), the `_usage_prober_loop` thread + stop signal (server.py:994-1014) — `keep_fresh` itself is round 2 and fully specced, so starting the prober early from Rust serve is safe if desired (Python serve doesn't).
+**Trait + data** (`src/backend.rs`): `JobClass`/`Verdict`/`Outlook` (:17-70); `SpendLedger`'s 7 methods (:76-113), implemented on `Store` over the sqlx pool (store.rs:1755-1862, SQL per §1.6); the `Prober` subprocess seam + `CmdProber` (:120-131); `Backend` itself (:139-161) with all four methods — `decide`, `keep_fresh`, `status_html`, `run`.
+
+**`omp_scavenge`** (`src/backends/omp_scavenge/`): `capacity.rs` (`read_windows`, the `ramp_7d`/`ramp_5h` + `retry_at_*` pair, `effective_used`), `facade.rs` (`impl Backend for OmpScavengeBackend`, facade.rs:400) including `_usage_snapshot` (facade.rs:336) taken either side of a worker run (facade.rs:634-660), and `harness.rs` (`run_worker` spawn+meter, `snapshot`/`discover` for the session JSONL, `ledger_usage`, and `kill_tree` SIGTERM→SIGKILL at harness.rs:183). `NullBackend` (backend.rs:164-197) remains for router tests only: its `run()` errors by construction, which is the point.
+
+**Callers**: `src/scheduler.rs` has `pick_next`, `anticipated_tokens`, `record_job`, `run_cycle` and every runner (`run_hunt`, `run_recheck`, `run_fix`, `run_engage`, `run_harvest`, plus the repo-level `run_test_gap`/`run_dep_update`/`run_refactor`/`run_modernize`/`run_standards`) and `sync_prs`. `src/daemon.rs` has `run_daemon` (UI server task + usage-prober task + scheduler loop in one process), `acquire_lockfile`, `reconcile_and_log`, `describe_cycle` and `compute_sleep_s`, with `USAGE_PROBE_TICK_S = 60` (daemon.rs:18) probing `keep_fresh()` at startup and each tick (daemon.rs:224-238).
+
+**Wake path**: the loop sleeps on `compute_sleep_s` but races that against its `Notify` and ctrl-c (daemon.rs:286-290), and sets the `cycle_running` flag around each cycle (daemon.rs:246-253). POST `/api/cycle` and a mode-setting POST `/api/override` notify it in-process — see API-CONTRACT-WRITES.md §§2,5. `serve` starts the UI alone: no scheduler, no prober, and `/api/cycle` answers 503 there.
 
 ---
 

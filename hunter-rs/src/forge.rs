@@ -1,7 +1,6 @@
 //! Forge abstraction — GitHub / GitLab PR/MR lifecycle via CLI tools.
 //! Port of hunter/forge.py. Methods shell out to `gh` / `glab`.
 
-use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -9,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::domain::ForgeName;
-use crate::util::run_cmd;
+use crate::util::{drain_pipe, join_pipes, run_cmd};
 
 /// Git forge PR/MR lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -261,28 +260,29 @@ fn run_cmd_cwd(argv: &[&str], cwd: &Path, timeout_s: u64) -> (i32, String) {
         Ok(c) => c,
         Err(e) => return (127, e.to_string()),
     };
+    // Drain both pipes while the child runs: reading them only after it
+    // exits deadlocks as soon as the child fills a pipe buffer.
+    let so = drain_pipe(child.stdout.take());
+    let se = drain_pipe(child.stderr.take());
     let deadline = Instant::now() + Duration::from_secs(timeout_s);
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut out = String::new();
-                if let Some(mut so) = child.stdout.take() {
-                    let _ = so.read_to_string(&mut out);
-                }
-                if let Some(mut se) = child.stderr.take() {
-                    let _ = se.read_to_string(&mut out);
-                }
-                return (status.code().unwrap_or(-1), out);
-            }
+            Ok(Some(status)) => return (status.code().unwrap_or(-1), join_pipes(so, se)),
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return (124, format!("timeout after {timeout_s}s"));
+                    let out = join_pipes(so, se);
+                    return (124, format!("timeout after {timeout_s}s\n{out}"));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return (127, e.to_string()),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let out = join_pipes(so, se);
+                return (127, format!("{e}\n{out}"));
+            }
         }
     }
 }
@@ -611,11 +611,12 @@ impl Forge for GitHubForge {
     }
 
     fn close_pr(&self, url: &str, pr_number: i64, comment: &str) -> anyhow::Result<()> {
-        // Post the withdrawal reason as a comment first, then close.
+        // Post the withdrawal reason as a comment first, then close. Only
+        // close once it lands — a lost reason must not become a silent close.
         // Truncate to 800 chars to avoid CLI arg-length limits.
-        let truncated = &comment[..comment.len().min(800)];
+        let truncated: String = comment.chars().take(800).collect();
         if !truncated.is_empty() {
-            let _ = self.comment_pr(url, pr_number, truncated);
+            self.comment_pr(url, pr_number, &truncated)?;
         }
         let (owner, repo) = self
             .owner_repo(url)
@@ -774,9 +775,10 @@ impl Forge for GitLabForge {
     }
 
     fn close_pr(&self, url: &str, pr_number: i64, comment: &str) -> anyhow::Result<()> {
-        let truncated = &comment[..comment.len().min(800)];
+        // Close only after the withdrawal reason has landed.
+        let truncated: String = comment.chars().take(800).collect();
         if !truncated.is_empty() {
-            let _ = self.comment_pr(url, pr_number, truncated);
+            self.comment_pr(url, pr_number, &truncated)?;
         }
         let (_, path) = gitlab_host_path(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;

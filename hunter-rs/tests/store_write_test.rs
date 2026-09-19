@@ -2,7 +2,8 @@
 //! Round-2 write-path + `SpendLedger` behavior tests, run against a writable
 //! copy of dev.db (schema-complete, zero rows). Each test seeds its own
 //! fixture copy through a plain sqlx pool, then exercises the read-write
-//! Store (`Store::connect`) the serve process uses for POST handlers.
+//! Store behind the POST handlers via `Store::connect`, the daemon's
+//! migrating opener (serve itself opens with `Store::connect_no_migrate`).
 //!
 //! Deviation note (documented in store.rs too): `append_repo_note` stamps
 //! dates/times in UTC, while the Python store used `datetime.now()` (local
@@ -369,22 +370,19 @@ async fn finished_between_is_half_open_start_excluded_end_included() {
 async fn last_window_observation_groups_by_resets_at_and_newest_wins() {
     let (path, pool) = fresh_db().await;
     const R: i64 = 9_999_999;
-    sqlx::raw_sql(&*Box::leak(
-        format!(
-            r"
-    INSERT INTO window_log (observed_at, limit_id, used_fraction, status, resets_at, source_age_s)
-    VALUES (100, 'anthropic:5h', 0.1, 'ok', {a}, 1),
-           (200, 'anthropic:5h', 0.2, 'ok', {b}, 1),
-           (300, 'anthropic:5h', 0.9, 'ok', {c}, 1),
-           (250, 'anthropic:7d', 0.7, 'ok', {r}, 1)
-    ",
-            a = R + 4_000,
-            b = R - 4_000,
-            c = R + 9_000,
-            r = R,
-        )
-        .into_boxed_str(),
-    ))
+    let (a, b, c) = (R + 4_000, R - 4_000, R + 9_000);
+    sqlx::query!(
+        "INSERT INTO window_log \
+         (observed_at, limit_id, used_fraction, status, resets_at, source_age_s) \
+         VALUES (100, 'anthropic:5h', 0.1, 'ok', ?, 1), \
+                (200, 'anthropic:5h', 0.2, 'ok', ?, 1), \
+                (300, 'anthropic:5h', 0.9, 'ok', ?, 1), \
+                (250, 'anthropic:7d', 0.7, 'ok', ?, 1)",
+        a,
+        b,
+        c,
+        R,
+    )
     .execute(&pool)
     .await
     .unwrap();
@@ -401,8 +399,12 @@ async fn last_window_observation_groups_by_resets_at_and_newest_wins() {
 
     // A newer row with NULL used_fraction poisons the lookup -> None
     // (even though older rows in the group have values).
-    sqlx::raw_sql(&*Box::leak(format!("INSERT INTO window_log (observed_at, limit_id, used_fraction, status, resets_at, source_age_s) \
-     VALUES (400, 'anthropic:5h', NULL, 'ok', {R}, 1)").into_boxed_str()))
+    sqlx::query!(
+        "INSERT INTO window_log \
+         (observed_at, limit_id, used_fraction, status, resets_at, source_age_s) \
+         VALUES (400, 'anthropic:5h', NULL, 'ok', ?, 1)",
+        R
+    )
     .execute(&pool)
     .await
     .unwrap();
@@ -461,21 +463,21 @@ async fn estimate_capacity_returns_max_spend_per_completed_cycle() {
     let r1 = (now / 10_000) * 10_000 - 100_000; // completed cycle 1 (newest)
     let r2 = r1 - PERIOD_5H; // completed cycle 2
 
-    sqlx::raw_sql(&*Box::leak(
-        format!(
-            r"
-    INSERT INTO window_log (observed_at, limit_id, used_fraction, status, resets_at, source_age_s)
-    VALUES ({o1}, 'anthropic:5h', 0.9, 'ok', {r1}, 1),
-           ({o1d}, 'anthropic:5h', 0.95, 'ok', {r1d}, 1),
-           ({o2}, 'anthropic:5h', 0.8, 'ok', {r2}, 1)
-    ",
-            o1 = r1 - 100,
-            o1d = r1 - 50,
-            r1d = r1 + 3_000, // same cycle observed twice: 10 s bucket dedups it
-            o2 = r2 - 100,
-        )
-        .into_boxed_str(),
-    ))
+    let r1d = r1 + 3_000; // same cycle observed twice: 10 s bucket dedups it
+    let (o1, o1d, o2) = (r1 - 100, r1 - 50, r2 - 100);
+    sqlx::query!(
+        "INSERT INTO window_log \
+         (observed_at, limit_id, used_fraction, status, resets_at, source_age_s) \
+         VALUES (?, 'anthropic:5h', 0.9, 'ok', ?, 1), \
+                (?, 'anthropic:5h', 0.95, 'ok', ?, 1), \
+                (?, 'anthropic:5h', 0.8, 'ok', ?, 1)",
+        o1,
+        r1,
+        o1d,
+        r1d,
+        o2,
+        r2,
+    )
     .execute(&pool)
     .await
     .unwrap();
@@ -518,10 +520,14 @@ async fn estimate_capacity_zero_spend_returns_none() {
         .unwrap()
         .as_millis() as i64;
     // One completed cycle, but no jobs at all.
-    sqlx::raw_sql(&*Box::leak(format!("INSERT INTO window_log (observed_at, limit_id, used_fraction, status, resets_at, source_age_s) \
-     VALUES ({o}, 'anthropic:5h', 0.5, 'ok', {r}, 1)",
-    o = now - 200_000,
-    r = now - 100_000).into_boxed_str()))
+    let (o, r) = (now - 200_000, now - 100_000);
+    sqlx::query!(
+        "INSERT INTO window_log \
+         (observed_at, limit_id, used_fraction, status, resets_at, source_age_s) \
+         VALUES (?, 'anthropic:5h', 0.5, 'ok', ?, 1)",
+        o,
+        r
+    )
     .execute(&pool)
     .await
     .unwrap();

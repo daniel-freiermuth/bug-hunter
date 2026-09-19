@@ -109,7 +109,7 @@
         Timeline ({finding.timeline.length})
       </summary>
       <div class="timeline-items">
-        {#each finding.timeline as ev (ev.at)}
+        {#each finding.timeline as ev (ev.id)}
           <div class="tl-row">
             <span class="tl-dot"></span>
             <span class="tl-time">{datetime(ev.at)}</span>
@@ -132,7 +132,7 @@
             class="reason-input"
             placeholder="Reason for {showReasonPrompt}…"
             bind:value={reasonText}
-            onkeydown={(e: KeyboardEvent) => { if (e.key === "Enter" && reasonText.trim()) doVerdict(showReasonPrompt!, reasonText.trim()); }}
+            onkeydown={(e: KeyboardEvent) => { if (e.key === "Enter" && !busy && reasonText.trim()) doVerdict(showReasonPrompt!, reasonText.trim()); }}
           />
           <button
             class="btn btn-confirm"

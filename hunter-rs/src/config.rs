@@ -157,6 +157,14 @@ impl Config {
                 root.join(p)
             }
         };
+        // pollS drives the harness meter tick (harness.rs); zero busy-loops
+        // the poll and negative/NaN panics Duration::from_secs_f64.
+        let poll_s = raw.poll_s.unwrap_or(2.0);
+        anyhow::ensure!(
+            poll_s.is_finite() && poll_s > 0.0,
+            "{}: pollS must be a finite number greater than 0 (got {poll_s})",
+            cfg_path.display()
+        );
         Ok(Self {
             root: root.to_owned(),
             work_root: resolve(raw.work_root.as_deref().unwrap_or("data")),
@@ -166,7 +174,7 @@ impl Config {
             omp_bin: raw.omp_bin.unwrap_or_else(|| "omp".to_owned()),
             stale_after_s: raw.budget.stale_after_s.unwrap_or(300.0),
             cache_ttl_s: raw.budget.cache_ttl_s.unwrap_or(3600.0),
-            poll_s: raw.poll_s.unwrap_or(2.0),
+            poll_s,
             model_default: raw.models.default,
             model_smol: raw.models.smol,
             model_hunt: raw.models.hunt,

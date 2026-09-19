@@ -113,8 +113,8 @@ pub async fn ingest_findings(
                 .unwrap_or("");
             let Ok(ft) = raw.parse::<FindingType>() else {
                 result.invalid += 1;
-                let truncated = &serde_json::to_string(f).unwrap_or_default();
-                let truncated = &truncated[..truncated.len().min(300)];
+                let truncated = serde_json::to_string(f).unwrap_or_default();
+                let truncated: String = truncated.chars().take(300).collect();
                 let _ = store
                     .log_event(
                         "error",
@@ -190,8 +190,8 @@ pub async fn ingest_findings(
         })();
         if let Some(problem) = problem {
             result.invalid += 1;
-            let truncated = &serde_json::to_string(f).unwrap_or_default();
-            let truncated = &truncated[..truncated.len().min(300)];
+            let truncated = serde_json::to_string(f).unwrap_or_default();
+            let truncated: String = truncated.chars().take(300).collect();
             let _ = store
                 .log_event(
                     "error",

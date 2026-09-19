@@ -2,7 +2,8 @@
 //!
 //! Hand-parsed args -- two subcommands and two flags do not justify a CLI
 //! dependency. `daemon` takes an exclusive lock on <`work_root>/hunter.lock`;
-//! `serve` does not, so a read-only UI can run beside a running daemon.
+//! `serve` does not, so a UI can run beside a running daemon -- and for that
+//! same reason `serve` never migrates: `daemon` owns the schema.
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -105,7 +106,9 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Serve => {
             let port = cli.port.unwrap_or(cfg.serve_port);
-            let store = Arc::new(Store::connect(&cfg.db_path).await?);
+            // No lockfile here, so serve must not migrate underneath a
+            // running daemon — daemon owns migrations.
+            let store = Arc::new(Store::connect_no_migrate(&cfg.db_path).await?);
             anyhow::ensure!(
                 cfg.backend_type == "omp-scavenge",
                 "unknown backend_type: {:?}",

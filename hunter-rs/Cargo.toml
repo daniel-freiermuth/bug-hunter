@@ -2,7 +2,7 @@
 name = "hunter"
 version = "0.1.0"
 edition = "2024"
-description = "Idle-token bug hunter — Rust port (migration round 1: read-only serve)"
+description = "Idle-token bug hunter — server, scheduler and worker harness"
 publish = false
 
 [lints.rust]

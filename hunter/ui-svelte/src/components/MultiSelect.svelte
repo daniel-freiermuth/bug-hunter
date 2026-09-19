@@ -4,7 +4,7 @@
   let {
     label,
     options,
-    selected = $bindable(new SvelteSet<string>()),
+    selected,
   }: {
     label: string;
     options: string[];
@@ -28,20 +28,21 @@
     return `${label} (${names.length})`;
   });
 
+  // Mutate the set in place, never reassign it: the SvelteSet instance is
+  // itself the reactive value, so replacing it costs the parent its
+  // subscription and forces a redundant `$state` wrapper on every caller.
   function toggle(value: string) {
-    const next = new SvelteSet(selected);
-    if (next.has(value)) next.delete(value);
-    else next.add(value);
-    selected = next;
+    if (selected.has(value)) selected.delete(value);
+    else selected.add(value);
   }
 
   function toggleAll() {
     if (allSelected) {
       // All checked → clear everything.
-      selected = new SvelteSet();
+      selected.clear();
     } else {
       // Unchecked or indeterminate → select all.
-      selected = new SvelteSet(options);
+      for (const option of options) selected.add(option);
     }
   }
 

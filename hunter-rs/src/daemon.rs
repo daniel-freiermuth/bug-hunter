@@ -261,11 +261,8 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
                     .set_scheduler_state(&state_label, &detail, Some(next_wake))
                     .await;
                 let summary_str = serde_json::to_string(&summary).unwrap_or_default();
-                tracing::info!(
-                    "cycle: {} -> sleep {:.0}s",
-                    &summary_str[..summary_str.len().min(200)],
-                    sleep_s
-                );
+                let summary_head: String = summary_str.chars().take(200).collect();
+                tracing::info!("cycle: {summary_head} -> sleep {sleep_s:.0}s");
             }
             Err(e) => {
                 tracing::error!("cycle crashed: {e:#}");

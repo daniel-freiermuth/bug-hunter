@@ -8,17 +8,24 @@
 
   async function runCycle() {
     btnDisabled = true;
-    const r = await post<unknown>("/api/cycle", {});
-    if (r.status === 409) {
-      btnText = "busy";
-    } else {
-      btnText = r.status === 202 ? "started\u2026" : "error";
+    try {
+      const r = await post<unknown>("/api/cycle", {});
+      if (r.status === 409) {
+        btnText = "busy";
+      } else {
+        btnText = r.status === 202 ? "started\u2026" : "error";
+      }
+      store.refresh();
+    } catch (err) {
+      console.error("run cycle request failed", err);
+      btnText = "error";
+    } finally {
+      // Always re-arm the button, even if the request never reached the server.
+      setTimeout(() => {
+        btnText = "Run Cycle";
+        btnDisabled = false;
+      }, 2500);
     }
-    setTimeout(() => {
-      btnText = "Run Cycle";
-      btnDisabled = false;
-    }, 2500);
-    store.refresh();
   }
 
   function candidateLabel(nc: NextCandidate): string {
