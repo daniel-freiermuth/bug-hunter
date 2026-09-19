@@ -4,7 +4,7 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=<project-root>/hunter
-ExecStart=/usr/bin/python3 -m hunter daemon
+ExecStart=/usr/bin/uv run python3 -m hunter daemon
 Restart=on-failure
 RestartSec=30
 
