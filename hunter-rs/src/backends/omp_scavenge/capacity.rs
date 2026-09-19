@@ -1,0 +1,200 @@
+//! Window reading + pure ramp math (capacity.py, BACKEND-CONTRACT.md §2.1).
+//! Bodies implemented by the round-2 backend builder. Pure fns stay
+//! parameterized on `now_ms` (deterministic tests); `read_windows` takes the
+//! agent.db path explicitly (tests point it at a fixture).
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+/// THE tunable: human headroom at 5h-window start (capacity.py:69).
+pub const HEADROOM_MS: i64 = 30 * 60 * 1000;
+pub const WEEK_MS: i64 = 604_800_000;
+pub const FIVE_H_MS: i64 = 18_000_000;
+/// 5h ramp span after headroom: 4.5 h.
+pub const RAMP_MS: i64 = FIVE_H_MS - HEADROOM_MS;
+
+/// One provider window as read from omp's usage mirror.
+#[derive(Debug, Clone)]
+pub struct WindowState {
+    pub limit_id: String,
+    pub used_fraction: Option<f64>,
+    pub status: Option<String>,
+    pub resets_at: Option<i64>,
+    /// When omp probed (epoch ms) — or, for rolled-forward expired
+    /// cycles, the current cycle's start boundary.
+    pub recorded_at: i64,
+    pub age_s: f64,
+}
+
+/// Default agent.db location (capacity.py:46); callers may override.
+pub fn default_agent_db() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    home.join(".omp/agent/agent.db")
+}
+
+/// Read newest `usage_history` row per anthropic:% `limit_id`; roll expired
+/// account-wide cycles forward (used=0, status=ok, `recorded_at=cycle`
+/// start), DROP expired per-model-class rows. Missing file or ANY sqlite
+/// error -> empty map. `BTreeMap`: deny-reason precedence needs ascending
+/// `limit_id` order.
+pub fn read_windows(agent_db: &Path, now_ms: i64) -> BTreeMap<String, WindowState> {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return BTreeMap::new();
+    };
+    handle
+        .block_on(read_windows_async(agent_db, now_ms))
+        .unwrap_or_default()
+}
+
+/// Async inner: opens `agent_db` read-only, queries newest row per
+/// `limit_id` via window function, rolls forward expired account-wide
+/// cycles, drops expired per-model-class rows.
+async fn read_windows_async(
+    agent_db: &Path,
+    now_ms: i64,
+) -> Result<BTreeMap<String, WindowState>, Box<dyn std::error::Error + Send + Sync>> {
+    use sqlx::Row;
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    if !agent_db.exists() {
+        return Ok(BTreeMap::new());
+    }
+
+    let opts = SqliteConnectOptions::new()
+        .filename(agent_db)
+        .read_only(true);
+    let pool = sqlx::SqlitePool::connect_with(opts).await?;
+
+    // Runtime query: reads external omp agent.db whose schema isn't available at compile time.
+    let rows = sqlx::query(
+        "SELECT limit_id, used_fraction, status, resets_at, recorded_at \
+         FROM ( \
+           SELECT limit_id, used_fraction, status, resets_at, recorded_at, \
+                  ROW_NUMBER() OVER (PARTITION BY limit_id ORDER BY recorded_at DESC) AS rn \
+           FROM usage_history \
+           WHERE limit_id LIKE 'anthropic:%' \
+         ) WHERE rn = 1",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    pool.close().await;
+
+    let mut result = BTreeMap::new();
+
+    for row in rows {
+        let limit_id: String = row.get("limit_id");
+        let used_fraction: Option<f64> = row.get("used_fraction");
+        let status: Option<String> = row.get("status");
+        let resets_at: Option<i64> = row.get("resets_at");
+        let recorded_at: i64 = row.get("recorded_at");
+
+        match resets_at {
+            // Truthy resets_at (> 0) that has expired (<= now_ms).
+            // Some(0) is falsy like Python's `not resets_at`.
+            Some(r) if r > 0 && r <= now_ms => {
+                // Determine period for account-wide lids; per-model-class → drop.
+                let period = match limit_id.as_str() {
+                    "anthropic:5h" => FIVE_H_MS,
+                    "anthropic:7d" => WEEK_MS,
+                    _ => continue, // per-model-class / unrecognized → drop
+                };
+                // Roll forward: advance resets_at by period until > now,
+                // recording each step as the current cycle's start.
+                let mut new_resets = r;
+                let mut new_recorded = recorded_at;
+                while new_resets <= now_ms {
+                    new_recorded = new_resets;
+                    new_resets += period;
+                }
+                result.insert(
+                    limit_id.clone(),
+                    WindowState {
+                        limit_id,
+                        used_fraction: Some(0.0),
+                        status: Some("ok".to_owned()),
+                        resets_at: Some(new_resets),
+                        recorded_at: new_recorded,
+                        age_s: (now_ms - new_recorded) as f64 / 1000.0,
+                    },
+                );
+            }
+            _ => {
+                // Not expired, NULL resets_at, or Some(0) → keep verbatim.
+                result.insert(
+                    limit_id.clone(),
+                    WindowState {
+                        limit_id,
+                        used_fraction,
+                        status,
+                        resets_at,
+                        recorded_at,
+                        age_s: (now_ms - recorded_at) as f64 / 1000.0,
+                    },
+                );
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// not `resets_at` or expired -> 1.0; else min(elapsed/week, 1.0).
+pub fn ramp_7d(resets_at: Option<i64>, now_ms: i64) -> f64 {
+    match resets_at {
+        None | Some(0) => 1.0,
+        Some(r) if r <= now_ms => 1.0, // expired
+        Some(r) => {
+            let elapsed = (now_ms - (r - WEEK_MS)) as f64;
+            (elapsed / WEEK_MS as f64).min(1.0)
+        }
+    }
+}
+
+/// not `resets_at` or expired -> None (no active window: opener allowed);
+/// else max(0, (elapsed - HEADROOM) / RAMP).
+pub fn ramp_5h(resets_at: Option<i64>, now_ms: i64) -> Option<f64> {
+    match resets_at {
+        None | Some(0) => None,
+        Some(r) if r <= now_ms => None, // expired
+        Some(r) => {
+            let elapsed = (FIVE_H_MS - (r - now_ms)) as f64;
+            Some(((elapsed - HEADROOM_MS as f64) / RAMP_MS as f64).max(0.0))
+        }
+    }
+}
+
+/// Exact inverse of `ramp_7d`; None when `resets_at` is None/0.
+pub fn retry_at_7d(resets_at: Option<i64>, effective_used: f64) -> Option<f64> {
+    match resets_at {
+        None | Some(0) => None,
+        Some(r) => {
+            let raw = (r - WEEK_MS) as f64 + effective_used * WEEK_MS as f64;
+            Some(raw.min(r as f64))
+        }
+    }
+}
+
+pub fn retry_at_5h(resets_at: Option<i64>, effective_used: f64) -> Option<f64> {
+    match resets_at {
+        None | Some(0) => None,
+        Some(r) => {
+            let raw = (r - FIVE_H_MS) as f64 + HEADROOM_MS as f64 + effective_used * RAMP_MS as f64;
+            Some(raw.min(r as f64))
+        }
+    }
+}
+
+/// status == "exhausted" clamps to exactly 1.0 (hard-stop signal; raw
+/// value unreliable); else `used_fraction` (call sites guarantee Some) +
+/// inflight reservation.
+pub fn effective_used(w: &WindowState, inflight_reservation: f64) -> f64 {
+    let used = if w.status.as_deref() == Some("exhausted") {
+        1.0
+    } else {
+        w.used_fraction.unwrap_or(0.0)
+    };
+    used + inflight_reservation
+}
