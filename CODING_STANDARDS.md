@@ -200,9 +200,45 @@ required for that operation.
 
 ### Patterns
 - Integration tests in `tests/` directory
-- Fresh isolated state per test: `fresh_db()`, `tempdir()`
 - `cargo nextest` for parallel execution and stress testing (libraries)
 - Compliance traceability where applicable (`covers!()` macro)
+
+### Shared test support (`hunter-rs/tests/support/mod.rs`)
+
+Each integration test is its own crate, so a test file opts in with `mod
+support;`. Reach for it before hand-rolling a fixture — every helper in
+there replaced something that was being reinvented per file, usually
+worse.
+
+- `TempDir` — scratch directory removed on drop, *including on panic*.
+  The `let _ = fs::remove_dir_all(..)` at the end of a test body leaks on
+  every failure, which is exactly when you least want it to.
+- `fresh_store` / `fresh_pool` — writable copy of the schema-only
+  `dev.db`. Never open `dev.db` itself.
+- `FakeBins` — scripted executables on `PATH` with an invocation log.
+  This is the only seam for forge behaviour: the runners build their
+  forge internally via `forge_for(repo.forge)`, so there is no trait to
+  inject, and intercepting the subprocess exercises the real argv too.
+  Match on the SUBCOMMAND (`ok_unless_action("gh", "pr comment", …)`) —
+  a substring match on `"comment"` also matches `gh pr view --json
+  ...,comments,...` and fails the wrong call.
+  - `isolate()` when a test's point is that a binary is ABSENT; the
+    default appends the real `PATH`, so a developer's own `npx` answers
+    and the test passes vacuously.
+  - `env(key, value)` for scoped environment variables. It hangs off
+    `FakeBins` because the environment is process-global and `FakeBins`
+    holds the lock that serialises it — taking one is what licenses
+    mutating the environment. Keeps every `unsafe` in the crate inside
+    this one file.
+- `ScriptedBackend` — a `Backend` whose `run()` is a closure over the
+  worktree, so a test stages exactly what a worker would leave behind.
+  `decide()` always grants, so tests need not satisfy the budget gate.
+- `GitRepo::with_branch` — bare `origin` plus a clone with a published
+  branch, the minimum for anything that fetches or adds a worktree.
+
+`tests/runner_engage_test.rs` is the worked example: a real git repo, a
+scripted `gh`, a scripted worker, the real `run_engage`, and assertions
+on what was persisted. Start from it.
 
 ### Proof, not compilation
 

@@ -140,4 +140,65 @@ mod tests {
             "bad byte should decode lossily: {out:?}"
         );
     }
+
+    // -- tail -------------------------------------------------------------
+    //
+    // `tail` truncates command output and worker logs at ~20 call sites,
+    // all of them on bytes that came from a subprocess. Indexing the tail
+    // by byte offset panicked whenever the cut landed inside a codepoint,
+    // which a diff containing one non-ASCII character is enough to trigger.
+
+    #[test]
+    fn test_tail_shorter_than_limit_is_whole() {
+        assert_eq!(tail("abc", 10), "abc");
+        assert_eq!(tail("", 10), "");
+    }
+
+    #[test]
+    fn test_tail_exactly_limit_is_whole() {
+        assert_eq!(tail("abcdef", 6), "abcdef");
+    }
+
+    #[test]
+    fn test_tail_longer_than_limit_keeps_the_end() {
+        let s = "abcdefghij";
+        let got = tail(s, 3);
+        // The end is the interesting part of a log: a prefix would show the
+        // startup banner and drop the error.
+        assert!(s.ends_with(got), "{got:?} is not a suffix of {s:?}");
+        assert_eq!(got, "hij");
+    }
+
+    /// The panic this function exists to prevent. `€` is 3 bytes, the limit
+    /// is 7, so the raw cut at `len - 7` lands one byte into a codepoint --
+    /// a limit divisible by the char width would pass even with byte
+    /// slicing restored.
+    #[test]
+    fn test_tail_does_not_split_a_codepoint() {
+        let s = "€€€€€"; // 15 bytes, boundaries at 0/3/6/9/12/15
+        assert_eq!(s.len(), 15);
+        let got = tail(s, 7);
+        assert!(s.ends_with(got), "{got:?} is not a suffix of {s:?}");
+        assert!(got.len() <= 7, "{} bytes exceeds the limit", got.len());
+        // Snapped forward from byte 8 to byte 9, so two whole chars.
+        assert_eq!(got, "€€");
+    }
+
+    /// Same cut, but with the split codepoint at the very front of what
+    /// survives and ASCII behind it -- the shape a truncated stack trace has.
+    #[test]
+    fn test_tail_snaps_forward_past_a_partial_char() {
+        let s = "aaa€bbb"; // 9 bytes: cut at 9-5=4 is inside the `€`
+        let got = tail(s, 5);
+        assert!(s.ends_with(got), "{got:?} is not a suffix of {s:?}");
+        assert!(got.len() <= 5, "{} bytes exceeds the limit", got.len());
+        assert_eq!(got, "bbb");
+    }
+
+    #[test]
+    fn test_tail_zero_limit_is_empty() {
+        assert_eq!(tail("abcdef", 0), "");
+        assert_eq!(tail("€", 0), "");
+        assert_eq!(tail("", 0), "");
+    }
 }

@@ -24,7 +24,7 @@
   // Trigger label: show what's selected when filtering.
   const triggerLabel = $derived.by(() => {
     if (!filtering) return label;
-    if (selected.size === 0) return `${label}: none`;
+    if (noneSelected) return `${label}: none`;
     const names = options.filter(o => selected.has(o));
     const joined = names.join(", ");
     if (names.length <= 3 && joined.length <= 30) return joined;
