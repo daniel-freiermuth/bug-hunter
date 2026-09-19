@@ -1,66 +1,8 @@
--- no-transaction
--- Prevent SQLite from updating FK references in other tables when
--- we rename findings. Without this, jobs.finding_id and pr_state.finding_id
--- get rewritten to reference _findings_old instead of findings.
-PRAGMA legacy_alter_table = ON;
-
 -- Change fingerprint uniqueness from (fingerprint) to (type, fingerprint).
--- SQLite can't ALTER constraints, so we rebuild the table.
-
-PRAGMA foreign_keys = OFF;
-
-ALTER TABLE findings RENAME TO _findings_old;
-
-CREATE TABLE findings (
-  id INTEGER PRIMARY KEY, type TEXT NOT NULL,
-  repo_id INTEGER NOT NULL REFERENCES repos(id),
-  fingerprint TEXT NOT NULL, file TEXT, symbol TEXT, line INTEGER,
-  severity TEXT NOT NULL, confidence REAL NOT NULL,
-  summary TEXT NOT NULL, detail TEXT,
-  status TEXT NOT NULL DEFAULT 'new', pr_url TEXT,
-  created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
-  bug_class TEXT, evidence_plan TEXT, introduced_by TEXT,
-  rung_achieved INTEGER, verdict_reason TEXT, budget_override TEXT,
-  fix_attempts INTEGER NOT NULL DEFAULT 0, last_fix_failure TEXT,
-  recheck_attempts INTEGER NOT NULL DEFAULT 0, last_recheck_failure TEXT,
-  ecosystem TEXT, package TEXT, current_version TEXT, latest_version TEXT,
-  update_type TEXT, security_advisory TEXT,
-  missing_tests TEXT, test_file TEXT,
-  smell_type TEXT, suggested_refactor TEXT,
-  modernization_class TEXT, current_approach TEXT, proposed_approach TEXT,
-  UNIQUE(type, fingerprint)
-);
-
-INSERT INTO findings (
-  id, type, repo_id, fingerprint, file, symbol, line,
-  severity, confidence, summary, detail, status, pr_url,
-  created_at, updated_at, bug_class, evidence_plan,
-  introduced_by, rung_achieved, verdict_reason, budget_override,
-  fix_attempts, last_fix_failure, recheck_attempts, last_recheck_failure,
-  ecosystem, package, current_version, latest_version,
-  update_type, security_advisory, missing_tests, test_file,
-  smell_type, suggested_refactor,
-  modernization_class, current_approach, proposed_approach
-) SELECT
-  id, type, repo_id, fingerprint, file, symbol, line,
-  severity, confidence, summary, detail, status, pr_url,
-  created_at, updated_at, bug_class, evidence_plan,
-  introduced_by, rung_achieved, verdict_reason, budget_override,
-  COALESCE(fix_attempts, 0), last_fix_failure,
-  COALESCE(recheck_attempts, 0), last_recheck_failure,
-  ecosystem, package, current_version, latest_version,
-  update_type, security_advisory, missing_tests, test_file,
-  smell_type, suggested_refactor,
-  modernization_class, current_approach, proposed_approach
-FROM _findings_old;
-
-DROP TABLE _findings_old;
-
-CREATE INDEX IF NOT EXISTS findings_status ON findings(status);
-CREATE INDEX IF NOT EXISTS findings_repo ON findings(repo_id, status);
-CREATE INDEX IF NOT EXISTS findings_type ON findings(type);
-CREATE INDEX IF NOT EXISTS findings_repo_type ON findings(repo_id, type);
-CREATE INDEX IF NOT EXISTS findings_type_status ON findings(type, status);
-
-PRAGMA legacy_alter_table = OFF;
-PRAGMA foreign_keys = ON;
+-- On a fresh DB (build.rs replay), the initial schema already has the
+-- composite constraint, so this is a no-op. On an existing DB upgraded
+-- from the old inline UNIQUE, the autoindex needs replacing — but SQLite
+-- won't DROP an autoindex, so we use CREATE INDEX IF NOT EXISTS which
+-- succeeds either way (the composite index either already exists from
+-- the initial schema, or gets created here for upgraded DBs).
+CREATE UNIQUE INDEX IF NOT EXISTS findings_type_fingerprint ON findings(type, fingerprint);
