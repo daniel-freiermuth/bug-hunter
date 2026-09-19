@@ -127,7 +127,16 @@ async fn fixture(label: &str) -> Fixture {
         .await
         .unwrap();
 
-    let mut cfg = Config::load(std::path::Path::new("../hunter")).expect("load config");
+    // Hermetic: the playbook is a stub written into the scratch root, not
+    // the repo's real one. Reading `../hunter` made the test depend on the
+    // developer's checkout layout — it broke the moment cargo-mutants ran
+    // it from a temp copy — and coupled it to prompt wording it does not
+    // care about. The scripted worker ignores the prompt entirely; all
+    // that matters is that rendering succeeds, so the stub uses one slot
+    // the engage builder is known to supply.
+    let playbooks = dir.subdir("playbooks");
+    std::fs::write(playbooks.join("engage.md"), "engage {{WORKTREE}}\n").unwrap();
+    let mut cfg = Config::load(dir.path()).expect("load config");
     cfg.work_root = dir.subdir("work_root");
     Fixture {
         _dir: dir,

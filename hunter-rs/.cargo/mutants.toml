@@ -1,0 +1,37 @@
+# cargo-mutants configuration.
+#
+# A full run is ~1900 mutants and takes hours, so it is not a per-push
+# gate. Two ways to use it:
+#
+#   cargo mutants --test-tool nextest -j 4 --file src/<module>.rs
+#       Focused audit of one module. This is the useful one.
+#
+#   cargo mutants --test-tool nextest --in-diff <(git diff origin/master)
+#       Only the mutants your change introduces. Cheap enough for CI on
+#       a pull request.
+#
+# What a surviving mutant means: the test suite cannot tell the mutated
+# code from the real code. Sometimes that is a missing test, sometimes
+# the mutant is genuinely equivalent — in which case the honest fix is
+# usually to delete the redundant code that made it equivalent, not to
+# add a test that cannot exist. Both happened on the first run here.
+
+timeout_multiplier = 3.0
+minimum_test_timeout = 20
+
+# Excluded because mutating them produces noise rather than signal:
+exclude_globs = [
+    # Generated at build time; not hand-written logic.
+    "build.rs",
+    # Argument parsing with a single caller (the systemd unit). Mutants
+    # here are all "accepts a flag it should reject", which the usage
+    # string already documents and no test should be pinned to.
+    "src/main.rs",
+]
+
+# Trait method bodies that only forward, and Display impls, generate
+# mutants whose "correct" behaviour is untestable in isolation.
+exclude_re = [
+    "impl Display",
+    "fn fmt",
+]

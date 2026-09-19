@@ -104,11 +104,10 @@ fn parse_renovate_output(output: &str, repo_name: &str) -> Vec<DepCandidate> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let config = match obj.get("config") {
-            Some(c) if c.is_object() => c,
-            _ => continue,
-        };
-        let Some(config_obj) = config.as_object() else {
+        // One check, not two: the `is_object()` guard this replaces was
+        // redundant with the `as_object()` below, so no input could tell
+        // them apart.
+        let Some(config_obj) = obj.get("config").and_then(serde_json::Value::as_object) else {
             continue;
         };
         for (manager, files) in config_obj {
@@ -152,10 +151,17 @@ fn parse_renovate_output(output: &str, repo_name: &str) -> Vec<DepCandidate> {
                             .or_else(|| u.get("newValue"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("?");
-                        let update_type = u
-                            .get("updateType")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
+                        // Normalise BEFORE grading. Renovate's
+                        // housekeeping types mean "this is a patch", and
+                        // the record says so — grading them off the raw
+                        // value gave two findings both labelled `patch`
+                        // different confidences, with pin/digest scored
+                        // 0.7, the same as a major bump.
+                        let update_type = normalize_update_type(
+                            u.get("updateType")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown"),
+                        );
 
                         let fp = format!(
                             "{repo_name}:{datasource}:{dep_name}:{current}\u{2192}{new_version}"
@@ -191,7 +197,7 @@ fn parse_renovate_output(output: &str, repo_name: &str) -> Vec<DepCandidate> {
                             package: dep_name.to_owned(),
                             current_version: current_clean.to_owned(),
                             latest_version: new_version.to_owned(),
-                            update_type: normalize_update_type(update_type).to_owned(),
+                            update_type: update_type.to_owned(),
                             severity: severity.to_owned(),
                             confidence,
                             summary: format!(

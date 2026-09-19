@@ -1,0 +1,33 @@
+# nextest runs each test in its own process, which matters here for more
+# than speed: the harness and forge tests manipulate PATH and the
+# environment, and process isolation makes that contention-free.
+#
+# The `PATH_LOCK` in tests/support/mod.rs is deliberately KEPT even so.
+# Under nextest it is a per-process static that is never contended, so it
+# costs nothing; under a plain `cargo test` it is load-bearing, because
+# tests are then threads sharing one environment. Dropping it would make
+# `cargo test` silently race, which is a worse trap than an uncontended
+# mutex.
+
+[profile.default]
+# Several tests spawn real subprocesses (`sleep`, oversized pipe writers,
+# a worker held past its grace period). A logic bug there hangs forever
+# rather than failing, so cap it: warn at 10s, kill at 60s.
+slow-timeout = { period = "10s", terminate-after = 6 }
+
+# Flakes are bugs. Retrying hides them, and this suite has no network and
+# no shared state beyond the serialised PATH lock, so there is nothing
+# legitimate to retry.
+retries = 0
+
+failure-output = "immediate-final"
+status-level = "fail"
+
+# CI wants the full picture in one run, plus machine-readable output.
+[profile.ci]
+slow-timeout = { period = "30s", terminate-after = 4 }
+retries = 0
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "fail"
+final-status-level = "slow"

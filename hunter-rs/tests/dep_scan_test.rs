@@ -225,3 +225,95 @@ fn renovate_runs_inside_the_repo_checkout() {
         "renovate ran in {recorded:?}, not the checkout"
     );
 }
+
+/// One update line with a chosen `updateType` and vulnerability flag.
+fn update_line(update_type: &str, vulnerability: bool) -> String {
+    let vuln = if vulnerability {
+        r#","isVulnerabilityAlert":true"#
+    } else {
+        ""
+    };
+    format!(
+        r#"{{"name":"renovate","level":20,"msg":"packageFiles with updates","config":{{"npm":[{{"packageFile":"package.json","deps":[{{"depName":"left-pad","currentValue":"1.0.0","datasource":"npm","updates":[{{"newVersion":"2.0.0","updateType":"{update_type}"{vuln}}}]}}]}}]}}}}"#
+    )
+}
+
+fn single_candidate(
+    label: &str,
+    update_type: &str,
+    vulnerability: bool,
+) -> hunter::dep_scan::DepCandidate {
+    let bins = FakeBins::acquire(label);
+    let work = TempDir::new(label);
+    bins.ok("npx", &update_line(update_type, vulnerability));
+    let got = scan_repo(work.path(), REPO, 30).expect("renovate succeeded");
+    assert_eq!(got.len(), 1, "expected one candidate: {got:?}");
+    got.into_iter().next().unwrap_or_else(|| unreachable!())
+}
+
+/// The triage table: `updateType` and `isVulnerabilityAlert` decide the
+/// severity and confidence every dep finding is ranked by.
+///
+/// Added after mutation testing showed the parsing tests pinned only THAT
+/// a candidate comes back, not how it is graded — six mutants that
+/// rewrote this table survived, including one that downgrades a security
+/// advisory to `low`.
+#[test]
+fn update_type_and_vulnerability_decide_severity() {
+    for (ut, vuln, severity) in [
+        ("major", false, "high"),
+        ("major", true, "high"),
+        ("minor", false, "medium"),
+        ("minor", true, "medium"),
+        // Neither major nor minor: the advisory flag is the only thing
+        // that lifts it off the floor.
+        ("patch", false, "low"),
+        ("patch", true, "high"),
+        ("replacement", false, "low"),
+        ("replacement", true, "high"),
+    ] {
+        let c = single_candidate(&format!("sev-{ut}-{vuln}"), ut, vuln);
+        assert_eq!(
+            c.severity, severity,
+            "updateType={ut} isVulnerabilityAlert={vuln} should be {severity}"
+        );
+    }
+}
+
+/// Confidence is graded separately from severity: a patch is the safest
+/// bump even though it is the lowest severity.
+#[test]
+fn update_type_decides_confidence() {
+    for (ut, confidence) in [
+        ("patch", 0.95),
+        ("minor", 0.85),
+        ("major", 0.7),
+        ("replacement", 0.7),
+    ] {
+        let c = single_candidate(&format!("conf-{ut}"), ut, false);
+        assert!(
+            (c.confidence - confidence).abs() < f64::EPSILON,
+            "updateType={ut} should be {confidence}, got {}",
+            c.confidence
+        );
+    }
+}
+
+/// Renovate's housekeeping update types are all reported as `patch`.
+/// Leaving them unnormalised would give each its own severity and
+/// confidence bucket, and none of them match the table above.
+#[test]
+fn housekeeping_update_types_normalise_to_patch() {
+    for ut in [
+        "pin",
+        "pinDigest",
+        "digest",
+        "lockFileMaintenance",
+        "lockfileUpdate",
+    ] {
+        let c = single_candidate(&format!("norm-{ut}"), ut, false);
+        assert_eq!(c.update_type, "patch", "{ut} should normalise to patch");
+        assert_eq!(c.severity, "low");
+        assert!((c.confidence - 0.95).abs() < f64::EPSILON);
+    }
+}

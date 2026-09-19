@@ -326,6 +326,14 @@ async fn test_read_windows_rolls_forward_expired_5h() {
     assert_eq!(w.resets_at, Some(old_resets + FIVE_H_MS));
     // recorded_at = old resets (current cycle's actual start)
     assert_eq!(w.recorded_at, old_resets);
+    // age is measured from the ROLLED recorded_at, not the original. It
+    // drives staleness, which gates spending, so a rolled window that
+    // looked fresher than it is would let hunter spend on stale data.
+    assert!(
+        (w.age_s - 47.0 * 60.0).abs() < 1.0,
+        "age_s should be time since the current cycle started, got {}",
+        w.age_s
+    );
     let _ = std::fs::remove_file(&db_path);
 }
 
