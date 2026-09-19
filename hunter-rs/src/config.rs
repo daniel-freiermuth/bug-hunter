@@ -20,6 +20,8 @@ struct RawConfig {
     omp_bin: Option<String>,
     #[serde(rename = "pollS")]
     poll_s: Option<f64>,
+    #[serde(rename = "sessionGraceS")]
+    session_grace_s: Option<u64>,
     serve: RawServe,
     budget: RawBudget,
     models: RawModels,
@@ -100,6 +102,12 @@ pub struct Config {
     pub cache_ttl_s: f64,
     /// pollS — harness meter tick (round 3).
     pub poll_s: f64,
+    /// How long a worker may run before its session ledger must have
+    /// appeared, after which the run is killed as unmetered. Injectable
+    /// only so the accounting path is testable without a 2-minute test —
+    /// `maxWallS` next to it in the same loop is a parameter for the same
+    /// reason.
+    pub session_grace_s: u64,
     pub model_default: Option<String>,
     pub model_smol: Option<String>,
     pub model_hunt: Option<String>,
@@ -157,6 +165,12 @@ impl Config {
                 root.join(p)
             }
         };
+        let session_grace_s = raw.session_grace_s.unwrap_or(120);
+        anyhow::ensure!(
+            session_grace_s > 0,
+            "{}: sessionGraceS must be greater than 0",
+            cfg_path.display()
+        );
         Ok(Self {
             root: root.to_owned(),
             work_root: resolve(raw.work_root.as_deref().unwrap_or("data")),
@@ -167,6 +181,7 @@ impl Config {
             stale_after_s: raw.budget.stale_after_s.unwrap_or(300.0),
             cache_ttl_s: raw.budget.cache_ttl_s.unwrap_or(3600.0),
             poll_s: raw.poll_s.unwrap_or(2.0),
+            session_grace_s,
             model_default: raw.models.default,
             model_smol: raw.models.smol,
             model_hunt: raw.models.hunt,

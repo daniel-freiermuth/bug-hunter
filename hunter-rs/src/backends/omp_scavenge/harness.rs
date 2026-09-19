@@ -379,6 +379,17 @@ pub fn run_worker(
             kill_tree(&mut proc);
             break;
         }
+        if session.is_none() && t0.elapsed().as_secs() >= cfg.session_grace_s {
+            tracing::warn!(
+                "harness: no session ledger under {} after {}s — \
+                 killing worker rather than running it unmetered",
+                sessions_dir.display(),
+                cfg.session_grace_s
+            );
+            killed = Some("unmetered".to_owned());
+            kill_tree(&mut proc);
+            break;
+        }
         if t0.elapsed().as_secs() as i64 >= max_wall_s {
             killed = Some("wallclock".to_owned());
             kill_tree(&mut proc);
@@ -394,6 +405,23 @@ pub fn run_worker(
         let (t, c) = ledger_usage(sess, &spawn_iso);
         tokens = t;
         calls = c;
+    }
+
+    // Exited before the grace period with no ledger: `tokens_new = 0` here
+    // means "unknown", never "free". Recording it Done would assert the
+    // worker cost nothing, which also drags the anticipated_tokens
+    // percentiles down. An existing reason (cap, wallclock) already marks
+    // the run as not-Done and is more specific, so it wins.
+    if session.is_none() {
+        if killed.is_none() {
+            killed = Some("unmetered".to_owned());
+        }
+        tracing::warn!(
+            "harness: worker exited after {:.1}s with no session ledger under {} — \
+             token spend unmetered",
+            t0.elapsed().as_secs_f64(),
+            sessions_dir.display()
+        );
     }
 
     // Capture output tail. kill_tree signals the whole process group, so
