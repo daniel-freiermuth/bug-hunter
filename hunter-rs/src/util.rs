@@ -1,9 +1,12 @@
 //! Small shared utilities (port of hunter/util.py where still needed).
 
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use nix::sys::signal::{self, Signal};
+use nix::unistd::Pid;
 
 /// Epoch milliseconds (types.py `now_ms`).
 pub fn now_ms() -> i64 {
@@ -41,6 +44,35 @@ pub fn join_pipes(so: JoinHandle<Vec<u8>>, se: JoinHandle<Vec<u8>>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+fn killpg(pgid: u32, sig: Signal) -> bool {
+    signal::killpg(Pid::from_raw(pgid as i32), sig).is_ok()
+}
+
+/// SIGTERM the child's process group, wait up to 10 s, then SIGKILL.
+///
+/// Signalling the group rather than the pid is what makes a timeout
+/// enforceable. Killing only the direct child leaves any descendant it
+/// spawned (`npx` → `node` → the tool itself) holding the inherited stdout
+/// and stderr, so the pipes never reach EOF and `join_pipes` blocks
+/// forever — the process we gave up waiting for outlives the deadline that
+/// was supposed to bound it. Callers must spawn with `process_group(0)`.
+pub fn kill_tree(child: &mut Child) {
+    let pgid = child.id();
+    if !killpg(pgid, Signal::SIGTERM) {
+        return; // already gone
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() >= deadline => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+        }
+    }
+    killpg(pgid, Signal::SIGKILL);
+    let _ = child.wait();
+}
+
 /// Last `max_bytes` of `s`, snapped forward to a char boundary.
 ///
 /// Command output and worker logs are arbitrary UTF-8, so indexing a tail
@@ -61,12 +93,17 @@ pub fn run_cmd(argv: &[&str], timeout_s: u64) -> (i32, String) {
     let Some((prog, rest)) = argv.split_first() else {
         return (127, "empty argv".to_owned());
     };
-    let child = Command::new(prog)
-        .args(rest)
+    let mut cmd = Command::new(prog);
+    cmd.args(rest)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn();
     let mut child = match child {
         Ok(c) => c,
         Err(e) => return (127, e.to_string()),
@@ -83,16 +120,14 @@ pub fn run_cmd(argv: &[&str], timeout_s: u64) -> (i32, String) {
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
                     let out = join_pipes(so, se);
                     return (124, format!("timeout after {timeout_s}s\n{out}"));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
                 let out = join_pipes(so, se);
                 return (127, format!("{e}\n{out}"));
             }
@@ -200,5 +235,31 @@ mod tests {
         assert_eq!(tail("abcdef", 0), "");
         assert_eq!(tail("€", 0), "");
         assert_eq!(tail("", 0), "");
+    }
+}
+
+#[cfg(test)]
+mod process_group_tests {
+    use super::*;
+
+    /// A timeout must bound the call even when the child leaves a
+    /// descendant holding the pipes.
+    ///
+    /// `sh -c "sleep 30 & ..."` models `npx` → `node` → tool: the shell
+    /// exits, the grandchild inherits stdout and stderr and keeps them
+    /// open. Killing only the direct child leaves those pipes unclosed, so
+    /// `join_pipes` blocks on `read_to_end` forever and `run_cmd` never
+    /// returns — the timeout it was given is unenforceable.
+    #[test]
+    fn test_timeout_holds_when_a_grandchild_inherits_the_pipes() {
+        let t0 = std::time::Instant::now();
+        let (rc, _out) = run_cmd(&["sh", "-c", "sleep 30 & sleep 30"], 1);
+        let elapsed = t0.elapsed();
+
+        assert_eq!(rc, 124, "expected the timeout exit code");
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "run_cmd hung past its 1s timeout: {elapsed:?}"
+        );
     }
 }

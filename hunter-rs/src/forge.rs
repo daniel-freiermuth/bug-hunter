@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use serde::Deserialize;
 
 use crate::domain::ForgeName;
-use crate::util::{drain_pipe, join_pipes, run_cmd};
+use crate::util::{drain_pipe, join_pipes, kill_tree, run_cmd};
 
 /// Git forge PR/MR lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -249,14 +249,18 @@ fn run_cmd_cwd(argv: &[&str], cwd: &Path, timeout_s: u64) -> (i32, String) {
     let Some((prog, rest)) = argv.split_first() else {
         return (127, "empty argv".to_owned());
     };
-    let mut child = match Command::new(prog)
-        .args(rest)
+    let mut cmd = Command::new(prog);
+    cmd.args(rest)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (127, e.to_string()),
     };
@@ -270,16 +274,14 @@ fn run_cmd_cwd(argv: &[&str], cwd: &Path, timeout_s: u64) -> (i32, String) {
             Ok(Some(status)) => return (status.code().unwrap_or(-1), join_pipes(so, se)),
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
                     let out = join_pipes(so, se);
                     return (124, format!("timeout after {timeout_s}s\n{out}"));
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
                 let out = join_pipes(so, se);
                 return (127, format!("{e}\n{out}"));
             }

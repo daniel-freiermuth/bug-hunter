@@ -277,7 +277,7 @@ fn test_kill_tree_terminates_process() {
         // Still running
         assert!(child.try_wait().unwrap().is_none());
 
-        harness::kill_tree(&mut child);
+        hunter::util::kill_tree(&mut child);
 
         // After kill_tree, wait() should return immediately (cached status)
         let status = child.wait().expect("wait after kill_tree");
@@ -302,6 +302,6 @@ fn test_kill_tree_already_exited() {
         child.wait().expect("wait");
 
         // kill_tree on an already-exited process should not panic
-        harness::kill_tree(&mut child);
+        hunter::util::kill_tree(&mut child);
     }
 }

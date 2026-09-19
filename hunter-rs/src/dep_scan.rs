@@ -8,7 +8,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::util::{drain_pipe, join_pipes};
+use crate::util::{drain_pipe, join_pipes, kill_tree};
 
 /// One update candidate, matching the `dep_update` finding schema.
 #[derive(Debug, Clone)]
@@ -30,15 +30,22 @@ pub struct DepCandidate {
 /// Returns None on failure (not installed, timeout, parse error) —
 /// the caller falls back to the AI-based analysis job.
 pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Vec<DepCandidate>> {
-    let child = Command::new("npx")
-        .args(["renovate", "--platform=local", "--dry-run=lookup"])
+    let mut cmd = Command::new("npx");
+    cmd.args(["renovate", "--platform=local", "--dry-run=lookup"])
         .current_dir(repo_path)
         .env("LOG_FORMAT", "json")
         .env("LOG_LEVEL", "debug")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        // npx execs node which execs renovate: the timeout below can only
+        // be enforced against the whole tree.
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn();
 
     let mut child = match child {
         Ok(c) => c,
@@ -77,8 +84,7 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
             }
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
                     let _ = join_pipes(so, se);
                     tracing::warn!("dep_scan: renovate timeout for {repo_name}");
                     return None;
@@ -86,8 +92,7 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
                 std::thread::sleep(Duration::from_millis(200));
             }
             Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_tree(&mut child);
                 let _ = join_pipes(so, se);
                 return None;
             }

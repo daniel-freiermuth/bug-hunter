@@ -10,23 +10,13 @@ use std::fs;
 use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::Config;
 use crate::types::RunResult;
-
-// ---------------------------------------------------------------------------
-// Process-group signal delivery via the `nix` crate (safe wrapper).
-// ---------------------------------------------------------------------------
-
-use nix::sys::signal::{self, Signal};
-use nix::unistd::Pid;
-
-fn killpg(pgid: u32, sig: Signal) -> bool {
-    signal::killpg(Pid::from_raw(pgid as i32), sig).is_ok()
-}
+use crate::util::kill_tree;
 
 // ---------------------------------------------------------------------------
 // Sessions directory
@@ -173,30 +163,6 @@ pub fn discover<S: BuildHasher>(
     pool.iter()
         .max_by_key(|p| p.metadata().ok().and_then(|m| m.modified().ok()))
         .map(|p| (*p).clone())
-}
-
-// ---------------------------------------------------------------------------
-// Process-tree kill (harness.py:90-100)
-// ---------------------------------------------------------------------------
-
-/// Send SIGTERM to the process group, wait up to 10 s, then SIGKILL if
-/// still alive.
-pub fn kill_tree(child: &mut Child) {
-    let pgid = child.id();
-    if !killpg(pgid, Signal::SIGTERM) {
-        return; // already gone
-    }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) | Err(_) => return,
-            Ok(None) if Instant::now() >= deadline => break,
-            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-    // Still alive → SIGKILL
-    killpg(pgid, Signal::SIGKILL);
-    let _ = child.wait();
 }
 
 // ---------------------------------------------------------------------------
