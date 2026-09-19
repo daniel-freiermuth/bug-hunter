@@ -28,7 +28,13 @@ For each outdated dependency, assess:
 
 NOT candidates: Pre-release versions, dependencies pinned for compatibility, internal/vendored packages.
 
-# Known updates already tracked
+# Known non-candidates (suppression corpus)
+Do NOT re-file these or variants unless the specific blocking reason below
+has actually been resolved upstream (e.g. a peer dependency range widened,
+a removed API was reinstated) — a newer version number alone is not enough.
+{{SUPPRESSIONS}}
+
+# Already tracked (open updates — file only if yours is genuinely NOVEL)
 {{KNOWN_UPDATES}}
 
 # Output contract — INCREMENTAL, you may be killed at any moment
