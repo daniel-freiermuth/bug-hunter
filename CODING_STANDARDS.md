@@ -241,16 +241,22 @@ worse.
   - `isolate()` when a test's point is that a binary is ABSENT; the
     default appends the real `PATH`, so a developer's own `npx` answers
     and the test passes vacuously.
-  - `env(key, value)` for scoped environment variables. It hangs off
-    `FakeBins` because the environment is process-global and `FakeBins`
-    holds the lock that serialises it — taking one is what licenses
-    mutating the environment. Keeps every `unsafe` in the crate inside
-    this one file.
+  - `env(key, value)` for scoped environment variables, restored on
+    drop. Hangs off `FakeBins` so one assertion covers both, and keeps
+    every `unsafe` in the crate inside that one file.
 - `ScriptedBackend` — a `Backend` whose `run()` is a closure over the
   worktree, so a test stages exactly what a worker would leave behind.
   `decide()` always grants, so tests need not satisfy the budget gate.
 - `GitRepo::with_branch` — bare `origin` plus a clone with a published
   branch, the minimum for anything that fetches or adds a worktree.
+
+The Rust suite is **nextest-only** (`cargo nextest run`, or `just
+test`). Not for speed: `FakeBins` scripts binaries on `PATH` and scopes
+environment variables, both process-global. Per-test process isolation
+makes that private, so the suite carries no locking to coordinate it —
+scaffolding you keep is scaffolding you maintain. `cargo test` would
+race silently, so `require_process_isolation` asserts on
+`NEXTEST_EXECUTION_MODE` and fails with an explanation instead.
 
 `tests/runner_engage_test.rs` is the worked example: a real git repo, a
 scripted `gh`, a scripted worker, the real `run_engage`, and assertions

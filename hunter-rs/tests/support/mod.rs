@@ -24,7 +24,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
 use std::time::SystemTime;
 
 use hunter::backend::JobClass;
@@ -116,47 +115,62 @@ pub async fn fresh_store(dir: &TempDir, name: &str) -> (PathBuf, Store) {
 // Fake executables on PATH
 // ---------------------------------------------------------------------------
 
-/// Serialises every test that manipulates `PATH`, which is process-global.
-static PATH_LOCK: Mutex<()> = Mutex::new(());
+/// Fail loudly if this suite is run without per-test process isolation.
+///
+/// `FakeBins` mutates `PATH` and the environment, which are process-global.
+/// Under `cargo nextest run` each test is its own process, so that is
+/// private and needs no coordination. Under plain `cargo test` the tests
+/// are threads in one process and would silently race — one test's `PATH`
+/// landing in another's subprocess, intermittently, usually on CI.
+///
+/// This crate is nextest-only precisely so that the coordination can be
+/// deleted rather than maintained. Asserting on the execution mode rather
+/// than merely on `NEXTEST` checks the guarantee we actually depend on.
+fn require_process_isolation() {
+    assert_eq!(
+        std::env::var("NEXTEST_EXECUTION_MODE").ok().as_deref(),
+        Some("process-per-test"),
+        "these tests mutate PATH and the environment and require per-test \
+         process isolation; run them with `cargo nextest run` (plain \
+         `cargo test` would race silently)"
+    );
+}
 
 /// Scripted executables shadowing the real ones for the duration of a test.
 ///
-/// Holds a process-wide lock, so only one test at a time has a modified
-/// `PATH`. The original `PATH` is appended, so binaries you do *not* script
+/// The original `PATH` is appended, so binaries you do *not* script
 /// (notably `git`) still resolve normally.
 pub struct FakeBins {
     dir: TempDir,
     log: PathBuf,
     original_path: String,
-    _guard: MutexGuard<'static, ()>,
 }
 
 impl FakeBins {
     pub fn acquire(label: &str) -> Self {
-        let guard = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        require_process_isolation();
         let dir = TempDir::new(&format!("bin-{label}"));
         let log = dir.join("invocations.log");
         std::fs::write(&log, "").expect("create invocation log");
         let original_path = std::env::var("PATH").unwrap_or_default();
         let combined = format!("{}:{original_path}", dir.path().display());
-        // SAFETY: guarded by `PATH_LOCK`, so no other test is reading or
-        // writing PATH concurrently; restored in `Drop`.
+        // SAFETY: this process runs exactly one test (asserted above), so
+        // nothing else here reads or writes the environment. Restored in
+        // `Drop` regardless, so the assertion is not load-bearing for
+        // correctness within the test itself.
         unsafe { std::env::set_var("PATH", &combined) };
         Self {
             dir,
             log,
             original_path,
-            _guard: guard,
         }
     }
 
     /// Scope an environment variable for the lifetime of the returned
     /// guard.
     ///
-    /// Hangs off `FakeBins` deliberately: the environment is
-    /// process-global, and `FakeBins` already holds the lock that
-    /// serialises tests touching it. Taking one is how you buy the right
-    /// to mutate the environment at all.
+    /// Hangs off `FakeBins` so the process-isolation assertion in
+    /// `acquire` covers environment mutation too, not just `PATH`.
     ///
     /// Needed because some seams are only reachable through the
     /// environment — `harness::omp_sessions_dir()` reads `$OMP_HOME`, so
@@ -165,7 +179,7 @@ impl FakeBins {
     /// that a live daemon is writing to.
     pub fn env(&self, key: &'static str, value: &Path) -> EnvGuard {
         let previous = std::env::var(key).ok();
-        // SAFETY: guarded by `PATH_LOCK`, held by `self`; restored on drop.
+        // SAFETY: one test per process; restored on drop.
         unsafe { std::env::set_var(key, value) };
         EnvGuard { key, previous }
     }
@@ -176,7 +190,7 @@ impl FakeBins {
     /// still resolve. Use this when the point of the test is that a binary
     /// is ABSENT — otherwise a developer's real `npx`/`gh` answers instead.
     pub fn isolate(&self) {
-        // SAFETY: guarded by `PATH_LOCK`, restored in `Drop`.
+        // SAFETY: one test per process; restored in `Drop`.
         unsafe { std::env::set_var("PATH", self.dir.path()) };
     }
 
@@ -256,7 +270,7 @@ impl FakeBins {
 
 impl Drop for FakeBins {
     fn drop(&mut self) {
-        // SAFETY: still holding `PATH_LOCK` (dropped after this).
+        // SAFETY: one test per process.
         unsafe { std::env::set_var("PATH", &self.original_path) };
     }
 }
@@ -451,7 +465,7 @@ pub struct EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
-        // SAFETY: the owning `FakeBins` still holds `PATH_LOCK`.
+        // SAFETY: one test per process.
         match &self.previous {
             Some(v) => unsafe { std::env::set_var(self.key, v) },
             None => unsafe { std::env::remove_var(self.key) },

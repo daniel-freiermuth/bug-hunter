@@ -1,13 +1,13 @@
-# nextest runs each test in its own process, which matters here for more
-# than speed: the harness and forge tests manipulate PATH and the
-# environment, and process isolation makes that contention-free.
+# This crate is nextest-ONLY, and not merely for speed. The harness and
+# forge tests script binaries on PATH and scope environment variables;
+# per-test process isolation makes that private, so the suite carries no
+# locking to coordinate it.
 #
-# The `PATH_LOCK` in tests/support/mod.rs is deliberately KEPT even so.
-# Under nextest it is a per-process static that is never contended, so it
-# costs nothing; under a plain `cargo test` it is load-bearing, because
-# tests are then threads sharing one environment. Dropping it would make
-# `cargo test` silently race, which is a worse trap than an uncontended
-# mutex.
+# `cargo test` therefore cannot run these tests. Rather than let it race
+# silently, `support::require_process_isolation` asserts on
+# NEXTEST_EXECUTION_MODE=process-per-test and fails with an explanation.
+# Deleting the coordination is the point: scaffolding you keep is
+# scaffolding you maintain.
 
 [profile.default]
 # Several tests spawn real subprocesses (`sleep`, oversized pipe writers,
