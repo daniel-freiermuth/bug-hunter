@@ -129,7 +129,7 @@
         note: text,
         ...(category ? { category } : {}),
       });
-      if (r.status !== 200) {
+      if (r.status !== 201) {
         toast("Failed to add note", false);
         return;
       }

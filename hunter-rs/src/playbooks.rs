@@ -1,7 +1,7 @@
 //! Render worker prompts from playbook templates (playbooks/*.md).
 //! Port of hunter/playbooks.py. Templates use {{`SLOT_NAME`}} placeholders
-//! substituted with _render. User content is brace-escaped to prevent
-//! false-positive assertion failures.
+//! substituted by `render`, which scans only the template -- user content
+//! is inserted verbatim and never reinterpreted.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -16,24 +16,34 @@ pub fn playbook_dir(root: &Path) -> std::path::PathBuf {
     root.join("playbooks")
 }
 
-/// Substitute {{KEY}} slots in a template. Errors if any {{...}} remain
-/// after substitution (typo/missing slot detection, matching Python's
-/// assertion) — a half-rendered prompt must never reach a worker.
+/// Substitute `{{KEY}}` slots in a template, in a single pass.
+///
+/// Single-pass matters twice. Substituted values are emitted verbatim and
+/// never rescanned, so a value containing `{{` can neither be mistaken for
+/// an unfilled slot nor be expanded by a later substitution — template
+/// injection through PR bodies, repo notes or finding text is structurally
+/// impossible rather than escaped away. And because only the TEMPLATE is
+/// scanned, an unknown key is a real playbook typo: a half-rendered prompt
+/// never reaches a worker.
 pub fn render<S: BuildHasher>(template: &str, slots: &HashMap<&str, String, S>) -> Result<String> {
-    let mut result = template.to_owned();
-    for (k, v) in slots {
-        result = result.replace(&format!("{{{{{k}}}}}"), v);
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 2..];
+        let Some(close) = after.find("}}") else {
+            let snippet: String = rest[open..].chars().take(60).collect();
+            bail!("unterminated placeholder in playbook: {snippet}");
+        };
+        let key = &after[..close];
+        let Some(value) = slots.get(key) else {
+            bail!("unfilled placeholder in playbook: {{{{{key}}}}}");
+        };
+        out.push_str(value);
+        rest = &after[close + 2..];
     }
-    if let Some(idx) = result.find("{{") {
-        let snippet: String = result[idx..].chars().take(60).collect();
-        bail!("unfilled placeholder in playbook: {snippet}");
-    }
-    Ok(result)
-}
-
-/// Escape {{ in user content so render's assertion doesn't fire.
-pub fn escape_braces(s: &str) -> String {
-    s.replace("{{", "{ {")
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Rejected/wontfix findings as a suppression corpus block.
@@ -44,12 +54,11 @@ pub fn suppressions_block(suppressions: &[Finding]) -> String {
     suppressions
         .iter()
         .map(|s| {
-            let fp = escape_braces(&s.fingerprint);
-            let reason = escape_braces(
-                s.verdict_reason
-                    .as_deref()
-                    .unwrap_or("(no reason recorded)"),
-            );
+            let fp = &s.fingerprint;
+            let reason = s
+                .verdict_reason
+                .as_deref()
+                .unwrap_or("(no reason recorded)");
             format!("- {fp} -- {reason}")
         })
         .collect::<Vec<_>>()
@@ -64,8 +73,8 @@ pub fn known_block(known: &[Finding]) -> String {
     known
         .iter()
         .map(|k| {
-            let fp = escape_braces(&k.fingerprint);
-            let summary = escape_braces(&k.summary);
+            let fp = &k.fingerprint;
+            let summary = &k.summary;
             format!("- {fp} [{}] -- {summary}", k.status)
         })
         .collect::<Vec<_>>()
@@ -135,7 +144,7 @@ fn notes_or_default(repo_notes: &str, default: &str) -> String {
     if repo_notes.is_empty() {
         default.to_owned()
     } else {
-        escape_braces(repo_notes)
+        repo_notes.to_owned()
     }
 }
 
@@ -221,7 +230,7 @@ fn checks_lines(pr: &PrView) -> String {
 /// JSON-encode finding subset for template injection.
 fn finding_json(f: &Finding) -> String {
     let subset = finding_subset(f);
-    escape_braces(&serde_json::to_string_pretty(&subset).unwrap_or_else(|_| "{}".to_owned()))
+    serde_json::to_string_pretty(&subset).unwrap_or_else(|_| "{}".to_owned())
 }
 
 // -- Build functions ---------------------------------------------------------
@@ -338,17 +347,17 @@ pub fn build_engage_prompt(
     slots.insert("BRANCH", branch.to_owned());
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("DEFAULT_BRANCH", repo.default_branch.clone());
-    slots.insert("PR_TITLE", escape_braces(&pr.title));
+    slots.insert("PR_TITLE", pr.title.clone());
     slots.insert(
         "PR_BODY",
-        escape_braces(if pr.body.is_empty() {
-            "(no description)"
+        if pr.body.is_empty() {
+            "(no description)".to_owned()
         } else {
-            &pr.body
-        }),
+            pr.body.clone()
+        },
     );
-    slots.insert("FEEDBACK", escape_braces(&feedback_blocks(pr, 8000)));
-    slots.insert("CHECKS", escape_braces(&checks_lines(pr)));
+    slots.insert("FEEDBACK", feedback_blocks(pr, 8000));
+    slots.insert("CHECKS", checks_lines(pr));
     slots.insert("ATTENTION", attention);
     slots.insert("REPO_NOTES", notes);
     render(&template, &slots)
@@ -373,16 +382,16 @@ pub fn build_harvest_prompt(
     slots.insert("DEFAULT_BRANCH", repo.default_branch.clone());
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("PR_NUMBER", pr_number.to_string());
-    slots.insert("PR_TITLE", escape_braces(&pr.title));
+    slots.insert("PR_TITLE", pr.title.clone());
     slots.insert(
         "PR_BODY",
-        escape_braces(if pr.body.is_empty() {
-            "(no description)"
+        if pr.body.is_empty() {
+            "(no description)".to_owned()
         } else {
-            &pr.body
-        }),
+            pr.body.clone()
+        },
     );
-    slots.insert("FEEDBACK", escape_braces(&feedback_blocks(pr, 8000)));
+    slots.insert("FEEDBACK", feedback_blocks(pr, 8000));
     slots.insert("REPO_NOTES", notes);
     render(&template, &slots)
 }
@@ -567,9 +576,68 @@ pub fn build_standards_prompt(
     slots.insert("SCOPE_NOTE", scope_note.to_owned());
     slots.insert("SUPPRESSIONS", suppressions_block(suppressions));
     slots.insert("KNOWN_FINDINGS", known_block(known));
-    slots.insert("STANDARDS", escape_braces(&standards_content));
+    slots.insert("STANDARDS", standards_content.clone());
     slots.insert("OUT_PATH", out_path.display().to_string());
     slots.insert("MAX_FINDINGS", max_findings.to_string());
     slots.insert("REPO_NOTES", notes);
     render(&template, &slots)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::render;
+    use std::collections::HashMap;
+
+    fn slots(pairs: &[(&'static str, &str)]) -> HashMap<&'static str, String> {
+        pairs.iter().map(|(k, v)| (*k, (*v).to_owned())).collect()
+    }
+
+    #[test]
+    fn substitutes_every_occurrence() {
+        let out = render("{{A}}-{{B}}-{{A}}", &slots(&[("A", "1"), ("B", "2")])).unwrap();
+        assert_eq!(out, "1-2-1");
+    }
+
+    /// The whole point of scanning only the template: a PR body or repo note
+    /// containing braces must not look like an unfilled slot.
+    #[test]
+    fn value_containing_braces_is_not_an_unfilled_placeholder() {
+        let out = render(
+            "body:\n{{PR_BODY}}",
+            &slots(&[("PR_BODY", "use {{ mustache }} like this")]),
+        )
+        .unwrap();
+        assert_eq!(out, "body:\nuse {{ mustache }} like this");
+    }
+
+    /// A value must never be rescanned -- otherwise content could inject a
+    /// placeholder that a later substitution expands.
+    #[test]
+    fn value_naming_another_slot_is_not_expanded() {
+        let out = render(
+            "{{PR_BODY}} {{SECRET}}",
+            &slots(&[("PR_BODY", "{{SECRET}}"), ("SECRET", "swordfish")]),
+        )
+        .unwrap();
+        assert_eq!(out, "{{SECRET}} swordfish");
+    }
+
+    #[test]
+    fn unknown_template_key_is_rejected() {
+        let err = render("hello {{TYPO}}", &slots(&[("NAME", "x")])).unwrap_err();
+        assert!(err.to_string().contains("TYPO"), "{err}");
+    }
+
+    #[test]
+    fn unterminated_placeholder_is_rejected() {
+        let err = render("hello {{NAME", &slots(&[("NAME", "x")])).unwrap_err();
+        assert!(err.to_string().contains("unterminated"), "{err}");
+    }
+
+    #[test]
+    fn multibyte_around_placeholders_is_preserved() {
+        let out = render("→{{A}}←", &slots(&[("A", "café")])).unwrap();
+        assert_eq!(out, "→café←");
+    }
 }

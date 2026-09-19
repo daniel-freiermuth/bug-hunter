@@ -64,6 +64,13 @@
     for (const option of options) selected.add(option);
   }
 
+  // A single-option dimension normally needs no control. The exception is
+  // when that option is deselected: the filter then matches nothing, and
+  // hiding the control would leave no way back short of a reload.
+  function needsSelector(options: string[], selected: SvelteSet<string>): boolean {
+    return options.length > 1 || options.some((option) => !selected.has(option));
+  }
+
   $effect(() => {
     absorb(repos, known.repos, selectedRepos);
     absorb(types, known.types, selectedTypes);
@@ -133,23 +140,23 @@
 </script>
 
 <div class="filter-bar">
-  {#if repos.length > 1}
+  {#if needsSelector(repos, selectedRepos)}
     <MultiSelect label="Repo" options={repos} selected={selectedRepos} />
   {/if}
 
-  {#if types.length > 1}
+  {#if needsSelector(types, selectedTypes)}
     <MultiSelect label="Type" options={types} selected={selectedTypes} />
   {/if}
 
-  {#if categories.length > 1}
+  {#if needsSelector(categories, selectedCategories)}
     <MultiSelect label="Class" options={categories} selected={selectedCategories} />
   {/if}
 
-  {#if severities.length > 1}
+  {#if needsSelector(severities, selectedSeverities)}
     <MultiSelect label="Severity" options={severities} selected={selectedSeverities} />
   {/if}
 
-  {#if showStatus && statuses.length > 1}
+  {#if showStatus && needsSelector(statuses, selectedStatuses)}
     <MultiSelect label="Status" options={statuses} selected={selectedStatuses} />
   {/if}
 

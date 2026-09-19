@@ -413,9 +413,14 @@ pub fn run_worker(
     }
 
     // Exited before the grace period with no ledger: `tokens_new = 0` here
-    // means "unknown", never "free" — say so rather than let the budget
-    // book this run as costless.
-    if session.is_none() && killed.as_deref() != Some("unmetered") {
+    // means "unknown", never "free". Recording it Done would assert the
+    // worker cost nothing, which also drags the anticipated_tokens
+    // percentiles down. An existing reason (cap, wallclock) already marks
+    // the run as not-Done and is more specific, so it wins.
+    if session.is_none() {
+        if killed.is_none() {
+            killed = Some("unmetered".to_owned());
+        }
         tracing::warn!(
             "harness: worker exited after {:.1}s with no session ledger under {} — \
              token spend unmetered",

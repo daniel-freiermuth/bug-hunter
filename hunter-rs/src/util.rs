@@ -17,22 +17,28 @@ pub fn now_ms() -> i64 {
 /// drained while the child runs — a child that fills a pipe buffer blocks
 /// forever if we only read after it exits (util.py got this for free from
 /// `communicate()`).
-pub fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<String> {
+///
+/// Bytes, not `String`: `read_to_string` aborts on the first invalid UTF-8
+/// sequence AND leaves the buffer empty, so one stray byte from a git diff
+/// or a worker would discard the whole stream and stop draining it —
+/// reinstating the deadlock this exists to prevent.
+pub fn drain_pipe<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
-        let mut buf = String::new();
+        let mut buf = Vec::new();
         if let Some(mut p) = pipe {
-            let _ = p.read_to_string(&mut buf);
+            let _ = p.read_to_end(&mut buf);
         }
         buf
     })
 }
 
 /// Join a pair of pipe readers, stdout first — the merged output util.py
-/// produced with `stderr=STDOUT`. A reader that panicked contributes "".
-pub fn join_pipes(so: JoinHandle<String>, se: JoinHandle<String>) -> String {
-    let mut out = so.join().unwrap_or_default();
-    out.push_str(&se.join().unwrap_or_default());
-    out
+/// produced with `stderr=STDOUT`. Decoded lossily once, after both streams
+/// reach EOF. A reader that panicked contributes nothing.
+pub fn join_pipes(so: JoinHandle<Vec<u8>>, se: JoinHandle<Vec<u8>>) -> String {
+    let mut bytes = so.join().unwrap_or_default();
+    bytes.extend_from_slice(&se.join().unwrap_or_default());
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// Last `max_bytes` of `s`, snapped forward to a char boundary.
@@ -113,5 +119,25 @@ mod tests {
         );
         assert_eq!(rc, 0);
         assert_eq!(out.len(), 600_000);
+    }
+
+    /// `read_to_string` would abort on the first invalid byte and leave the
+    /// buffer EMPTY -- losing the whole stream and stopping the drain.
+    #[test]
+    fn test_run_cmd_survives_invalid_utf8() {
+        let (rc, out) = run_cmd(&["sh", "-c", "printf 'before\\377after'"], 30);
+        assert_eq!(rc, 0);
+        assert!(
+            out.contains("before"),
+            "lost output before the bad byte: {out:?}"
+        );
+        assert!(
+            out.contains("after"),
+            "stopped draining at the bad byte: {out:?}"
+        );
+        assert!(
+            out.contains('\u{fffd}'),
+            "bad byte should decode lossily: {out:?}"
+        );
     }
 }
