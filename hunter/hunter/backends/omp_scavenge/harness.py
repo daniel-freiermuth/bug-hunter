@@ -18,7 +18,10 @@ import tempfile
 import time
 from pathlib import Path
 
-from .types import OMP_SESSIONS_DIR, Config, RunResult
+from hunter.types import Config, RunResult
+
+# omp-specific path; lives here rather than in core types.
+OMP_SESSIONS_DIR = Path.home() / ".omp/agent/sessions"
 
 
 def ledger_usage(session_file: Path, since_iso: str = "") -> tuple[int, int]:
@@ -114,12 +117,30 @@ def run_worker(
     if cfg.model_smol:
         cmd += [f"--smol={cfg.model_smol}"]
     out = tempfile.TemporaryFile(mode="w+")
+    # Build a minimal env so the worker doesn't inherit the full daemon env.
+    allowlist = {
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "SSH_AUTH_SOCK",
+    }
+    prefixes = ("OMP_", "XDG_")
+    worker_env = {k: v for k, v in os.environ.items() if k in allowlist or k.startswith(prefixes)}
+
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
         stdout=out,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=worker_env,
     )
     session: Path | None = None
     tokens = calls = 0
