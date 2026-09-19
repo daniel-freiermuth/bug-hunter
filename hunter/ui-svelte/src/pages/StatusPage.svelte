@@ -1,0 +1,286 @@
+<script lang="ts">
+  import { store, post } from "../lib/api.svelte";
+  import { ts, countdown, dur, ktok } from "../lib/format";
+  import type { NextCandidate } from "../lib/types";
+
+  let btnText = $state("Run Cycle");
+  let btnDisabled = $state(false);
+
+  async function runCycle() {
+    btnDisabled = true;
+    const r = await post<unknown>("/api/cycle", {});
+    if (r.status === 409) {
+      btnText = "busy";
+    } else {
+      btnText = r.status === 202 ? "started\u2026" : "error";
+    }
+    setTimeout(() => {
+      btnText = "Run Cycle";
+      btnDisabled = false;
+    }, 2500);
+    store.refresh();
+  }
+
+  function candidateLabel(nc: NextCandidate): string {
+    return nc.is_finding ? `#${nc.id} ${nc.label || ""}` : (nc.label || "");
+  }
+
+  // Format <time data-ms="..."> elements in the backend-rendered HTML
+  // using the browser's local timezone (the server can't know it).
+  $effect(() => {
+    if (!store.summary) return;
+    // Wait one tick for {@html} to render into the DOM.
+    requestAnimationFrame(() => {
+      for (const el of document.querySelectorAll<HTMLTimeElement>("time[data-ms]")) {
+        const ms = Number(el.dataset.ms);
+        if (!ms) continue;
+        const d = new Date(ms);
+        el.textContent = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      }
+    });
+  });
+
+  const activityKind = $derived(store.summary?.activity_status?.kind ?? null);
+</script>
+
+<div class="page-enter">
+  <h2 class="page-title">Status</h2>
+
+  {#if store.summary}
+    <div class="dashboard-grid">
+      <!-- Backend windows card -->
+      <div class="dash-card windows-card">
+        {@html store.summary.backend_status_html}
+      </div>
+
+      <!-- Cycle control card -->
+      <div class="dash-card cycle-card">
+        <button
+          class="cycle-btn"
+          class:ready={activityKind === "ready" && !btnDisabled && !store.summary.cycle_running}
+          disabled={btnDisabled || store.summary.cycle_running}
+          onclick={runCycle}
+        >
+          {store.summary.cycle_running ? "cycle running\u2026" : btnText}
+        </button>
+        {#if store.summary.last_cycle}
+          <div class="last-cycle">
+            {ts(store.summary.last_cycle.at)} · {store.summary.last_cycle.kind}: {store.summary.last_cycle.message}
+          </div>
+        {/if}
+      </div>
+    </div>
+
+    <!-- Activity status -->
+    <div class="activity-card">
+      {#if store.summary.activity_status.kind === "running"}
+        {@const cj = store.summary.activity_status.job}
+        {@const label = cj.finding_id != null
+          ? `#${cj.finding_id} ${cj.finding_summary || cj.finding_fingerprint || ""}`
+          : cj.repo_name}
+        <div class="row">
+          <span class="status-icon running">▶</span>
+          <b class="running">running</b>
+          <span>{cj.kind}: {label}</span>
+          <span class="dim">({dur(cj.started_at, cj.finished_at)}, {ktok(cj.tokens_new)} tok, job #{cj.id})</span>
+        </div>
+      {:else if store.summary.activity_status.kind === "working"}
+        <div class="row">
+          <span class="status-icon running">▶</span>
+          <b class="running">running</b> cycle in progress&hellip;
+        </div>
+      {:else if store.summary.activity_status.kind === "error"}
+        <div class="row">
+          <span class="status-icon error-icon">⚠</span>
+          <b class="error">error</b> {store.summary.activity_status.detail}
+        </div>
+      {:else if store.summary.activity_status.kind === "paused"}
+        {@const nc = store.summary.activity_status.candidate}
+        {@const ss = store.summary.scheduler_state}
+        <div class="row">
+          <span class="status-icon paused-icon">⏸</span>
+          <b class="paused">paused</b>
+          <span>next up: {nc.kind} {candidateLabel(nc)}</span>
+          <span>&middot; budget: <span class="b-denied">denied</span> ({nc.budget_reason})</span>
+        </div>
+        {#if nc.budget_retry_at}
+          <div class="row dim sub-row">
+            budget available ~{countdown(nc.budget_retry_at)} ({ts(nc.budget_retry_at)})
+          </div>
+        {/if}
+        {#if ss?.next_wake_at}
+          {@const heartbeatOnly = nc.budget_retry_at != null && ss.next_wake_at < nc.budget_retry_at}
+          <div class="row dim sub-row">
+            {heartbeatOnly ? "next sync check" : "next check"} ~{countdown(ss.next_wake_at)} ({ts(ss.next_wake_at)}){heartbeatOnly ? " \u2014 budget still closed" : ""}
+          </div>
+        {/if}
+      {:else if store.summary.activity_status.kind === "ready"}
+        {@const nc = store.summary.activity_status.candidate}
+        {@const ss = store.summary.scheduler_state}
+        <div class="row">
+          <span class="status-icon ready-icon">🚀</span>
+          <b class="ready-text">ready</b>
+          <span>next up: {nc.kind} {candidateLabel(nc)}</span>
+          <span>&middot; budget: <span class={nc.budget_state === "denied" ? "b-denied" : nc.budget_state === "allowed" ? "b-allowed" : "b-exempt"}>{nc.budget_state}</span></span>
+        </div>
+        {#if ss?.next_wake_at}
+          <div class="row dim sub-row">
+            starting ~{countdown(ss.next_wake_at)} ({ts(ss.next_wake_at)})
+          </div>
+        {/if}
+      {:else if store.summary.activity_status.kind === "idle"}
+        {@const ss = store.summary.scheduler_state}
+        <div class="row">
+          <span class="status-icon idle-icon">✓</span>
+          <b class="idle">idle</b> nothing to do
+        </div>
+        {#if ss?.next_wake_at}
+          <div class="row dim sub-row">
+            next check ~{countdown(ss.next_wake_at)} ({ts(ss.next_wake_at)})
+          </div>
+        {/if}
+      {:else if store.summary.activity_status.kind === "warming_up"}
+        <div class="row dim">warming up &mdash; no cycle has run yet</div>
+      {/if}
+
+      <!-- Scheduler detail (last log) -->
+      {#if store.summary.scheduler_state}
+        <div class="row last-log">{store.summary.scheduler_state.detail}</div>
+      {/if}
+    </div>
+  {:else}
+    <p class="loading">Loading&hellip;</p>
+  {/if}
+</div>
+
+<style>
+  /* ── Page ────────────────────────────────────────────────────── */
+  .page-title {
+    font-size: 1.25rem;
+    font-weight: 700;
+    margin-bottom: 1rem;
+  }
+
+  /* ── Dashboard grid ─────────────────────────────────────────── */
+  .dashboard-grid {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .dash-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 0.875rem;
+  }
+
+  .windows-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .cycle-card {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    justify-content: center;
+    min-width: 180px;
+  }
+
+  /* ── Cycle button ───────────────────────────────────────────── */
+  .cycle-btn {
+    padding: 0.5rem 1.25rem;
+    border-radius: var(--radius-md);
+    background: var(--accent);
+    color: var(--bg);
+    font-weight: 600;
+    font-size: 0.875rem;
+  }
+  .cycle-btn:hover:not(:disabled) { background: var(--accent-hover); }
+  .cycle-btn:disabled { opacity: 0.45; cursor: default; }
+  .cycle-btn.ready {
+    animation: readyPulse 2s ease-in-out infinite;
+  }
+
+  .last-cycle {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    margin-top: 0.5rem;
+    max-width: 260px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    text-align: right;
+  }
+
+  /* ── Loading ────────────────────────────────────────────────── */
+  .loading {
+    color: var(--text-dim);
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  /* ── Backend-rendered scv-* classes (verbatim from Rust) ─────── */
+  :global(.scv-win) { min-width: 190px; }
+  :global(.scv-lab) { display: flex; justify-content: space-between; font-size: 0.875rem; margin-bottom: 2px; }
+  :global(.scv-lab b) { font-weight: 600; }
+  :global(.scv-bar) { position: relative; height: 14px; background: #2a2a3a; border-radius: var(--radius-sm); overflow: hidden; }
+  :global(.scv-fill) { display: inline-block; height: 100%; }
+  :global(.scv-fill.scv-ok) { background: #4e8; }
+  :global(.scv-fill.scv-bad) { background: #e54; }
+  :global(.scv-fill.scv-stale) { background: #888; }
+  :global(.scv-soft) { display: inline-block; height: 100%; background: repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(255,255,255,0.15) 3px, rgba(255,255,255,0.15) 6px); }
+  :global(.scv-ramp) { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff8; }
+  :global(.scv-sub) { font-size: 0.75rem; color: var(--text-dim); margin-top: 2px; }
+  :global(.scv-note) { font-size: 0.875rem; color: var(--text-dim); }
+
+  /* ── Activity card ──────────────────────────────────────────── */
+  .activity-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 0.75rem 0.875rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+  .activity-card .row {
+    font-size: 0.9375rem;
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    flex-wrap: wrap;
+  }
+  .activity-card .dim { color: var(--text-dim); }
+  .activity-card .sub-row { font-size: 0.8125rem; padding-left: 1.5rem; }
+
+  .status-icon {
+    font-size: 0.8125rem;
+    flex-shrink: 0;
+  }
+  .running       { color: var(--ok); font-weight: 600; }
+  .ready-text    { color: var(--accent); font-weight: 600; }
+  .paused        { color: var(--sev-medium); font-weight: 600; }
+  .error         { color: var(--bad); font-weight: 600; }
+  .idle          { color: var(--text-dim); font-weight: 600; }
+
+  .last-log { color: rgba(255, 255, 255, 0.3); font-size: 0.75rem; margin-top: 0.25rem; }
+  :global(.b-denied) { color: var(--bad); }
+  :global(.b-allowed) { color: var(--ok); }
+  :global(.b-exempt) { color: var(--accent); }
+
+  /* ── Responsive ──────────────────────────────────────────────── */
+  @media (max-width: 600px) {
+    .dashboard-grid {
+      grid-template-columns: 1fr;
+    }
+    .cycle-card {
+      align-items: flex-start;
+    }
+    .last-cycle {
+      text-align: left;
+    }
+  }
+</style>
