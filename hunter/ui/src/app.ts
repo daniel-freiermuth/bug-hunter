@@ -1406,6 +1406,24 @@ async function refresh(): Promise<void> {
         (inbox.length ? "all filtered out" : "inbox zero") +
         "</div>";
 
+
+    // If the URL hash targets a specific finding, ensure it survives
+    // the "af" filters — clear them so the card renders and the scroll
+    // code below can find it.
+    const _targetHash = location.hash.slice(1);
+    if (_targetHash.startsWith("findings:")) {
+      const _targetId = parseInt(_targetHash.split(":")[1], 10);
+      const afFiltered = applyFindingFilters(all, "af");
+      if (
+        all.some((f) => f.id === _targetId) &&
+        !afFiltered.some((f) => f.id === _targetId)
+      ) {
+        // Target exists but is hidden by filters — clear af filters
+        for (const suffix of ["Status", "Repo", "Type", "Class", "Sev"]) {
+          filterState.delete(`af${suffix}`);
+        }
+      }
+    }
     renderPipeline(applyFindingFilters(all, "pf"));
     renderAllFindings(all, applyFindingFilters(all, "af"));
     renderRepos(s.repos || []);
