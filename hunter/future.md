@@ -532,3 +532,36 @@ the vanilla UI, include in the Svelte rewrite.
 **Status:** absorbed into §5.2 (single-account layer). The prior analysis
 (per-repo locking, `running_estimate` already in-flight-aware, protocol
 already dispatch-agnostic) carries over verbatim as the design basis.
+
+### 8.7 Tooling: frontend lint + SQL lint
+**Status:** idea; both deliberately out of scope when CI was wired up.
+
+CI currently runs ruff (format + check), mypy `--strict`, pytest, `tsc` and
+the esbuild bundle. Two gaps, both skipped because neither has a defined
+command in the justfile — adding them is a tooling/config decision, not a CI
+wiring change:
+
+- **ESLint for `ui/src/app.ts`.** `tsc` catches type errors but nothing
+  catches lint-class problems: unused code (a dead `fmtTokens()` duplicate of
+  `ktok()` sat there until the `tsc` CI step flagged it), `innerHTML` misuse,
+  floating promises, `==` vs `===`. Static analysis in review already flags
+  the whole file for `innerHTML` assignment on every pass; a real rule set
+  would let us either fix those properly or suppress them once, with reason,
+  instead of re-reading the same advisory each review. Needs: pick a config
+  (`typescript-eslint` recommended + a few DOM/XSS rules), fix the existing
+  violations, add a `lint-ui` justfile target, wire into the frontend CI job.
+
+- **SQL linting for `schema.sql` and the query builders.** Review tooling
+  repeatedly reports `python-fstring-execute` on `store.py` — SQL assembled
+  by f-string and handed to `execute()`. Every current instance is safe: the
+  interpolated parts are column names and `?` placeholder runs drawn from
+  internal allowlists (`_JOB_COLUMNS`, the migration's `all_cols` list), never
+  caller data, and values are always parameterized. But "safe by convention,
+  re-litigated every review" is the wrong steady state. Options: sqlfluff for
+  `schema.sql` style/dialect, plus either a narrow suppression with a comment
+  documenting the identifier-allowlist invariant, or a small typed helper
+  that makes the invariant structural (identifiers only from an enum) so the
+  linter is satisfied by construction.
+
+Neither blocks anything; both remove recurring review noise and a class of
+bug the current gates cannot see.
