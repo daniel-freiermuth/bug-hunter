@@ -191,8 +191,24 @@ required for that operation.
 ## Testing
 
 ### Philosophy
-- **Deterministic:** no flaky tests. Use simulation (turmoil) over
-  mocking. Fresh state per test (temp dirs, fresh DBs).
+- **Deterministic:** no flaky tests. Simulate the outside world rather
+  than mocking the code that reaches it. Fresh state per test (temp
+  dirs, fresh DBs).
+  - For this daemon that means *subprocess* simulation, not network
+    simulation. Every external boundary it crosses is a CLI —
+    `git` (34 call sites), `gh`, `glab`, `omp`, `npx` — and there is no
+    outbound network client in the crate at all. `FakeBins` scripts
+    those binaries so the real `Forge`/`dep_scan`/harness code runs and
+    builds real argv against a simulated world.
+  - Reach for `turmoil` only if that changes: it simulates a network
+    between hosts (partitions, latency, loss), so it earns its place
+    the day hunter talks to a forge REST API directly instead of
+    shelling out, or grows a second process. Today the sole
+    `tokio::net` call is the localhost listener, and the router tests
+    drive `router()` directly, which is both faster and simpler.
+  - For time, use `tokio::time` pause/advance rather than shortening
+    intervals. Sleeping less is still sleeping, and a 120 s grace
+    period cannot be shortened at all.
 - **Behavioral:** test what the code does, not how it's structured.
   Assert on domain types, not string representations.
 - **Coverage:** every changed line should be covered. Use `llvm-cov`

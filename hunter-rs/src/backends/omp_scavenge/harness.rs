@@ -267,12 +267,6 @@ fn tail_str(s: &str) -> &str {
     crate::util::tail(s, TAIL_BYTES)
 }
 
-/// How long the worker's session JSONL may take to appear before the run
-/// counts as unmetered. harness.py:151-154 just carried on with zero
-/// tokens, which silently disarms the cap — the one thing the cap design
-/// says never to trust.
-const SESSION_GRACE_S: u64 = 120;
-
 // ---------------------------------------------------------------------------
 // Worker execution (harness.py:103-163)
 // ---------------------------------------------------------------------------
@@ -385,11 +379,12 @@ pub fn run_worker(
             kill_tree(&mut proc);
             break;
         }
-        if session.is_none() && t0.elapsed().as_secs() >= SESSION_GRACE_S {
+        if session.is_none() && t0.elapsed().as_secs() >= cfg.session_grace_s {
             tracing::warn!(
-                "harness: no session ledger under {} after {SESSION_GRACE_S}s — \
+                "harness: no session ledger under {} after {}s — \
                  killing worker rather than running it unmetered",
-                sessions_dir.display()
+                sessions_dir.display(),
+                cfg.session_grace_s
             );
             killed = Some("unmetered".to_owned());
             kill_tree(&mut proc);

@@ -24,7 +24,7 @@
 
 mod support;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use hunter::backends::omp_scavenge::harness;
 use hunter::config::Config;
@@ -444,5 +444,39 @@ fn output_cut_mid_multibyte_char_is_not_a_panic() {
             .all(|c| c == '€'),
         "the boundary snap must not mangle the characters it keeps: {:?}",
         res.stdout_tail.chars().take(8).collect::<String>()
+    );
+}
+
+/// The sibling of `worker_without_a_ledger_is_flagged_unmetered_despite_exit_zero`:
+/// a worker that never exits and never produces a ledger.
+///
+/// This is the branch the cap exists for — a worker burning tokens that
+/// nothing can measure. It was untestable while the grace period was a
+/// hardcoded 120 s constant; `sessionGraceS` makes it injectable, exactly
+/// as `maxWallS` already is for the wall-clock branch in the same loop.
+/// Shortening the interval is the only honest option here: the sleep is
+/// `std::thread::sleep` on a blocking thread, so `tokio::time::pause()`
+/// has no effect on it.
+#[test]
+fn hanging_worker_without_a_ledger_is_killed_as_unmetered() {
+    let mut fx = Fixture::new("unmetered-hang");
+    fx.cfg.session_grace_s = 1;
+    // Sleeps well past the grace period and writes no ledger.
+    fx.bins.script("omp", "sleep 30");
+
+    let started = std::time::Instant::now();
+    // max_wall_s is far larger, so a pass cannot be the wall-clock branch.
+    let res = fx.run(1_000_000, 300);
+
+    assert_eq!(
+        res.killed_reason.as_deref(),
+        Some("unmetered"),
+        "a worker that never produced a ledger must be killed, not left running"
+    );
+    assert_eq!(res.tokens_new, 0);
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "must be killed at the grace period, not left to run: {:?}",
+        started.elapsed()
     );
 }

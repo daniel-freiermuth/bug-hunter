@@ -71,6 +71,7 @@ fn test_config(cache_ttl_s: f64) -> Config {
         stale_after_s: 300.0,
         cache_ttl_s,
         poll_s: 2.0,
+        session_grace_s: 120,
         model_default: None,
         model_smol: None,
         model_hunt: None,
