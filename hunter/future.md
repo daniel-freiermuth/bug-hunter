@@ -165,7 +165,7 @@ still needs tests and review in any language.
 | Repo access | GitHub App installation tokens | kills the global `gh` credential model |
 | TLS / edge | Caddy reverse proxy | the binary stays plain HTTP on localhost |
 | UI v1 | Svelte SPA against a clean JSON API | novelty budget goes to the backend; one unknown at a time |
-| UI styling | Tailwind, adopted *with* the Svelte rewrite | supersedes the earlier plan to migrate the vanilla-TS UI to Tailwind first (§8.1) |
+| UI styling | hand-written CSS custom properties | Tailwind was planned with the Svelte rewrite (§8.1) but not adopted; the token system carried over as-is |
 | UI later | Leptos experiment allowed | affordable *because* the JSON API boundary makes the UI swappable in a weekend |
 | Sandbox | rootless podman per job | §5.3 |
 | Backup | Litestream-style SQLite replication | Phase 4 |
@@ -505,10 +505,12 @@ One-week parity run starts now (Phase 2 exit criterion = §1).
 
 ---
 
-## 6b. Svelte + Tailwind UI rewrite — **DONE 2026-09-14**
+## 6b. Svelte UI rewrite — **DONE 2026-09-14**
 
 Migration 2 per §4/§8.1: vanilla-TS SPA (1560 lines, 1 file) replaced by
-Svelte 5 (runes) + Tailwind v4 + Vite. Source at `hunter/ui-svelte/`,
+Svelte 5 (runes) + Vite. Tailwind was *not* adopted — styling stayed
+hand-written CSS with the existing custom-property token system
+(`hunter/ui-svelte/src/app.css`). Source at `hunter/ui-svelte/`,
 production build outputs to `hunter/ui/` (where the Rust binary serves it).
 
 Components: App shell with sidebar nav + hash routing, StatusPage (backend
@@ -556,7 +558,7 @@ with live data, zero console errors, dark theme matching the original.
 7. **server** → axum from scratch, but *first* in the round order (see
    round 1): read-only API parity validates the stack early; auth redesign
    comes in Phase 3. UI initially unchanged (current vanilla-TS SPA talks
-   to the same JSON endpoints); Svelte+Tailwind rewrite follows as its own
+   to the same JSON endpoints); Svelte rewrite follows as its own
    step.
 
 Invariants that MUST survive the port (all currently enforced and tested):
@@ -585,14 +587,15 @@ Invariants that MUST survive the port (all currently enforced and tested):
 | 5 | Webhooks vs polling threshold | Defer to Phase 4; polling fine at current repo counts |
 | 6 | Keep omp vs Claude Agent SDK for workers | Keep omp; revisit only if the coupling (§5.4) keeps hurting — trait makes it cheap |
 | 7 | Repo layout | **Decided:** `hunter-rs/` beside `hunter/`, single bin crate, no workspace until earned (§6 round 1) |
-| 8 | Tailwind on the *current* UI before the port | **No** — superseded; adopt Tailwind with the Svelte rewrite (§8.1) |
+| 8 | Tailwind on the *current* UI before the port | **No** — superseded; Tailwind was to arrive with the Svelte rewrite (§8.1), but in the event was never adopted |
 
 ---
 
 ## 8. Nearer-term items (pre-existing living-doc entries, reconciled with the pivot)
 
 ### 8.1 UI: Tailwind CSS + `status() -> data, not HTML`
-**Status:** superseded / resolved by the port plan.
+**Status:** superseded / resolved by the port plan. Tailwind itself was
+dropped: the Svelte rewrite (§6b) kept the hand-written CSS token system.
 
 Previously decided: migrate the hand-rolled ~300-line CSS to Tailwind on the
 current vanilla-TS UI. The Rust pivot changes the calculus — migrating the

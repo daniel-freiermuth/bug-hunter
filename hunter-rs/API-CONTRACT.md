@@ -66,12 +66,12 @@ Handler: server.py:211-212 -> `_summary()` (server.py:251-326) -> `_validate_sum
 | `backend_status_html` | string | `self.backend.status()` — **this is the key that carries the backend-status HTML fragment**; the UI assigns it via `innerHTML` (server.py:256,306; app.ts:167). Opaque string; Rust port must expose the same key name. |
 | `counts` | object: status -> int | `dict.fromkeys(FINDING_STATUSES, 0)` then `Counter` of `status` over `list_all_findings()` (server.py:257-259). **All 9 status keys always present** (zero-filled): `new, rechecking, queued, fixing, pr_open, merged, rejected, wontfix, note` (types.py:23-33,66). |
 | `type_counts` | object: type -> int | `Counter` of `type` over the same rows (server.py:261,308). Only observed types present; may be `{}`. |
-| `repos` | array of Repo | `store.list_repos()`: `SELECT * FROM repos ORDER BY name` (store.py:226-227), pydantic-narrowed to `RepoDict` (types.py:143-159): `id:int, name:str, url:str, path:str, forge:str, default_branch:str, last_hunt_sha:str|null, last_hunt_at:int|null, enabled:int (0/1, NOT bool), added_at:int`. |
+| `repos` | array of Repo | `store.list_repos()`: `SELECT * FROM repos ORDER BY name` (store.py:226-227), pydantic-narrowed to `RepoDict` (types.py:143-159): `id:int, name:str, url:str, path:str, forge:str, default_branch:str, last_hunt_sha:str\|null, last_hunt_at:int\|null, enabled:int (0/1, NOT bool), added_at:int`. |
 | `last_cycle` | Event object or null | first event with `kind == "cycle"` within `recent_events(limit=500)` (server.py:262-265). Event shape: see /api/events. |
 | `cycle_running` | bool | `_cycle_lock.locked()` (server.py:304,319) — true JSON boolean. |
 | `current_job` | Job object or null | `store.current_job()` (store.py:738-761), see below. |
 | `next_candidate` | object or null | computed only when `current_job` is null AND `scheduler.pick_next` yields a candidate (server.py:272-301); see below. |
-| `scheduler_state` | object or null | `store.get_scheduler_state()`: `SELECT * FROM scheduler_state WHERE id = 1` (store.py:775-782). Shape (types.py:109-115): `id:1, state:str ("idle"|"denied"|"error"), detail:str, next_wake_at:int|null (epoch ms), updated_at:int`. Null until the daemon loop has run once. |
+| `scheduler_state` | object or null | `store.get_scheduler_state()`: `SELECT * FROM scheduler_state WHERE id = 1` (store.py:775-782). Shape (types.py:109-115): `id:1, state:str ("idle"\|"denied"\|"error"), detail:str, next_wake_at:int\|null (epoch ms), updated_at:int`. Null until the daemon loop has run once. |
 | `activity_status` | tagged union on `kind` | `_activity_status(...)` (server.py:863-960); see below. |
 
 ### current_job (store.py:738-761)
@@ -120,7 +120,7 @@ Handler: server.py:214-215 -> `_findings(qs)` (server.py:340-384).
 |---|---|---|---|
 | `status` | string | none | SQL `status = ?`. Not validated against the enum — an unknown value just matches nothing. |
 | `repo` | string | none | all-digits -> repo id lookup, else name lookup (`get_repo`, store.py:220-224). **Unknown repo raises ValueError -> `500 {"error":"internal error"}`** (server.py:350-355 + 247-249). Not 400. |
-| `severity` | string | none | minimum severity; case-insensitive `low|medium|high` (types.py:44-63). Expands to `severity IN (...)` of all values at-or-above. **Invalid value -> ValueError -> 500** (same catch-all). |
+| `severity` | string | none | minimum severity; case-insensitive `low\|medium\|high` (types.py:44-63). Expands to `severity IN (...)` of all values at-or-above. **Invalid value -> ValueError -> 500** (same catch-all). |
 | `type` | string | none | SQL `type = ?` on `findings.type`. |
 | `unified` | string | `"1"` | `"1"` (default) -> `list_all_findings` (adds `category`); any other value -> legacy `list_findings` (no `type` filter applied, no `category` key) (server.py:346,357-371). The UI never sends it. |
 

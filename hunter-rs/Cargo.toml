@@ -12,11 +12,12 @@ unused_must_use = "deny"
 [lints.clippy]
 all = { level = "deny", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
-# No-panic guarantee: these are denied so any future unwrap/expect/panic
+# No-panic guarantee: these are denied so any future unwrap/expect/panic/todo
 # is a compile error, not a code review catch.
 unwrap_used = "deny"
 expect_used = "deny"
 panic = "deny"
+todo = "deny"
 # Accepted pedantic exceptions (noisy, low value for this codebase):
 too_many_arguments = "allow"         # scheduler executors have many params by nature
 module_name_repetitions = "allow"    # e.g. FindingFilter in store
