@@ -2,6 +2,7 @@
   import type { Finding } from "../lib/types";
   import { SEV_RANK } from "../lib/format";
   import { SvelteSet } from "svelte/reactivity";
+  import { absorb, needsSelector, reselect } from "../lib/selection";
   import MultiSelect from "./MultiSelect.svelte";
 
   let {
@@ -49,27 +50,8 @@
     statuses: new Set<string>(),
   };
 
-  function absorb(options: string[], seen: Set<string>, selected: SvelteSet<string>) {
-    for (const option of options) {
-      if (!seen.has(option)) {
-        seen.add(option);
-        selected.add(option);
-      }
-    }
-  }
-
-  // Reset a dimension to "everything currently on offer", in place.
-  function reselect(selected: SvelteSet<string>, options: string[]) {
-    selected.clear();
-    for (const option of options) selected.add(option);
-  }
-
-  // A single-option dimension normally needs no control. The exception is
-  // when that option is deselected: the filter then matches nothing, and
-  // hiding the control would leave no way back short of a reload.
-  function needsSelector(options: string[], selected: SvelteSet<string>): boolean {
-    return options.length > 1 || options.some((option) => !selected.has(option));
-  }
+  // absorb / reselect / needsSelector live in lib/selection.ts, shared
+  // with MultiSelect and pinned by lib/selection.test.ts.
 
   $effect(() => {
     absorb(repos, known.repos, selectedRepos);

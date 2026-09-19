@@ -215,10 +215,27 @@ after, or a command whose output demonstrates it.
   against the pre-fix code. If you cannot make it fail, it is not
   testing your change. Invert the condition, confirm exactly the
   expected test breaks, revert.
-- Test-first ordering is optional; the red step is not. Writing the
-  test before the code guarantees only that the code matches the
-  requirement — which is no help when the requirement is the thing
-  that was incomplete.
+- **Test-driven, in the strict sense.** Not "write a test first" but
+  "write tests until the laziest implementation that passes them all is
+  the correct one." Assume an adversarial implementer: if
+  `render("{{A}} {{TYPO}}", …).is_err()` is the only test, `bail!()`
+  passes it. The pressure to defeat that laziness is what forces you to
+  enumerate the positive cases and the edge conditions — which is the
+  step our regressions actually skipped, every time.
+- Enumerate the **input domain**, not the requirement. A substitution
+  function takes values that may contain the delimiter. A pipe emits
+  bytes that may not be UTF-8. A worker either hangs or exits, with or
+  without a ledger — that is a 2x2, so write four tests. All three of
+  those were real regressions and all three are boring edge-case
+  enumeration.
+- **Do not test through a mock you invented.** A mocked 200 for an
+  endpoint that returns 201 enshrines the bug instead of catching it;
+  we shipped exactly that. Prefer the real collaborator or a
+  simulation of it.
+- The tests **stay around**, and that is most of the value. Every
+  invariant broken in review here was one no test encoded: `render`
+  had none, the whole Svelte UI had none. A suite is a ratchet against
+  the next person changing an assumption you did not write down.
 
 ### Fixing a reported defect
 

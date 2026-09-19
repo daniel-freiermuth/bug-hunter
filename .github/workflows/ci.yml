@@ -82,7 +82,7 @@ jobs:
 
   # ── Svelte frontend (hunter/ui-svelte/) ────────────────────────
   frontend:
-    name: Frontend — lint + typecheck + build
+    name: Frontend — lint + typecheck + test + build
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -106,6 +106,9 @@ jobs:
 
       - name: Svelte check
         run: npx svelte-check --tsconfig tsconfig.app.json
+
+      - name: Test
+        run: npx vitest run
 
       - name: Build
         run: npx vite build

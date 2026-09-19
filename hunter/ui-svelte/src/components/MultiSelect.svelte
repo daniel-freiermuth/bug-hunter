@@ -1,5 +1,6 @@
 <script lang="ts">
   import { SvelteSet } from "svelte/reactivity";
+  import * as sel from "../lib/selection";
 
   let {
     label,
@@ -14,13 +15,10 @@
   let open = $state(false);
   let container: HTMLDivElement | undefined = $state();
 
-  // Membership, not size. `selected` may retain options that have since
-  // disappeared from `options` (FilterBar remembers a choice across data
-  // refreshes), so `selected.size === options.length` can be true while
-  // covering none of them -- reporting "no filter active" for a filter
-  // that excludes everything.
-  const allSelected = $derived(options.length > 0 && options.every((o) => selected.has(o)));
-  const noneSelected = $derived(!options.some((o) => selected.has(o)));
+  // Membership, not size -- see lib/selection.ts for why `selected` is not
+  // a subset of `options`. Pinned by lib/selection.test.ts.
+  const allSelected = $derived(sel.allSelected(options, selected));
+  const noneSelected = $derived(sel.noneSelected(options, selected));
   const filtering = $derived(!allSelected);
 
   // Trigger label: show what's selected when filtering.
