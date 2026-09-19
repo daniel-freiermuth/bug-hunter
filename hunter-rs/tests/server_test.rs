@@ -95,9 +95,8 @@ async fn test_state() -> AppState {
         store: Arc::new(store),
         config: Arc::new(config),
         backend: Arc::new(hunter::backend::NullBackend),
-        // Unreachable on purpose — no test here exercises forwarding.
-        py_base: String::new(),
-        wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+        // Read-only GET tests; no cycle is triggered from here.
+        scheduler: None,
     }
 }
 
