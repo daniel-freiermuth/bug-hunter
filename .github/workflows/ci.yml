@@ -13,6 +13,93 @@ permissions:
   contents: read
 
 jobs:
+  # ── Rust backend (hunter-rs/) ──────────────────────────────────
+  rust:
+    name: Rust — lint + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter-rs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: hunter-rs
+
+      # Dev DB for sqlx compile-time checks
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+      - name: Generate dev.db
+        run: |
+          cd ../hunter
+          python3 -c "
+          from pathlib import Path; import dataclasses
+          from hunter.types import Config; from hunter.store import Store
+          dev = Path('../hunter-rs/dev.db').resolve(); dev.unlink(missing_ok=True)
+          Store(dataclasses.replace(Config.load(), db_path=dev))
+          print('dev.db regenerated')
+          "
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      - name: SQL encapsulation
+        run: |
+          echo "Checking pool() encapsulation..."
+          ! grep -rn '\.pool()' src/ | grep -v 'store\.rs' | grep -v '//'
+          echo "✓ pool() only in store.rs"
+
+          echo "Checking compile-time checked queries..."
+          ! grep -rn 'sqlx::query(' src/ | grep -v 'query!\|query_as!\|query_scalar!\|capacity\.rs\|//'
+          echo "✓ all queries compile-time checked"
+
+          echo "Checking no QueryBuilder..."
+          ! grep -rn 'QueryBuilder' src/ | grep -v '//'
+          echo "✓ no QueryBuilder"
+
+      - name: Test
+        run: cargo test
+
+  # ── Svelte frontend (hunter/ui-svelte/) ────────────────────────
+  frontend:
+    name: Frontend — lint + typecheck + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter/ui-svelte
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hunter/ui-svelte/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: ESLint
+        run: npx eslint src/
+
+      - name: Svelte check
+        run: npx svelte-check --tsconfig tsconfig.app.json
+
+      - name: Build
+        run: npx vite build
   # ── Python hunter (hunter/) ────────────────────────────────────
   python:
     name: Python — lint + typecheck + test
@@ -44,29 +131,3 @@ jobs:
       - name: Test
         run: pytest tests/ -q
 
-  # ── Frontend (hunter/ui/) ──────────────────────────────────────
-  frontend:
-    name: Frontend — typecheck + build
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: hunter
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: hunter/package-lock.json
-
-      - name: Install deps
-        run: npm ci
-
-      - name: Typecheck
-        run: npx tsc --project ui/tsconfig.json
-
-      - name: Build
-        run: npx esbuild ui/src/app.ts --bundle --outfile=ui/app.js --sourcemap --target=es2022 --format=iife
