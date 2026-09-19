@@ -11,6 +11,7 @@ use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::config::Config;
@@ -227,6 +228,46 @@ fn epoch_to_iso(secs: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Worker output capture
+// ---------------------------------------------------------------------------
+
+/// Bytes of worker output kept for `RunResult::stdout_tail`.
+const TAIL_BYTES: usize = 2000;
+
+/// Drain a worker pipe on its own thread, keeping only the last
+/// `TAIL_BYTES`. The pipe has to be read for as long as the worker runs: a
+/// full pipe buffer blocks the worker, and a blocked worker stops writing
+/// the ledger the cap watchdog reads. Everything before the tail is
+/// dropped as it arrives — a chatty worker emits megabytes.
+fn drain_tail<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut tail: Vec<u8> = Vec::new();
+        if let Some(mut p) = pipe {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match p.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        tail.extend_from_slice(&chunk[..n]);
+                        if tail.len() > TAIL_BYTES {
+                            tail.drain(..tail.len() - TAIL_BYTES);
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        }
+        tail
+    })
+}
+
+/// Last `TAIL_BYTES` of `s`, snapped forward to a `char` boundary.
+fn tail_str(s: &str) -> &str {
+    crate::util::tail(s, TAIL_BYTES)
+}
+
+// ---------------------------------------------------------------------------
 // Worker execution (harness.py:103-163)
 // ---------------------------------------------------------------------------
 
@@ -311,6 +352,10 @@ pub fn run_worker(
         }
     };
 
+    // Readers start here and run until the pipes close: see `drain_tail`.
+    let so = drain_tail(proc.stdout.take());
+    let se = drain_tail(proc.stderr.take());
+
     let mut session: Option<PathBuf> = None;
     let mut tokens: i64 = 0;
     let mut calls: i64 = 0;
@@ -351,16 +396,12 @@ pub fn run_worker(
         calls = c;
     }
 
-    // Capture output tail (last 2000 bytes).
-    let mut stdout_buf = String::new();
-    if let Some(mut so) = proc.stdout.take() {
-        let _ = so.read_to_string(&mut stdout_buf);
-    }
-    if let Some(mut se) = proc.stderr.take() {
-        let _ = se.read_to_string(&mut stdout_buf);
-    }
-    let tail_start = stdout_buf.len().saturating_sub(2000);
-    let stdout_tail = stdout_buf[tail_start..].to_owned();
+    // Capture output tail. kill_tree signals the whole process group, so
+    // the pipes are closed by now on every path and the joins are short.
+    let mut bytes = so.join().unwrap_or_default();
+    bytes.extend_from_slice(&se.join().unwrap_or_default());
+    let text = String::from_utf8_lossy(&bytes);
+    let stdout_tail = tail_str(&text).to_owned();
 
     RunResult {
         exit_code,
@@ -384,5 +425,32 @@ mod tests {
         assert_eq!(epoch_to_iso(0), "1970-01-01T00:00:00.000Z");
         // 2026-01-01T00:00:00.000Z = 1767225600
         assert_eq!(epoch_to_iso(1_767_225_600), "2026-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn test_tail_str_snaps_to_char_boundary() {
+        // 3-byte chars: the raw byte cut at len-TAIL_BYTES lands mid-char
+        // (3000 - 2000 = 1000, and 1000 % 3 != 0), which would panic.
+        let s = "€".repeat(1000);
+        let tail = tail_str(&s);
+        assert_eq!(tail.len(), 1998);
+        assert!(s.ends_with(tail));
+        assert!(tail.chars().all(|c| c == '€'));
+    }
+
+    #[test]
+    fn test_tail_str_keeps_short_input_whole() {
+        assert_eq!(tail_str("héllo"), "héllo");
+    }
+
+    #[test]
+    fn test_drain_tail_retains_only_the_tail() {
+        let mut src = vec![b'a'; TAIL_BYTES * 3];
+        src.extend_from_slice(b"END");
+        let out = drain_tail(Some(std::io::Cursor::new(src)))
+            .join()
+            .unwrap_or_default();
+        assert_eq!(out.len(), TAIL_BYTES);
+        assert!(out.ends_with(b"END"));
     }
 }

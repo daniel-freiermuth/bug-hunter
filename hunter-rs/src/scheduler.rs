@@ -410,13 +410,7 @@ pub async fn record_job(
 ) -> anyhow::Result<JobState> {
     let state = job_state(rr);
     let notes = if state != JobState::Done && !rr.stdout_tail.is_empty() {
-        let tail = &rr.stdout_tail;
-        let start = if tail.len() > 500 {
-            tail.len() - 500
-        } else {
-            0
-        };
-        Some(&tail[start..])
+        Some(crate::util::tail(&rr.stdout_tail, 500))
     } else {
         None
     };
@@ -494,7 +488,7 @@ async fn sync_repo(
         .await
         .unwrap_or((127, "spawn error".to_owned()));
         if rc != 0 {
-            let tail = &out[out.len().saturating_sub(300)..];
+            let tail = crate::util::tail(&out, 300);
             let _ = store
                 .log_event(
                     "error",
@@ -522,7 +516,7 @@ async fn sync_repo(
         .await
         .unwrap_or((127, "spawn error".to_owned()));
         if rc != 0 {
-            let tail = &out[out.len().saturating_sub(300)..];
+            let tail = crate::util::tail(&out, 300);
             let cmd_str = format!("git {}", cmd_tail.join(" "));
             let _ = store
                 .log_event(
@@ -1065,7 +1059,8 @@ pub async fn run_recheck(
     };
 
     let reason_owned = verdict_obj.reason.as_deref().unwrap_or_default();
-    let reason = &reason_owned[..reason_owned.len().min(500)];
+    let reason: String = reason_owned.chars().take(500).collect();
+    let reason = reason.as_str();
 
     let verdict_str = match outcome {
         RecheckOutcome::Confirmed => {
@@ -1609,7 +1604,7 @@ pub async fn run_fix(
     .await
     .unwrap_or((127, "spawn error".to_owned()));
     if rc != 0 {
-        let tail = &out[out.len().saturating_sub(300)..];
+        let tail = crate::util::tail(&out, 300);
         let _ = store
             .log_event(
                 "error",
@@ -1742,13 +1737,17 @@ pub async fn run_fix(
         None
     };
     if let Some(ref ofile) = outcome_file {
-        let reason = std::fs::read_to_string(ofile).unwrap_or_default();
-        let reason = &reason[..reason.len().min(500)];
+        let raw = std::fs::read_to_string(ofile).unwrap_or_default();
+        let reason: String = raw.chars().take(500).collect();
         let _ = store
-            .set_finding_verdict(fid, FindingStatus::Rejected, reason)
+            .set_finding_verdict(fid, FindingStatus::Rejected, &reason)
             .await;
         let _ = store.clear_fix_attempts(fid).await;
-        let first_line = reason.lines().next().map_or("", |l| &l[..l.len().min(120)]);
+        let first_line: String = reason
+            .lines()
+            .next()
+            .map(|l| l.chars().take(120).collect())
+            .unwrap_or_default();
         let verb = if ofile == &decline_file {
             "rejected"
         } else {
@@ -1884,17 +1883,15 @@ pub async fn run_fix(
                                 .await;
                             return Ok(summary);
                         }
-                        failure = Some(format!(
-                            "PR create failed: {}",
-                            &err_msg[..err_msg.len().min(300)]
-                        ));
+                        let head: String = err_msg.chars().take(300).collect();
+                        failure = Some(format!("PR create failed: {head}"));
                     }
                 }
             } else {
                 failure = Some(format!("unparseable repo url for PR: {:?}", repo.url));
             }
         } else {
-            let tail = &pout[pout.len().saturating_sub(300)..];
+            let tail = crate::util::tail(&pout, 300);
             failure = Some(format!("push failed: {tail}"));
         }
     } else if failure.is_none() {
@@ -1912,7 +1909,7 @@ pub async fn run_fix(
     // Salvage
     let failure = failure.unwrap_or_else(|| "unknown failure".to_owned());
     let streak = store.record_fix_attempt(fid, &failure).await.unwrap_or(1);
-    let tail = &rr.stdout_tail[rr.stdout_tail.len().saturating_sub(300)..];
+    let tail = crate::util::tail(&rr.stdout_tail, 300);
     if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
         let _ = store
             .set_finding_verdict(
@@ -2017,8 +2014,10 @@ fn iso_ms(ts: &str) -> i64 {
     // Fractional seconds -> ms
     let frac_ms: i64 = if time_parts.len() == 2 {
         let frac = time_parts[1];
+        // Timestamps come from the forge API; a malformed non-ASCII
+        // fraction must not panic the slice.
         let digits = frac.len().min(3);
-        let n: i64 = frac[..digits].parse().unwrap_or(0);
+        let n: i64 = frac.get(..digits).unwrap_or("").parse().unwrap_or(0);
         // Scale to ms: if 1 digit, *100; 2 digits, *10; 3 digits, *1
         n * 10i64.pow((3 - digits) as u32)
     } else {
@@ -2436,7 +2435,7 @@ pub async fn run_engage(
     .await
     .unwrap_or((127, "spawn error".to_owned()));
     if rc != 0 {
-        let tail = &out[out.len().saturating_sub(300)..];
+        let tail = crate::util::tail(&out, 300);
         let _ = store
             .log_event(
                 "error",
@@ -2468,7 +2467,7 @@ pub async fn run_engage(
     .await
     .unwrap_or((127, "spawn error".to_owned()));
     if rc != 0 {
-        let tail = &out[out.len().saturating_sub(300)..];
+        let tail = crate::util::tail(&out, 300);
         let _ = store
             .log_event(
                 "error",
@@ -2595,15 +2594,19 @@ pub async fn run_engage(
     if withdraw.exists() {
         let reason = std::fs::read_to_string(&withdraw).unwrap_or_default();
         if fg.owner_repo(&repo.url).is_some() {
-            let comment = &reason[..reason.len().min(800)];
-            let _ = fg.close_pr(&repo.url, pr_number, comment);
+            let comment: String = reason.chars().take(800).collect();
+            let _ = fg.close_pr(&repo.url, pr_number, &comment);
         }
-        let reason_short = &reason[..reason.len().min(500)];
+        let reason_short: String = reason.chars().take(500).collect();
         let _ = store
-            .set_finding_verdict(fid, FindingStatus::Rejected, reason_short)
+            .set_finding_verdict(fid, FindingStatus::Rejected, &reason_short)
             .await;
         let _ = store.mark_pr_closed(fid, pr_number, now_ms()).await;
-        let first_line = reason.lines().next().map_or("", |l| &l[..l.len().min(120)]);
+        let first_line: String = reason
+            .lines()
+            .next()
+            .map(|l| l.chars().take(120).collect())
+            .unwrap_or_default();
         let _ = store
             .log_event(
                 "verdict",
@@ -2675,7 +2678,7 @@ pub async fn run_engage(
             if prc == 0 {
                 pushed = true;
             } else {
-                let tail = &pout[pout.len().saturating_sub(300)..];
+                let tail = crate::util::tail(&pout, 300);
                 failure = Some(format!("push failed: {tail}"));
             }
         }
@@ -2691,7 +2694,7 @@ pub async fn run_engage(
                 Err(e) => {
                     failure = Some(format!(
                         "PR comment failed: {}",
-                        &e.to_string()[..e.to_string().len().min(300)]
+                        crate::util::tail(&e.to_string(), 300)
                     ));
                 }
             }
@@ -2702,7 +2705,7 @@ pub async fn run_engage(
         if state == JobState::Done {
             let _ = store.fail_job(job, fail.as_str()).await;
         }
-        let tail = &rr.stdout_tail[rr.stdout_tail.len().saturating_sub(300)..];
+        let tail = crate::util::tail(&rr.stdout_tail, 300);
         let _ = store
             .log_event(
                 "engage",
@@ -2859,7 +2862,7 @@ pub async fn run_harvest(
     .await
     .unwrap_or((127, "spawn error".to_owned()));
     if rc != 0 {
-        let tail = &out[out.len().saturating_sub(300)..];
+        let tail = crate::util::tail(&out, 300);
         let _ = store
             .log_event(
                 "error",
@@ -2891,7 +2894,7 @@ pub async fn run_harvest(
     .await
     .unwrap_or((127, "spawn error".to_owned()));
     if rc != 0 {
-        let tail = &out[out.len().saturating_sub(300)..];
+        let tail = crate::util::tail(&out, 300);
         let _ = store
             .log_event(
                 "error",
