@@ -125,10 +125,18 @@ jobs:
   # A full run is ~1900 mutants and takes hours, so CI tests only the
   # mutants a change actually introduces. A survivor means the suite
   # cannot distinguish the new code from a broken version of it.
+  #
+  # Bounded on purpose: on a long-lived branch "the diff" can be the
+  # whole codebase — this very branch introduces all of hunter-rs, which
+  # is 1872 mutants and about four hours. Past the budget the job says
+  # so and stops, rather than burning a runner to tell you what
+  # `cargo llvm-cov` already said. Mutation testing is a focused audit
+  # tool; for a large change run `just mutants <file>` per module.
   mutants:
     name: Rust — mutation coverage of the diff
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: hunter-rs
@@ -151,12 +159,28 @@ jobs:
           tool: cargo-nextest,cargo-mutants
 
       - name: Mutants introduced by this PR
+        env:
+          MAX_MUTANTS: "150"
         run: |
           # --relative is load-bearing: without it git emits repo-relative
           # paths (a/hunter-rs/src/...) while cargo-mutants runs inside the
           # package and matches on src/..., so every mutant is filtered out
           # and the job passes having tested nothing.
           git diff --no-color --relative "origin/${{ github.base_ref }}"...HEAD -- . > /tmp/pr.diff
+
+          count=$(cargo mutants --in-diff /tmp/pr.diff --list 2>/dev/null | wc -l)
+          echo "diff introduces $count mutants (budget: $MAX_MUTANTS)"
+
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::No mutable code in this diff."
+            exit 0
+          fi
+          if [ "$count" -gt "$MAX_MUTANTS" ]; then
+            echo "::notice::$count mutants exceeds the per-PR budget of $MAX_MUTANTS."
+            echo "Run 'just mutants <file>' on the modules you touched instead."
+            exit 0
+          fi
+
           cargo mutants --test-tool nextest --in-diff /tmp/pr.diff -j 2 --colors never
 
   # ── Svelte frontend (hunter/ui-svelte/) ────────────────────────
