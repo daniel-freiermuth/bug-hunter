@@ -32,7 +32,7 @@ pub fn acquire_lockfile(work_root: &Path) -> anyhow::Result<std::fs::File> {
     file.try_lock().map_err(|_| {
         anyhow::anyhow!(
             "another hunter process is already running (lock: {})\n  \
-             check: ps aux | grep 'hunter daemon'\n  \
+             check: ps aux | grep '[h]unter --root'\n  \
              or:    systemctl --user status hunter.service",
             lock_path.display()
         )

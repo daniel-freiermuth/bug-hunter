@@ -875,6 +875,32 @@ impl Store {
         .await
     }
 
+    /// Running jobs only, filtered in SQL — reconcile must not drag the whole
+    /// job history into memory. Same join and newest-first ordering as
+    /// `list_jobs`; finding_* keys stay None.
+    pub async fn list_running_jobs(&self) -> sqlx::Result<Vec<Job>> {
+        let running = JobState::Running;
+        sqlx::query_as!(
+            Job,
+            r#"
+            SELECT j.id AS "id!", j.kind AS "kind!: JobKind", j.repo_id AS "repo_id!",
+                   j.finding_id, j.state AS "state!: JobState", j.pid, j.session_file,
+                   j.cap_tokens, j.tokens_new, j.calls, j.exit_code,
+                   j.killed_reason, j.notes, j.model, j.usage_delta,
+                   j.started_at, j.finished_at, r.name AS "repo_name!",
+                   NULL AS "finding_summary?: String",
+                   NULL AS "finding_fingerprint?: String"
+            FROM jobs j
+            JOIN repos r ON r.id = j.repo_id
+            WHERE j.state = ?1
+            ORDER BY j.id DESC
+            "#,
+            running
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
     // -- events / scheduler ----------------------------------------------------
 
     /// ORDER BY id DESC LIMIT ?.
@@ -1492,19 +1518,16 @@ impl Store {
             self.set_finding_status(f.id, FindingStatus::Queued).await?;
         }
         // Jobs stuck at 'running' -> killed/orphaned
-        let all_jobs = self.list_jobs(i64::MAX).await?;
         let mut orphaned_jobs = Vec::new();
-        for j in all_jobs {
-            if j.state == JobState::Running {
-                let now = now_ms();
-                self.orphan_job(
-                    j.id,
-                    "reconciled at cycle startup -- prior process died mid-job",
-                    now,
-                )
-                .await?;
-                orphaned_jobs.push(j);
-            }
+        for j in self.list_running_jobs().await? {
+            let now = now_ms();
+            self.orphan_job(
+                j.id,
+                "reconciled at cycle startup -- prior process died mid-job",
+                now,
+            )
+            .await?;
+            orphaned_jobs.push(j);
         }
         Ok((stuck_findings, orphaned_jobs))
     }

@@ -394,6 +394,19 @@ impl OmpScavengeBackend {
             prioritized,
         })
     }
+
+    /// Staleness predicate behind `keep_fresh`'s probe gate: fresh iff the
+    /// anthropic:5h window exists and its age is within `stale_after_s`,
+    /// inclusive — an age landing exactly on the threshold is still fresh.
+    /// A missing 5h window (or no windows at all) is not fresh.
+    ///
+    /// Split out from `keep_fresh` so the boundary is observable without
+    /// the wall-clock read that derives `age_s`.
+    pub fn is_fresh(&self, windows: &BTreeMap<String, WindowState>) -> bool {
+        windows
+            .get("anthropic:5h")
+            .is_some_and(|w5| w5.age_s <= self.cfg.stale_after_s)
+    }
 }
 
 #[async_trait]
@@ -414,12 +427,10 @@ impl Backend for OmpScavengeBackend {
         self.observe(&windows).await?;
 
         // Staleness gate on anthropic:5h only: fresh → no probe.
-        if let Some(w5) = windows.get("anthropic:5h")
-            && w5.age_s <= self.cfg.stale_after_s
-        {
+        // Missing 5h (or no windows at all) → not fresh → probe.
+        if self.is_fresh(&windows) {
             return Ok(false);
         }
-        // Missing 5h (or no windows at all) → probe.
 
         // Probe: invalidate then read (two spawn_blocking calls).
         {

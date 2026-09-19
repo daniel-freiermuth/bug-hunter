@@ -999,9 +999,10 @@ async fn test_stale_window_forces_probe() {
     let _ = std::fs::remove_file(&db);
 }
 
-/// Item 52: exactly at threshold → fresh (≤).
+/// Item 52: age just inside `stale_after_s` → fresh, no probe. The exact
+/// `<=` boundary is pinned by `test_age_exactly_at_threshold_is_fresh`.
 #[tokio::test]
-async fn test_exactly_at_threshold_no_probe() {
+async fn test_age_just_inside_threshold_no_probe() {
     let now = now_ms();
     let db = make_agent_db(&[(
         "anthropic:5h",
@@ -1022,6 +1023,40 @@ async fn test_exactly_at_threshold_no_probe() {
     assert!(!result);
     assert_eq!(calls.lock().unwrap().len(), 0);
     let _ = std::fs::remove_file(&db);
+}
+
+/// Item 52 (boundary): an age landing EXACTLY on `stale_after_s` is fresh,
+/// one millisecond past it is not. Goes through `is_fresh` — the predicate
+/// `keep_fresh` gates the probe on — with `age_s` injected directly, because
+/// the agent.db path derives `age_s` from the clock read inside `keep_fresh`
+/// and so can never land on the threshold deterministically.
+#[test]
+fn test_age_exactly_at_threshold_is_fresh() {
+    let now = now_ms();
+    let (prober, _calls) = SharedProber::new(0);
+    let b = OmpScavengeBackend {
+        cfg: cfg(), // stale_after_s = 1800
+        ledger: Arc::new(FakeLedger::new(0, 0)),
+        // Never read: is_fresh inspects the passed-in windows only.
+        agent_db: PathBuf::from("/nonexistent/agent.db"),
+        prober: Arc::new(prober),
+    };
+
+    let at = |age_s| {
+        BTreeMap::from([(
+            "anthropic:5h".to_owned(),
+            ws("anthropic:5h", 0.10, "ok", now + HOUR_MS, age_s),
+        )])
+    };
+
+    assert!(
+        b.is_fresh(&at(1800.0)),
+        "age == stale_after_s is fresh (inclusive ≤), so keep_fresh skips the probe"
+    );
+    assert!(
+        !b.is_fresh(&at(1800.001)),
+        "one millisecond past the threshold is stale"
+    );
 }
 
 /// Item 53: respects configured `stale_after_s`.
