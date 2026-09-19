@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! POST endpoint tests (API-CONTRACT-WRITES.md): oneshot router with
-//! `NullBackend` over a WRITABLE tempdir copy of dev.db. `py_base` points at an
-//! unreachable port on purpose — forwarding failure must never be fatal
-//! except for /api/cycle's explicit 502.
+//! `NullBackend` over a WRITABLE tempdir copy of dev.db. The default state
+//! carries a scheduler handle (as `daemon` does); `test_state_serve` drops
+//! it to exercise the `serve` process, which runs no cycles.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -100,10 +100,18 @@ async fn test_state() -> AppState {
         store: Arc::new(store),
         config: Arc::new(config),
         backend: Arc::new(hunter::backend::NullBackend),
-        // Unreachable — proves forwarding is non-fatal (and drives the
-        // /api/cycle 502 test).
-        py_base: String::new(),
-        wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+        scheduler: Some(hunter::server::SchedulerHandle {
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        }),
+    }
+}
+
+/// A `serve`-mode state: no scheduler loop in this process.
+async fn test_state_serve() -> AppState {
+    AppState {
+        scheduler: None,
+        ..test_state().await
     }
 }
 
@@ -327,16 +335,19 @@ async fn unqueue_happy_path_and_precondition() {
 // -- §5 /api/override ------------------------------------------------------------
 
 #[tokio::test]
-async fn override_set_once_row_updated_forward_failure_nonfatal() {
+async fn override_set_once_row_updated_and_wakes_loop() {
     let state = test_state().await;
-    // py_base is unreachable — the spawned wake forward must not affect
-    // the response.
+    let wake = Arc::clone(&state.scheduler.as_ref().unwrap().wake);
     let (status, body) = post(&state, "/api/override", json!({ "id": 1, "mode": "once" })).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["ok"], json!(true));
     assert_eq!(body["finding"]["budget_override"], "once");
     let finding = state.store.get_finding(1).await.unwrap().unwrap();
     assert_eq!(finding.budget_override.as_deref(), Some("once"));
+    // Setting an override must not wait for the loop's next natural wake.
+    tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+        .await
+        .expect("setting an override must wake the scheduler loop");
 }
 
 #[tokio::test]
@@ -586,13 +597,53 @@ async fn repo_notes_append_201_and_validations() {
 
 // -- §2 /api/cycle ------------------------------------------------------------------------
 
+/// Contract §2: an idle scheduler accepts the trigger with 202.
 #[tokio::test]
-async fn cycle_unreachable_python_is_502() {
+async fn cycle_starts_returns_202() {
     let state = test_state().await;
     let (status, body) = post(&state, "/api/cycle", json!({})).await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(body["started"], true);
+}
+
+/// Contract §2: the 202 is not cosmetic -- it must actually reach the loop.
+/// The handler notifies before responding, so the permit is already held
+/// and `notified()` resolves immediately.
+#[tokio::test]
+async fn cycle_wakes_the_scheduler_loop() {
+    let state = test_state().await;
+    let wake = Arc::clone(&state.scheduler.as_ref().unwrap().wake);
+    let (status, _) = post(&state, "/api/cycle", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+        .await
+        .expect("POST /api/cycle must wake the scheduler loop");
+}
+
+/// Contract §2: a cycle already under way is refused, not queued twice.
+#[tokio::test]
+async fn cycle_while_running_is_409_busy() {
+    let state = test_state().await;
+    state
+        .scheduler
+        .as_ref()
+        .unwrap()
+        .running
+        .store(true, Ordering::SeqCst);
+    let (status, body) = post(&state, "/api/cycle", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "busy");
+}
+
+/// `serve` runs no loop, so it must say so rather than report a start that
+/// will never happen.
+#[tokio::test]
+async fn cycle_without_scheduler_is_503() {
+    let state = test_state_serve().await;
+    let (status, body) = post(&state, "/api/cycle", json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         body["error"],
-        "python daemon unreachable (round-2 forwarding)"
+        "no scheduler in this process (started with serve, not daemon)"
     );
 }

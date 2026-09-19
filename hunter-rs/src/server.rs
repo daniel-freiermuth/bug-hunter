@@ -12,8 +12,8 @@
 //!   404-JSON behavior (contract §2) don't match `ServeDir` semantics.
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Router;
 use axum::body::Bytes;
@@ -33,20 +33,30 @@ use crate::types::{
     Stats, Summary,
 };
 
+/// Handle to the scheduler loop running in *this* process.
+///
+/// `serve` starts no loop, so its `AppState` holds `None` and the manual
+/// cycle trigger says so instead of pretending to have started something.
+#[derive(Clone)]
+pub struct SchedulerHandle {
+    /// Set by the loop for the duration of a cycle. Drives `cycle_running`,
+    /// the "working" activity status, and the busy check on manual triggers.
+    pub running: Arc<AtomicBool>,
+    /// Interrupts the loop's sleep so the next cycle starts immediately.
+    /// A notify delivered mid-cycle is held as a permit, so a trigger is
+    /// never lost -- it just lands on the following iteration.
+    pub wake: Arc<tokio::sync::Notify>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
     pub config: Arc<Config>,
-    /// Budget/status brain (round 2+). Summary reads `status_html()` and
-    /// `decide()`; POST handlers never touch it directly.
+    /// Budget/status brain. Summary reads `status_html()` and `decide()`;
+    /// POST handlers never touch it directly.
     pub backend: Arc<dyn crate::backend::Backend>,
-    /// Wake signal for the daemon scheduler loop (round 3).
-    pub wake: Arc<tokio::sync::Notify>,
-    /// Base URL of the Python daemon ("<http://127.0.0.1:8377>") — the
-    /// TEMPORARY round-2 forward target for POST /api/cycle and
-    /// /api/override (in-process _`cycle_lock`/_wake live there). Deleted
-    /// in round 3 when the scheduler moves.
-    pub py_base: String,
+    /// The in-process scheduler loop, if this process runs one.
+    pub scheduler: Option<SchedulerHandle>,
 }
 
 /// Response shape for GET /api/repo/notes.
@@ -187,10 +197,12 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
     let scheduler_state = store.scheduler_state().await?;
 
     let backend_status_html = state.backend.status_html().await?;
-    // Round-3 comment: cycle_running mirrors Python's in-process
-    // _cycle_lock, which still lives in the Python daemon in round 2 —
-    // this serve never runs cycles, so the honest constant stays false.
-    let cycle_running = false;
+    // True only while this process's loop is inside a cycle. `serve` has no
+    // loop, so it reports false -- which is the truth there, not a stub.
+    let cycle_running = state
+        .scheduler
+        .as_ref()
+        .is_some_and(|s| s.running.load(Ordering::SeqCst));
 
     // "What's next" preview (server.py:272-301): only when nothing is
     // running, from the SAME pick_next/decide the scheduler itself uses.
@@ -235,13 +247,14 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
         None
     };
 
-    // Full priority chain per contract §3 / server.py:919-931. Working
-    // (priority 2, cycle_running) is SKIPPED — cycle_running is hardwired
-    // false until the in-process cycle lock moves here in round 3.
+    // Full priority chain per contract §3 / server.py:919-931.
     let activity_status = if let Some(job) = &current_job {
         ActivityStatus::Running {
             job: Box::new(job.clone()),
         }
+    } else if cycle_running {
+        // Priority 2: a cycle is under way but has not created a job row yet.
+        ActivityStatus::Working
     } else if let Some(s) = scheduler_state.as_ref().filter(|s| s.state == "error") {
         ActivityStatus::Error {
             detail: s.detail.clone(),
@@ -459,15 +472,6 @@ async fn static_files(State(state): State<AppState>, uri: Uri) -> Response {
 // contract; deliberate deviations are commented ACCEPTED DEVIATION inline.
 // ============================================================================
 
-/// Shared reqwest client for the TEMPORARY round-2 forwarding shim
-/// (/api/cycle relay + /api/override wake — the Python daemon owns
-/// _`cycle_lock`/_wake). `AppState` is frozen, so the lazily-built client
-/// lives in a static instead of a field. Deleted in round 3.
-fn http_client() -> &'static reqwest::Client {
-    static CLIENT: LazyLock<reqwest::Client> = LazyLock::new(reqwest::Client::new);
-    &CLIENT
-}
-
 /// Content-Type gate (contract §0.1): prefix match on "application/json"
 /// (so "; charset=utf-8" passes), applied to every POST — including
 /// /api/cycle, which never reads a body. Missing header == "".
@@ -617,42 +621,25 @@ async fn verdict(
 
 // -- POST /api/cycle (contract §2) --------------------------------------------
 
-/// TEMPORARY round-2 forwarding shim: /api/cycle mutates Python-process
-/// state (_`cycle_lock`, backend singleton, scheduler), so we relay the POST
-/// verbatim and pipe back status+body. Our §0.1 gate runs FIRST, so the
-/// UI's missing-Content-Type bug still 415s here exactly like Python; the
-/// forward adds the header (the daemon would 415 otherwise) since our gate
-/// already passed. Deleted in round 3 when the scheduler moves.
+/// Trigger a scheduler cycle now (contract §2): 409 if one is already
+/// running, otherwise 202 and the loop starts immediately.
+///
+/// The busy check is advisory, as Python's non-blocking lock acquire was:
+/// a trigger that races the loop into its next cycle is held as a notify
+/// permit and runs on the following iteration rather than being dropped.
 async fn cycle(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     post_gate(&headers)?;
-    let url = format!("{}/api/cycle", state.py_base);
-    let forwarded = http_client()
-        .post(&url)
-        .header(header::CONTENT_TYPE, "application/json")
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
-    match forwarded {
-        Ok(resp) => {
-            // Convert via u16 — reqwest's http types are not nominally ours.
-            let status =
-                StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let body = resp.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
-            Ok((
-                status,
-                [(header::CONTENT_TYPE, "application/json")],
-                axum::body::Body::from(body),
-            )
-                .into_response())
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, "cycle forward failed (round-2 shim)");
-            Ok(error_body(
-                StatusCode::BAD_GATEWAY,
-                "python daemon unreachable (round-2 forwarding)",
-            ))
-        }
+    let Some(sched) = state.scheduler.as_ref() else {
+        return Ok(error_body(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no scheduler in this process (started with serve, not daemon)",
+        ));
+    };
+    if sched.running.load(Ordering::SeqCst) {
+        return Ok(error_body(StatusCode::CONFLICT, "busy"));
     }
+    sched.wake.notify_one();
+    Ok((StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response())
 }
 
 // -- POST /api/recheck, /api/unqueue (contract §§3,4) --------------------------
@@ -778,32 +765,12 @@ async fn override_(
         )
         .await?;
     let refreshed = fetch_finding(&state.store, fid).await?;
-    // TEMPORARY round-2 double-write (deleted in round 3): when SETTING an
-    // override, the Python handler must also run so its in-process `_wake`
-    // event fires (contract §5 — otherwise the daemon only notices at its
-    // next natural wake, up to ~60 min). The Python handler re-writes the
-    // same DB value, which is idempotent. Python fires the wake after
-    // responding; we spawn before returning (closest axum equivalent) and
-    // log-and-ignore failures — the forward is never fatal.
-    if let Some(mode) = mode {
-        // Wake the daemon scheduler loop so it picks up the override promptly.
-        state.wake.notify_one();
-        // TEMPORARY round-2 double-write (deleted in round 3): forward to
-        // the Python daemon so its in-process `_wake` fires too.
-        let url = format!("{}/api/override", state.py_base);
-        let payload = json!({ "id": fid, "mode": mode }).to_string();
-        tokio::spawn(async move {
-            let result = http_client()
-                .post(&url)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(payload)
-                .timeout(Duration::from_secs(2))
-                .send()
-                .await;
-            if let Err(err) = result {
-                tracing::warn!(error = %err, "override wake forward failed (round-2 shim)");
-            }
-        });
+    // Setting an override should take effect now, not at the loop's next
+    // natural wake (contract §5 -- otherwise up to ~60 min later).
+    if mode.is_some()
+        && let Some(sched) = state.scheduler.as_ref()
+    {
+        sched.wake.notify_one();
     }
     Ok(Json(json!({ "ok": true, "finding": refreshed })).into_response())
 }

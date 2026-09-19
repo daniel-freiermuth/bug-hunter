@@ -121,8 +121,7 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
                 store,
                 config: Arc::new(cfg),
                 backend,
-                wake: Arc::new(tokio::sync::Notify::new()),
-                py_base: String::new(),
+                scheduler: None, // serve runs no cycles
             };
             let listener =
                 tokio::net::TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))

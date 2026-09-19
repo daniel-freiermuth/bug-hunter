@@ -196,8 +196,10 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         store: store.clone(),
         config: Arc::new(cfg.clone()),
         backend: backend.clone(),
-        wake: wake.clone(),
-        py_base: String::new(), // no forwarding in daemon mode
+        scheduler: Some(crate::server::SchedulerHandle {
+            running: cycle_running.clone(),
+            wake: wake.clone(),
+        }),
     };
 
     let port = cfg.serve_port;

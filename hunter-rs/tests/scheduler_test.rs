@@ -374,8 +374,7 @@ async fn summary_paused_on_denied_candidate() {
         store: Arc::new(store),
         config: Arc::new(config),
         backend: Arc::new(hunter::backend::NullBackend),
-        py_base: "http://127.0.0.1:0".to_owned(),
-        wake: Arc::new(tokio::sync::Notify::new()),
+        scheduler: None,
     };
 
     let response = router(state)
