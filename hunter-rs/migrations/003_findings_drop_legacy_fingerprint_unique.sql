@@ -2,12 +2,16 @@
 -- Drop the legacy single-column UNIQUE on findings.fingerprint.
 --
 -- Migration 002 could only ADD the composite unique index; SQLite will not
--- DROP the implicit autoindex behind an inline column constraint, so any
--- database upgraded through 002 still carries `fingerprint TEXT NOT NULL
--- UNIQUE`. That rejects two findings of DIFFERENT types sharing a
--- fingerprint -- exactly what (type, fingerprint) uniqueness exists to
--- allow. Fresh databases never had it (001 declares the composite form),
--- so there the rebuild below is a no-op that lands on the same schema.
+-- DROP the implicit autoindex behind an inline column constraint. Migration
+-- 001 declares `fingerprint TEXT NOT NULL UNIQUE`, so EVERY database --
+-- fresh or upgraded -- still carries it after 002. That rejects two
+-- findings of DIFFERENT types sharing a fingerprint, exactly what
+-- (type, fingerprint) uniqueness exists to allow, so the rebuild below is
+-- required on every database rather than an upgrade-only repair.
+--
+-- (002's own comment claims the initial schema already has the composite
+-- form. That was true while 001 was a symlink to hunter/schema.sql; it
+-- went stale when 001 was frozen as a copy of the deployed schema.)
 --
 -- SQLite cannot alter a constraint, so the table is rebuilt. The column
 -- list must stay identical to hunter/schema.sql, or fresh and upgraded
