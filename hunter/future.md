@@ -286,8 +286,8 @@ exposed but NOT needed by the worker:
 - Other repos' worktrees in `data/wt/` and `data/repos/`
 - All env vars, full network, full filesystem
 
-The bwrap approach hides all of these. The podman endgame adds network
-isolation (deny all except git+LLM endpoints) and per-repo credential
+The bwrap approach hides all of these. The podman endgame adds restricted
+egress (see the egress policy under tier 3 below) and per-repo credential
 injection via GitHub App installation tokens.
 
 **System-package installation under bwrap — the `/usr` tension.**
@@ -346,10 +346,27 @@ Three tiers, in order of complexity:
    podman run --rm \
      -v hunter-env-glosdalen:/home/hunter \
      -v $WORKTREE:$WORKTREE \
-     --network=none \           # deny all network (scheduler pushes, not worker)
+     --network=slirp4netns \
      hunter-base \
      omp -p "..."
    ```
+
+   **Egress policy.** The worker cannot run with `--network=none`: `omp` is
+   an LLM agent and must reach its API endpoint, and the persistent-env
+   design above depends on the worker installing dependencies on first run
+   (`npm install`, `apt install`, cache priming). What the worker must *not*
+   have is forge write access — pushes are the scheduler's job, with scoped
+   per-repo tokens (§5.3 opening). So the requirement is restricted egress,
+   not no egress:
+   - **allow:** the LLM endpoint, package registries (npm/PyPI/crates/Maven)
+   - **deny:** the forge's write API, anything holding operator credentials
+
+   Enforcement options, cheapest first: a filtering proxy the container is
+   pointed at via `HTTPS_PROXY` with a host allowlist; a pasta/slirp4netns
+   port-restricted config; or a full netns with nftables egress rules. An
+   offline-only variant (`--network=none`) is viable only if every
+   dependency is pre-provisioned into the volume beforehand, which
+   contradicts the "worker installs what it needs" model above — pick one.
 
    The volume persists across `--rm` containers. `apt install`, global caches,
    tooling config all survive in `/home/hunter`. The container filesystem itself
@@ -368,7 +385,7 @@ Three tiers, in order of complexity:
    2. Install it in the base image
    3. Bind-mount `/usr` read-only (same as bwrap — keeps all host tools,
       container only adds writable overlay for `apt install`). Makes podman
-      behave like "bwrap with network isolation and system package support."
+      behave like "bwrap with egress control and system package support."
 
    Option 3 is appealing for single-user: no base image to maintain, host
    tool updates propagate instantly, and the container's value-add is purely
