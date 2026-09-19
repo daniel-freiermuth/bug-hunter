@@ -48,16 +48,23 @@ def build_hunt_prompt(
 ) -> str:
     sup = (
         "\n".join(
-            f"- {s['fingerprint']} -- {_escape_braces(s.get('verdict_reason') or '(no reason recorded)')}"
+            f"- {s['fingerprint']} -- "
+            f"{_escape_braces(s.get('verdict_reason') or '(no reason recorded)')}"
             for s in suppressions
         )
         or "(none yet)"
     )
     kn = (
-        "\n".join(f"- {k['fingerprint']} [{k['status']}] -- {_escape_braces(k.get('summary', ''))}" for k in known)
+        "\n".join(
+            f"- {k['fingerprint']} [{k['status']}] -- {_escape_braces(k.get('summary', ''))}"
+            for k in known
+        )
         or "(none yet)"
     )
-    notes = repo_notes or "(No notes yet — consider adding conventions/architecture/gotchas as you discover them)"
+    notes = (
+        repo_notes
+        or "(No notes yet — consider adding conventions/architecture/gotchas as you discover them)"
+    )
     return _render(
         (PLAYBOOK_DIR / "hunt.md").read_text(),
         {
@@ -74,7 +81,9 @@ def build_hunt_prompt(
     )
 
 
-def build_fix_prompt(finding: Row, worktree: Path, branch: str, repo: Row, repo_notes: str = "") -> str:
+def build_fix_prompt(
+    finding: Row, worktree: Path, branch: str, repo: Row, repo_notes: str = ""
+) -> str:
     subset = {k: finding.get(k) for k in _FINDING_PROMPT_KEYS}
     notes = repo_notes or "(No notes yet)"
     return _render(
@@ -130,6 +139,8 @@ def _checks_lines(rollup: list[Row] | None) -> str:
         f"{c.get('conclusion') or c.get('state') or 'PENDING'}"
         for c in rollup[:30]
     )
+
+
 def build_engage_prompt(
     worktree: Path,
     head_ref: str,
@@ -154,6 +165,8 @@ def build_engage_prompt(
             "REPO_NOTES": notes,
         },
     )
+
+
 def build_recheck_prompt(finding: Row, repo: Row, out_path: Path, repo_notes: str = "") -> str:
     subset = {k: finding.get(k) for k in _FINDING_PROMPT_KEYS}
     notes = repo_notes or "(No notes yet)"
@@ -178,7 +191,10 @@ def build_test_gap_prompt(
     repo_notes: str = "",
 ) -> str:
     kn = (
-        "\n".join(f"- {g['fingerprint']} [{g['status']}] -- {_escape_braces(g.get('summary', ''))}" for g in known_gaps)
+        "\n".join(
+            f"- {g['fingerprint']} [{g['status']}] -- {_escape_braces(g.get('summary', ''))}"
+            for g in known_gaps
+        )
         or "(none yet)"
     )
     notes = repo_notes or "(No notes yet)"
@@ -205,7 +221,10 @@ def build_dep_update_prompt(
     repo_notes: str = "",
 ) -> str:
     kn = (
-        "\n".join(f"- {u['fingerprint']} [{u['status']}] -- {_escape_braces(u.get('summary', ''))}" for u in known_updates)
+        "\n".join(
+            f"- {u['fingerprint']} [{u['status']}] -- {_escape_braces(u.get('summary', ''))}"
+            for u in known_updates
+        )
         or "(none yet)"
     )
     notes = repo_notes or "(No notes yet)"
@@ -232,7 +251,10 @@ def build_refactor_prompt(
     repo_notes: str = "",
 ) -> str:
     kn = (
-        "\n".join(f"- {r['fingerprint']} [{r['status']}] -- {_escape_braces(r.get('summary', ''))}" for r in known_refactors)
+        "\n".join(
+            f"- {r['fingerprint']} [{r['status']}] -- {_escape_braces(r.get('summary', ''))}"
+            for r in known_refactors
+        )
         or "(none yet)"
     )
     notes = repo_notes or "(No notes yet)"

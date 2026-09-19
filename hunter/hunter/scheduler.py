@@ -13,6 +13,7 @@ from pathlib import Path
 
 from . import budget, runner
 from .forge import forge_for
+from .ingest import ingest_findings
 from .playbooks import (
     build_dep_update_prompt,
     build_engage_prompt,
@@ -108,7 +109,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
     last_full = repo.get("last_full_hunt_at") or 0
     rehunt_interval_ms = cfg.hunt_rehunt_days * 86400_000
     rehunt_due = (now_ms() - last_full) > rehunt_interval_ms
-    
+
     if rehunt_due and not force:
         # Clear watermark → triggers full-history hunt below
         store.db.execute(
@@ -120,7 +121,6 @@ def run_hunt(store: Store, cfg: Config, repo: Row, force: bool = False) -> Row:
             "hunt",
             f"{rname}: full re-hunt triggered ({cfg.hunt_rehunt_days}d interval)",
         )
-        last = None  # Force full hunt below
 
     last: str | None = repo.get("last_hunt_sha")
     if last == head and not force:
@@ -414,12 +414,12 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
     rid: int = repo["id"]
     rname: str = repo["name"]
     rpath = Path(repo["path"])
-    
+
     # Ensure repo is up-to-date (same as hunt)
     if not rpath.exists():
         store.log_event("error", f"test_gap {rname}: repo not cloned")
         return {"error": "repo not cloned"}
-    
+
     for cmd in (
         ["git", "fetch", "origin"],
         ["git", "checkout", repo["default_branch"]],
@@ -429,7 +429,7 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
         if rc != 0:
             store.log_event("error", f"test_gap {rname}: {' '.join(cmd)} failed: {out[-300:]}")
             return {"error": f"{' '.join(cmd)} failed"}
-    
+
     # Budget check
     windows = budget.read_windows()
     dec = budget.decide(cfg, "hunt", windows)  # Use hunt budget for now
@@ -438,18 +438,18 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"test_gap {rname}: {dec.reason}", job_id=job)
         return {"denied": dec.reason, "job": job}
-    
+
     job = store.create_job("test_gap", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.test_gaps.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Load known gaps
     known_gaps = store.db.execute(
         "SELECT * FROM test_gaps WHERE repo_id = ? AND status IN ('new', 'queued', 'pr_open')",
         (rid,),
     ).fetchall()
     known = [dict(r) for r in known_gaps]
-    
+
     prompt = build_test_gap_prompt(
         repo,
         "Full repository scan for test coverage gaps.",
@@ -458,7 +458,7 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
         cfg.hunt_max_findings,  # Reuse hunt max for now
         store.repo_notes(rid),
     )
-    
+
     pre_usage = _usage_snapshot(windows)
     store.update_job(job, state="running")
     model = cfg.model_for("hunt")
@@ -473,7 +473,7 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
     post_usage = _usage_snapshot(budget.read_windows())
     delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
     state = _record_job(store, job, rr, model=model, usage_delta=delta)
-    
+
     summary: Row = {
         "kind": "test_gap",
         "repo": rname,
@@ -481,7 +481,7 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
         "state": state,
         "tokens_new": rr.tokens_new,
     }
-    
+
     if out_path.exists():
         # Ingest test gaps
         try:
@@ -494,9 +494,11 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
                 try:
                     t = now_ms()
                     store.db.execute(
-                        """INSERT INTO test_gaps 
-                           (repo_id, fingerprint, file, symbol, line, severity, confidence,
-                            summary, detail, missing_tests, test_file, status, created_at, updated_at)
+                        """INSERT INTO test_gaps
+                           (repo_id, fingerprint, file, symbol, line,
+                            severity, confidence,
+                            summary, detail, missing_tests, test_file,
+                            status, created_at, updated_at)
                            VALUES (?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)""",
                         (
                             rid,
@@ -521,7 +523,8 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
             summary["ingest"] = {"inserted": inserted, "duplicates": duplicates, "invalid": invalid}
             store.log_event(
                 "test_gap",
-                f"{rname}: job {job} {state} -- +{inserted} new / {duplicates} dup / {invalid} invalid ({rr.tokens_new} tok)",
+                f"{rname}: job {job} {state} -- +{inserted} new"
+                f" / {duplicates} dup / {invalid} invalid ({rr.tokens_new} tok)",
                 job_id=job,
             )
         except Exception as e:
@@ -533,8 +536,7 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
             f"{rname}: job {job} {state}, no gaps file ({rr.tokens_new} tok)",
             job_id=job,
         )
-    
-    
+
     if state == "done":
         store.db.execute(
             "UPDATE repos SET last_test_gap_at = ? WHERE id = ?",
@@ -542,7 +544,6 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
         )
         store.db.commit()
     return summary
-
 
 
 # -- dependency updates -----------------------------------------------------
@@ -553,12 +554,12 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
     rid: int = repo["id"]
     rname: str = repo["name"]
     rpath = Path(repo["path"])
-    
+
     # Ensure repo is up-to-date
     if not rpath.exists():
         store.log_event("error", f"dep_update {rname}: repo not cloned")
         return {"error": "repo not cloned"}
-    
+
     for cmd in (
         ["git", "fetch", "origin"],
         ["git", "checkout", repo["default_branch"]],
@@ -568,7 +569,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
         if rc != 0:
             store.log_event("error", f"dep_update {rname}: {' '.join(cmd)} failed: {out[-300:]}")
             return {"error": f"{' '.join(cmd)} failed"}
-    
+
     # Budget check
     windows = budget.read_windows()
     dec = budget.decide(cfg, "hunt", windows)
@@ -577,18 +578,18 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"dep_update {rname}: {dec.reason}", job_id=job)
         return {"denied": dec.reason, "job": job}
-    
+
     job = store.create_job("dep_update", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.dep_updates.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Load known updates
     known_updates = store.db.execute(
         "SELECT * FROM dep_updates WHERE repo_id = ? AND status IN ('new', 'queued', 'pr_open')",
         (rid,),
     ).fetchall()
     known = [dict(r) for r in known_updates]
-    
+
     prompt = build_dep_update_prompt(
         repo,
         "Check all package manifests for outdated dependencies.",
@@ -597,7 +598,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
         cfg.hunt_max_findings,
         store.repo_notes(rid),
     )
-    
+
     pre_usage = _usage_snapshot(windows)
     store.update_job(job, state="running")
     model = cfg.model_for("hunt")
@@ -612,7 +613,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
     post_usage = _usage_snapshot(budget.read_windows())
     delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
     state = _record_job(store, job, rr, model=model, usage_delta=delta)
-    
+
     summary: Row = {
         "kind": "dep_update",
         "repo": rname,
@@ -620,7 +621,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
         "state": state,
         "tokens_new": rr.tokens_new,
     }
-    
+
     if out_path.exists():
         # Ingest dependency updates
         try:
@@ -633,8 +634,9 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
                 try:
                     t = now_ms()
                     store.db.execute(
-                        """INSERT INTO dep_updates 
-                           (repo_id, fingerprint, ecosystem, package, current_version, latest_version,
+                        """INSERT INTO dep_updates
+                           (repo_id, fingerprint, ecosystem, package,
+                            current_version, latest_version,
                             update_type, severity, confidence, summary, detail, security_advisory,
                             status, created_at, updated_at)
                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)""",
@@ -662,7 +664,8 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
             summary["ingest"] = {"inserted": inserted, "duplicates": duplicates, "invalid": invalid}
             store.log_event(
                 "dep_update",
-                f"{rname}: job {job} {state} -- +{inserted} new / {duplicates} dup / {invalid} invalid ({rr.tokens_new} tok)",
+                f"{rname}: job {job} {state} -- +{inserted} new"
+                f" / {duplicates} dup / {invalid} invalid ({rr.tokens_new} tok)",
                 job_id=job,
             )
         except Exception as e:
@@ -674,14 +677,14 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
             f"{rname}: job {job} {state}, no updates file ({rr.tokens_new} tok)",
             job_id=job,
         )
-    
+
     if state == "done":
         store.db.execute(
             "UPDATE repos SET last_dep_update_at = ? WHERE id = ?",
             (now_ms(), rid),
         )
         store.db.commit()
-    
+
     return summary
 
 
@@ -693,12 +696,12 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
     rid: int = repo["id"]
     rname: str = repo["name"]
     rpath = Path(repo["path"])
-    
+
     # Ensure repo is up-to-date
     if not rpath.exists():
         store.log_event("error", f"refactor {rname}: repo not cloned")
         return {"error": "repo not cloned"}
-    
+
     for cmd in (
         ["git", "fetch", "origin"],
         ["git", "checkout", repo["default_branch"]],
@@ -708,7 +711,7 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
         if rc != 0:
             store.log_event("error", f"refactor {rname}: {' '.join(cmd)} failed: {out[-300:]}")
             return {"error": f"{' '.join(cmd)} failed"}
-    
+
     # Budget check
     windows = budget.read_windows()
     dec = budget.decide(cfg, "hunt", windows)
@@ -717,18 +720,18 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
         store.update_job(job, state="denied", notes=dec.reason, finished_at=now_ms())
         store.log_event("deny", f"refactor {rname}: {dec.reason}", job_id=job)
         return {"denied": dec.reason, "job": job}
-    
+
     job = store.create_job("refactor", rid, cap_tokens=dec.cap_tokens)
     out_path = cfg.work_root / "out" / f"job{job}.refactorings.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Load known refactorings
     known_refactorings = store.db.execute(
         "SELECT * FROM refactorings WHERE repo_id = ? AND status IN ('new', 'queued', 'pr_open')",
         (rid,),
     ).fetchall()
     known = [dict(r) for r in known_refactorings]
-    
+
     prompt = build_refactor_prompt(
         repo,
         "Scan for safe, mechanical refactoring opportunities (duplication, dead code, complexity).",
@@ -737,7 +740,7 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
         cfg.hunt_max_findings,
         store.repo_notes(rid),
     )
-    
+
     pre_usage = _usage_snapshot(windows)
     store.update_job(job, state="running")
     model = cfg.model_for("hunt")
@@ -752,7 +755,7 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
     post_usage = _usage_snapshot(budget.read_windows())
     delta = (post_usage - pre_usage) if pre_usage is not None and post_usage is not None else None
     state = _record_job(store, job, rr, model=model, usage_delta=delta)
-    
+
     summary: Row = {
         "kind": "refactor",
         "repo": rname,
@@ -760,7 +763,7 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
         "state": state,
         "tokens_new": rr.tokens_new,
     }
-    
+
     if out_path.exists():
         # Ingest refactorings
         try:
@@ -773,7 +776,7 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
                 try:
                     t = now_ms()
                     store.db.execute(
-                        """INSERT INTO refactorings 
+                        """INSERT INTO refactorings
                            (repo_id, fingerprint, file, symbol, line, smell_type,
                             severity, confidence, summary, detail, suggested_refactor,
                             status, created_at, updated_at)
@@ -801,7 +804,8 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
             summary["ingest"] = {"inserted": inserted, "duplicates": duplicates, "invalid": invalid}
             store.log_event(
                 "refactor",
-                f"{rname}: job {job} {state} -- +{inserted} new / {duplicates} dup / {invalid} invalid ({rr.tokens_new} tok)",
+                f"{rname}: job {job} {state} -- +{inserted} new"
+                f" / {duplicates} dup / {invalid} invalid ({rr.tokens_new} tok)",
                 job_id=job,
             )
         except Exception as e:
@@ -813,14 +817,14 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
             f"{rname}: job {job} {state}, no refactorings file ({rr.tokens_new} tok)",
             job_id=job,
         )
-    
+
     if state == "done":
         store.db.execute(
             "UPDATE repos SET last_refactor_at = ? WHERE id = ?",
             (now_ms(), rid),
         )
         store.db.commit()
-    
+
     return summary
 
 
@@ -1582,17 +1586,15 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
                     "dep_update": target.get("last_dep_update_at") or 0,
                     "refactor": target.get("last_refactor_at") or 0,
                 }
-                
+
                 # Pick job type that hasn't run (0) or is most stale
                 # Priority: never-run > oldest timestamp
                 never_run = [k for k, v in job_times.items() if v == 0]
-                if never_run:
-                    # Deterministic order for never-run jobs
-                    job_type = sorted(never_run)[0]
-                else:
-                    # Pick oldest
-                    job_type = min(job_times, key=job_times.get)
-                
+                # Deterministic order for never-run jobs, else oldest
+                job_type = (
+                    min(never_run) if never_run else min(job_times, key=lambda k: job_times[k])
+                )
+
                 if job_type == "hunt":
                     result = run_hunt(store, cfg, target)
                 elif job_type == "test_gap":

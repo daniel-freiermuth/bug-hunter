@@ -7,8 +7,6 @@ during cycle execution survive to the sleep loop.
 
 from __future__ import annotations
 
-import threading
-
 from hunter.server import _cycle_lock, _wake
 
 

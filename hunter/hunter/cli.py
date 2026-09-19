@@ -255,13 +255,13 @@ def cmd_show_notes(store: Store, cfg: Config, args: argparse.Namespace) -> None:
         print(notes)
     else:
         print(f"No notes for {repo['name']} yet")
-        print(f"Create with: hunter note {repo['name']} \"your message\"")
+        print(f'Create with: hunter note {repo["name"]} "your message"')
 
 
 # -- parser ---------------------------------------------------------------
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:  # noqa: PLR0915 (flat subparser table)
     ap = argparse.ArgumentParser(prog="hunter", description="Idle-Token Bug Hunter")
     ap.add_argument(
         "-v",
@@ -290,7 +290,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="forge type (auto-detected from URL if omitted)",
     )
     p.set_defaults(fn=cmd_add_repo)
-
 
     p = sub.add_parser("note", help="add a note to a repo")
     p.add_argument("repo")

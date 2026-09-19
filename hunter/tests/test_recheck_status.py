@@ -62,21 +62,19 @@ class TestRunRecheckResetsStatus:
 
         after = store.get_finding(fid)
         assert after is not None
-        assert after["status"] == "new", (
-            f"finding stuck in {after['status']!r}, expected 'new'"
-        )
-    def test_clone_failure_resets_to_new(
-        self, store: Store, cfg: Config, tmp_path: Path
-    ) -> None:
+        assert after["status"] == "new", f"finding stuck in {after['status']!r}, expected 'new'"
+
+    def test_clone_failure_resets_to_new(self, store: Store, cfg: Config, tmp_path: Path) -> None:
         """When git clone fails the finding must go back to 'new'."""
         # Path that doesn't exist yet → triggers the clone branch.
         clone_dest = str(tmp_path / "repos" / "will-fail")
-        repo_id = store.add_repo(
-            "bad-clone", str(tmp_path / "nonexistent-source"), clone_dest
+        repo_id = store.add_repo("bad-clone", str(tmp_path / "nonexistent-source"), clone_dest)
+        fid, _ = store.upsert_finding(
+            repo_id,
+            _make_finding(
+                fingerprint="repo:f.py:fn:clone-fail",
+            ),
         )
-        fid, _ = store.upsert_finding(repo_id, _make_finding(
-            fingerprint="repo:f.py:fn:clone-fail",
-        ))
         store.set_status(fid, "rechecking")
 
         finding = store.get_finding(fid)
@@ -86,9 +84,7 @@ class TestRunRecheckResetsStatus:
 
         after = store.get_finding(fid)
         assert after is not None
-        assert after["status"] == "new", (
-            f"finding stuck in {after['status']!r}, expected 'new'"
-        )
+        assert after["status"] == "new", f"finding stuck in {after['status']!r}, expected 'new'"
 
     def test_git_sync_failure_resets_to_new(
         self, store: Store, cfg: Config, tmp_path: Path
@@ -97,12 +93,13 @@ class TestRunRecheckResetsStatus:
         # Path exists but is not a git repo → git commands fail.
         not_a_repo = tmp_path / "repos" / "not-git"
         not_a_repo.mkdir(parents=True)
-        repo_id = store.add_repo(
-            "bad-sync", "https://example.com/r.git", str(not_a_repo)
+        repo_id = store.add_repo("bad-sync", "https://example.com/r.git", str(not_a_repo))
+        fid, _ = store.upsert_finding(
+            repo_id,
+            _make_finding(
+                fingerprint="repo:f.py:fn:sync-fail",
+            ),
         )
-        fid, _ = store.upsert_finding(repo_id, _make_finding(
-            fingerprint="repo:f.py:fn:sync-fail",
-        ))
         store.set_status(fid, "rechecking")
 
         finding = store.get_finding(fid)
@@ -112,6 +109,4 @@ class TestRunRecheckResetsStatus:
 
         after = store.get_finding(fid)
         assert after is not None
-        assert after["status"] == "new", (
-            f"finding stuck in {after['status']!r}, expected 'new'"
-        )
+        assert after["status"] == "new", f"finding stuck in {after['status']!r}, expected 'new'"

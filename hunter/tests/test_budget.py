@@ -94,7 +94,9 @@ def test_stale_5h_denied_by_7d_ramp():
     resets_at = _NOW_MS + int(_WEEK_MS * 0.95)  # 5% elapsed
     windows = {
         "anthropic:5h": _ws("anthropic:5h", age_s=stale_age),
-        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.30, resets_at=resets_at, age_s=stale_age),
+        "anthropic:7d": _ws(
+            "anthropic:7d", used_fraction=0.30, resets_at=resets_at, age_s=stale_age
+        ),
     }
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
@@ -112,7 +114,9 @@ def test_7d_used_above_ramp_deny():
     resets_at = _NOW_MS + int(_WEEK_MS * 0.90)  # 10% elapsed
     windows = _healthy_windows(w5_elapsed_h=4.5)
     windows["anthropic:7d"] = _ws(
-        "anthropic:7d", used_fraction=0.30, resets_at=resets_at,
+        "anthropic:7d",
+        used_fraction=0.30,
+        resets_at=resets_at,
     )
     d = decide(_cfg(), "hunt", windows)
     assert not d.allow
@@ -124,7 +128,9 @@ def test_7d_used_below_ramp_allow():
     resets_at = _NOW_MS + int(_WEEK_MS * 0.50)  # 50% elapsed
     windows = _healthy_windows(w5_elapsed_h=4.5)
     windows["anthropic:7d"] = _ws(
-        "anthropic:7d", used_fraction=0.30, resets_at=resets_at,
+        "anthropic:7d",
+        used_fraction=0.30,
+        resets_at=resets_at,
     )
     d = decide(_cfg(), "hunt", windows)
     assert d.allow
@@ -157,6 +163,7 @@ def test_5h_harvest_halfway_low_usage_allow():
     d = decide(_cfg(), "hunt", windows)
     assert d.allow
 
+
 def test_5h_harvest_halfway_high_usage_deny():
     """2.75h elapsed → ramp = 0.5; usage 0.60 ≥ 0.5 → deny."""
     windows = _healthy_windows(w5_used=0.60, w5_elapsed_h=2.75)
@@ -164,6 +171,7 @@ def test_5h_harvest_halfway_high_usage_deny():
     assert not d.allow
     assert "5h" in d.reason
     assert "harvest" in d.reason
+
 
 def test_5h_harvest_end_high_usage_allow():
     """4.95h elapsed → ramp ≈ 0.989; usage 0.90 < 0.989 → allow."""

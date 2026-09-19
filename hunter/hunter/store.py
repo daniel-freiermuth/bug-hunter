@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from .types import (
     ACTIVE_STATUSES,
@@ -79,9 +83,17 @@ class Store:
             ("model", "jobs", "ALTER TABLE jobs ADD COLUMN model TEXT"),
             ("usage_delta", "jobs", "ALTER TABLE jobs ADD COLUMN usage_delta REAL"),
             ("budget_override", "findings", "ALTER TABLE findings ADD COLUMN budget_override TEXT"),
-            ("last_full_hunt_at", "repos", "ALTER TABLE repos ADD COLUMN last_full_hunt_at INTEGER"),
+            (
+                "last_full_hunt_at",
+                "repos",
+                "ALTER TABLE repos ADD COLUMN last_full_hunt_at INTEGER",
+            ),
             ("last_test_gap_at", "repos", "ALTER TABLE repos ADD COLUMN last_test_gap_at INTEGER"),
-            ("last_dep_update_at", "repos", "ALTER TABLE repos ADD COLUMN last_dep_update_at INTEGER"),
+            (
+                "last_dep_update_at",
+                "repos",
+                "ALTER TABLE repos ADD COLUMN last_dep_update_at INTEGER",
+            ),
             ("last_refactor_at", "repos", "ALTER TABLE repos ADD COLUMN last_refactor_at INTEGER"),
         ]:
             try:
@@ -89,7 +101,7 @@ class Store:
             except sqlite3.OperationalError:
                 self.db.execute(sql)
                 self.db.commit()
-        
+
         # Table migrations
         try:
             self.db.execute("SELECT 1 FROM test_gaps LIMIT 1")
@@ -116,7 +128,7 @@ class Store:
                 CREATE INDEX test_gaps_status ON test_gaps(status);
                 CREATE INDEX test_gaps_repo ON test_gaps(repo_id, status);
             """)
-        
+
         # Dependency updates table
         try:
             self.db.execute("SELECT 1 FROM dep_updates LIMIT 1")
@@ -145,7 +157,7 @@ class Store:
                 CREATE INDEX dep_updates_repo ON dep_updates(repo_id, status);
             """)
             self.db.commit()
-        
+
         # Refactorings table
         try:
             self.db.execute("SELECT 1 FROM refactorings LIMIT 1")
@@ -231,7 +243,7 @@ class Store:
         if not repo:
             msg = f"repo {repo_id} not found"
             raise ValueError(msg)
-        return self.cfg.work_root / "repos" / repo["name"] / "NOTES.md"
+        return self.cfg.work_root / "repos" / str(repo["name"]) / "NOTES.md"
 
     def repo_notes(self, repo_id: int) -> str:
         """Read repo notes, or empty string if none exist."""
@@ -240,19 +252,19 @@ class Store:
 
     def append_repo_note(self, repo_id: int, note: str, category: str | None = None) -> None:
         """Append timestamped note to repo's NOTES.md."""
-        from datetime import datetime
-
         p = self.repo_notes_path(repo_id)
         p.parent.mkdir(parents=True, exist_ok=True)
-        
+
         # If file doesn't exist, create with header
         if not p.exists():
             repo = self.get_repo(repo_id)
-            p.write_text(f"# Notes: {repo['name']}\n\nLast updated: {datetime.now().date()}\n\n")
-        
+            name = repo["name"] if repo else f"repo-{repo_id}"
+            today = datetime.now(tz=UTC).date()
+            p.write_text(f"# Notes: {name}\n\nLast updated: {today}\n\n")
+
         # Append note
         with p.open("a") as f:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+            ts = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M")
             if category:
                 f.write(f"## {category}\n")
             f.write(f"- [{ts}] {note}\n\n")

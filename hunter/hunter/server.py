@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, ClassVar
 from urllib.parse import parse_qs, urlparse
 
-from .budget import HEADROOM_MS, _RAMP_MS
+from .budget import _RAMP_MS
 from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
 
 log = logging.getLogger(__name__)
@@ -369,7 +369,11 @@ class Handler(BaseHTTPRequestHandler):
             fields["enabled"] = 1 if body["enabled"] else 0
         if "url" in body and isinstance(body["url"], str) and body["url"].strip():
             fields["url"] = body["url"].strip()
-        if "default_branch" in body and isinstance(body["default_branch"], str) and body["default_branch"].strip():
+        if (
+            "default_branch" in body
+            and isinstance(body["default_branch"], str)
+            and body["default_branch"].strip()
+        ):
             fields["default_branch"] = body["default_branch"].strip()
         if "forge" in body and body["forge"] in ("github", "gitlab"):
             fields["forge"] = body["forge"]
@@ -423,7 +427,7 @@ def serve(cfg: Config) -> None:
         httpd.server_close()
 
 
-def daemon(cfg: Config) -> None:
+def daemon(cfg: Config) -> None:  # noqa: PLR0912, PLR0915 (flat supervisor loop)
     """Run forever: UI server + scheduler loop in one process.
 
     The loop shares _cycle_lock with POST /api/cycle, so manual and timed
