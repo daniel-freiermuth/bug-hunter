@@ -38,27 +38,30 @@ pub struct OmpScavengeBackend {
 
 // ---- private helpers (facade.py functions) --------------------------------
 
+/// html.escape equivalent: & < > " ' (facade.py:41-43).
+///
+/// Free functions rather than associated ones: they are pure, and
+/// `render_status` needs them without a backend instance.
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+/// Format token count (facade.py:456-462).
+fn fmt_tokens(n: f64) -> String {
+    if n >= 1_000_000.0 {
+        format!("{:.1}M", n / 1_000_000.0)
+    } else if n >= 1_000.0 {
+        format!("{:.0}k", n / 1_000.0)
+    } else {
+        format!("{}", n as i64)
+    }
+}
+
 impl OmpScavengeBackend {
-    /// html.escape equivalent: & < > " ' (facade.py:41-43).
-    fn _esc(s: &str) -> String {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&#x27;")
-    }
-
-    /// Format token count (facade.py:456-462).
-    fn _fmt_tokens(n: f64) -> String {
-        if n >= 1_000_000.0 {
-            format!("{:.1}M", n / 1_000_000.0)
-        } else if n >= 1_000.0 {
-            format!("{:.0}k", n / 1_000.0)
-        } else {
-            format!("{}", n as i64)
-        }
-    }
-
     /// Fraction → token cap. 7d ALWAYS derives from 5h cap × period ratio
     /// (deliberate asymmetry; facade.py:214-220).
     #[allow(clippy::similar_names)]
@@ -409,6 +412,196 @@ impl OmpScavengeBackend {
     }
 }
 
+/// Returned verbatim when there is no window data at all.
+pub const NO_WINDOW_DATA: &str = r#"<div class="scv-note">No window data available</div>"#;
+
+/// Everything [`render_status`] needs, resolved by `status_html` from the
+/// clock, `agent.db` and the ledger.
+///
+/// Split out so the markup can be pinned by snapshot. `status_html`
+/// otherwise reads the wall clock and two databases, which makes its
+/// output — a precisely specified HTML fragment the UI injects with
+/// `{@html}` — impossible to assert on. Same seam as
+/// `decide_with_windows` and `is_fresh` elsewhere in this file.
+pub struct StatusInputs {
+    pub now_ms: i64,
+    pub windows: BTreeMap<String, WindowState>,
+    pub unaccounted_5h: f64,
+    pub unaccounted_7d: f64,
+    /// `limit_id` -> estimated window capacity in tokens, when known.
+    pub capacities: BTreeMap<String, Option<f64>>,
+    pub stale_after_s: f64,
+}
+
+/// Render the budget window bars (BACKEND-CONTRACT.md §2.3).
+///
+/// The class names are load-bearing against the stylesheet in
+/// `hunter/ui/index.html`, and the UI injects this as raw HTML, so the
+/// markup is the contract. Pinned by `tests/status_html_test.rs`.
+#[must_use]
+pub fn render_status(inputs: &StatusInputs) -> String {
+    if inputs.windows.is_empty() {
+        return NO_WINDOW_DATA.to_owned();
+    }
+    let mut fragments: Vec<String> = Vec::new();
+
+    for (lid, w) in &inputs.windows {
+        let label = format!("{} window", lid.replace("anthropic:", ""));
+
+        let used_pct = match w.used_fraction {
+            Some(f) => format!("{:.0}%", f * 100.0),
+            None => "?".to_owned(),
+        };
+
+        // Dimension select.
+        let (unacct, ramp_val, elapsed_frac): (f64, Option<f64>, Option<f64>) =
+            if lid.contains(":5h") {
+                let r = ramp_5h(w.resets_at, inputs.now_ms);
+                let ef = match w.resets_at {
+                    Some(ra) if ra > inputs.now_ms => {
+                        Some((FIVE_H_MS as f64 - (ra - inputs.now_ms) as f64) / FIVE_H_MS as f64)
+                    }
+                    _ => None,
+                };
+                (inputs.unaccounted_5h, r, ef)
+            } else if lid.contains(":7d") {
+                (
+                    inputs.unaccounted_7d,
+                    Some(ramp_7d(w.resets_at, inputs.now_ms)),
+                    None,
+                )
+            } else {
+                (0.0, None, None)
+            };
+
+        // fill_pct: round-half-to-even (Python's round()), clamped 0..100.
+        let fill_pct =
+            ((w.used_fraction.unwrap_or(0.0) * 100.0).round_ties_even() as i64).clamp(0, 100) as u8;
+        let soft_pct =
+            ((unacct * 100.0).round_ties_even() as i64).clamp(0, 100 - i64::from(fill_pct)) as u8;
+        let ramp_pct: Option<u8> =
+            ramp_val.map(|r| ((r * 100.0).round_ties_even() as i64).clamp(0, 100) as u8);
+
+        let ramp_for_avail = ramp_val.unwrap_or(1.0);
+        let avail_frac = (ramp_for_avail - w.used_fraction.unwrap_or(0.0) - unacct).max(0.0);
+        let avail_pct_str = format!("{:.0}%", avail_frac * 100.0);
+
+        let cap = inputs.capacities.get(lid).copied().flatten();
+        let avail_tok = cap.filter(|&c| c > 0.0).map(|c| avail_frac * c);
+
+        let avail_str = if w.used_fraction.is_none() {
+            String::new()
+        } else if let Some(tok) = avail_tok {
+            format!(
+                " \u{00b7} {} avail (~{} tok)",
+                avail_pct_str,
+                fmt_tokens(tok)
+            )
+        } else {
+            format!(" \u{00b7} {avail_pct_str} avail")
+        };
+
+        let is_stale = w.age_s > inputs.stale_after_s;
+        let is_exhausted =
+            w.status.as_deref() == Some("exhausted") || w.used_fraction.is_some_and(|f| f >= 1.0);
+        let tone = if is_stale {
+            "stale"
+        } else if is_exhausted {
+            "bad"
+        } else {
+            "ok"
+        };
+
+        let probe_age = format!("{:.0}m ago", w.age_s / 60.0);
+
+        let reset_str = match w.resets_at {
+            Some(r) => {
+                let remain_s = (r - inputs.now_ms) as f64 / 1000.0;
+                if remain_s > 0.0 {
+                    let h = (remain_s / 3600.0) as i64;
+                    let m = ((remain_s % 3600.0) / 60.0) as i64;
+                    let countdown = if h > 0 {
+                        format!("{h}h{m:02}m")
+                    } else {
+                        format!("{m}m")
+                    };
+                    // Emit <time data-ms="..."> so the client renders
+                    // in the *browser's* local timezone, not the server's.
+                    format!("resets <time data-ms=\"{r}\"></time> ({countdown})")
+                } else {
+                    "resetting".to_owned()
+                }
+            }
+            None => "reset unknown".to_owned(),
+        };
+
+        let headroom_str = match (elapsed_frac, ramp_val) {
+            (Some(ef), Some(r)) if r == 0.0 && ef > 0.0 => {
+                let headroom_remain_ms = HEADROOM_MS as f64 - ef * FIVE_H_MS as f64;
+                if headroom_remain_ms > 0.0 {
+                    format!(
+                        " \u{00b7} headroom {}m",
+                        (headroom_remain_ms / 60_000.0) as i64
+                    )
+                } else {
+                    String::new()
+                }
+            }
+            _ => String::new(),
+        };
+
+        let unacct_str = if unacct > 0.005 {
+            format!(" +{:.0}% in flight", unacct * 100.0)
+        } else {
+            String::new()
+        };
+
+        let marker = match ramp_pct {
+            Some(rp) if rp > 0 => {
+                format!(r#"<i class="scv-ramp" style="left:{rp}%"></i>"#)
+            }
+            _ => String::new(),
+        };
+
+        let stale_marker = if is_stale {
+            " \u{26a0}\u{fe0f}stale"
+        } else {
+            ""
+        };
+
+        // Per-window fragment: exact HTML from BACKEND-CONTRACT.md §2.3.
+        let fragment = format!(
+            "<div class=\"scv-win\">\
+                <div class=\"scv-lab\">\
+                <b>{}</b>\
+                <span>{} used{}{}{}</span>\
+                </div>\
+                <div class=\"scv-bar\">\
+                <i class=\"scv-fill scv-{}\" style=\"width:{}%\"></i>\
+                <i class=\"scv-soft\" style=\"width:{}%\"></i>\
+                {}</div>\
+                <div class=\"scv-sub\">{}{} \u{00b7} probed {}</div>\
+                </div>",
+            esc(&label),
+            esc(&used_pct),
+            esc(&unacct_str),
+            esc(&avail_str),
+            stale_marker,
+            tone,
+            fill_pct,
+            soft_pct,
+            marker,
+            reset_str, // NOT escaped: contains <time data-ms="..."> for client-side TZ formatting
+            esc(&headroom_str),
+            esc(&probe_age),
+        );
+
+        fragments.push(fragment);
+    }
+
+    fragments.join("\n")
+}
+
 #[async_trait]
 impl Backend for OmpScavengeBackend {
     async fn decide(&self, anticipated_tokens: i64) -> anyhow::Result<Outlook> {
@@ -470,165 +663,26 @@ impl Backend for OmpScavengeBackend {
             tokio::task::spawn_blocking(move || capacity::read_windows(&db, now_ms)).await?;
 
         if windows.is_empty() {
-            return Ok(r#"<div class="scv-note">No window data available</div>"#.to_owned());
+            return Ok(NO_WINDOW_DATA.to_owned());
         }
 
         // anticipated=0: bars show observable state, not gate's hypothetical.
-        let (res_5h, res_7d, _cap_5h, _cap_7d) = self.unaccounted_fraction(&windows, 0).await?;
+        let (unaccounted_5h, unaccounted_7d, _cap_5h, _cap_7d) =
+            self.unaccounted_fraction(&windows, 0).await?;
 
-        let mut fragments: Vec<String> = Vec::new();
-
-        for (lid, w) in &windows {
-            let label = format!("{} window", lid.replace("anthropic:", ""));
-
-            let used_pct = match w.used_fraction {
-                Some(f) => format!("{:.0}%", f * 100.0),
-                None => "?".to_owned(),
-            };
-
-            // Dimension select.
-            let (unacct, ramp_val, elapsed_frac): (f64, Option<f64>, Option<f64>) =
-                if lid.contains(":5h") {
-                    let r = ramp_5h(w.resets_at, now_ms);
-                    let ef = match w.resets_at {
-                        Some(ra) if ra > now_ms => {
-                            Some((FIVE_H_MS as f64 - (ra - now_ms) as f64) / FIVE_H_MS as f64)
-                        }
-                        _ => None,
-                    };
-                    (res_5h, r, ef)
-                } else if lid.contains(":7d") {
-                    (res_7d, Some(ramp_7d(w.resets_at, now_ms)), None)
-                } else {
-                    (0.0, None, None)
-                };
-
-            // fill_pct: round-half-to-even (Python's round()), clamped 0..100.
-            let fill_pct = ((w.used_fraction.unwrap_or(0.0) * 100.0).round_ties_even() as i64)
-                .clamp(0, 100) as u8;
-            let soft_pct = ((unacct * 100.0).round_ties_even() as i64)
-                .clamp(0, 100 - i64::from(fill_pct)) as u8;
-            let ramp_pct: Option<u8> =
-                ramp_val.map(|r| ((r * 100.0).round_ties_even() as i64).clamp(0, 100) as u8);
-
-            let ramp_for_avail = ramp_val.unwrap_or(1.0);
-            let avail_frac = (ramp_for_avail - w.used_fraction.unwrap_or(0.0) - unacct).max(0.0);
-            let avail_pct_str = format!("{:.0}%", avail_frac * 100.0);
-
-            let cap = self.ledger.estimate_capacity(lid).await?;
-            let avail_tok = cap.filter(|&c| c > 0.0).map(|c| avail_frac * c);
-
-            let avail_str = if w.used_fraction.is_none() {
-                String::new()
-            } else if let Some(tok) = avail_tok {
-                format!(
-                    " \u{00b7} {} avail (~{} tok)",
-                    avail_pct_str,
-                    Self::_fmt_tokens(tok)
-                )
-            } else {
-                format!(" \u{00b7} {avail_pct_str} avail")
-            };
-
-            let is_stale = w.age_s > self.cfg.stale_after_s;
-            let is_exhausted = w.status.as_deref() == Some("exhausted")
-                || w.used_fraction.is_some_and(|f| f >= 1.0);
-            let tone = if is_stale {
-                "stale"
-            } else if is_exhausted {
-                "bad"
-            } else {
-                "ok"
-            };
-
-            let probe_age = format!("{:.0}m ago", w.age_s / 60.0);
-
-            let reset_str = match w.resets_at {
-                Some(r) => {
-                    let remain_s = (r - now_ms) as f64 / 1000.0;
-                    if remain_s > 0.0 {
-                        let h = (remain_s / 3600.0) as i64;
-                        let m = ((remain_s % 3600.0) / 60.0) as i64;
-                        let countdown = if h > 0 {
-                            format!("{h}h{m:02}m")
-                        } else {
-                            format!("{m}m")
-                        };
-                        // Emit <time data-ms="..."> so the client renders
-                        // in the *browser's* local timezone, not the server's.
-                        format!("resets <time data-ms=\"{r}\"></time> ({countdown})")
-                    } else {
-                        "resetting".to_owned()
-                    }
-                }
-                None => "reset unknown".to_owned(),
-            };
-
-            let headroom_str = match (elapsed_frac, ramp_val) {
-                (Some(ef), Some(r)) if r == 0.0 && ef > 0.0 => {
-                    let headroom_remain_ms = HEADROOM_MS as f64 - ef * FIVE_H_MS as f64;
-                    if headroom_remain_ms > 0.0 {
-                        format!(
-                            " \u{00b7} headroom {}m",
-                            (headroom_remain_ms / 60_000.0) as i64
-                        )
-                    } else {
-                        String::new()
-                    }
-                }
-                _ => String::new(),
-            };
-
-            let unacct_str = if unacct > 0.005 {
-                format!(" +{:.0}% in flight", unacct * 100.0)
-            } else {
-                String::new()
-            };
-
-            let marker = match ramp_pct {
-                Some(rp) if rp > 0 => {
-                    format!(r#"<i class="scv-ramp" style="left:{rp}%"></i>"#)
-                }
-                _ => String::new(),
-            };
-
-            let stale_marker = if is_stale {
-                " \u{26a0}\u{fe0f}stale"
-            } else {
-                ""
-            };
-
-            // Per-window fragment: exact HTML from BACKEND-CONTRACT.md §2.3.
-            let fragment = format!(
-                "<div class=\"scv-win\">\
-                <div class=\"scv-lab\">\
-                <b>{}</b>\
-                <span>{} used{}{}{}</span>\
-                </div>\
-                <div class=\"scv-bar\">\
-                <i class=\"scv-fill scv-{}\" style=\"width:{}%\"></i>\
-                <i class=\"scv-soft\" style=\"width:{}%\"></i>\
-                {}</div>\
-                <div class=\"scv-sub\">{}{} \u{00b7} probed {}</div>\
-                </div>",
-                Self::_esc(&label),
-                Self::_esc(&used_pct),
-                Self::_esc(&unacct_str),
-                Self::_esc(&avail_str),
-                stale_marker,
-                tone,
-                fill_pct,
-                soft_pct,
-                marker,
-                reset_str, // NOT escaped: contains <time data-ms="..."> for client-side TZ formatting
-                Self::_esc(&headroom_str),
-                Self::_esc(&probe_age),
-            );
-
-            fragments.push(fragment);
+        let mut capacities = BTreeMap::new();
+        for lid in windows.keys() {
+            capacities.insert(lid.clone(), self.ledger.estimate_capacity(lid).await?);
         }
 
-        Ok(fragments.join("\n"))
+        Ok(render_status(&StatusInputs {
+            now_ms,
+            windows,
+            unaccounted_5h,
+            unaccounted_7d,
+            capacities,
+            stale_after_s: self.cfg.stale_after_s,
+        }))
     }
 
     async fn run(

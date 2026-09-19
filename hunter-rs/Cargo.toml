@@ -51,6 +51,7 @@ fs4 = { version = "1.1.0", features = ["sync"] }
 nix = { version = "0.31.3", features = ["signal", "process"] }
 
 [dev-dependencies]
+insta = "1.48.0"
 proptest = "1.11.0"
 tower = { version = "0.5", features = ["util"] }
 

@@ -1,0 +1,5 @@
+---
+source: tests/status_html_test.rs
+expression: case.render()
+---
+<div class="scv-win"><div class="scv-lab"><b>7d:model-class window</b><span>21% used · 50% avail</span></div><div class="scv-bar"><i class="scv-fill scv-ok" style="width:21%"></i><i class="scv-soft" style="width:0%"></i><i class="scv-ramp" style="left:71%"></i></div><div class="scv-sub">resets <time data-ms="1800172800000"></time> (48h00m) · probed 1m ago</div></div>

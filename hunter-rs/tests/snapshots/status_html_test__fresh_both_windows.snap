@@ -1,0 +1,6 @@
+---
+source: tests/status_html_test.rs
+expression: "Case::new(vec![window(\"anthropic:5h\", Some(0.32), \"ok\", Some(2 * HOUR), 45.0),\nwindow(\"anthropic:7d\", Some(0.43), \"ok\", Some(64 * HOUR), 90.0),]).render()"
+---
+<div class="scv-win"><div class="scv-lab"><b>5h window</b><span>32% used · 24% avail (~707k tok)</span></div><div class="scv-bar"><i class="scv-fill scv-ok" style="width:32%"></i><i class="scv-soft" style="width:0%"></i><i class="scv-ramp" style="left:56%"></i></div><div class="scv-sub">resets <time data-ms="1800007200000"></time> (2h00m) · probed 1m ago</div></div>
+<div class="scv-win"><div class="scv-lab"><b>7d window</b><span>43% used · 19% avail (~567k tok)</span></div><div class="scv-bar"><i class="scv-fill scv-ok" style="width:43%"></i><i class="scv-soft" style="width:0%"></i><i class="scv-ramp" style="left:62%"></i></div><div class="scv-sub">resets <time data-ms="1800230400000"></time> (64h00m) · probed 2m ago</div></div>
