@@ -174,7 +174,7 @@ class TestHarvestFollowUpIngestion:
         result = run_harvest(store, cfg, finding, backend)
 
         assert result.get("outcome") == "harvested", result
-        all_findings = store.list_all_findings()
+        all_findings = store.list_findings()
         modernization = [f for f in all_findings if f["type"] == "modernization"]
         assert len(modernization) == 1, all_findings
         mf = modernization[0]
@@ -206,7 +206,7 @@ class TestHarvestFollowUpIngestion:
         result = run_harvest(store, cfg, finding, backend)
 
         assert result.get("outcome") == "harvested", result
-        all_findings = store.list_all_findings()
+        all_findings = store.list_findings()
         assert all(f["type"] != "modernization" for f in all_findings)
         ps = store.get_pr_state(finding["id"])
         assert ps is not None
@@ -225,7 +225,7 @@ class TestHarvestFollowUpIngestion:
         result = run_harvest(store, cfg, finding, backend)
 
         assert result.get("outcome") == "harvested", result
-        all_findings = store.list_all_findings()
+        all_findings = store.list_findings()
         assert all(f["type"] != "modernization" for f in all_findings)
         ps = store.get_pr_state(finding["id"])
         assert ps is not None
@@ -281,7 +281,7 @@ class TestHarvestFollowUpIngestion:
         result = run_harvest(store, cfg, finding, backend)
 
         assert result.get("outcome") == "harvested", result
-        all_findings = store.list_all_findings()
+        all_findings = store.list_findings()
         injected = [f for f in all_findings if f["id"] != finding["id"]]
         assert injected == [], (
             f"structural validation must reject both injection-shaped entries,"
@@ -495,7 +495,7 @@ class TestEngageWithdrawFollowUpIngestion:
         assert after is not None
         assert after["status"] == "rejected"
 
-        all_findings = store.list_all_findings()
+        all_findings = store.list_findings()
         dep_updates = [
             f for f in all_findings if f["type"] == "dep_update" and f["id"] != finding["id"]
         ]
@@ -529,5 +529,5 @@ class TestEngageWithdrawFollowUpIngestion:
         after = store.get_finding(finding["id"])
         assert after is not None
         assert after["status"] == "rejected"
-        all_findings = store.list_all_findings()
+        all_findings = store.list_findings()
         assert len(all_findings) == 1  # only the original finding, nothing new

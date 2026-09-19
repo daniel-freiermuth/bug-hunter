@@ -265,6 +265,51 @@ class TestFindings:
         # fid2 stays "new"
         assert len(store.list_findings(status="new", min_severity="high")) == 1
 
+    def test_list_findings_by_type(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.upsert_finding(rid, _make_finding(fingerprint="fp1"), finding_type="bug")
+        store.upsert_finding(
+            rid,
+            {
+                "fingerprint": "fp2",
+                "ecosystem": "npm",
+                "package": "foo",
+                "current_version": "1.0.0",
+                "latest_version": "2.0.0",
+                "update_type": "major",
+                "severity": "medium",
+                "confidence": 1.0,
+                "summary": "foo is outdated",
+            },
+            finding_type="dep_update",
+        )
+        assert len(store.list_findings()) == 2
+        assert len(store.list_findings(finding_type="bug")) == 1
+        assert len(store.list_findings(finding_type="dep_update")) == 1
+        assert store.list_findings(finding_type="bug")[0]["type"] == "bug"
+
+    def test_list_findings_computes_category_per_type(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        store.upsert_finding(rid, _make_finding(fingerprint="fp1"), finding_type="bug")
+        store.upsert_finding(
+            rid,
+            {
+                "fingerprint": "fp2",
+                "ecosystem": "npm",
+                "package": "foo",
+                "current_version": "1.0.0",
+                "latest_version": "2.0.0",
+                "update_type": "major",
+                "severity": "medium",
+                "confidence": 1.0,
+                "summary": "foo is outdated",
+            },
+            finding_type="dep_update",
+        )
+        rows = {r["type"]: r for r in store.list_findings()}
+        assert rows["bug"]["category"] == "logic"  # from bug_class
+        assert rows["dep_update"]["category"] == "major"  # from update_type
+
 
 # -- set_status ------------------------------------------------------------
 

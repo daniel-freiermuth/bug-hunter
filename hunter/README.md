@@ -196,7 +196,7 @@ only client, but usable directly:
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/summary` | Budget windows, counts, activity status, "what's next" preview — validated against a pydantic schema before it ships |
-| GET | `/api/findings` | List findings (`status`, `repo`, `severity`, `type`, `unified` query params) |
+| GET | `/api/findings` | List findings across all types (`status`, `repo`, `severity`, `type` query params) |
 | GET | `/api/finding` | One finding's full job history + PR state |
 | GET | `/api/jobs` | Recent jobs (last 50) |
 | GET | `/api/repos` | List repos |

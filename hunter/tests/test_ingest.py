@@ -223,7 +223,7 @@ def test_dep_update_ingested_with_type_columns(env: tuple[Store, int, Path]) -> 
         store, repo_id, _write_findings(fdir, entries), finding_type="dep_update"
     )
     assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
-    rows = store.list_all_findings(finding_type="dep_update")
+    rows = store.list_findings(finding_type="dep_update")
     assert len(rows) == 1
     assert rows[0]["type"] == "dep_update"
     assert rows[0]["package"] == "foo"
@@ -271,7 +271,7 @@ def test_test_gap_ingested_with_missing_tests_list(env: tuple[Store, int, Path])
         store, repo_id, _write_findings(fdir, entries), finding_type="test_gap"
     )
     assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
-    rows = store.list_all_findings(finding_type="test_gap")
+    rows = store.list_findings(finding_type="test_gap")
     assert rows[0]["type"] == "test_gap"
     assert rows[0]["category"] == "coverage"
     assert json.loads(rows[0]["missing_tests"]) == ["empty input", "negative numbers"]
@@ -295,7 +295,7 @@ def test_refactor_ingested_with_type_columns(env: tuple[Store, int, Path]) -> No
         store, repo_id, _write_findings(fdir, entries), finding_type="refactor"
     )
     assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
-    rows = store.list_all_findings(finding_type="refactor")
+    rows = store.list_findings(finding_type="refactor")
     assert rows[0]["type"] == "refactor"
     assert rows[0]["category"] == "duplication"
     assert rows[0]["suggested_refactor"] == "extract shared helper"
@@ -319,7 +319,7 @@ def test_modernization_ingested_with_type_columns(env: tuple[Store, int, Path]) 
         store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
     )
     assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
-    rows = store.list_all_findings(finding_type="modernization")
+    rows = store.list_findings(finding_type="modernization")
     assert rows[0]["type"] == "modernization"
     assert rows[0]["category"] == "format-or-protocol-shift"
     assert rows[0]["current_approach"] == "MVT (Mapbox Vector Tile)"
@@ -371,7 +371,7 @@ def test_modernization_missing_class_is_invalid(env: tuple[Store, int, Path]) ->
         store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
     )
     assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
-    assert store.list_all_findings(finding_type="modernization") == []
+    assert store.list_findings(finding_type="modernization") == []
 
 
 def test_different_types_do_not_leak_into_each_others_known_list(
@@ -400,9 +400,9 @@ def test_different_types_do_not_leak_into_each_others_known_list(
         ),
         finding_type="dep_update",
     )
-    assert len(store.list_all_findings(finding_type="bug")) == 1
-    assert len(store.list_all_findings(finding_type="dep_update")) == 1
-    assert len(store.list_all_findings()) == 2
+    assert len(store.list_findings(finding_type="bug")) == 1
+    assert len(store.list_findings(finding_type="dep_update")) == 1
+    assert len(store.list_findings()) == 2
 
 
 # ── type-specific required fields (dep_update/test_gap/refactor/modernization) ──
@@ -423,7 +423,7 @@ def test_dep_update_missing_required_field_is_invalid(env: tuple[Store, int, Pat
         store, repo_id, _write_findings(fdir, entries), finding_type="dep_update"
     )
     assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
-    assert store.list_all_findings(finding_type="dep_update") == []
+    assert store.list_findings(finding_type="dep_update") == []
 
 
 def test_dep_update_all_required_fields_ingests(env: tuple[Store, int, Path]) -> None:
@@ -460,7 +460,7 @@ def test_test_gap_missing_required_field_is_invalid(env: tuple[Store, int, Path]
         store, repo_id, _write_findings(fdir, entries), finding_type="test_gap"
     )
     assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
-    assert store.list_all_findings(finding_type="test_gap") == []
+    assert store.list_findings(finding_type="test_gap") == []
 
 
 def test_test_gap_malformed_missing_tests_shape_is_invalid_not_a_crash(
@@ -497,7 +497,7 @@ def test_test_gap_malformed_missing_tests_shape_is_invalid_not_a_crash(
         "the malformed entry must be skipped as invalid, and the LATER valid"
         " entry must still be processed, not lost to an aborted batch"
     )
-    rows = store.list_all_findings(finding_type="test_gap")
+    rows = store.list_findings(finding_type="test_gap")
     assert len(rows) == 1
     assert rows[0]["fingerprint"] == "repo:foo.py:baz:test-gap-after"
 
@@ -536,7 +536,7 @@ def test_refactor_missing_required_field_is_invalid(env: tuple[Store, int, Path]
         store, repo_id, _write_findings(fdir, entries), finding_type="refactor"
     )
     assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
-    assert store.list_all_findings(finding_type="refactor") == []
+    assert store.list_findings(finding_type="refactor") == []
 
 
 def test_refactor_all_required_fields_ingests(env: tuple[Store, int, Path]) -> None:
@@ -573,7 +573,7 @@ def test_modernization_missing_required_field_is_invalid(env: tuple[Store, int, 
         store, repo_id, _write_findings(fdir, entries), finding_type="modernization"
     )
     assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
-    assert store.list_all_findings(finding_type="modernization") == []
+    assert store.list_findings(finding_type="modernization") == []
 
 
 def test_modernization_all_required_fields_ingests(env: tuple[Store, int, Path]) -> None:

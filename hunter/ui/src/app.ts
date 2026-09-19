@@ -98,7 +98,7 @@ interface PrState {
 // /api/finding?id=<id> response: everything about one finding NOT
 // already on its list-view card -- see hunter.server._finding_detail's
 // docstring for why (list_jobs()'s /api/jobs feed is capped at 50 and
-// list_findings() only ever embeds needs_attention for pr_open).
+// the findings list only ever embeds needs_attention for pr_open).
 interface FindingDetail {
   jobs: Job[];
   pr_state: PrState | null;

@@ -28,7 +28,7 @@ from .types import (
 
 # The value types SQLite actually stores for every column these dynamic
 # setters (update_repo/update_job/upsert_pr_state) and query-parameter
-# builders (list_findings/list_all_findings/set_status/
+# builders (list_findings/set_status/
 # update_finding_analysis) touch -- str/int/float per schema.sql, plus
 # None for nullable columns. Precise enough to catch a real type error
 # (e.g. passing a dict or a list by mistake) while still fitting every
@@ -568,36 +568,13 @@ class Store:
         status: str | None = None,
         repo_id: int | None = None,
         min_severity: str | None = None,
-    ) -> list[Row]:
-        q = "SELECT * FROM findings"
-        args: list[SqlParam] = []
-        conds: list[str] = ["type = 'bug'"]
-        if status:
-            conds.append("status = ?")
-            args.append(status)
-        if repo_id:
-            conds.append("repo_id = ?")
-            args.append(repo_id)
-        if min_severity:
-            allowed = Severity.at_or_above(Severity.from_str(min_severity))
-            ph = ",".join("?" * len(allowed))
-            conds.append(f"severity IN ({ph})")
-            args.extend(allowed)
-        q += " WHERE " + " AND ".join(conds)
-        q += " ORDER BY id DESC"
-        return _rows(self.db.execute(q, args))
-
-    def list_all_findings(
-        self,
-        status: str | None = None,
-        repo_id: int | None = None,
-        min_severity: str | None = None,
         finding_type: str | None = None,
     ) -> list[Row]:
         """
-        Query findings across all types (bug, dep_update, test_gap, refactor).
-        Each result has a 'type' field and a computed 'category' field for UI
-        display (bug_class | update_type | 'coverage' | smell_type).
+        Query findings across all types (bug, dep_update, test_gap, refactor,
+        modernization). Each result has a 'type' field and a computed
+        'category' field for UI display (bug_class | update_type |
+        'coverage' | smell_type | modernization_class).
         """
         conds: list[str] = []
         args: list[SqlParam] = []

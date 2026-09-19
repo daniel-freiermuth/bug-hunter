@@ -255,7 +255,7 @@ class Handler(BaseHTTPRequestHandler):
         store = self._store()
         backend_status_html = self.backend.status()
         counts: dict[str, int] = dict.fromkeys(FINDING_STATUSES, 0)
-        all_findings = store.list_all_findings()
+        all_findings = store.list_findings()
         counts.update(Counter(f["status"] for f in all_findings))
         # Also add type breakdown
         type_counts = Counter(f["type"] for f in all_findings)
@@ -345,7 +345,6 @@ class Handler(BaseHTTPRequestHandler):
         repo_key = (qs.get("repo") or [None])[0] or None  # type: ignore[list-item]
         severity = (qs.get("severity") or [None])[0] or None  # type: ignore[list-item]
         finding_type = (qs.get("type") or [None])[0] or None  # type: ignore[list-item]
-        unified = (qs.get("unified") or ["1"])[0] == "1"  # default true
         repo_id: int | None = None
         if repo_key is not None:
             key: int | str = int(repo_key) if repo_key.isdigit() else repo_key
@@ -355,20 +354,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError(msg)
             repo_id = repo["id"]
 
-        if unified:
-            findings: list[Row] = store.list_all_findings(
-                status=status,
-                repo_id=repo_id,
-                min_severity=severity,
-                finding_type=finding_type,
-            )
-        else:
-            # Legacy: bugs only
-            findings = store.list_findings(
-                status=status,
-                repo_id=repo_id,
-                min_severity=severity,
-            )
+        findings: list[Row] = store.list_findings(
+            status=status,
+            repo_id=repo_id,
+            min_severity=severity,
+            finding_type=finding_type,
+        )
         # Embed per-finding event timeline.
         fids: list[int] = [f["id"] for f in findings]
         timelines = store.events_by_finding(fids)
@@ -389,7 +380,7 @@ class Handler(BaseHTTPRequestHandler):
         """Everything about one finding NOT already on its list-view card:
         the full job history (list_jobs()'s /api/jobs feed is capped at
         the most recent 50 across ALL findings, so an older finding's
-        jobs can already be gone from it) and PR state (list_findings()
+        jobs can already be gone from it) and PR state (the findings list
         only ever embeds needs_attention, and only for pr_open -- this
         returns the whole row, for any status a PR could still exist
         under, e.g. merged/rejected). Returns None if id is missing or
