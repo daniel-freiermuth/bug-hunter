@@ -77,7 +77,7 @@ jobs:
           fi
           echo "✓ no QueryBuilder"
 
-      - uses: taiki-e/install-action@e3bbdb61bd87a1c0f9a9e16d1ae3ee2ca24ff78e # v2
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cargo-nextest
 
@@ -114,7 +114,7 @@ jobs:
         with:
           workspaces: hunter-rs
 
-      - uses: taiki-e/install-action@e3bbdb61bd87a1c0f9a9e16d1ae3ee2ca24ff78e # v2
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cargo-nextest,cargo-llvm-cov
 
@@ -146,7 +146,7 @@ jobs:
 
       # No dev.db step: build.rs regenerates it from migrations/ on every
       # build, which is what sqlx::query! validates against.
-      - uses: taiki-e/install-action@e3bbdb61bd87a1c0f9a9e16d1ae3ee2ca24ff78e # v2
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cargo-nextest,cargo-mutants
 
