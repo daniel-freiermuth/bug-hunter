@@ -204,6 +204,58 @@ required for that operation.
 - `cargo nextest` for parallel execution and stress testing (libraries)
 - Compliance traceability where applicable (`covers!()` macro)
 
+### Proof, not compilation
+
+`cargo check` is not evidence that a change works. Neither is a green
+suite that predates the change. A fix is verified when you have
+**observed the new behaviour**: a test seen failing before and passing
+after, or a command whose output demonstrates it.
+
+- **Red first.** Every new or changed assertion must be watched failing
+  against the pre-fix code. If you cannot make it fail, it is not
+  testing your change. Invert the condition, confirm exactly the
+  expected test breaks, revert.
+- Test-first ordering is optional; the red step is not. Writing the
+  test before the code guarantees only that the code matches the
+  requirement — which is no help when the requirement is the thing
+  that was incomplete.
+
+### Fixing a reported defect
+
+Measured on this repo: of six agents fixing a review round, the two
+that proved their fixes by *running* them introduced zero regressions;
+the three that proved theirs by compiling introduced five between
+them. Every one was a gap in what the author considered, not in what
+they implemented. So:
+
+- **Verify the report, then verify the fix.** Confirming the finding
+  is real says nothing about whether the repair is right. Check your
+  fix against inputs the report never mentioned.
+- **Enumerate the failure boundary.** Any change that adds or moves an
+  error, `bail!`, or terminal state must name the inputs that now land
+  on the new side. "Reject unfilled placeholders" silently became
+  "reject any PR body containing braces".
+- **Cover the sibling branch.** Handling one arm of a state machine is
+  an invitation to check the others. A worker that *hangs* unmetered
+  and one that *exits* unmetered are the same accounting hole.
+- **Read the contract before asserting about an interface.** Status
+  codes, JSON shapes and endpoint behaviour are specified in
+  `hunter-rs/API-CONTRACT*.md`. Cite the line; do not encode a belief.
+- **Changing an invariant means finding its dependents.** Run
+  `lsp references` (or grep) on the state you changed. Callers in other
+  files still assume what you just stopped guaranteeing.
+
+### Adversarial pass before shipping
+
+Green gates are necessary and not sufficient: an entire review round's
+regressions passed 187 tests, clippy, `svelte-check` and ESLint, and
+were caught by a human-grade reader looking at the diff. Before
+pushing a batch of fixes, run one reviewer over the diffs whose only
+question is *"what input class did the author not consider?"* — not
+*"is this correct?"*. That is the process that actually catches this
+class, so run it deliberately rather than waiting for it to arrive
+from outside.
+
 ---
 
 ## Dependencies

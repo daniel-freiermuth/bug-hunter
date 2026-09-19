@@ -2596,9 +2596,32 @@ pub async fn run_engage(
         if fg.owner_repo(&repo.url).is_some() {
             let comment: String = reason.chars().take(800).collect();
             if let Err(err) = fg.close_pr(&repo.url, pr_number, &comment) {
-                // Best-effort: the local verdict below still stands, but a
-                // PR we failed to close must not look closed in the log.
+                // close_pr posts the withdrawal reason and only then closes,
+                // so a failure here means the PR is still OPEN on the forge.
+                // Recording the verdict anyway would mark it closed locally
+                // and set the finding Rejected -- and sync_prs only revisits
+                // pr_open findings, so nothing would ever reconcile it. Leave
+                // the finding untouched and let the next cycle retry.
                 tracing::warn!(finding = fid, pr = pr_number, error = %err, "close_pr failed");
+                let _ = store
+                    .log_event(
+                        "error",
+                        &format!("#{fid} withdrawal aborted: PR #{pr_number} could not be closed"),
+                        Some(job),
+                        Some(fid),
+                    )
+                    .await;
+                let rps = rpath.to_string_lossy().to_string();
+                let wts = worktree.to_string_lossy().to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    run_cmd_sync(
+                        &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                        30,
+                    );
+                })
+                .await;
+                summary.outcome = Some("withdraw-failed".into());
+                return Ok(summary);
             }
         }
         let reason_short: String = reason.chars().take(500).collect();

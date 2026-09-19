@@ -38,7 +38,7 @@
     const enabled = repo.enabled ? 0 : 1;
     try {
       const r = await post("/api/repo", { id: repo.id, enabled });
-      if (r.status === 200) {
+      if (r.ok) {
         toast(`${repo.name} ${enabled ? "enabled" : "paused"}`, true);
         store.refresh();
       } else {
@@ -54,7 +54,7 @@
     if (!confirm(`Remove repo "${repo.name}"? This cannot be undone.`)) return;
     try {
       const r = await post("/api/repo/delete", { id: repo.id });
-      if (r.status === 200) {
+      if (r.ok) {
         toast(`Removed ${repo.name}`, true);
         store.refresh();
       } else {
@@ -79,7 +79,7 @@
     if (newForge) body.forge = newForge;
     try {
       const r = await post("/api/repos", body);
-      if (r.status === 201) {
+      if (r.ok) {
         toast(`Added ${newName}`, true);
         newName = "";
         newUrl = "";
@@ -129,7 +129,7 @@
         note: text,
         ...(category ? { category } : {}),
       });
-      if (r.status !== 201) {
+      if (!r.ok) {
         toast("Failed to add note", false);
         return;
       }

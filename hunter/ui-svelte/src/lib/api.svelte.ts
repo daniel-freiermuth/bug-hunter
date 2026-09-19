@@ -13,6 +13,15 @@ const POLL_MS = 5000;
 
 interface ApiResult<T> {
   status: number;
+  /**
+   * 2xx. Prefer this over comparing `status` to a literal: the write
+   * endpoints are a mix of 200 and 201 (see hunter-rs/API-CONTRACT-WRITES.md
+   * §7), and guessing which is which has already shipped as a bug — a 201
+   * from /api/repo/notes read as failure. Compare `status` only where the
+   * code carries meaning the caller acts on, such as 202 vs 409 on
+   * /api/cycle.
+   */
+  ok: boolean;
   body: T | null;
 }
 
@@ -24,7 +33,7 @@ async function api<T>(path: string, opts?: RequestInit): Promise<ApiResult<T>> {
   } catch {
     /* empty body or non-JSON */
   }
-  return { status: r.status, body };
+  return { status: r.status, ok: r.ok, body };
 }
 
 /** POST with JSON body, Content-Type set. */
