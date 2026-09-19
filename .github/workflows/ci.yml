@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Python hunter (hunter/) ────────────────────────────────────
+  python:
+    name: Python — lint + typecheck + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+
+      - name: Install deps
+        run: pip install ruff mypy pydantic pytest
+
+      - name: Format check
+        run: ruff format --check hunter/ tests/
+
+      - name: Lint
+        run: ruff check hunter/ tests/
+
+      - name: Typecheck
+        run: mypy --strict hunter/
+
+      - name: Test
+        run: pytest tests/ -q
+
+  # ── Frontend (hunter/ui/) ──────────────────────────────────────
+  frontend:
+    name: Frontend — typecheck + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: hunter/package-lock.json
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --project ui/tsconfig.json
+
+      - name: Build
+        run: npx esbuild ui/src/app.ts --bundle --outfile=ui/app.js --sourcemap --target=es2022 --format=iife
