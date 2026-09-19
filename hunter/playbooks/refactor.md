@@ -41,7 +41,11 @@ Focus on safe, mechanical improvements with LOW RISK:
 
 NOT refactors: Style preferences, subjective improvements, architectural changes, introducing new abstractions.
 
-# Known refactorings already tracked
+# Known non-candidates (suppression corpus — do NOT re-file these or variants)
+{{SUPPRESSIONS}}
+
+# Already tracked (open refactorings — file only if yours is genuinely NOVEL)
+Refactors move code, so compare by mechanism, not by file/line location.
 {{KNOWN_REFACTORS}}
 
 # Output contract — INCREMENTAL, you may be killed at any moment

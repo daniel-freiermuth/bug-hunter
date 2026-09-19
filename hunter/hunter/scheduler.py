@@ -453,6 +453,7 @@ def run_test_gap(store: Store, cfg: Config, repo: Row) -> Row:
     prompt = build_test_gap_prompt(
         repo,
         "Full repository scan for test coverage gaps.",
+        [],  # suppressions: not tracked for this job type yet
         known,
         out_path,
         cfg.hunt_max_findings,  # Reuse hunt max for now
@@ -593,6 +594,7 @@ def run_dep_update(store: Store, cfg: Config, repo: Row) -> Row:
     prompt = build_dep_update_prompt(
         repo,
         "Check all package manifests for outdated dependencies.",
+        [],  # suppressions: not tracked for this job type yet
         known,
         out_path,
         cfg.hunt_max_findings,
@@ -735,6 +737,7 @@ def run_refactor(store: Store, cfg: Config, repo: Row) -> Row:
     prompt = build_refactor_prompt(
         repo,
         "Scan for safe, mechanical refactoring opportunities (duplication, dead code, complexity).",
+        [],  # suppressions: not tracked for this job type yet
         known,
         out_path,
         cfg.hunt_max_findings,
