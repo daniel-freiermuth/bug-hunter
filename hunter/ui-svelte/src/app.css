@@ -1,0 +1,122 @@
+/* Hunter theme — plain CSS custom properties, no framework. */
+:root {
+  --bg: #1a1a2e;
+  --bg-card: #16213e;
+  --bg-panel: #0f1628;
+  --bg-elevated: #1e2a4a;
+  --text: #e8e8e8;
+  --text-dim: #888;
+  --accent: #4ea8de;
+  --accent-hover: #6bc5f8;
+  --sev-high: #e54;
+  --sev-medium: #f90;
+  --sev-low: #4e8;
+  --ok: #4e8;
+  --bad: #e54;
+  --stale: #888;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-hover: rgba(255, 255, 255, 0.15);
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --transition: 150ms ease;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: system-ui, -apple-system, sans-serif;
+  margin: 0;
+  line-height: 1.5;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background: rgba(78, 168, 222, 0.35);
+  color: #fff;
+}
+
+/* Scrollbar — WebKit */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+
+/* Scrollbar — Firefox */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.1) transparent;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  transition: color var(--transition);
+}
+a:hover { color: var(--accent-hover); }
+
+button {
+  cursor: pointer;
+  font: inherit;
+  border: none;
+  background: none;
+  color: inherit;
+  transition: color var(--transition), background-color var(--transition),
+              border-color var(--transition), box-shadow var(--transition),
+              transform var(--transition), opacity var(--transition);
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+input, select, textarea {
+  font: inherit;
+  color: var(--text);
+}
+
+/* Dialog centering + entrance */
+dialog {
+  animation: dialogIn 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+}
+
+/* ── Shared keyframes ─────────────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.4; }
+  50%      { opacity: 1; }
+}
+
+@keyframes readyPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(78, 168, 222, 0.4); }
+  50%      { box-shadow: 0 0 0 8px rgba(78, 168, 222, 0); }
+}
+
+@keyframes dialogIn {
+  from { opacity: 0; transform: scale(0.95); }
+  to   { opacity: 1; transform: scale(1); }
+}

@@ -1,0 +1,5 @@
+---
+source: tests/status_html_test.rs
+expression: "Case::new(vec![window(\"anthropic:5h\", None, \"ok\", Some(3 * HOUR),\n12.0)]).render()"
+---
+<div class="scv-win"><div class="scv-lab"><b>5h window</b><span>? used</span></div><div class="scv-bar"><i class="scv-fill scv-ok" style="width:0%"></i><i class="scv-soft" style="width:0%"></i><i class="scv-ramp" style="left:33%"></i></div><div class="scv-sub">resets <time data-ms="1800010800000"></time> (3h00m) · probed 0m ago</div></div>

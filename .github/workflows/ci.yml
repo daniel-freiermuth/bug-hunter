@@ -13,6 +13,208 @@ permissions:
   contents: read
 
 jobs:
+  # ── Rust backend (hunter-rs/) ──────────────────────────────────
+  rust:
+    name: Rust — lint + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter-rs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: hunter-rs
+
+      # Dev DB for sqlx compile-time checks
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+      - name: Generate dev.db
+        run: |
+          cd ../hunter
+          python3 -c "
+          from pathlib import Path; import dataclasses
+          from hunter.types import Config; from hunter.store import Store
+          dev = Path('../hunter-rs/dev.db').resolve(); dev.unlink(missing_ok=True)
+          Store(dataclasses.replace(Config.load(), db_path=dev))
+          print('dev.db regenerated')
+          "
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets
+
+      - name: SQL encapsulation
+        run: |
+          echo "Checking pool() encapsulation..."
+          if grep -rn '\.pool()' src/ | grep -v 'store\.rs' | grep -v '//'; then
+            echo "✗ pool() leaked outside store.rs"
+            exit 1
+          fi
+          echo "✓ pool() only in store.rs"
+
+          echo "Checking compile-time checked queries..."
+          if grep -rn 'sqlx::query(' src/ | grep -v 'query!\|query_as!\|query_scalar!\|capacity\.rs\|//'; then
+            echo "✗ unchecked sqlx::query found"
+            exit 1
+          fi
+          echo "✓ all queries compile-time checked"
+
+          echo "Checking no QueryBuilder..."
+          if grep -rn 'QueryBuilder' src/ | grep -v '//'; then
+            echo "✗ QueryBuilder found"
+            exit 1
+          fi
+          echo "✓ no QueryBuilder"
+
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: cargo-nextest
+
+      - name: Test
+        run: cargo nextest run --profile ci
+
+  # ── Line coverage ─────────────────────────────────────────────
+  # A ratchet, not a target. The floor sits just under the current
+  # number so an unrelated change cannot drift it downward unnoticed;
+  # raise it when a module gets covered, never lower it to go green.
+  #
+  # Coverage and mutation testing answer different questions and are
+  # both needed: coverage says whether a line RUNS, mutants says whether
+  # anything NOTICES when it changes. A module can score 90% coverage
+  # and still lose every mutant. Coverage is also what says where
+  # running mutants is worthwhile at all — mutating code no test
+  # executes just reports "untested" slowly.
+  coverage:
+    name: Rust — line coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter-rs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: hunter-rs
+
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: cargo-nextest,cargo-llvm-cov
+
+      - name: Coverage
+        run: cargo llvm-cov nextest --profile ci --summary-only --fail-under-lines 50
+
+  # ── Mutation testing (pull requests only) ─────────────────────
+  # A full run is ~1900 mutants and takes hours, so CI tests only the
+  # mutants a change actually introduces. A survivor means the suite
+  # cannot distinguish the new code from a broken version of it.
+  #
+  # Bounded on purpose: on a long-lived branch "the diff" can be the
+  # whole codebase — this very branch introduces all of hunter-rs, which
+  # is 1872 mutants and about four hours. Past the budget the job says
+  # so and stops, rather than burning a runner to tell you what
+  # `cargo llvm-cov` already said. Mutation testing is a focused audit
+  # tool; for a large change run `just mutants <file>` per module.
+  mutants:
+    name: Rust — mutation coverage of the diff
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: hunter-rs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: hunter-rs
+
+      # No dev.db step: build.rs regenerates it from migrations/ on every
+      # build, which is what sqlx::query! validates against.
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: cargo-nextest,cargo-mutants
+
+      - name: Mutants introduced by this PR
+        env:
+          MAX_MUTANTS: "150"
+        run: |
+          # --relative is load-bearing: without it git emits repo-relative
+          # paths (a/hunter-rs/src/...) while cargo-mutants runs inside the
+          # package and matches on src/..., so every mutant is filtered out
+          # and the job passes having tested nothing.
+          git diff --no-color --relative "origin/${{ github.base_ref }}"...HEAD -- . > /tmp/pr.diff
+
+          count=$(cargo mutants --in-diff /tmp/pr.diff --list 2>/dev/null | wc -l)
+          echo "diff introduces $count mutants (budget: $MAX_MUTANTS)"
+
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::No mutable code in this diff."
+            exit 0
+          fi
+          if [ "$count" -gt "$MAX_MUTANTS" ]; then
+            echo "::notice::$count mutants exceeds the per-PR budget of $MAX_MUTANTS."
+            echo "Run 'just mutants <file>' on the modules you touched instead."
+            exit 0
+          fi
+
+          cargo mutants --test-tool nextest --in-diff /tmp/pr.diff -j 2 --colors never
+
+  # ── Svelte frontend (hunter/ui-svelte/) ────────────────────────
+  frontend:
+    name: Frontend — lint + typecheck + test + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter/ui-svelte
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hunter/ui-svelte/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: ESLint
+        run: npx eslint src/
+
+      - name: Svelte check
+        run: npx svelte-check --tsconfig tsconfig.app.json
+
+      - name: Test
+        run: npx vitest run
+
+      - name: Build
+        run: npx vite build
   # ── Python hunter (hunter/) ────────────────────────────────────
   python:
     name: Python — lint + typecheck + test
@@ -44,29 +246,3 @@ jobs:
       - name: Test
         run: pytest tests/ -q
 
-  # ── Frontend (hunter/ui/) ──────────────────────────────────────
-  frontend:
-    name: Frontend — typecheck + build
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: hunter
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: hunter/package-lock.json
-
-      - name: Install deps
-        run: npm ci
-
-      - name: Typecheck
-        run: npx tsc --project ui/tsconfig.json
-
-      - name: Build
-        run: npx esbuild ui/src/app.ts --bundle --outfile=ui/app.js --sourcemap --target=es2022 --format=iife

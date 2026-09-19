@@ -25,11 +25,11 @@ CREATE TABLE IF NOT EXISTS findings (
   id            INTEGER PRIMARY KEY,
   type          TEXT NOT NULL,             -- bug | dep_update | test_gap | refactor
   repo_id       INTEGER NOT NULL REFERENCES repos(id),
-  fingerprint   TEXT NOT NULL,
+  fingerprint   TEXT NOT NULL UNIQUE,
   file          TEXT,
   symbol        TEXT,
   line          INTEGER,
-
+  
   -- Common fields (all types)
   severity      TEXT NOT NULL,             -- high|medium|low
   confidence    REAL NOT NULL,
@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS findings (
   pr_url        TEXT,
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL,
-
+  
   -- Bug-specific fields (nullable for other types)
   bug_class     TEXT,                      -- boundary|error-path|race|contract-drift|leak|logic
   evidence_plan TEXT,
@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS findings (
   last_fix_failure TEXT,                   -- fingerprint of the last fix attempt's failure reason
   recheck_attempts INTEGER NOT NULL DEFAULT 0, -- consecutive run_recheck attempts hitting last_recheck_failure
   last_recheck_failure TEXT,               -- fingerprint of the last recheck attempt's failure reason
-
+  
   -- Dep update fields (nullable for other types)
   ecosystem     TEXT,
   package       TEXT,
@@ -60,11 +60,11 @@ CREATE TABLE IF NOT EXISTS findings (
   latest_version TEXT,
   update_type   TEXT,                      -- major|minor|patch
   security_advisory TEXT,
-
+  
   -- Test gap fields (nullable for other types)
   missing_tests TEXT,
   test_file     TEXT,
-
+  
   -- Refactoring fields (nullable for other types)
   smell_type    TEXT,
   suggested_refactor TEXT,
@@ -72,9 +72,7 @@ CREATE TABLE IF NOT EXISTS findings (
   -- Modernization / standards fields (nullable for other types)
   modernization_class TEXT,
   current_approach TEXT,
-  proposed_approach TEXT,
-
-  UNIQUE(type, fingerprint)
+  proposed_approach TEXT
 );
 CREATE INDEX IF NOT EXISTS findings_status ON findings(status);
 CREATE INDEX IF NOT EXISTS findings_repo ON findings(repo_id, status);
@@ -95,7 +93,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   tokens_new    INTEGER,                   -- input+output+cacheWrite, from ledger
   calls         INTEGER,
   exit_code     INTEGER,
-  killed_reason TEXT,                      -- cap | wallclock | unmetered | NULL
+  killed_reason TEXT,                      -- cap | wallclock | NULL
   notes         TEXT,
   model         TEXT,                      -- model used for this job
   usage_delta   REAL,                      -- 7d used_fraction increase observed during job
