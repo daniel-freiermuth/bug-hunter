@@ -13,7 +13,7 @@ use std::io::Write;
 use std::path::Path;
 
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::domain::{
     BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState, RepoJobKind, Severity,
@@ -303,6 +303,16 @@ impl Store {
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
             .create_if_missing(true)
+            // Set here, not left to migration 001's `PRAGMA journal_mode =
+            // WAL`: sqlx runs each migration inside a transaction, and SQLite
+            // refuses to change journal mode there. On a database that is
+            // already WAL the pragma is a no-op and the migration passes,
+            // which is why every existing deployment works and a brand-new
+            // one could not be created at all. Applying it as a connect
+            // option runs it outside any transaction, so 001 finds the mode
+            // already set and its pragma stays the no-op it has always been
+            // in practice — no migration text changes, no checksum breaks.
+            .journal_mode(SqliteJournalMode::Wal)
             .busy_timeout(std::time::Duration::from_secs(5));
         let pool = SqlitePoolOptions::new()
             .max_connections(4)

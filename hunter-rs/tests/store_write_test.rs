@@ -577,3 +577,73 @@ fn append_repo_note_header_category_and_entry_format() {
 
     std::fs::remove_dir_all(&work_root).ok();
 }
+
+/// A brand-new install: `Store::connect` on a path that does not exist yet
+/// must create and fully migrate the database.
+///
+/// Every other test here starts from a copy of `dev.db`, which `build.rs`
+/// produces by replaying the migrations through `sqlite3` — so the *sqlx*
+/// migrator running against an empty file was never exercised. It was also
+/// broken: migration 001 sets `journal_mode = WAL`, sqlx runs migrations in
+/// a transaction, and SQLite refuses the change there. Existing databases
+/// were already WAL, which made the pragma a silent no-op and hid it.
+#[tokio::test]
+async fn connect_creates_and_migrates_a_brand_new_database() {
+    let path = unique_temp_path("hunter-store-bootstrap", ".db");
+    assert!(!path.exists(), "precondition: nothing at the path yet");
+
+    let store = Store::connect(&path)
+        .await
+        .expect("bootstrap a new database");
+
+    // Schema is usable, not merely present.
+    let repo_id = store
+        .add_repo(
+            "acme/widget",
+            "git@github.com:acme/widget.git",
+            "/tmp/acme-widget",
+            "main",
+            ForgeName::Github,
+        )
+        .await
+        .expect("insert into the freshly created schema");
+    assert!(store.get_repo_by_id(repo_id).await.unwrap().is_some());
+
+    let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path))
+        .await
+        .unwrap();
+    // Compare against the directory rather than a hardcoded list, so
+    // adding a migration cannot silently stop being covered here.
+    let mut on_disk: Vec<i64> =
+        std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
+            .unwrap()
+            .filter_map(|e| {
+                let name = e.ok()?.file_name().into_string().ok()?;
+                name.split('_').next()?.parse::<i64>().ok()
+            })
+            .collect();
+    on_disk.sort_unstable();
+    let applied: Vec<i64> =
+        sqlx::query_scalar("SELECT version FROM _sqlx_migrations ORDER BY version")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(applied, on_disk, "every migration on disk ran");
+
+    // 003 rebuilt findings to drop the legacy single-column UNIQUE; if the
+    // rebuild had been skipped, two findings could not share a fingerprint.
+    let legacy: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='findings_fingerprint'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap()
+    .flatten();
+    assert!(
+        legacy.is_none(),
+        "migration 003 applied on a fresh database"
+    );
+
+    pool.close().await;
+    cleanup(&path);
+}
