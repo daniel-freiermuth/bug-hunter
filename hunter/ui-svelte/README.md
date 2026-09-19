@@ -1,47 +1,61 @@
-# Svelte + TS + Vite
+# hunter UI
 
-This template should help get you started developing with Svelte and TypeScript in Vite.
+Svelte 5 frontend for the hunter daemon. Replaces the hand-rolled
+TypeScript app that previously lived in `../ui/src/app.ts`.
 
-## Recommended IDE Setup
+## Layout
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode).
+| Path | Contents |
+| --- | --- |
+| `src/pages/` | One component per nav page: Status, Inbox, Kanban, All Findings, Repos, Stats, Log |
+| `src/components/` | Shared widgets: `FilterBar`, `FindingCard`, `FindingDetail`, `MultiSelect` |
+| `src/lib/api.svelte.ts` | Polling store and the `post()` helper (sets `Content-Type`, which the server's POST gate requires) |
+| `src/lib/types.ts` | Hand-maintained mirror of the server's JSON shapes — see `hunter-rs/API-CONTRACT.md` |
+| `src/lib/format.ts` | Timestamp, duration and token formatting |
 
-## Need an official Svelte framework?
+State uses runes (`$state`, `$derived`, `$effect`). Reactive collections
+are `SvelteMap`/`SvelteSet` and must be **mutated in place** — replacing
+the instance breaks fine-grained invalidation.
 
-Check out [SvelteKit](https://github.com/sveltejs/kit#readme), which is also powered by Vite. Deploy anywhere with its serverless-first approach and adapt to various platforms, with out of the box support for TypeScript, SCSS, and Less, and easily-added support for mdsvex, GraphQL, PostCSS, Tailwind CSS, and more.
+## Develop
 
-## Technical considerations
-
-**Why use this over SvelteKit?**
-
-- It brings its own routing solution which might not be preferable for some users.
-- It is first and foremost a framework that just happens to use Vite under the hood, not a Vite app.
-
-This template contains as little as possible to get started with Vite + TypeScript + Svelte, while taking into account the developer experience with regards to HMR and intellisense. It demonstrates capabilities on par with the other `create-vite` templates and is a good starting point for beginners dipping their toes into a Vite + Svelte project.
-
-Should you later need the extended capabilities and extensibility provided by SvelteKit, the template has been structured similarly to SvelteKit so that it is easy to migrate.
-
-**Why `global.d.ts` instead of `compilerOptions.types` inside `jsconfig.json` or `tsconfig.json`?**
-
-Setting `compilerOptions.types` shuts out all other types not explicitly listed in the configuration. Using triple-slash references keeps the default TypeScript setting of accepting type information from the entire workspace, while also adding `svelte` and `vite/client` type information.
-
-**Why include `.vscode/extensions.json`?**
-
-Other templates indirectly recommend extensions via the README, but this file allows VS Code to prompt the user to install the recommended extension upon opening the project.
-
-**Why enable `allowJs` in the TS template?**
-
-While `allowJs: false` would indeed prevent the use of `.js` files in the project, it does not prevent the use of JavaScript syntax in `.svelte` files. In addition, it would force `checkJs: false`, bringing the worst of both worlds: not being able to guarantee the entire codebase is TypeScript, and also having worse typechecking for the existing JavaScript. In addition, there are valid use cases in which a mixed codebase may be relevant.
-
-**Why is HMR not preserving my local component state?**
-
-HMR state preservation comes with a number of gotchas! It has been disabled by default in both `svelte-hmr` and `@sveltejs/vite-plugin-svelte` due to its often surprising behavior. You can read the details [here](https://github.com/rixo/svelte-hmr#svelte-hmr).
-
-If you have state that's important to retain within a component, consider creating an external store which would not be replaced by HMR.
-
-```ts
-// store.ts
-// An extremely simple external store
-import { writable } from 'svelte/store'
-export default writable(0)
+```sh
+npm install
+npm run dev
 ```
+
+The dev server proxies `/api` to the Rust daemon on `127.0.0.1:8377`
+(`vite.config.ts`), so start the backend alongside it:
+
+```sh
+cd ../../hunter-rs && cargo run -- --root ../hunter
+```
+
+The binary has a single mode: it takes the lockfile, runs migrations and
+runs the scheduler loop, so only one instance can own a given `--root`.
+
+## Validate
+
+```sh
+npm run check
+```
+
+Runs `svelte-check` against `tsconfig.app.json` plus `tsc` on the Vite
+config. CI runs this, ESLint and the production build.
+
+> A bare `npx svelte-check` checks almost nothing here: the root
+> `tsconfig.json` is a project-references stub with `files: []`, so none
+> of the app's compiler options apply. Always go through `npm run check`
+> or pass `--tsconfig ./tsconfig.app.json` explicitly.
+
+## Build
+
+```sh
+npm run build
+```
+
+Vite writes to `../ui/` (`emptyOutDir: true`), which the Rust binary
+serves as static files. **The build output is committed**, because the
+daemon ships as a single binary beside a directory of static files with
+no node toolchain on the target host — so rebuild and commit `../ui/`
+whenever you change anything here.

@@ -9,10 +9,16 @@
   let loading = $state(true);
   let error = $state(false);
 
+  // Guards against a stale in-flight response clobbering a newer one when
+  // findingId changes mid-fetch: only the latest generation may write state.
+  let generation = 0;
+
   async function load() {
+    const gen = ++generation;
     loading = true;
     error = false;
     const d = await store.fetchFindingDetail(findingId);
+    if (gen !== generation) return;
     if (d) {
       detail = d;
     } else {
@@ -50,7 +56,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each detail.jobs as job (job.kind)}
+            {#each detail.jobs as job (job.id)}
               <tr>
                 <td>{job.kind}</td>
                 <td>

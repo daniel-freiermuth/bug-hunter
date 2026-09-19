@@ -22,35 +22,46 @@
   let newBranch = $state("main");
   let newForge = $state("");
 
-  // Notes panel: which repo id is expanded
-  let expandedNotes = new SvelteSet<number>();
-  let notesContent = new SvelteMap<number, string>();
-  let notesLoading = new SvelteSet<number>();
+  // Notes panel: which repo id is expanded. These reactive collections are
+  // mutated in place — replacing the instance drops fine-grained invalidation.
+  const expandedNotes = new SvelteSet<number>();
+  const notesContent = new SvelteMap<number, string>();
+  const notesLoading = new SvelteSet<number>();
 
   // New note form per repo
-  let newNoteText = new SvelteMap<number, string>();
-  let newNoteCategory = new SvelteMap<number, string>();
+  const newNoteText = new SvelteMap<number, string>();
+  const newNoteCategory = new SvelteMap<number, string>();
 
   let repos = $derived(store.summary?.repos ?? []);
 
   async function toggleRepo(repo: Repo) {
     const enabled = repo.enabled ? 0 : 1;
-    const r = await post("/api/repo", { id: repo.id, enabled });
-    if (r.status === 200) {
-      toast(`${repo.name} ${enabled ? "enabled" : "paused"}`, true);
-      store.refresh();
-    } else {
+    try {
+      const r = await post("/api/repo", { id: repo.id, enabled });
+      if (r.ok) {
+        toast(`${repo.name} ${enabled ? "enabled" : "paused"}`, true);
+        store.refresh();
+      } else {
+        toast(`Failed to toggle ${repo.name}`, false);
+      }
+    } catch (err) {
+      console.error(`toggle repo ${repo.name} (id ${repo.id}) failed`, err);
       toast(`Failed to toggle ${repo.name}`, false);
     }
   }
 
   async function removeRepo(repo: Repo) {
     if (!confirm(`Remove repo "${repo.name}"? This cannot be undone.`)) return;
-    const r = await post("/api/repo/delete", { id: repo.id });
-    if (r.status === 200) {
-      toast(`Removed ${repo.name}`, true);
-      store.refresh();
-    } else {
+    try {
+      const r = await post("/api/repo/delete", { id: repo.id });
+      if (r.ok) {
+        toast(`Removed ${repo.name}`, true);
+        store.refresh();
+      } else {
+        toast(`Failed to remove ${repo.name}`, false);
+      }
+    } catch (err) {
+      console.error(`remove repo ${repo.name} (id ${repo.id}) failed`, err);
       toast(`Failed to remove ${repo.name}`, false);
     }
   }
@@ -66,38 +77,43 @@
       branch: newBranch.trim() || "main",
     };
     if (newForge) body.forge = newForge;
-    const r = await post("/api/repos", body);
-    if (r.status === 201) {
-      toast(`Added ${newName}`, true);
-      newName = "";
-      newUrl = "";
-      newBranch = "main";
-      newForge = "";
-      store.refresh();
-    } else {
+    try {
+      const r = await post("/api/repos", body);
+      if (r.ok) {
+        toast(`Added ${newName}`, true);
+        newName = "";
+        newUrl = "";
+        newBranch = "main";
+        newForge = "";
+        store.refresh();
+      } else {
+        toast("Failed to add repo", false);
+      }
+    } catch (err) {
+      console.error(`add repo ${newUrl.trim()} failed`, err);
       toast("Failed to add repo", false);
     }
   }
 
   async function toggleNotes(repoId: number) {
     if (expandedNotes.has(repoId)) {
-      const next = new SvelteSet(expandedNotes);
-      next.delete(repoId);
-      expandedNotes = next;
+      expandedNotes.delete(repoId);
       return;
     }
     // Lazy-load notes
     if (!notesContent.has(repoId)) {
-      notesLoading = new SvelteSet([...notesLoading, repoId]);
-      const notes = await store.fetchRepoNotes(repoId);
-      const m = new SvelteMap(notesContent);
-      m.set(repoId, notes);
-      notesContent = m;
-      const s = new SvelteSet(notesLoading);
-      s.delete(repoId);
-      notesLoading = s;
+      notesLoading.add(repoId);
+      try {
+        notesContent.set(repoId, await store.fetchRepoNotes(repoId));
+      } catch (err) {
+        console.error(`load notes for repo ${repoId} failed`, err);
+        toast("Failed to load notes", false);
+        return;
+      } finally {
+        notesLoading.delete(repoId);
+      }
     }
-    expandedNotes = new SvelteSet([...expandedNotes, repoId]);
+    expandedNotes.add(repoId);
   }
 
   async function addNote(repoId: number) {
@@ -107,28 +123,32 @@
       return;
     }
     const category = newNoteCategory.get(repoId)?.trim() || null;
-    const r = await post("/api/repo/notes", {
-      id: repoId,
-      note: text,
-      ...(category ? { category } : {}),
-    });
-    if (r.status === 200) {
-      toast("Note added", true);
-      // Clear form
-      const tm = new SvelteMap(newNoteText);
-      tm.delete(repoId);
-      newNoteText = tm;
-      const cm = new SvelteMap(newNoteCategory);
-      cm.delete(repoId);
-      newNoteCategory = cm;
-      // Invalidate cache and reload
-      store.repoNotesCache.delete(repoId);
-      const notes = await store.fetchRepoNotes(repoId);
-      const m = new SvelteMap(notesContent);
-      m.set(repoId, notes);
-      notesContent = m;
-    } else {
+    try {
+      const r = await post("/api/repo/notes", {
+        id: repoId,
+        note: text,
+        ...(category ? { category } : {}),
+      });
+      if (!r.ok) {
+        toast("Failed to add note", false);
+        return;
+      }
+    } catch (err) {
+      console.error(`add note to repo ${repoId} failed`, err);
       toast("Failed to add note", false);
+      return;
+    }
+    toast("Note added", true);
+    // Clear form
+    newNoteText.delete(repoId);
+    newNoteCategory.delete(repoId);
+    // Invalidate cache and reload
+    store.repoNotesCache.delete(repoId);
+    try {
+      notesContent.set(repoId, await store.fetchRepoNotes(repoId));
+    } catch (err) {
+      console.error(`reload notes for repo ${repoId} failed`, err);
+      toast("Note saved, but reloading notes failed", false);
     }
   }
 </script>
@@ -276,9 +296,7 @@
                       placeholder="Add a note…"
                       value={newNoteText.get(repo.id) ?? ""}
                       oninput={(e: Event) => {
-                        const m = new SvelteMap(newNoteText);
-                        m.set(repo.id, (e.target as HTMLTextAreaElement).value);
-                        newNoteText = m;
+                        newNoteText.set(repo.id, (e.target as HTMLTextAreaElement).value);
                       }}
                       class="note-input"
                     ></textarea>
@@ -288,9 +306,7 @@
                         placeholder="Category (optional)"
                         value={newNoteCategory.get(repo.id) ?? ""}
                         oninput={(e: Event) => {
-                          const m = new SvelteMap(newNoteCategory);
-                          m.set(repo.id, (e.target as HTMLInputElement).value);
-                          newNoteCategory = m;
+                          newNoteCategory.set(repo.id, (e.target as HTMLInputElement).value);
                         }}
                         class="note-category"
                       />

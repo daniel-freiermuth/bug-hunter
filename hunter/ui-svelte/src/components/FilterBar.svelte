@@ -2,6 +2,7 @@
   import type { Finding } from "../lib/types";
   import { SEV_RANK } from "../lib/format";
   import { SvelteSet } from "svelte/reactivity";
+  import { absorb, needsSelector, reselect } from "../lib/selection";
   import MultiSelect from "./MultiSelect.svelte";
 
   let {
@@ -26,35 +27,46 @@
   const statuses = $derived([...new Set(findings.map((f) => f.status))].sort());
 
   // -- Filter selections (Svelte 5 runes) -----------------------------------
-  let selectedRepos = new SvelteSet<string>();
-  let selectedTypes = new SvelteSet<string>();
-  let selectedCategories = new SvelteSet<string>();
-  let selectedSeverities = new SvelteSet<string>();
-  let selectedStatuses = new SvelteSet<string>();
+  // `const`, mutated in place: a SvelteSet is itself the reactive value, so
+  // it needs no `$state` wrapper and must never be reassigned.
+  const selectedRepos = new SvelteSet<string>();
+  const selectedTypes = new SvelteSet<string>();
+  const selectedCategories = new SvelteSet<string>();
+  const selectedSeverities = new SvelteSet<string>();
+  const selectedStatuses = new SvelteSet<string>();
   let minConfidence = $state(0);
   let sortBy = $state("severity");
 
-  // Initialize selections with all options on first render.
-  // After that, user controls everything — new options from data changes
-  // are added automatically so they don't silently hide.
-  let seeded = false;
+  // Options this component has ever seen, per dimension. An option showing
+  // up for the first time is selected automatically so new data cannot
+  // silently hide itself; an option the user deselected is already known,
+  // so it is never re-added behind their back. (A repo label changing from
+  // "unknown" to its real name is simply a new option, and is absorbed.)
+  const known = {
+    repos: new Set<string>(),
+    types: new Set<string>(),
+    categories: new Set<string>(),
+    severities: new Set<string>(),
+    statuses: new Set<string>(),
+  };
+
+  // absorb / reselect / needsSelector live in lib/selection.ts, shared
+  // with MultiSelect and pinned by lib/selection.test.ts.
+
   $effect(() => {
-    if (!seeded && repos.length > 0) {
-      seeded = true;
-      selectedRepos = new SvelteSet(repos);
-      selectedTypes = new SvelteSet(types);
-      selectedCategories = new SvelteSet(categories);
-      selectedSeverities = new SvelteSet(severities);
-      if (showStatus) selectedStatuses = new SvelteSet(statuses);
-    }
+    absorb(repos, known.repos, selectedRepos);
+    absorb(types, known.types, selectedTypes);
+    absorb(categories, known.categories, selectedCategories);
+    absorb(severities, known.severities, selectedSeverities);
+    if (showStatus) absorb(statuses, known.statuses, selectedStatuses);
   });
 
   export function clearFilters() {
-    selectedRepos = new SvelteSet(repos);
-    selectedTypes = new SvelteSet(types);
-    selectedCategories = new SvelteSet(categories);
-    selectedSeverities = new SvelteSet(severities);
-    if (showStatus) selectedStatuses = new SvelteSet(statuses);
+    reselect(selectedRepos, repos);
+    reselect(selectedTypes, types);
+    reselect(selectedCategories, categories);
+    reselect(selectedSeverities, severities);
+    if (showStatus) reselect(selectedStatuses, statuses);
     minConfidence = 0;
   }
 
@@ -110,24 +122,24 @@
 </script>
 
 <div class="filter-bar">
-  {#if repos.length > 1}
-    <MultiSelect label="Repo" options={repos} bind:selected={selectedRepos} />
+  {#if needsSelector(repos, selectedRepos)}
+    <MultiSelect label="Repo" options={repos} selected={selectedRepos} />
   {/if}
 
-  {#if types.length > 1}
-    <MultiSelect label="Type" options={types} bind:selected={selectedTypes} />
+  {#if needsSelector(types, selectedTypes)}
+    <MultiSelect label="Type" options={types} selected={selectedTypes} />
   {/if}
 
-  {#if categories.length > 1}
-    <MultiSelect label="Class" options={categories} bind:selected={selectedCategories} />
+  {#if needsSelector(categories, selectedCategories)}
+    <MultiSelect label="Class" options={categories} selected={selectedCategories} />
   {/if}
 
-  {#if severities.length > 1}
-    <MultiSelect label="Severity" options={severities} bind:selected={selectedSeverities} />
+  {#if needsSelector(severities, selectedSeverities)}
+    <MultiSelect label="Severity" options={severities} selected={selectedSeverities} />
   {/if}
 
-  {#if showStatus && statuses.length > 1}
-    <MultiSelect label="Status" options={statuses} bind:selected={selectedStatuses} />
+  {#if showStatus && needsSelector(statuses, selectedStatuses)}
+    <MultiSelect label="Status" options={statuses} selected={selectedStatuses} />
   {/if}
 
   <div class="control">

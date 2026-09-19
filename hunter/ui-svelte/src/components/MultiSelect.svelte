@@ -1,10 +1,11 @@
 <script lang="ts">
   import { SvelteSet } from "svelte/reactivity";
+  import * as sel from "../lib/selection";
 
   let {
     label,
     options,
-    selected = $bindable(new SvelteSet<string>()),
+    selected,
   }: {
     label: string;
     options: string[];
@@ -14,34 +15,37 @@
   let open = $state(false);
   let container: HTMLDivElement | undefined = $state();
 
-  const allSelected = $derived(selected.size === options.length);
-  const noneSelected = $derived(selected.size === 0);
+  // Membership, not size -- see lib/selection.ts for why `selected` is not
+  // a subset of `options`. Pinned by lib/selection.test.ts.
+  const allSelected = $derived(sel.allSelected(options, selected));
+  const noneSelected = $derived(sel.noneSelected(options, selected));
   const filtering = $derived(!allSelected);
 
   // Trigger label: show what's selected when filtering.
   const triggerLabel = $derived.by(() => {
     if (!filtering) return label;
-    if (selected.size === 0) return `${label}: none`;
+    if (noneSelected) return `${label}: none`;
     const names = options.filter(o => selected.has(o));
     const joined = names.join(", ");
     if (names.length <= 3 && joined.length <= 30) return joined;
     return `${label} (${names.length})`;
   });
 
+  // Mutate the set in place, never reassign it: the SvelteSet instance is
+  // itself the reactive value, so replacing it costs the parent its
+  // subscription and forces a redundant `$state` wrapper on every caller.
   function toggle(value: string) {
-    const next = new SvelteSet(selected);
-    if (next.has(value)) next.delete(value);
-    else next.add(value);
-    selected = next;
+    if (selected.has(value)) selected.delete(value);
+    else selected.add(value);
   }
 
   function toggleAll() {
     if (allSelected) {
       // All checked → clear everything.
-      selected = new SvelteSet();
+      selected.clear();
     } else {
       // Unchecked or indeterminate → select all.
-      selected = new SvelteSet(options);
+      for (const option of options) selected.add(option);
     }
   }
 
