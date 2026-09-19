@@ -37,6 +37,18 @@ def _always_fails(_store: Store, _cfg: Config, _repo: Row, _backend: object) -> 
     return {"kind": "test_gap", "error": "simulated persistent failure"}
 
 
+def _done_without_ingest(_store: Store, _cfg: Config, _repo: Row, _backend: object) -> Row:
+    return {"kind": "test_gap", "state": "done"}
+
+
+def _done_with_invalid_ingest(_store: Store, _cfg: Config, _repo: Row, _backend: object) -> Row:
+    return {
+        "kind": "test_gap",
+        "state": "done",
+        "ingest": {"inserted": 0, "duplicates": 0, "invalid": 1},
+    }
+
+
 class TestJobRotationStarvation:
     def test_persistent_failure_does_not_monopolize_the_rotation(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -78,3 +90,75 @@ class TestJobRotationStarvation:
             f" starvation bug reproduced: kind={kind2!r}"
         )
         assert kind2 == "dep_update", kind2
+
+    def test_done_without_ingest_does_not_monopolize_the_rotation(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker that finishes 'done' but produces no ingestable output
+        (no 'ingest' key at all) must still bump last_test_gap_at -- this
+        is the anti-starvation safety net, distinct from _run_analysis_job's
+        own success-gated timestamp update which governs normal retry
+        cadence for THIS kind."""
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        rid = store.add_repo("r", "https://r", str(repo_path))
+        store.db.execute(
+            "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
+            " last_dep_update_at=?, last_refactor_at=?, last_modernization_at=? WHERE id=?",
+            (5000, 1000, 3000, 4000, scheduler.now_ms() + 999_999, rid),
+        )
+        store.db.commit()
+
+        fake_runners = {**scheduler._RUNNERS, "test_gap": _done_without_ingest}
+        monkeypatch.setattr(scheduler, "_RUNNERS", fake_runners)
+
+        result1 = run_cycle(store, cfg, backend=object())
+        assert result1.get("kind") == "test_gap", result1
+
+        after1 = store.get_repo(rid)
+        assert after1 is not None
+        assert after1["last_test_gap_at"] > 1000, (
+            "done-without-output must still bump last_test_gap_at, or this"
+            " kind keeps winning min()-based fairness forever"
+        )
+
+        kind2, _target2 = pick_next(store, cfg)
+        assert kind2 != "test_gap", (
+            f"test_gap was re-selected again immediately after producing no"
+            f" output -- starvation bug reproduced: kind={kind2!r}"
+        )
+
+    def test_invalid_ingestion_does_not_monopolize_the_rotation(
+        self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A worker that finishes 'done' with output, but every candidate is
+        rejected as invalid, must still bump last_test_gap_at for the same
+        anti-starvation reason."""
+        repo_path = tmp_path / "repo"
+        repo_path.mkdir()
+        rid = store.add_repo("r", "https://r", str(repo_path))
+        store.db.execute(
+            "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
+            " last_dep_update_at=?, last_refactor_at=?, last_modernization_at=? WHERE id=?",
+            (5000, 1000, 3000, 4000, scheduler.now_ms() + 999_999, rid),
+        )
+        store.db.commit()
+
+        fake_runners = {**scheduler._RUNNERS, "test_gap": _done_with_invalid_ingest}
+        monkeypatch.setattr(scheduler, "_RUNNERS", fake_runners)
+
+        result1 = run_cycle(store, cfg, backend=object())
+        assert result1.get("kind") == "test_gap", result1
+
+        after1 = store.get_repo(rid)
+        assert after1 is not None
+        assert after1["last_test_gap_at"] > 1000, (
+            "fully-invalid ingestion must still bump last_test_gap_at, or"
+            " this kind keeps winning min()-based fairness forever"
+        )
+
+        kind2, _target2 = pick_next(store, cfg)
+        assert kind2 != "test_gap", (
+            f"test_gap was re-selected again immediately after an invalid"
+            f" ingestion -- starvation bug reproduced: kind={kind2!r}"
+        )

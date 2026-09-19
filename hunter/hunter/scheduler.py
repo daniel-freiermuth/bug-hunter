@@ -722,8 +722,8 @@ def run_dep_update(store: Store, cfg: Config, repo: Row, backend: Backend) -> Ro
     candidates = scan_repo(rpath, rname)
 
     if candidates is None:
-        # Renovate found nothing or failed — fall back to AI
-        log.info("dep_update %s: renovate returned 0 candidates, falling back to AI", rname)
+        # Renovate exited unsuccessfully without output — fall back to AI
+        log.info("dep_update %s: renovate failed without output, falling back to AI", rname)
         return _run_analysis_job(store, cfg, repo, _DEP_UPDATE_SPEC, backend)
 
     # Write candidates to a temp file and ingest via the standard path
@@ -1975,6 +1975,8 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None, *, backe
                 result.get("state") in ("killed", "failed")
                 or result.get("error")
                 or result.get("ingest_error")
+                or (result.get("ingest") or {}).get("invalid", 0) > 0
+                or ("ingest" not in result and result.get("state") == "done")
             )
             if failed:
                 sql = f"UPDATE repos SET last_{kind}_at = ? WHERE id = ?"  # noqa: S608

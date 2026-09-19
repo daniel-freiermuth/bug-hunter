@@ -1414,7 +1414,14 @@ async function refresh(): Promise<void> {
       ) {
         // Target exists but is hidden by filters — clear af filters
         for (const suffix of ["Status", "Repo", "Type", "Class", "Sev"]) {
-          filterState.delete(`af${suffix}`);
+          const gid = `af${suffix}`;
+          filterState.delete(gid);
+          const grp = document.querySelector(`[data-filter-id="${gid}"]`);
+          for (const cb of grp?.querySelectorAll<HTMLInputElement>('input[type="checkbox"]') ?? []) {
+            cb.checked = true;
+            cb.indeterminate = false;
+          }
+          syncAllBox(gid);
         }
       }
     }
