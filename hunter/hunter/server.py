@@ -16,11 +16,14 @@ import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar, cast
 from urllib.parse import parse_qs, urlparse
 
-from .budget import _RAMP_MS
+from .backends.omp_scavenge.capacity import _RAMP_MS
 from .types import FINDING_STATUSES, REASON_REQUIRED, UI_DIR, VERDICT_STATUSES, Config, Row
+
+if TYPE_CHECKING:
+    from .backend import Backend
 
 log = logging.getLogger(__name__)
 
@@ -134,10 +137,10 @@ class Handler(BaseHTTPRequestHandler):
             self._error(500, "internal error")
 
     def _summary(self) -> Row:
-        from . import budget
+        from .backends.omp_scavenge import capacity
 
         windows: Row = {}
-        for limit_id, w in budget.read_windows().items():
+        for limit_id, w in capacity.read_windows().items():
             windows[limit_id] = {
                 "used_fraction": w.used_fraction,
                 "status": w.status,
@@ -268,7 +271,9 @@ class Handler(BaseHTTPRequestHandler):
 
                 store = Store(cfg)
                 try:
-                    scheduler.run_cycle(store, cfg)
+                    scheduler.run_cycle(
+                        store, cfg, backend=cast("Backend", cfg.make_backend(store))
+                    )
                 except Exception:
                     log.exception("cycle failed")
                     with contextlib.suppress(Exception):
@@ -453,7 +458,7 @@ def daemon(cfg: Config) -> None:  # noqa: PLR0912, PLR0915 (flat supervisor loop
     for sig in (_signal.SIGTERM, _signal.SIGINT):
         _signal.signal(sig, lambda *_args: stop.set())
 
-    from . import budget, scheduler
+    from . import scheduler
     from .store import Store
 
     while not stop.is_set():
@@ -462,7 +467,9 @@ def daemon(cfg: Config) -> None:  # noqa: PLR0912, PLR0915 (flat supervisor loop
             _wake.clear()
             try:
                 store = Store(cfg)
-                summary = scheduler.run_cycle(store, cfg)
+                summary = scheduler.run_cycle(
+                    store, cfg, backend=cast("Backend", cfg.make_backend(store))
+                )
                 if "error" in summary:
                     sleep_s = 5 * 60
                 elif summary.get("state") in (
@@ -474,7 +481,9 @@ def daemon(cfg: Config) -> None:  # noqa: PLR0912, PLR0915 (flat supervisor loop
                 elif summary.get("denied"):
                     # Sleep until the harvest window opens (HEADROOM into 5h window)
                     # or until a new window can be opened.
-                    w5 = budget.read_windows().get("anthropic:5h")
+                    from .backends.omp_scavenge import capacity
+
+                    w5 = capacity.read_windows().get("anthropic:5h")
                     if w5 and w5.resets_at:
                         harvest_at = (w5.resets_at - _RAMP_MS) / 1000
                         until_harvest = harvest_at - time.time()

@@ -9,16 +9,12 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from typing import Any, NotRequired, TypedDict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # .../hunter
-# Paths the master-era budget/runner modules read; they move into
-# backends/omp_scavenge/ when the Backend protocol lands.
-OMP_SESSIONS_DIR = Path.home() / ".omp/agent/sessions"
-OMP_AGENT_DB = Path.home() / ".omp/agent/agent.db"
 SCHEMA_PATH = PROJECT_ROOT / "schema.sql"
 PLAYBOOK_DIR = PROJECT_ROOT / "playbooks"
 UI_DIR = PROJECT_ROOT / "ui"
@@ -233,26 +229,18 @@ class Config:
             backend_type=raw.get("backend", {}).get("type", "omp-scavenge"),
         )
 
+    def make_backend(self, ledger: object) -> object:
+        """Construct the configured backend.  Returns a Backend instance.
 
-@dataclass
-class WindowState:
-    limit_id: str
-    used_fraction: float | None
-    status: str | None  # ok | exhausted | ...
-    resets_at: int | None  # epoch ms
-    recorded_at: int  # epoch ms -- when omp probed it
-    age_s: float = field(default=0.0)
+        ``ledger`` must satisfy the backend's SpendLedger protocol (Store).
+        Import is deferred to avoid circular deps and to keep the types
+        module free of backend-package knowledge beyond the discriminator.
+        """
+        if self.backend_type == "omp-scavenge":
+            from .backends.omp_scavenge import OmpScavengeBackend  # noqa: PLC0415
 
-    @property
-    def stale(self) -> bool:
-        return self.age_s > 1800
-
-
-@dataclass
-class BudgetDecision:
-    allow: bool
-    reason: str
-    cap_tokens: int = 0  # effective per-job cap when allowed
+            return OmpScavengeBackend(cfg=self, ledger=ledger)  # type: ignore[arg-type]
+        raise ValueError(f"unknown backend_type: {self.backend_type!r}")
 
 
 @dataclass

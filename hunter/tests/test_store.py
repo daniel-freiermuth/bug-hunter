@@ -10,8 +10,9 @@ from typing import Any
 
 import pytest
 
+from hunter.backends.omp_scavenge.capacity import WindowState
 from hunter.store import Store, _require_keys
-from hunter.types import Config, SchedulerStateDict
+from hunter.types import Config, SchedulerStateDict, now_ms
 
 
 @pytest.fixture
@@ -494,6 +495,142 @@ class TestWindowLog:
         assert dict(rows[0])["limit_id"] == "anthropic:5h"
         assert dict(rows[1])["limit_id"] == "anthropic:7d"
         assert dict(rows[0])["source_age_s"] == 5
+
+
+# -- calibration -------------------------------------------------------
+
+
+class TestCalibration:
+    """Backend._observe calibration side effect and estimate_capacity."""
+
+    _RESETS_AT = 99_999_999_999
+
+    def _probe(self, used_fraction: float) -> WindowState:
+        return WindowState(
+            limit_id="anthropic:5h",
+            used_fraction=used_fraction,
+            status="ok",
+            resets_at=self._RESETS_AT,
+            recorded_at=1,
+            age_s=1.0,
+        )
+
+    def _observe(self, store: Store, probe: WindowState) -> None:
+        """Simulate backend._observe for a single probe."""
+        from hunter.backends.omp_scavenge.facade import OmpScavengeBackend  # noqa: PLC0415
+
+        cfg = Config(work_root=Path("/tmp"), db_path=Path("/tmp/test.db"))
+        backend = OmpScavengeBackend(cfg=cfg, ledger=store)
+        backend._observe({"anthropic:5h": probe})
+
+    def test_first_probe_records_no_sample(self, store: Store) -> None:
+        """Nothing to compare against yet -- no prior row for this window."""
+        self._observe(store, self._probe(0.10))
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_fresh_probe_with_hunter_spend_records_a_sample(self, store: Store) -> None:
+        rid = store.add_repo("r", "https://r", "/r")
+        self._observe(store, self._probe(0.10))
+        time.sleep(0.02)
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
+        time.sleep(0.02)
+        self._observe(store, self._probe(0.20))
+
+        rows = store.db.execute("SELECT * FROM calibration_samples").fetchall()
+        assert len(rows) == 1
+        row = dict(rows[0])
+        assert row["limit_id"] == "anthropic:5h"
+        assert row["hunter_tokens"] == 500_000
+        assert row["used_fraction_delta"] == pytest.approx(0.10)
+        assert row["window_resets_at"] == self._RESETS_AT
+
+    def test_unchanged_used_fraction_records_no_sample(self, store: Store) -> None:
+        """A re-read of the same stale probe (used_fraction didn't move)
+        must not fabricate a sample out of noise."""
+        rid = store.add_repo("r", "https://r", "/r")
+        self._observe(store, self._probe(0.10))
+        time.sleep(0.02)
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
+        time.sleep(0.02)
+        self._observe(store, self._probe(0.10))  # same fraction -- no fresh probe
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_no_hunter_spend_records_no_sample(self, store: Store) -> None:
+        """used_fraction moved but hunter didn't run anything in the gap
+        (e.g. a human's own interactive usage) -- nothing attributable."""
+        self._observe(store, self._probe(0.10))
+        time.sleep(0.02)
+        self._observe(store, self._probe(0.20))
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_different_window_instance_not_compared(self, store: Store) -> None:
+        """A genuinely new window (different resets_at) must not be
+        diffed against the previous instance's used_fraction."""
+        rid = store.add_repo("r", "https://r", "/r")
+        self._observe(store, self._probe(0.90))  # old window, nearly full
+        time.sleep(0.02)
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=500_000, finished_at=now_ms())
+        time.sleep(0.02)
+        fresh = WindowState(
+            limit_id="anthropic:5h",
+            used_fraction=0.05,
+            status="ok",
+            resets_at=self._RESETS_AT + 6 * 3600 * 1000,
+            recorded_at=1,
+            age_s=1.0,
+        )
+        self._observe(store, fresh)
+        assert store.db.execute("SELECT COUNT(*) c FROM calibration_samples").fetchone()["c"] == 0
+
+    def test_estimate_capacity_no_data_returns_none(self, store: Store) -> None:
+        assert store.estimate_capacity("anthropic:5h") is None
+
+    def test_estimate_capacity_returns_max_spend_per_cycle(self, store: Store) -> None:
+        """Capacity = max tokens hunter spent in any single window cycle."""
+        now = now_ms()
+        rid = store.add_repo("r", "https://r", "/r")
+        five_h = 5 * 3600 * 1000
+        # Two completed 5h cycles with different spend levels
+        resets1 = now - five_h  # one cycle ago
+        resets2 = now - 2 * five_h  # two cycles ago
+        for ra in (resets1, resets2):
+            store.db.execute(
+                "INSERT INTO window_log (observed_at, limit_id,"
+                " used_fraction, status, resets_at, source_age_s)"
+                " VALUES (?, 'anthropic:5h', 0.5, 'ok', ?, 60)",
+                (ra - 1000, ra),
+            )
+        # Cycle 1: 500k tokens
+        jid1 = store.create_job("hunt", rid)
+        store.update_job(jid1, state="done", tokens_new=500_000, finished_at=resets1 - 1000)
+        # Cycle 2: 2M tokens (the max)
+        jid2 = store.create_job("hunt", rid)
+        store.update_job(jid2, state="done", tokens_new=2_000_000, finished_at=resets2 - 1000)
+        store.db.commit()
+
+        cap = store.estimate_capacity("anthropic:5h")
+        assert cap == 2_000_000  # max of the two cycles
+
+    def test_estimate_capacity_scoped_by_limit_id(self, store: Store) -> None:
+        """5h and 7d use separate window_log entries."""
+        now = now_ms()
+        rid = store.add_repo("r", "https://r", "/r")
+        resets = now - 7 * 24 * 3600 * 1000
+        store.db.execute(
+            "INSERT INTO window_log (observed_at, limit_id,"
+            " used_fraction, status, resets_at, source_age_s)"
+            " VALUES (?, 'anthropic:7d', 0.5, 'ok', ?, 60)",
+            (resets - 1000, resets),
+        )
+        jid = store.create_job("hunt", rid)
+        store.update_job(jid, state="done", tokens_new=1_000_000, finished_at=resets - 500)
+        store.db.commit()
+
+        assert store.estimate_capacity("anthropic:5h") is None  # no 5h cycles
+        assert store.estimate_capacity("anthropic:7d") == 1_000_000
 
 
 # -- update_finding_analysis -----------------------------------------------

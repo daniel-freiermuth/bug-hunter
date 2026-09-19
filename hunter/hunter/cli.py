@@ -7,10 +7,14 @@ import json
 import logging
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 from .ingest import ingest_findings
 from .store import Store
 from .types import REASON_REQUIRED, VERDICT_STATUSES, Config, Row
+
+if TYPE_CHECKING:
+    from .backend import Backend
 
 
 def _fmt(rows: list[Row], cols: list[str]) -> None:
@@ -192,7 +196,12 @@ def cmd_hunt(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     from .scheduler import run_hunt
 
     repo = _repo_or_die(store, args.repo)
-    print(json.dumps(run_hunt(store, cfg, repo, force=args.force), default=str))
+    print(
+        json.dumps(
+            run_hunt(store, cfg, repo, cast("Backend", cfg.make_backend(store)), force=args.force),
+            default=str,
+        )
+    )
 
 
 def cmd_fix(store: Store, cfg: Config, args: argparse.Namespace) -> None:
@@ -201,7 +210,11 @@ def cmd_fix(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     finding = store.get_finding(args.fid)
     if finding is None:
         sys.exit(f"error: no finding #{args.fid}")
-    print(json.dumps(run_fix(store, cfg, finding), default=str))
+    print(
+        json.dumps(
+            run_fix(store, cfg, finding, cast("Backend", cfg.make_backend(store))), default=str
+        )
+    )
 
 
 def cmd_recheck(store: Store, cfg: Config, args: argparse.Namespace) -> None:
@@ -210,14 +223,25 @@ def cmd_recheck(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     finding = store.get_finding(args.fid)
     if finding is None:
         sys.exit(f"error: no finding #{args.fid}")
-    print(json.dumps(run_recheck(store, cfg, finding), default=str))
+    print(
+        json.dumps(
+            run_recheck(store, cfg, finding, cast("Backend", cfg.make_backend(store))), default=str
+        )
+    )
 
 
 def cmd_cycle(store: Store, cfg: Config, args: argparse.Namespace) -> None:
     from .scheduler import run_cycle
 
     force_repo = _repo_or_die(store, args.repo)["name"] if args.repo else None
-    print(json.dumps(run_cycle(store, cfg, force_repo=force_repo), default=str))
+    print(
+        json.dumps(
+            run_cycle(
+                store, cfg, force_repo=force_repo, backend=cast("Backend", cfg.make_backend(store))
+            ),
+            default=str,
+        )
+    )
 
 
 def cmd_sync(store: Store, cfg: Config, args: argparse.Namespace) -> None:
