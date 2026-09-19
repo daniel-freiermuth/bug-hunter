@@ -2595,7 +2595,56 @@ pub async fn run_engage(
         let reason = std::fs::read_to_string(&withdraw).unwrap_or_default();
         if fg.owner_repo(&repo.url).is_some() {
             let comment: String = reason.chars().take(800).collect();
-            let _ = fg.close_pr(&repo.url, pr_number, &comment);
+            if let Err(err) = fg.close_pr(&repo.url, pr_number, &comment) {
+                // close_pr posts the withdrawal reason and only then closes,
+                // so a failure here means the PR is still OPEN on the forge.
+                // Recording the verdict anyway would mark it closed locally
+                // and set the finding Rejected -- and sync_prs only revisits
+                // pr_open findings, so nothing would ever reconcile it.
+                //
+                // Leaving the finding untouched is not enough either: it
+                // stays in list_attention, which pick_next ranks second, so
+                // a persistently failing forge would monopolise every cycle
+                // running a fresh worker each time. Unlike fix/recheck/
+                // harvest there is no engage attempt counter to cap that.
+                // So mark THIS attention reason addressed, exactly as a
+                // reply-only engage does: the finding stops being re-picked
+                // until the PR sees genuinely new activity (the attention
+                // fingerprint or head_sha changes), and the error event
+                // below is what surfaces it in the meantime.
+                tracing::warn!(finding = fid, pr = pr_number, error = %err, "close_pr failed");
+                let _ = store
+                    .mark_pr_engaged(
+                        fid,
+                        ps.last_activity_at.unwrap_or_else(now_ms),
+                        now_ms(),
+                        ps.attention_fingerprint.as_deref(),
+                        ps.head_sha.as_deref(),
+                    )
+                    .await;
+                let _ = store
+                    .log_event(
+                        "error",
+                        &format!(
+                            "#{fid} withdrawal aborted: PR #{pr_number} could not be closed \
+                             (retries when the PR next changes)"
+                        ),
+                        Some(job),
+                        Some(fid),
+                    )
+                    .await;
+                let rps = rpath.to_string_lossy().to_string();
+                let wts = worktree.to_string_lossy().to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    run_cmd_sync(
+                        &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                        30,
+                    );
+                })
+                .await;
+                summary.outcome = Some("withdraw-failed".into());
+                return Ok(summary);
+            }
         }
         let reason_short: String = reason.chars().take(500).collect();
         let _ = store

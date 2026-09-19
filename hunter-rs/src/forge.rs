@@ -611,11 +611,12 @@ impl Forge for GitHubForge {
     }
 
     fn close_pr(&self, url: &str, pr_number: i64, comment: &str) -> anyhow::Result<()> {
-        // Post the withdrawal reason as a comment first, then close.
+        // Post the withdrawal reason as a comment first, then close. Only
+        // close once it lands — a lost reason must not become a silent close.
         // Truncate to 800 chars to avoid CLI arg-length limits.
         let truncated: String = comment.chars().take(800).collect();
         if !truncated.is_empty() {
-            let _ = self.comment_pr(url, pr_number, &truncated);
+            self.comment_pr(url, pr_number, &truncated)?;
         }
         let (owner, repo) = self
             .owner_repo(url)
@@ -774,9 +775,10 @@ impl Forge for GitLabForge {
     }
 
     fn close_pr(&self, url: &str, pr_number: i64, comment: &str) -> anyhow::Result<()> {
+        // Close only after the withdrawal reason has landed.
         let truncated: String = comment.chars().take(800).collect();
         if !truncated.is_empty() {
-            let _ = self.comment_pr(url, pr_number, &truncated);
+            self.comment_pr(url, pr_number, &truncated)?;
         }
         let (_, path) = gitlab_host_path(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
