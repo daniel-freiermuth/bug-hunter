@@ -309,12 +309,6 @@ function countdown(ms: number | null): string {
   return sign + (h ? h + "h" + String(m).padStart(2, "0") + "m" : m + "m");
 }
 
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
-  if (n >= 1_000) return Math.round(n / 1_000) + "k";
-  return String(Math.round(n));
-}
-
 function dur(j: Job): string {
   if (!j.started_at) return "\u2013";
   const end = j.finished_at || Date.now();
