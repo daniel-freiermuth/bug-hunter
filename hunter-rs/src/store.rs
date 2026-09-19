@@ -281,8 +281,9 @@ impl Store {
 }
 
 impl Store {
-    /// Open the live DB strictly read-only (round 1 must be physically
-    /// unable to write; the Python daemon owns the schema and the WAL).
+    /// Open the DB strictly read-only -- physically unable to write, so a
+    /// caller that must not mutate cannot. Used by the tests to assert a
+    /// read path touches nothing.
     pub async fn connect_read_only(db_path: &Path) -> anyhow::Result<Self> {
         let opts = SqliteConnectOptions::new()
             .filename(db_path)

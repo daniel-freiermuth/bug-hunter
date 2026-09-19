@@ -246,8 +246,8 @@ pub struct FindingDetail {
     pub pr_state: Option<PrState>,
 }
 
-/// /`api/summary.next_candidate`. Round 1 never constructs one (the Rust
-/// serve has no scheduler yet); the shape is fixed for round 2.
+/// /`api/summary.next_candidate` -- the job the scheduler would pick next,
+/// shown in the UI so a human can see what the budget gate is holding back.
 #[derive(Debug, Clone, Serialize)]
 pub struct NextCandidate {
     pub kind: JobKind,

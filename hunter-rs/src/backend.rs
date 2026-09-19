@@ -142,7 +142,7 @@ pub trait Backend: Send + Sync {
     async fn decide(&self, anticipated_tokens: i64) -> anyhow::Result<Outlook>;
     /// Refresh stale accounting, log observations, record calibration.
     /// Returns true iff a probe was performed. Called by the daemon's
-    /// prober tick (round 3) — the method itself is round 2.
+    /// prober tick.
     async fn keep_fresh(&self) -> anyhow::Result<bool>;
     /// Status HTML fragment for /`api/summary.backend_status_html`
     /// (innerHTML'd by the UI every 5 s; byte-parity spec in
