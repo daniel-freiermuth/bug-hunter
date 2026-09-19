@@ -1526,7 +1526,10 @@ def run_engage(store: Store, cfg: Config, finding: Row) -> Row:
 def run_cycle(store: Store, cfg: Config, force_repo: str | None = None) -> Row:
     try:
         windows = budget.read_windows()
-        store.log_window(list(windows.values()))
+        for w in windows.values():
+            store.log_window_observation(
+                w.limit_id, w.used_fraction, w.status, w.resets_at, w.age_s
+            )
 
         # (0) Cheap PR sync -- gh reads only, no tokens.
         sync: Row | None = sync_prs(store, cfg) if store.list_findings(status="pr_open") else None
