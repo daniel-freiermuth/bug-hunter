@@ -145,7 +145,9 @@ async fn read_windows_async(
 pub fn ramp_7d(resets_at: Option<i64>, now_ms: i64) -> f64 {
     match resets_at {
         None | Some(0) => 1.0,
-        Some(r) if r <= now_ms => 1.0, // expired
+        // An expired window needs no arm of its own: elapsed is then at
+        // least a full week, so the `.min(1.0)` below already returns 1.0.
+        // A guard here would be unfalsifiable — no input distinguishes it.
         Some(r) => {
             let elapsed = (now_ms - (r - WEEK_MS)) as f64;
             (elapsed / WEEK_MS as f64).min(1.0)

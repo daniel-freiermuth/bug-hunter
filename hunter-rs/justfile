@@ -19,8 +19,13 @@ lint:
 check:
     cargo check --all-targets
 
+# nextest-only: see .config/nextest.toml.
 test:
-    cargo test
+    cargo nextest run
+
+# Mutation-test one module: does the suite notice when it breaks?
+mutants FILE:
+    cargo mutants --test-tool nextest -j 4 --file {{FILE}}
 
 # Run the daemon against the local hunter/ root.
 run:
