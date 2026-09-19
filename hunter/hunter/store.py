@@ -111,6 +111,14 @@ def _require_keys[T](row: Row, *required: str, shape: type[T]) -> T:
 
 
 class Store:
+    # ThreadingHTTPServer spawns one Store per handler thread, each with
+    # its own SQLite connection.  A per-connection lock cannot serialize
+    # delete_repo()'s notes-file cleanup against a concurrent
+    # append_repo_note() on a different connection/thread -- both touch
+    # the same on-disk NOTES.md.  This lock is process-wide (class-level,
+    # shared by every Store instance) and guards that file's lifecycle.
+    _NOTES_LOCK: ClassVar[threading.Lock] = threading.Lock()
+
     def __init__(self, cfg: Config) -> None:  # noqa: PLR0915 (migration code)
         self.cfg = cfg
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -410,30 +418,36 @@ class Store:
                 "cannot delete without losing history; pause it instead"
             )
             raise ValueError(msg)
-        # Capture notes path before deleting the row.  SQLite can reuse
-        # INTEGER PRIMARY KEY ids, so a new repo could inherit stale notes.
-        # Delete the file while the DB row deletion is still uncommitted so
-        # we can rollback if file cleanup fails.
-        notes_path = self.cfg.work_root / "repos" / f"repo-{repo_id}" / "NOTES.md"
-        self.db.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
-        # Save notes content so we can restore if commit fails
-        notes_backup = None
-        try:
-            if notes_path.exists():
-                notes_backup = notes_path.read_bytes()
-                notes_path.unlink()
-        except OSError:
-            self.db.rollback()
-            raise
-        try:
-            self.db.commit()
-        except Exception:
-            self.db.rollback()
-            # Restore notes file if commit fails
-            if notes_backup is not None:
-                notes_path.parent.mkdir(parents=True, exist_ok=True)
-                notes_path.write_bytes(notes_backup)
-            raise
+        # Serialize against append_repo_note() on other threads/connections:
+        # both touch the same on-disk NOTES.md, and SQLite can reuse this
+        # repo_id after commit, so an interleaved append could recreate the
+        # file between our unlink and commit (or between commit and a
+        # would-be restore).
+        with self._NOTES_LOCK:
+            # Capture notes path before deleting the row.  SQLite can reuse
+            # INTEGER PRIMARY KEY ids, so a new repo could inherit stale notes.
+            # Delete the file while the DB row deletion is still uncommitted so
+            # we can rollback if file cleanup fails.
+            notes_path = self.cfg.work_root / "repos" / f"repo-{repo_id}" / "NOTES.md"
+            self.db.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
+            # Save notes content so we can restore if commit fails
+            notes_backup = None
+            try:
+                if notes_path.exists():
+                    notes_backup = notes_path.read_bytes()
+                    notes_path.unlink()
+            except OSError:
+                self.db.rollback()
+                raise
+            try:
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                # Restore notes file if commit fails
+                if notes_backup is not None:
+                    notes_path.parent.mkdir(parents=True, exist_ok=True)
+                    notes_path.write_bytes(notes_backup)
+                raise
 
     # -- repo notes ----------------------------------------------------
     def repo_notes_path(self, repo_id: int) -> Path:
@@ -467,23 +481,27 @@ class Store:
         """Append timestamped note to repo's NOTES.md."""
         from datetime import UTC, datetime  # noqa: PLC0415
 
-        p = self.repo_notes_path(repo_id)
-        p.parent.mkdir(parents=True, exist_ok=True)
+        # Serialize against delete_repo(): both touch the same NOTES.md,
+        # and validating repo_id here must not race a concurrent deletion
+        # that could otherwise let us recreate a just-deleted repo's file.
+        with self._NOTES_LOCK:
+            p = self.repo_notes_path(repo_id)
+            p.parent.mkdir(parents=True, exist_ok=True)
 
-        # If file doesn't exist, create with header
-        if not p.exists():
-            repo = self.get_repo(repo_id)
-            name = repo["name"] if repo else f"repo-{repo_id}"
-            today = datetime.now(tz=UTC).date()
-            header = f"# Notes: {name}\n\nLast updated: {today}\n\n"
-            p.write_text(header)
+            # If file doesn't exist, create with header
+            if not p.exists():
+                repo = self.get_repo(repo_id)
+                name = repo["name"] if repo else f"repo-{repo_id}"
+                today = datetime.now(tz=UTC).date()
+                header = f"# Notes: {name}\n\nLast updated: {today}\n\n"
+                p.write_text(header)
 
-        # Append note
-        with p.open("a") as f:
-            ts = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M")
-            if category:
-                f.write(f"## {category}\n")
-            f.write(f"- [{ts}] {note}\n\n")
+            # Append note
+            with p.open("a") as f:
+                ts = datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M")
+                if category:
+                    f.write(f"## {category}\n")
+                f.write(f"- [{ts}] {note}\n\n")
 
     # -- findings ------------------------------------------------------
     def upsert_finding(self, repo_id: int, f: Row, finding_type: str = "bug") -> tuple[int, bool]:

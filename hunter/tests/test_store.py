@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -103,6 +105,83 @@ class TestRepos:
 
     def test_delete_repo_missing_is_noop(self, store: Store) -> None:
         store.delete_repo(999)  # no rows affected, does not raise
+
+    def test_notes_lock_is_shared_across_store_instances(self, tmp_path: Path) -> None:
+        """ThreadingHTTPServer creates one Store (and one SQLite connection)
+        per handler thread. The notes-file lock must be class-level so it
+        actually serializes across those independent instances, not just
+        within a single instance/connection."""
+        cfg = Config(work_root=tmp_path, db_path=tmp_path / "test.db")
+        store1 = Store(cfg)
+        store2 = Store(cfg)
+        assert store1._NOTES_LOCK is store2._NOTES_LOCK
+
+    def test_delete_repo_blocks_concurrent_append_repo_note(self, tmp_path: Path) -> None:
+        """A delete_repo() in flight must block append_repo_note() on a
+        different Store/connection until the deletion resolves. Without
+        this, a racing append can recreate NOTES.md between delete_repo's
+        unlink and commit -- and since repos.id can be reused, that file
+        could later be read as a *new* repo's notes.
+
+        Mirrors ThreadingHTTPServer: each handler thread gets its own
+        Store (own SQLite connection), created in that thread.
+        """
+        cfg = Config(work_root=tmp_path, db_path=tmp_path / "test.db")
+        setup_store = Store(cfg)
+        rid = setup_store.add_repo("r", "https://r", "/r")
+
+        order: list[str] = []
+        release = threading.Event()
+
+        class _SlowDb:
+            """Delegates to a real connection; blocks after the DELETE
+            statement so the test can observe delete_repo mid-transaction."""
+
+            def __init__(self, real: object) -> None:
+                self._real = real
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._real, name)
+
+            def execute(self, query: str, *args: object) -> object:
+                result = self._real.execute(query, *args)  # type: ignore[attr-defined]
+                if query.startswith("DELETE FROM repos"):
+                    order.append("delete:entered")
+                    release.wait(timeout=2)
+                    order.append("delete:resumed")
+                return result
+
+        def do_delete() -> None:
+            store_a = Store(cfg)  # own connection, created in this thread
+            store_a.db = _SlowDb(store_a.db)  # type: ignore[assignment]
+            store_a.delete_repo(rid)
+
+        def do_append() -> None:
+            store_b = Store(cfg)  # own connection, created in this thread
+            with contextlib.suppress(ValueError):
+                store_b.append_repo_note(rid, "racy note")
+            order.append("append:done")
+
+        t1 = threading.Thread(target=do_delete)
+        t1.start()
+        for _ in range(200):
+            if "delete:entered" in order:
+                break
+            time.sleep(0.01)
+        assert "delete:entered" in order, "delete_repo never reached its DELETE"
+
+        t2 = threading.Thread(target=do_append)
+        t2.start()
+        # append_repo_note must still be blocked on the shared lock while
+        # delete_repo holds it -- give it many chances to (wrongly) finish.
+        for _ in range(20):
+            assert "append:done" not in order
+            time.sleep(0.01)
+
+        release.set()
+        t1.join(timeout=2)
+        t2.join(timeout=2)
+        assert order.index("delete:resumed") < order.index("append:done")
 
 
 # -- findings --------------------------------------------------------------
