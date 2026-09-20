@@ -1023,3 +1023,42 @@ class TestRequireKeys:
             row, "id", "state", "detail", "next_wake_at", "updated_at", shape=SchedulerStateDict
         )
         assert result["some_future_column"] == "unexpected but harmless"  # type: ignore[typeddict-item]
+
+
+def test_standards_finding_round_trips_through_the_fallback(store: Store) -> None:
+    """The rollback must not lose a field the primary path keeps.
+
+    `standard_section` is what a `standards` finding cites, and the Rust
+    daemon persists it and exposes it as the computed `category`. The
+    Python store gained the column via migration but neither wrote it on
+    insert nor mapped it on read, so a fallback ingest would have stored
+    NULL and served a standards finding with no category — silently
+    dropping the one field that type exists to record.
+    """
+    repo_id = store.add_repo("widget", "https://example.com/widget.git", "main")
+    section = "Type safety / Domain types over primitives"
+    fid, created = store.upsert_finding(
+        repo_id,
+        {
+            "fingerprint": "widget:src/lib.rs:parse:type-safety",
+            "file": "src/lib.rs",
+            "severity": "medium",
+            "confidence": 0.9,
+            "summary": "raw String where a domain type is specified",
+            "standard_section": section,
+            "current_approach": "takes a String",
+            "proposed_approach": "takes a RepoName",
+        },
+        finding_type="standards",
+    )
+    assert created
+
+    stored = store.get_finding(fid)
+    assert stored is not None
+    assert stored["standard_section"] == section, "the cited standard must be persisted"
+
+    listed = [r for r in store.list_findings() if r["id"] == fid]
+    assert listed, "the finding must be listed"
+    assert listed[0]["category"] == section, (
+        "standards findings must expose their section as category, like every other type"
+    )
