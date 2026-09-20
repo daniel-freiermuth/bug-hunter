@@ -119,8 +119,8 @@ Handler: server.py:214-215 -> `_findings(qs)` (server.py:340-384).
 | param | type | default | behavior |
 |---|---|---|---|
 | `status` | string | none | SQL `status = ?`. Not validated against the enum — an unknown value just matches nothing. |
-| `repo` | string | none | all-digits -> repo id lookup, else name lookup (`get_repo`, store.py:220-224). **Unknown repo raises ValueError -> `500 {"error":"internal error"}`** (server.py:350-355 + 247-249). Not 400. |
-| `severity` | string | none | minimum severity; case-insensitive `low\|medium\|high` (types.py:44-63). Expands to `severity IN (...)` of all values at-or-above. **Invalid value -> ValueError -> 500** (same catch-all). |
+| `repo` | string | none | all-digits -> repo id lookup, else name lookup (`get_repo`, store.py:220-224). Python: **unknown repo raises ValueError -> `500 {"error":"internal error"}`** (server.py:350-355 + 247-249), not 400. **Rust deviation — `400 {"error":"unknown repo <key>"}`** (`ApiError::BadRequest`, server.rs:333): a bad query param is the caller's mistake, and a 500 both lies about whose fault it is and hides the reason behind the generic body. |
+| `severity` | string | none | minimum severity; case-insensitive `low\|medium\|high` (types.py:44-63). Expands to `severity IN (...)` of all values at-or-above. Python: **invalid value -> ValueError -> 500** (same catch-all). **Rust deviation — `400 {"error":"invalid severity <value>"}`** (server.rs:337-338), same reasoning. |
 | `type` | string | none | SQL `type = ?` on `findings.type`. |
 | `unified` | string | `"1"` | `"1"` (default) -> `list_all_findings` (adds `category`); any other value -> legacy `list_findings` (no `type` filter applied, no `category` key) (server.py:346,357-371). The UI never sends it. |
 

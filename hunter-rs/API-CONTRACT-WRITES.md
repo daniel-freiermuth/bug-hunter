@@ -230,7 +230,13 @@ Handler `_delete_repo` (server.py:642-655).
 2. no repo -> `404 {"error": "no repo <rid>"}` (server.py:649-652).
 3. `store.delete_repo(rid)` (store.py:251-266) counts `SELECT COUNT(*) FROM findings WHERE repo_id = ?` and `SELECT COUNT(*) FROM jobs WHERE repo_id = ?`; if either > 0 raises `ValueError` -> **`400`** with exactly: `repo <rid> has <n> finding(s) and <m> job(s) -- cannot delete without losing history; pause it instead` (store.py:255-264; do_POST maps it, server.py:445-446).
 
-**What is deleted**: only `DELETE FROM repos WHERE id = ?` + commit (store.py:265-266). **Nothing on the filesystem** — the clone dir `<work_root>/repos/<name>`, any worktrees, and `<work_root>/repos/repo-<id>/NOTES.md` are all left in place. events rows referencing the repo's findings can't exist (findings count was 0), but repo-kind events mentioning it by name remain.
+**What is deleted from the DB**: only `DELETE FROM repos WHERE id = ?` + commit (store.py:265-266). The clone dir `<work_root>/repos/<name>` and any worktrees are left in place (Rust too). events rows referencing the repo's findings can't exist (findings count was 0), but repo-kind events mentioning it by name remain.
+
+**Rust deviation — the notes file IS removed** (server.rs:1000-1021). Python left `<work_root>/repos/repo-<id>/NOTES.md` on disk; the Rust handler unlinks it right after the row delete:
+- Missing file is success: `Err(e) if e.kind() == ErrorKind::NotFound => {}` (server.rs:1014) — a repo that never took a note has no file, and that is the common case.
+- Any other `remove_file` error aborts with `ApiError::Internal` (server.rs:1015-1020), i.e. `500 {"error": "internal error"}` (the generic body every 500 carries, server.rs:110-113) while the specific text `repo <rid> deleted, but its notes file could not be removed (<e>): remove it before reusing that id` goes to the `tracing::error!` log. The failure is surfaced rather than swallowed because SQLite reuses `INTEGER PRIMARY KEY` ids: the next repo to be assigned id `<rid>` would open that same path and inherit a dead repo's notes — the exact leak the removal exists to prevent, and one only the operator can clear.
+- The row is already gone when the unlink runs, so a 500 here does **not** mean the delete failed. No rollback: the DB delete is the user's request, the file is cleanup.
+- The whole handler holds the `repo_notes` mutex (server.rs:996, same lock `POST /api/repo/notes` takes at :1063), so a concurrent append cannot recreate the file between the row delete and the unlink.
 
 **Then**: `log_event("repo", f"deleted {repo['name']} (#{rid})")` (server.py:654).
 
