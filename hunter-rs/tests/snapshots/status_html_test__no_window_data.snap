@@ -1,0 +1,5 @@
+---
+source: tests/status_html_test.rs
+expression: "Case::new(vec![]).render()"
+---
+<div class="scv-note">No window data available</div>
