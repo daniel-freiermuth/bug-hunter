@@ -1,0 +1,61 @@
+// Structural checks for the polled API responses.
+//
+// `api<T>()` casts whatever JSON came back to `T` without looking at it, so
+// the type parameter is a claim about the server, not a fact about the
+// bytes. The claim holds for the real daemon; it does not hold for the
+// things that sit between the two in practice — a proxy error page served
+// as 200 with a JSON content type, a captive portal, a truncated body, or
+// a daemon mid-rollback answering an older schema.
+//
+// The previous guard only checked top-level categories: object vs array.
+// `{}` is an object, so an empty body passed as a `Summary` and was written
+// into the store, and `StatusPage` then read `summary.activity_status.kind`
+// off `undefined`.
+//
+// These validators deliberately check only what the UI actually
+// dereferences without a `?.`, which is why they are not a schema mirror:
+// a field the components already treat as optional does not need to be
+// present for the dashboard to render, and requiring it would turn a
+// harmless server addition into a blank page. The rule for adding to this
+// file is the same rule that put each line in it — something renders it
+// unconditionally.
+
+import type { FindingDetail, Stats, Summary } from "./types";
+
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function isObjectArray(v: unknown): v is Record<string, unknown>[] {
+  return Array.isArray(v) && v.every(isObject);
+}
+
+/** `activity_status.kind` drives the whole status panel's branch. */
+export function isSummary(v: unknown): v is Summary {
+  if (!isObject(v)) return false;
+  if (!isObject(v.activity_status) || typeof v.activity_status.kind !== "string") return false;
+  if (typeof v.backend_status_html !== "string") return false;
+  if (!isObject(v.counts) || !isObject(v.type_counts)) return false;
+  return Array.isArray(v.repos);
+}
+
+/** `StatsPage` maps `by_kind`/`by_finding` and reads `totals.jobs`. */
+export function isStats(v: unknown): v is Stats {
+  if (!isObject(v)) return false;
+  if (!isObject(v.totals)) return false;
+  return isObjectArray(v.by_kind) && isObjectArray(v.by_finding);
+}
+
+/** `FindingDetail` reads `detail.jobs.length` unconditionally. */
+export function isFindingDetail(v: unknown): v is FindingDetail {
+  if (!isObject(v)) return false;
+  if (!Array.isArray(v.jobs)) return false;
+  // Nullable by contract, so absent is fine, but a non-object non-null
+  // would be read as a record by the PR block.
+  return v.pr_state === null || v.pr_state === undefined || isObject(v.pr_state);
+}
+
+/** The three polled collections are arrays of records. */
+export function isRecordList<T>(v: unknown): v is T[] {
+  return isObjectArray(v);
+}
