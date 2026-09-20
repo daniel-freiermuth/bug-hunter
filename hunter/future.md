@@ -586,22 +586,18 @@ the vanilla UI, include in the Svelte rewrite.
 already dispatch-agnostic) carries over verbatim as the design basis.
 
 ### 8.7 Tooling: frontend lint + SQL lint
-**Status:** idea; both deliberately out of scope when CI was wired up.
+**Status:** frontend lint done; SQL lint still an idea.
 
-CI currently runs ruff (format + check), mypy `--strict`, pytest, `tsc` and
-the esbuild bundle. Two gaps, both skipped because neither has a defined
-command in the justfile — adding them is a tooling/config decision, not a CI
-wiring change:
+CI now runs ruff (format + check), mypy `--strict` and pytest for the
+Python daemon; fmt, clippy `-D warnings`, `check-sql.sh` and nextest for
+hunter-rs; and ESLint, `npm run check` (svelte-check), vitest and a Vite
+build for the Svelte frontend. `check-sql.sh` enforces the Rust store's SQL
+encapsulation (compile-time-checked queries only, no QueryBuilder); it does
+not lint SQL text, and nothing covers the Python side.
 
-- **ESLint for `ui/src/app.ts`.** `tsc` catches type errors but nothing
-  catches lint-class problems: unused code (a dead `fmtTokens()` duplicate of
-  `ktok()` sat there until the `tsc` CI step flagged it), `innerHTML` misuse,
-  floating promises, `==` vs `===`. Static analysis in review already flags
-  the whole file for `innerHTML` assignment on every pass; a real rule set
-  would let us either fix those properly or suppress them once, with reason,
-  instead of re-reading the same advisory each review. Needs: pick a config
-  (`typescript-eslint` recommended + a few DOM/XSS rules), fix the existing
-  violations, add a `lint-ui` justfile target, wire into the frontend CI job.
+- **ESLint for the frontend** — done. It was scoped to the hand-written
+  `ui/src/app.ts`, which the Svelte UI replaced; the Svelte sources are
+  linted in the frontend CI job instead.
 
 - **SQL linting for `schema.sql` and the query builders.** Review tooling
   repeatedly reports `python-fstring-execute` on `store.py` — SQL assembled
@@ -615,5 +611,5 @@ wiring change:
   that makes the invariant structural (identifiers only from an enum) so the
   linter is satisfied by construction.
 
-Neither blocks anything; both remove recurring review noise and a class of
+It blocks nothing; it would remove recurring review noise and a class of
 bug the current gates cannot see.
