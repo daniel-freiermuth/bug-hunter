@@ -533,6 +533,46 @@ class TestAddRepoPathTraversal:
         assert responses
         assert responses[0][0] == 201
         assert len(add_repo_calls) == 1
-        name, _url, path_str, _branch = add_repo_calls[0][:4]
+        name, _url, repos_dir, _branch = add_repo_calls[0][:4]
         assert name == "my-repo_1.0"
-        assert Path(path_str) == (cfg.work_root / "repos" / "my-repo_1.0").resolve()  # type: ignore[arg-type]
+        # The handler hands over the repos *directory*; the store picks
+        # repo-<id> inside it. The name is never part of a path, which is
+        # what makes traversal structurally impossible rather than merely
+        # filtered -- and is also why two names differing only in case
+        # cannot collide on a case-insensitive filesystem.
+        assert Path(repos_dir) == cfg.work_root / "repos"  # type: ignore[arg-type]
+
+
+class TestRepoUrlScheme:
+    """The UI renders a repo's url into an `href`, so the scheme is a
+    security boundary, not a formatting preference. Rust enforced this
+    and Python did not, which matters because Python is the rollback
+    daemon -- falling back would have reopened the hole.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://github.com/acme/widget.git",
+            "HTTP://example.com/x.git",
+            "git@github.com:acme/widget.git",  # scp-style: colon is a path, not a scheme
+            "/srv/mirrors/widget.git",  # bare path
+            "ssh://git@host/x.git",  # the message promises ssh; the code must mean it
+            "SSH://git@host/x.git",
+        ],
+    )
+    def test_accepts_clone_urls(self, url: str) -> None:
+        assert server.valid_repo_url(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "javascript:alert(1)",
+            "JavaScript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "ftp://example.com/x.git",
+        ],
+    )
+    def test_rejects_other_schemes(self, url: str) -> None:
+        assert server.valid_repo_url(url) is False
