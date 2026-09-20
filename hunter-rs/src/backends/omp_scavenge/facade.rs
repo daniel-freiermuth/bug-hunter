@@ -441,9 +441,11 @@ pub struct StatusInputs {
 
 /// Render the budget window bars (BACKEND-CONTRACT.md §2.3).
 ///
-/// The class names are load-bearing against the stylesheet in
-/// `hunter/ui/index.html`, and the UI injects this as raw HTML, so the
-/// markup is the contract. Pinned by `tests/status_html_test.rs`.
+/// The class names are load-bearing against the `:global(.scv-*)` rules in
+/// `hunter/ui-svelte/src/pages/StatusPage.svelte` -- not `hunter/ui/`, which
+/// is generated build output -- and the UI injects this as raw HTML, so the
+/// markup is the contract. A new class needs a rule there too. Pinned by
+/// `tests/status_html_test.rs`.
 #[allow(
     clippy::too_many_lines,
     reason = "one HTML template expressed as sequential `write!` calls; the \
