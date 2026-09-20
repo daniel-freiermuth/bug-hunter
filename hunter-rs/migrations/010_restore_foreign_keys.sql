@@ -1,0 +1,23 @@
+-- no-transaction
+-- Turn foreign key enforcement back on after migration 009 disabled it.
+--
+-- 009 must run outside a transaction for its table rebuild to be
+-- possible, which means its `PRAGMA foreign_keys = OFF` genuinely takes
+-- effect rather than being the no-op it would be inside one. The pragma
+-- is connection-scoped, sqlx sets it when it opens a connection, and it
+-- does not reapply connection options when an idle pooled connection is
+-- handed back out. So without this, the connection that ran the
+-- migrations returns to the pool with enforcement disabled and whatever
+-- borrows it next can delete a repo out from under its jobs -- visible
+-- only later, as a `JOIN repos` quietly dropping rows.
+--
+-- This belongs at the end of 009 and is a separate file only because 009
+-- is already applied to the deployed database: sqlx checksums applied
+-- migrations, so editing one is refused at startup with "migration 9 was
+-- previously applied but has been modified". Migrations run in order on
+-- one connection, so arriving here immediately after 009 restores the
+-- pragma on exactly the connection 009 disabled it on.
+--
+-- `-- no-transaction` for the same reason 009 needs it: inside a
+-- transaction this statement would be silently ignored.
+PRAGMA foreign_keys = ON;
