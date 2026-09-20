@@ -288,7 +288,11 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         case Granted(cap_tokens=backend_cap):
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
-    job = store.create_job("hunt", rid, cap_tokens=cap, state="running")
+    try:
+        job = store.create_job("hunt", rid, cap_tokens=cap, state="running")
+    except ValueError as e:
+        # The repo was deleted after this run was picked: skip, don't crash.
+        return {"skipped": str(e)}
     out_path = cfg.work_root / "out" / f"job{job}.findings.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prompt = build_hunt_prompt(
@@ -417,7 +421,13 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
         case Granted(cap_tokens=backend_cap):
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
-    job = store.create_job("recheck", repo["id"], finding_id=fid, cap_tokens=cap, state="running")
+    try:
+        job = store.create_job(
+            "recheck", repo["id"], finding_id=fid, cap_tokens=cap, state="running"
+        )
+    except ValueError as e:
+        # The repo was deleted after this run was picked: skip, don't crash.
+        return {"skipped": str(e)}
     out_path = cfg.work_root / "out" / f"recheck{fid}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     if out_path.exists():
@@ -593,7 +603,11 @@ def _run_analysis_job(
         case Granted(cap_tokens=backend_cap):
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
-    job = store.create_job(kind, rid, cap_tokens=cap, state="running")
+    try:
+        job = store.create_job(kind, rid, cap_tokens=cap, state="running")
+    except ValueError as e:
+        # The repo was deleted after this run was picked: skip, don't crash.
+        return {"skipped": str(e)}
     out_path = cfg.work_root / "out" / f"job{job}.{spec.out_plural}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -895,7 +909,12 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
         case Granted(cap_tokens=backend_cap):
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
-    job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=cap, state="running")
+    try:
+        job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=cap, state="running")
+    except ValueError as e:
+        # The repo was deleted after this run was picked: skip, don't crash.
+        _drop_worktree(delete_branch=True)
+        return {"skipped": str(e)}
     with store.in_progress(fid, "fixing", fallback="queued"):
         build_prompt = (
             build_fix_prompt
@@ -1457,13 +1476,18 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
         _drop_worktree()
         return {"error": "PR/MR view failed"}
 
-    job = store.create_job(
-        "engage",
-        repo["id"],
-        finding_id=fid,
-        cap_tokens=cap,
-        state="running",
-    )
+    try:
+        job = store.create_job(
+            "engage",
+            repo["id"],
+            finding_id=fid,
+            cap_tokens=cap,
+            state="running",
+        )
+    except ValueError as e:
+        # The repo was deleted after this run was picked: skip, don't crash.
+        _drop_worktree()
+        return {"skipped": str(e)}
     prompt = build_engage_prompt(
         worktree,
         head_ref,
@@ -1738,7 +1762,14 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
         _drop_worktree()
         return {"error": "PR/MR view failed"}
 
-    job = store.create_job("harvest", repo["id"], finding_id=fid, cap_tokens=cap, state="running")
+    try:
+        job = store.create_job(
+            "harvest", repo["id"], finding_id=fid, cap_tokens=cap, state="running"
+        )
+    except ValueError as e:
+        # The repo was deleted after this run was picked: skip, don't crash.
+        _drop_worktree()
+        return {"skipped": str(e)}
     prompt = build_harvest_prompt(finding, worktree, repo, pr, num, store.repo_notes(repo["id"]))
     model = cfg.model_for("fix")
     rr = backend.run(

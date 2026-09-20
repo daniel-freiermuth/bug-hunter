@@ -119,7 +119,11 @@ def _setup_harvest(store: Store, tmp_path: Path, **finding_overrides: Any) -> di
     unset -- exactly what store.list_pending_harvest() (and thus
     pick_next) would hand to run_harvest."""
     upstream_path, repo_path = _make_repo(tmp_path)
-    repo_id = store.add_repo("repo", str(upstream_path), str(repo_path), default_branch="main")
+    repo_id = store.add_repo("repo", str(upstream_path), tmp_path, default_branch="main")
+    # The store owns the clone location (repos/repo-<id>), so the
+    # fixture's repo moves to it rather than the row pointing at
+    # wherever the fixture happened to build it.
+    repo_path = repo_path.rename(store.get_repo(repo_id)["path"])
     fid, _ = store.upsert_finding(
         repo_id, _make_finding(**finding_overrides), finding_type="dep_update"
     )
@@ -408,7 +412,11 @@ class _EngageFakeForge:
 
 def _setup_engage(store: Store, tmp_path: Path, **finding_overrides: Any) -> dict[str, Any]:
     upstream_path, repo_path = _make_repo_with_published_branch(tmp_path)
-    repo_id = store.add_repo("repo", str(upstream_path), str(repo_path), default_branch="main")
+    repo_id = store.add_repo("repo", str(upstream_path), tmp_path, default_branch="main")
+    # The store owns the clone location (repos/repo-<id>), so the
+    # fixture's repo moves to it rather than the row pointing at
+    # wherever the fixture happened to build it.
+    repo_path = repo_path.rename(store.get_repo(repo_id)["path"])
     fid, _ = store.upsert_finding(
         repo_id,
         _make_finding(
