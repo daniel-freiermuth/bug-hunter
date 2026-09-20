@@ -1,0 +1,5 @@
+---
+source: tests/status_html_test.rs
+expression: case.render()
+---
+<div class="scv-win"><div class="scv-lab"><b>5h window</b><span>32% used +10% in flight · 14% avail (~407k tok)</span></div><div class="scv-bar"><i class="scv-fill scv-ok" style="width:32%"></i><i class="scv-soft" style="width:10%"></i><i class="scv-ramp" style="left:56%"></i></div><div class="scv-sub">resets <time data-ms="1800007200000"></time> (2h00m) · probed 1m ago</div></div>

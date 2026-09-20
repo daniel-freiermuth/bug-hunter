@@ -1,0 +1,5 @@
+---
+source: tests/status_html_test.rs
+expression: out
+---
+<div class="scv-win"><div class="scv-lab"><b>&lt;script&gt; window</b><span>50% used · 50% avail (~1.5M tok)</span></div><div class="scv-bar"><i class="scv-fill scv-ok" style="width:50%"></i><i class="scv-soft" style="width:0%"></i></div><div class="scv-sub">resets <time data-ms="1800003600000"></time> (1h00m) · probed 0m ago</div></div>
