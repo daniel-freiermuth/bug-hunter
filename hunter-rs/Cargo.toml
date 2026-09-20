@@ -1,0 +1,60 @@
+[package]
+name = "hunter"
+version = "0.1.0"
+edition = "2024"
+description = "Idle-token bug hunter — server, scheduler and worker harness"
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# No-panic guarantee: these are denied so any future unwrap/expect/panic/todo
+# is a compile error, not a code review catch.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+# Accepted pedantic exceptions (noisy, low value for this codebase):
+too_many_arguments = "allow"         # scheduler executors have many params by nature
+module_name_repetitions = "allow"    # e.g. FindingFilter in store
+missing_errors_doc = "allow"         # internal crate, not a public API
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+cast_possible_truncation = "allow"   # i64 ↔ usize is pervasive and reviewed
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+cast_possible_wrap = "allow"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "derive",
+    "json",
+    "migrate",
+] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tower-http = { version = "0.7", features = ["fs", "set-header", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+fs4 = { version = "1.1.0", features = ["sync"] }
+nix = { version = "0.31.3", features = ["signal", "process"] }
+
+[dev-dependencies]
+insta = "1.48.0"
+proptest = "1.11.0"
+tower = { version = "0.5", features = ["util"] }
+
+[profile.release]
+lto = "thin"

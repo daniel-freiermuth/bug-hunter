@@ -1,0 +1,33 @@
+# This crate is nextest-ONLY, and not merely for speed. The harness and
+# forge tests script binaries on PATH and scope environment variables;
+# per-test process isolation makes that private, so the suite carries no
+# locking to coordinate it.
+#
+# `cargo test` therefore cannot run these tests. Rather than let it race
+# silently, `support::require_process_isolation` asserts on
+# NEXTEST_EXECUTION_MODE=process-per-test and fails with an explanation.
+# Deleting the coordination is the point: scaffolding you keep is
+# scaffolding you maintain.
+
+[profile.default]
+# Several tests spawn real subprocesses (`sleep`, oversized pipe writers,
+# a worker held past its grace period). A logic bug there hangs forever
+# rather than failing, so cap it: warn at 10s, kill at 60s.
+slow-timeout = { period = "10s", terminate-after = 6 }
+
+# Flakes are bugs. Retrying hides them, and this suite has no network and
+# no shared state beyond the serialised PATH lock, so there is nothing
+# legitimate to retry.
+retries = 0
+
+failure-output = "immediate-final"
+status-level = "fail"
+
+# CI wants the full picture in one run, plus machine-readable output.
+[profile.ci]
+slow-timeout = { period = "30s", terminate-after = 4 }
+retries = 0
+fail-fast = false
+failure-output = "immediate-final"
+status-level = "fail"
+final-status-level = "slow"
