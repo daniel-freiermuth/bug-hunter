@@ -66,7 +66,7 @@ Handler: server.py:216-217 -> `_summary()` (server.py:256-333) -> `_validate_sum
 | `backend_status_html` | string | `self.backend.status()` — **this is the key that carries the backend-status HTML fragment**; the UI injects it with `{@html}` (server.py:261,313; `pages/StatusPage.svelte:60`) and then rewrites any `<time data-ms>` element inside it into the browser's local time, which the server cannot know (`StatusPage.svelte:37-48`; the Rust facade emits that markup unescaped for exactly this, `backends/omp_scavenge/facade.rs:577-579,643`). Otherwise opaque; Rust port must expose the same key name. |
 | `counts` | object: status -> int | `dict.fromkeys(FINDING_STATUSES, 0)` then `Counter` of `status` over `list_findings()` (server.py:262-264). **All 9 status keys always present** (zero-filled): `new, rechecking, queued, fixing, pr_open, merged, rejected, wontfix, note` (types.py:23-32,66). |
 | `type_counts` | object: type -> int | `Counter` of `type` over the same rows (server.py:266,315). Only observed types present; may be `{}`. |
-| `repos` | array of Repo | `store.list_repos()`: `SELECT * FROM repos ORDER BY name` (store.py:226-227), pydantic-narrowed to `RepoDict` (types.py:143-159): `id:int, name:str, url:str, path:str, forge:str, default_branch:str, last_hunt_sha:str\|null, last_hunt_at:int\|null, enabled:int (0/1, NOT bool), added_at:int`. |
+| `repos` | array of Repo | `store.list_repos()`: `SELECT * FROM repos WHERE deleted_at IS NULL ORDER BY name`, rows through `_repo_row` (store.py:592-596, 116-128), then pydantic-narrowed to `RepoDict` (types.py:143-158): `id:int, name:str, url:str, path:str, forge:str, default_branch:str, last_hunt_sha:str\|null, last_hunt_at:int\|null, enabled:int (0/1, NOT bool), added_at:int`. The narrowing drops the 6 `last_*_at` migration columns here; `deleted_at` is already gone before it (§7). |
 | `last_cycle` | Event object or null | first event with `kind == "cycle"` within `recent_events(limit=500)` (server.py:267-270). Event shape: see /api/events. |
 | `cycle_running` | bool | `_cycle_lock.locked()` (server.py:311,326) — true JSON boolean. |
 | `current_job` | Job object or null | `store.current_job()` (store.py:1243-1280), see below. |
@@ -119,8 +119,8 @@ Handler: server.py:219-220 -> `_findings(qs)` (server.py:347-382).
 | param | type | default | behavior |
 |---|---|---|---|
 | `status` | string | none | SQL `status = ?`. Not validated against the enum — an unknown value just matches nothing. |
-| `repo` | string | none | all-digits -> repo id lookup, else name lookup (`get_repo`, store.py:220-224). **Unknown repo raises ValueError -> `500 {"error":"internal error"}`** (server.py:350-355 + 247-249). Not 400. |
-| `severity` | string | none | minimum severity; case-insensitive `low\|medium\|high` (types.py:44-63). Expands to `severity IN (...)` of all values at-or-above. **Invalid value -> ValueError -> 500** (same catch-all). |
+| `repo` | string | none | all-digits -> repo id lookup, else name lookup (`get_repo`, store.py:585-590). Python: **unknown repo raises ValueError -> `500 {"error":"internal error"}`** (server.py:354-359 + 252-254), not 400. **Rust deviation — `400 {"error":"unknown repo <key>"}`** (`ApiError::BadRequest`, server.rs:361): a bad query param is the caller's mistake, and a 500 both lies about whose fault it is and hides the reason behind the generic body. |
+| `severity` | string | none | minimum severity; case-insensitive `low\|medium\|high` (types.py:44-63). Expands to `severity IN (...)` of all values at-or-above. Python: **invalid value -> ValueError -> 500** (same catch-all). **Rust deviation — `400 {"error":"invalid severity <value>"}`** (server.rs:365-366), same reasoning. |
 | `type` | string | none | SQL `type = ?` on `findings.type`. |
 | `unified` | string | `"1"` | **Python: not read** — `_findings` always calls the one `list_findings`, which applies the `type` filter and adds `category` (server.py:362-367). Rust still honours it: any value other than `"1"` drops the `type` filter and the `category` key (server.rs:329,369-375,386). The UI never sends it. |
 
@@ -188,9 +188,13 @@ Note: jobs whose repo row was deleted would vanish (INNER JOIN) — moot in prac
 
 ## 7. GET /api/repos
 
-Handler: server.py:227-229. No query params.
-Store: `list_repos()` (store.py:226-227): `SELECT * FROM repos ORDER BY name` (case-sensitive BINARY collation).
-Response: `200`, JSON array of full repos rows — schema columns `id:int, name:str, url:str, path:str, forge:str (github|gitlab), default_branch:str, last_hunt_sha:str|null, last_hunt_at:int|null, enabled:int (0|1), added_at:int` (schema.sql:5-16) **plus** migration columns `last_full_hunt_at:int|null, last_test_gap_at:int|null, last_dep_update_at:int|null, last_refactor_at:int|null, last_modernization_at:int|null, last_standards_at:int|null` (store.py:135-151,224-228). Unlike `/api/summary.repos`, nothing strips these here.
+Handler: server.py:232-233; Rust `repos` -> `Json<Vec<Repo>>` (server.rs:435-437). No query params.
+Store: `list_repos()` — Python `SELECT * FROM repos WHERE deleted_at IS NULL ORDER BY name` with each row passed through `_repo_row` (store.py:592-596, helper at store.py:116-128); Rust `Store::list_repos` selects an explicit column list with the same `WHERE deleted_at IS NULL ORDER BY name` (store.rs:1006-1021). `ORDER BY name` is the default BINARY collation, so it is case-sensitive.
+Response: `200`, JSON array of repos rows — schema columns `id:int, name:str, url:str, path:str, forge:str (github|gitlab), default_branch:str, last_hunt_sha:str|null, last_hunt_at:int|null, enabled:int (0|1), added_at:int` (schema.sql:5-18) **plus** the 6 migration columns `last_full_hunt_at:int|null, last_test_gap_at:int|null, last_dep_update_at:int|null, last_refactor_at:int|null, last_modernization_at:int|null, last_standards_at:int|null` (schema.sql:19-24; §11). Unlike `/api/summary.repos`, nothing strips *those*.
+
+**`deleted_at` is not part of this shape**, in either daemon. The column exists on the table (schema.sql:25, §11) but it is bookkeeping for two-phase deletion, not API surface: Rust never selects it (`Repo` has no such field, types.rs:35-52), and Python's `SELECT *` would otherwise leak it, so `_repo_row` pops it (store.py:116-128). The filter makes the value uninteresting anyway — every repo read path is `WHERE deleted_at IS NULL`, so a flagged repo is absent from this array entirely rather than present with a timestamp, and the key could only ever have serialized as `null`. Stripping it keeps a rollback from changing the response shape. The same applies to `/api/repo`'s and `POST /api/repos`' embedded `repo` object, which come from `get_repo` through the same helper (WRITES §§6-7).
+
+`repos.id` is `INTEGER PRIMARY KEY AUTOINCREMENT` (schema.sql:9; hunter-rs migration 009, which rebuilds the table because AUTOINCREMENT cannot be added by ALTER TABLE, 009_repos_autoincrement.sql:32, :68-69). Ids therefore come from `sqlite_sequence` and only ever move forward: a freed id is never handed out again — with one bounded exception at the rebuild itself, where the counter restarts from the highest id *surviving* rather than the highest ever issued. Every id freed before the upgrade that sits above that floor is therefore handed out again, one per insert, until inserts pass the pre-rebuild high-water mark: reaping 3 and 4 while 1 and 2 survive means the next two repos are 3 and 4, not one repo and then safety (§11 spells out the arithmetic). Once the counter is past that mark it is a true high-water mark, and from then on a client still holding a stale id — a browser tab left open across the deletion — can only ever *miss*. It gets `404 {"error": "no repo <id>"}` from `/api/repo` and `/api/repo/notes`, and from `/api/repo/delete` either a `404` or, while the row is still flagged, an idempotent `{"ok": true}` that re-attempts reclamation (server.py:671-684; server.rs:1329-1343). What it can no longer do is pause, delete or annotate whichever repo would otherwise have inherited the number — a window that ordering the cleanup cannot close, because it is as long as the tab stays open (009_repos_autoincrement.sql:2-21). Two-phase deletion (WRITES §8) stays: it is what stops a half-removed directory being mistaken for a clone.
 
 ---
 
@@ -269,7 +273,7 @@ Row keys: `finding_id:int, fingerprint:str, status:str, severity:str, jobs:int, 
 
 ## 11. Database DDL (schema.sql + in-code migrations)
 
-`Store.__init__` (store.py:114-200): executes `schema.sql` as a script on every connection open (all `CREATE TABLE/INDEX IF NOT EXISTS`), then probes-and-applies these ALTERs for pre-existing DBs (store.py:122-196; probe = `SELECT <col> FROM <tbl> LIMIT 1`, on OperationalError run the ALTER):
+`Store.__init__` (store.py:168): executes `schema.sql` as a script on every connection open (all `CREATE TABLE/INDEX IF NOT EXISTS`), then probes-and-applies these ALTERs for pre-existing DBs (list and loop at store.py:171-284; probe = `SELECT <col> FROM <tbl> LIMIT 1`, on OperationalError run the ALTER):
 
 ```sql
 ALTER TABLE repos ADD COLUMN forge TEXT NOT NULL DEFAULT 'github';           -- also in schema.sql
@@ -283,6 +287,7 @@ ALTER TABLE repos ADD COLUMN last_refactor_at INTEGER;                        --
 ALTER TABLE repos ADD COLUMN last_modernization_at INTEGER;                   -- also in schema.sql
 ALTER TABLE findings ADD COLUMN modernization_class TEXT;                     -- also in schema.sql
 ALTER TABLE findings ADD COLUMN current_approach TEXT;                        -- also in schema.sql
+ALTER TABLE repos ADD COLUMN deleted_at INTEGER;                              -- also in schema.sql
 ALTER TABLE findings ADD COLUMN proposed_approach TEXT;                       -- also in schema.sql
 ALTER TABLE findings ADD COLUMN standard_section TEXT;                        -- also in schema.sql
 ALTER TABLE repos ADD COLUMN last_standards_at INTEGER;                       -- also in schema.sql
@@ -301,19 +306,28 @@ ALTER TABLE pr_state ADD COLUMN addressed_head_sha TEXT;                      --
 ALTER TABLE findings ADD COLUMN found_by_job INTEGER;                         -- also in schema.sql
 ```
 
-Every column here is *also* declared in `schema.sql`, so a fresh Python
-install and an upgraded one converge. The ALTERs still matter: `schema.sql`
-runs `CREATE TABLE IF NOT EXISTS`, which does nothing to a table that
-already exists, so on a pre-existing database the ALTER list is the only
-thing that adds them. The Rust port's migrations must cover both paths —
-`hunter/tests/test_schema_parity.py` asserts the two systems agree from a
-fresh install *and* from an upgrade.
+Every column in that list is *also* declared in `schema.sql`, so a fresh Python
+install and an upgraded one converge on the same set of columns. The ALTERs
+still matter: `schema.sql` runs `CREATE TABLE IF NOT EXISTS`, which does
+nothing to a table that already exists, so on a pre-existing database the ALTER
+list is the only thing that adds them. The Rust port's migrations must cover
+both paths — `hunter/tests/test_schema_parity.py` asserts the two systems agree
+from a fresh install *and* from an upgrade.
 
-Also: `DROP INDEX IF EXISTS findings_fingerprint` cleanup on every open (store.py:199-200). PRAGMAs: `journal_mode = WAL`, `foreign_keys = ON` (schema.sql:2-3).
+Three things do **not** follow that pattern:
 
-Tables (schema.sql): `repos` (:5-16), `findings` (:18-66 + 5 indexes :67-71), `jobs` (:73-93 + index :94), `window_log` (:97-105), `calibration_samples` (:113-120), `events` (:125-132), `pr_state` (:135-176), `scheduler_state` (:183-189, single row `CHECK (id = 1)`).
+- The partial index `repos_deleted_at ON repos(deleted_at) WHERE deleted_at IS NOT NULL` is **not** in `schema.sql`, and cannot be: `schema.sql` runs before the ALTERs, and on a pre-existing database `repos.deleted_at` does not exist yet at that point. Python creates it after the ALTER loop instead (store.py:321-324); hunter-rs creates it in migration 008 next to the column (008_repos_deleted_at.sql:21, :27-28) and again after the rebuild in 009, because dropping a table drops its indexes (009_repos_autoincrement.sql:104-105).
+- `repos.id` is `INTEGER PRIMARY KEY AUTOINCREMENT` in `schema.sql` (:9), and AUTOINCREMENT cannot be added by an ALTER — it needs a table rebuild, so neither `CREATE TABLE IF NOT EXISTS` nor the probe-and-ALTER list can deliver it to a database that already has the table. Both daemons rebuild instead, and the two rebuilds are the same shape statement for statement: build `_repos_new`, copy every column, `DROP TABLE repos`, rename the new table *into* the referenced name (store.py:360-393; 009_repos_autoincrement.sql:68-100). Never the rename-first shape migration 003 uses on `findings`: `findings.repo_id` and `jobs.repo_id` reference `repos`, and renaming it out of the way first rewrites their REFERENCES clauses to point at a table that is then dropped. Ids are copied verbatim rather than reissued, because those two columns hold them (store.py:386-391). Both recreate the `repos_deleted_at` partial index the DROP took with them (store.py:395-398; 009:104-105), and both seed `sqlite_sequence` with the same guarded INSERT (store.py:405-409; 009:113-115). Python runs the rebuild behind a probe that strips comments out of `sqlite_master.sql` before looking for the keyword, so schema.sql's comment *explaining* AUTOINCREMENT cannot be mistaken for the declaration (store.py:42-50, :341-348) — on the deployed database, where migration 009 has already run, the probe does nothing. So this converges like everything else: fresh install or upgrade, Rust daemon or the Python rollback, whichever opens the database first, `repos.id` ends up non-reusable. Every id issued from that point on comes out of `sqlite_sequence`, which only moves forward, so a stale client reference can only miss rather than hit whatever repo now answers to it (§7).
+  - One limit both implementations share, since neither comment says it outright: the seed is `COALESCE(MAX(id), 0)` over the rows that survived the copy, and `WHERE NOT EXISTS` makes it a no-op whenever the copy inserted anything — an explicit id on an AUTOINCREMENT table already raises the counter. The floor is therefore the highest id *still present*, not the highest ever issued, so every id freed before the rebuild that sits above that floor is handed out again, one per insert, until the counter passes the pre-rebuild high-water mark. Rebuilt from rows 1 and 2 after 3 and 4 were reaped, the next two inserts are 3 and then 4 — the window is as many inserts as there were freed ids above the floor, not one. Rebuilt from an empty table the next insert is 1: the empty case the seed exists for behaves exactly as it would with no sequence row at all, which is also the widest version of this window. Once inserts pass the old mark the counter is a real high-water mark again. The exposure is bounded to repos deleted before the rebuild; it is not ongoing.
+- The partial index `findings_found_by_job ON findings(found_by_job) WHERE found_by_job IS NOT NULL` is not in `schema.sql` either, and cannot be, for the same reason as `repos_deleted_at`: on a pre-existing database `findings.found_by_job` does not exist when `schema.sql` runs. Python creates it after the ALTER loop, and after the findings rebuild that would drop it (store.py:538-548); hunter-rs creates it in migration 011 beside the column (011_findings_found_by_job.sql:24-25). Partial because the column is NULL for every finding ingested before provenance was recorded, and those are exactly the rows no job will ever be looked up by.
 
-**There is no `repo_notes` table** — repo notes are Markdown files under `<work_root>/repos/repo-<id>/NOTES.md` (store.py:269-276).
+`findings.found_by_job` is **not API surface**, in either daemon — same treatment as `repos.deleted_at` (§7), and for the same reason: Python reads findings with `SELECT *` while Rust names its columns, so an internal column would otherwise land in one daemon's responses and not the other's. Python pops it in `_public_finding` (store.py:854-857); Rust's `Finding` has no such field. `/api/jobs` reports the same fact from the other side, as `produced_finding_ids` (§6). It is also not a foreign key to `jobs(id)`: jobs are pruned on a retention policy that knows nothing about findings, and a finding must outlive the job that found it rather than block its cleanup (011_findings_found_by_job.sql:19-21).
+
+Also: `DROP INDEX IF EXISTS findings_fingerprint` cleanup on every open (store.py:291). PRAGMAs: `journal_mode = WAL`, `foreign_keys = ON` (schema.sql:2-3).
+
+Tables (schema.sql): `repos` (:5-26), `findings` (:28-91 + 5 indexes :92-96), `jobs` (:98-117 + 2 indexes :118-120), `window_log` (:123-131), `calibration_samples` (:143-150), `events` (:152-159 + index :160), `pr_state` (:164-207), `scheduler_state` (:214-220, single row `CHECK (id = 1)`).
+
+**There is no `repo_notes` table** — repo notes are Markdown files at `<work_root>/notes/repo-<id>.md`, one per repo, outside the clone directories (store.py:703-727; store.rs:772-774).
 
 Tables the read-only API touches: `findings`, `repos`, `jobs`, `events`, `pr_state`, `scheduler_state`. (`window_log`/`calibration_samples` are backend-internal.)
 
