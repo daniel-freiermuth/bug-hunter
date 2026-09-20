@@ -1,0 +1,52 @@
+# CodeRabbit skips a PR entirely past 100 files, and this one is a port:
+# it adds a whole crate and a whole frontend at once. Rather than split the
+# review and lose the cross-cutting findings, exclude files that carry no
+# review signal.
+#
+# The bar for exclusion is "produced by a tool, never edited by hand" —
+# scaffolder output, vite's build output, and proptest's seed file.
+# Reviewing generated files reviews their generator's output while the
+# input sits reviewable next door. Everything the port actually decided
+# stays listed, including tsconfig.app.json, eslint.config.js and
+# vite.config.ts, which were modified by hand after scaffolding.
+#
+# Prose is deliberately NOT excluded. Docs-vs-code drift has been one of
+# the more productive finding categories on this PR: a UI rewrite recorded
+# as using a framework it never adopted, a decision section contradicting
+# its own status line, contract rows describing status codes the handler
+# does not return. Buying file budget by hiding documentation would trade
+# away review signal that is working.
+reviews:
+  path_filters:
+    - "!hunter/ui-svelte/.gitignore"
+    - "!hunter/ui-svelte/.vscode/extensions.json"
+    - "!hunter/ui-svelte/svelte.config.js"
+    - "!hunter/ui-svelte/tsconfig.json"
+    - "!hunter/ui-svelte/tsconfig.node.json"
+    # This file.
+    - "!.coderabbit.yaml"
+
+    # `hunter/ui/` is vite's outDir (ui-svelte/vite.config.ts:15): the
+    # daemon serves a committed bundle so that deploying is `cargo build`
+    # plus a restart, with no node toolchain on the box. Everything below
+    # is emitted by `vite build` — the hashed asset pair changes name on
+    # every rebuild, and index.html/the icons are copied verbatim from
+    # ui-svelte/. Reviewing them reviews the compiler's output, and the
+    # input is already reviewable in ui-svelte/src.
+    #
+    # The two *deletions* under hunter/ui/ (src/app.ts, tsconfig.json) are
+    # the retired hand-written UI and stay listed: that removal is a real
+    # decision, not build output.
+    - "!hunter/ui/assets/**"
+    - "!hunter/ui/index.html"
+    - "!hunter/ui/favicon.svg"
+    - "!hunter/ui/icons.svg"
+
+    # Same file, before vite copies it. An icon sprite has no review
+    # surface in either location.
+    - "!hunter/ui-svelte/public/favicon.svg"
+    - "!hunter/ui-svelte/public/icons.svg"
+
+    # Written by proptest itself when a property fails: a list of seeds,
+    # replayed by the suite. Hand-editing it would only delete coverage.
+    - "!hunter-rs/tests/properties_test.proptest-regressions"
