@@ -164,6 +164,11 @@ class Store:
                 "findings",
                 "ALTER TABLE findings ADD COLUMN proposed_approach TEXT",
             ),
+            (
+                "standard_section",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN standard_section TEXT",
+            ),
             ("harvested_at", "pr_state", "ALTER TABLE pr_state ADD COLUMN harvested_at INTEGER"),
             (
                 "attention_since",
@@ -271,6 +276,7 @@ class Store:
                     "  missing_tests TEXT, test_file TEXT,"
                     "  smell_type TEXT, suggested_refactor TEXT,"
                     "  modernization_class TEXT, current_approach TEXT, proposed_approach TEXT,"
+                    "  standard_section TEXT,"
                     "  UNIQUE(type, fingerprint))"
                 )
                 # Build column list dynamically: old tables may not have every
@@ -315,6 +321,7 @@ class Store:
                     "modernization_class",
                     "current_approach",
                     "proposed_approach",
+                    "standard_section",
                 ]
                 # Defaults for NOT NULL columns that might be absent in the old table.
                 _defaults = {
@@ -521,9 +528,9 @@ class Store:
             " severity, confidence, summary, detail, evidence_plan, introduced_by,"
             " ecosystem, package, current_version, latest_version, update_type, security_advisory,"
             " missing_tests, test_file, smell_type, suggested_refactor,"
-            " modernization_class, current_approach, proposed_approach,"
+            " modernization_class, current_approach, proposed_approach, standard_section,"
             " status, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)",
             (
                 finding_type,
                 repo_id,
@@ -551,6 +558,7 @@ class Store:
                 f.get("modernization_class"),
                 f.get("current_approach"),
                 f.get("proposed_approach"),
+                f.get("standard_section"),
                 t,
                 t,
             ),
@@ -608,6 +616,8 @@ class Store:
                 r["category"] = r.get("smell_type")
             elif r["type"] == "modernization":
                 r["category"] = r.get("modernization_class")
+            elif r["type"] == "standards":
+                r["category"] = r.get("standard_section")
         return rows
 
     def set_status(
