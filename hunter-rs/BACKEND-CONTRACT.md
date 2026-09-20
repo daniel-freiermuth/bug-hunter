@@ -1,6 +1,6 @@
 # BACKEND-CONTRACT.md — Backend protocol + omp_scavenge for the Rust port
 
-Extracted 2026-09-13 from the Python source at the paths cited below. Companion to `hunter-rs/API-CONTRACT.md` (round 1: error envelope, Row types, `/api/summary` shape — see its lines 66 and 338 for where `backend_status_html` crosses the HTTP boundary). Precision bar: a Rust developer should never need to open the Python source. Every claim carries `file:line` (paths relative to `hunter/`; `hunter/…` = `hunter/hunter/…`).
+Extracted 2026-09-13 from the Python source at the paths cited below. Companion to `hunter-rs/API-CONTRACT.md` (the read path: error envelope, Row types, `/api/summary` shape — see its lines 66 and 338 for where `backend_status_html` crosses the HTTP boundary). Precision bar: a Rust developer should never need to open the Python source. Every claim carries `file:line` (paths relative to `hunter/`; `hunter/…` = `hunter/hunter/…`).
 
 Sources of truth: `hunter/backend.py`; `hunter/backends/omp_scavenge/{__init__,facade,capacity,harness}.py`; `hunter/store.py`; `hunter/types.py`; call sites in `hunter/server.py` + `hunter/scheduler.py`; tests `tests/test_budget.py`, `tests/test_unaccounted_tokens.py`, `tests/test_refresh_stale_probe.py`, `tests/test_store.py`, `tests/test_server.py`.
 
@@ -12,12 +12,12 @@ Sources of truth: `hunter/backend.py`; `hunter/backends/omp_scavenge/{__init__,f
 |---|---|---|
 | Construction | `serve()` server.py:713-725: `backend = cfg.make_backend(ThreadLocalLedger(cfg))` → `make_server(cfg, backend)`. Same in `daemon()` server.py:1034. Factory types.py:232-243. | `Config::make_backend` + `SpendLedger` impl |
 | GET `/api/summary` → `backend_status_html` | `self.backend.status()` server.py:256, emitted :306; typed field server.py:837; zod `z.string()` app.ts:170-171; `$("windows").innerHTML` app.ts:972-975, called app.ts:1375 (5 s poll) | `status()` |
-| GET `/api/summary` → next-candidate budget preview | server.py:272-301: when `current_job is None` and `scheduler.pick_next` yields, handler calls `self.backend.decide(anticipated_tokens=scheduler.anticipated_tokens(store, cfg, repo_id, kind))` (:283-285), indexes `outlook.prioritized if override else outlook.normal` (:287), maps to `budget_state: "denied"\|"allowed"`, `budget_reason`, `budget_retry_at`, `is_prioritized: bool(override)` (:288-301). `override = target.get("budget_override")` only for kinds `engage\|harvest\|recheck\|fix` (:280-281). | **`decide()` on the READ path — round-2 serve cannot stub it** |
-| POST `/api/cycle` | server.py:482-506: spawns `scheduler.run_cycle(store, cfg, backend=backend)` in a thread under `_cycle_lock` | full scheduler + `run()` → round 3 (§6) |
-| Usage prober thread | `_usage_prober_loop(backend, stop)` server.py:994-1014; tick `USAGE_PROBE_TICK_S = 60.0` server.py:111; started **only** by `daemon()` (server.py:1047-1049). `serve()` does NOT start it (server.py:713-725). CLI: `serve` = UI-only, `daemon` = UI+scheduler+prober (cli.py:3-6,22-35,54-63). | `keep_fresh()` (method is round 2; calling thread arrives with daemon) |
+| GET `/api/summary` → next-candidate budget preview | server.py:272-301: when `current_job is None` and `scheduler.pick_next` yields, handler calls `self.backend.decide(anticipated_tokens=scheduler.anticipated_tokens(store, cfg, repo_id, kind))` (:283-285), indexes `outlook.prioritized if override else outlook.normal` (:287), maps to `budget_state: "denied"\|"allowed"`, `budget_reason`, `budget_retry_at`, `is_prioritized: bool(override)` (:288-301). `override = target.get("budget_override")` only for kinds `engage\|harvest\|recheck\|fix` (:280-281). | **`decide()` on the READ path** — live: server.rs:216-218 computes `anticipated_tokens`, then awaits `backend.decide(...)` |
+| POST `/api/cycle` | server.py:482-506: spawns `scheduler.run_cycle(store, cfg, backend=backend)` in a thread under `_cycle_lock` | full scheduler + `run()` — both landed (§6): `scheduler::run_cycle` scheduler.rs:3109, `Backend::run` backend.rs:153-160 |
+| Usage prober thread | `_usage_prober_loop(backend, stop)` server.py:994-1014; tick `USAGE_PROBE_TICK_S = 60.0` server.py:111; started **only** by `daemon()` (server.py:1047-1049). `serve()` does NOT start it (server.py:713-725). CLI: `serve` = UI-only, `daemon` = UI+scheduler+prober (cli.py:3-6,22-35,54-63). | `keep_fresh()` — landed; the Rust prober is a tokio task inside `run_daemon` (daemon.rs:224-239, `USAGE_PROBE_TICK_S = 60` daemon.rs:18), and `serve` still never probes |
 | Denial → daemon sleep | `retry_at` flows through every scheduler `{"denied":…, "retry_at":…}` return into `_compute_sleep_s` server.py:934-992: truthy → `sleep = max(60.0, min(retry_at/1000 − time.time() + 30, 3600))` (:979-985); `None` → 30 min (:986-988) | `Denied.retry_at` semantics |
 
-Scheduler call sites (execute in round 3 but define `decide()`'s contract): run_hunt scheduler.py:277-288 (`outlook.normal`; hunts have no override), run_recheck :404-420, run_fix :884-901, run_engage :1435-1452, run_harvest :1719-1731 (all four: `verdict = outlook.prioritized if override else outlook.normal`; `override = finding.get("budget_override")`, values `'once'|'exempt'|None`, store.py:502-510; `'once'` is cleared after any attempt), `_run_analysis_job` :583-594 (normal). Uniform pattern:
+Scheduler call sites (all ported to `src/scheduler.rs`; they define `decide()`'s contract): run_hunt scheduler.py:277-288 (`outlook.normal`; hunts have no override), run_recheck :404-420, run_fix :884-901, run_engage :1435-1452, run_harvest :1719-1731 (all four: `verdict = outlook.prioritized if override else outlook.normal`; `override = finding.get("budget_override")`, values `'once'|'exempt'|None`, store.py:502-510; `'once'` is cleared after any attempt), `_run_analysis_job` :583-594 (normal). Uniform pattern:
 - `Denied(reason, retry_at)` → create job row; `update_job(state='denied', notes=reason, finished_at=now_ms())`; `log_event('deny', …)`; return `{"denied": reason, "retry_at": retry_at, "job": job}` (e.g. scheduler.py:281-285). These writes are the **caller's**, not the backend's.
 - `Granted(cap_tokens=backend_cap)` → `cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap` (scheduler.py:288,420,594,901,1452,1731); `cfg_cap` = `hunt_cap_tokens` (hunt/recheck/analysis) or `fix_cap_tokens` (fix/engage/harvest). **Backend never sees config caps; core min()s** (backend.py:44-46).
 
@@ -111,7 +111,7 @@ Backing tables (schema.sql): `window_log` :97-105 (`id, observed_at INTEGER NOT 
 ```python
 def decide(self, *, anticipated_tokens: int) -> Outlook      # :154-164
 def run(self, cwd: Path, prompt: str, *, cap_tokens: int,
-        max_wall_s: int, job_class: JobClass) -> RunResult   # :166-181  ROUND 3
+        max_wall_s: int, job_class: JobClass) -> RunResult   # :166-181  (Rust: backend.rs:153-160)
 def keep_fresh(self) -> bool                                 # :183-192
 def status(self) -> str                                      # :194-206
 ```
@@ -134,9 +134,9 @@ Warm iff this exact `(repo_id, kind)` finished a non-denied job within `cfg.cach
 
 Package inventory:
 - `__init__.py` (1-16): docstring (harness spawn/meter/SIGTERM; accounting reads agent.db, rolls forward expired cycles, computes unaccounted; policy = dual linear ramps, prioritized waives pacing not exhaustion); `from .facade import OmpScavengeBackend`; `__all__ = ["OmpScavengeBackend"]`.
-- `capacity.py` (212 lines) — window reading + pure ramp math. Round 2.
-- `facade.py` (462 lines) — `OmpScavengeBackend` (decide/run/keep_fresh/status). Round 2 except `run`/`_usage_snapshot`.
-- `harness.py` (163 lines) — worker subprocess harness. **Round 3.**
+- `capacity.py` (212 lines) — window reading + pure ramp math. Ported: `capacity.rs`.
+- `facade.py` (462 lines) — `OmpScavengeBackend` (decide/run/keep_fresh/status). Ported whole, `run` and `_usage_snapshot` included: `facade.rs` (`impl Backend` :606, `run` :688, `_usage_snapshot_sync` :339).
+- `harness.py` (163 lines) — worker subprocess harness. Ported: `harness.rs` (`run_worker` :243).
 
 ### 2.1 `capacity.py`
 
@@ -199,7 +199,7 @@ Constants: `_TOK_PER_FRAC_5H = 200_000 / 0.10 = 2_000_000.0` (:37; comment :34-3
 
 **`_compute_headroom(windows, res_5h, res_7d, *, prio) -> int | None`** (:178-212). Min headroom in tokens across windows. Fresh `now_ms = time.time()*1000` (:186 — second clock read inside one decide()). Per window: skip `used_fraction is None` (:189-190). `:7d` lids: `ceiling = 1.0 if prio else ramp_7d(w.resets_at, now_ms)`; `frac = max(0.0, ceiling − _effective_used(w, res_7d))`; `tok = _frac_to_tokens(frac, "7d")` (:191-196). `:5h` lids: `allowed = ramp_5h(…)`; only if not None: `ceiling = 1.0 if prio else allowed`; same with res_5h, dim "5h" (:197-204). `return min(caps) if caps else None` (:212).
 
-**`_frac_to_tokens(frac, dim) -> int`** (:214-220): `cap_5h = ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H`; `dim == "5h" or ":5h" in dim` → `int(frac * cap_5h)`; else → `int(frac * cap_5h / _5H_7D_RATIO)`. ⚠️ Asymmetry: 7d tokens ALWAYS derive from the 5h capacity × period ratio; `estimate_capacity("anthropic:7d")` is NOT consulted here (unlike `_unaccounted_fraction` :94). Port verbatim.
+**`_frac_to_tokens(frac, dim) -> int`** (:214-220): `cap_5h = ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H`; `cap_7d = ledger.estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)`; `dim == "5h" or ":5h" in dim` → `int(frac * cap_5h)`; else → `int(frac * cap_7d)`. Both caps are derived exactly as in `_unaccounted_fraction` (:94-99): the 7d estimate is consulted, and the 5h-times-ratio value is only the fallback when there is not yet enough history to estimate one. (An earlier revision of this document claimed the 7d estimate was *not* consulted here and told the port to reproduce that asymmetry verbatim. It was a mis-transcription: facade.py:224 has always read the estimate. The Rust port matches the source, not that sentence.)
 
 **`decide(*, anticipated_tokens) -> Outlook`** (:222-242):
 1. `windows = capacity.read_windows()` (:224); `res_5h, res_7d = _unaccounted_fraction(windows, anticipated_tokens)` (:225).
@@ -220,7 +220,7 @@ Verdict quick reference (tests substring-match `"5h"`, `"7d"`, `"ramp"`, `"no wi
 | prio waiver but cap ≤ 0 | Denied | the pacing reason | the pacing retry |
 | all pass | Granted | `ok` | cap = min-headroom or None |
 
-**`run(cwd, prompt, *, cap_tokens, max_wall_s, job_class) -> RunResult`** (:244-268) — **ROUND 3**. Usage-delta sandwich: `pre = _usage_snapshot()` (:254); `model = cfg.model_for(job_class.value)` (:255); `rr = run_worker(cfg, cwd, prompt, cap_tokens, max_wall_s, model=model)` (:256-263); `post = _usage_snapshot()` (:264); `rr.usage_delta = post − pre` iff both non-None else None (:265-267). `_usage_snapshot() -> float|None` (:270-280): fresh `read_windows()`; max `used_fraction` over `:7d` lids; None if none. Only caller is run().
+**`run(cwd, prompt, *, cap_tokens, max_wall_s, job_class) -> RunResult`** (:244-268) — ported at facade.rs:688-731. Usage-delta sandwich: `pre = _usage_snapshot()` (:254); `model = cfg.model_for(job_class.value)` (:255); `rr = run_worker(cfg, cwd, prompt, cap_tokens, max_wall_s, model=model)` (:256-263); `post = _usage_snapshot()` (:264); `rr.usage_delta = post − pre` iff both non-None else None (:265-267). `_usage_snapshot() -> float|None` (:270-280): fresh `read_windows()`; max `used_fraction` over `:7d` lids; None if none. Only caller is run().
 
 **`keep_fresh() -> bool`** (:282-304):
 1. `windows = capacity.read_windows()` (:284).
@@ -271,7 +271,7 @@ struct WindowPanel { label: String, used_pct: String /* "37%" | "?" */, unacct_n
 ```
 UI dependency map (class names are load-bearing): container `#windows` index.html:108; `.scv-win` :109; `.scv-lab`/`b` :110-111; `.scv-bar` :112; `.scv-fill` :113 + tones `.scv-ok` #4e8 / `.scv-bad` #e54 / `.scv-stale` #888 :114-116; `.scv-soft` striped overlay :117; `.scv-ramp` 2px white marker :118; `.scv-sub` :119. `.scv-note` has no stylesheet rule (plain text fallback). Consumer: `backend_status_html: z.string()` app.ts:170-171 (summary render hard-fails if missing); `renderWindows` app.ts:972-975 (`innerHTML`); invoked app.ts:1375 each 5 s refresh.
 
-### 2.4 `harness.py` — ROUND 3 inventory (do not port in round 2)
+### 2.4 `harness.py` — inventory (ported: `harness.rs`)
 `OMP_SESSIONS_DIR = ~/.omp/agent/sessions` (:24). `ledger_usage(session_file, since_iso="") -> (tokens, calls)` (:27-55): per JSONL line, skip JSON-decode failures (partial trailing line mid-write) and records with `timestamp < since_iso` (lexicographic ISO compare — needed because omp REUSES a session file for a repeated cwd); count assistant-role records with usage; `tokens += input + output + cacheWrite`; OSError → totals so far. `_snapshot()` (:58-62): `{path: size}` over `sessions/*/*.jsonl`. `_discover(before, cwd)` (:65-87): candidates = appeared-or-grew files; prefer parent-dir slug fuzzy-matching cwd (`str(cwd).replace("/", "-").strip("-")` substring either way), else most-recent mtime. `_kill_tree(proc)` (:90-100): SIGTERM the process group, wait 10 s, SIGKILL fallback. `run_worker(cfg, cwd, prompt, cap_tokens, max_wall_s, model=None)` (:103-163): `cmd = [cfg.omp_bin, "-p", prompt]` + `[f"--model={model}"]` if model (:115-116) + `[f"--smol={cfg.model_smol}"]` if set (:117-118); spawn_iso = gmtime-formatted spawn timestamp; TemporaryFile captures stdout+stderr; `start_new_session=True` (:125); poll every `cfg.poll_s` (:147) discovering the session and metering; kill at `tokens >= cap_tokens` ("cap") or wall > max_wall_s ("wallclock"); final re-meter; `stdout_tail = last 2000 chars`; RunResult (:152-163).
 
 ---
@@ -280,12 +280,12 @@ UI dependency map (class names are load-bearing): container `#windows` index.htm
 
 | config.json path | Config field | default | consumed by |
 |---|---|---|---|
-| `ompBin` | `omp_bin` | `"omp"` | keep_fresh probe argv facade.py:297,301; worker argv harness.py:113 (r3) |
+| `ompBin` | `omp_bin` | `"omp"` | keep_fresh probe argv facade.py:297,301; worker argv harness.py:113 / harness.rs:264 |
 | `budget.staleAfterS` | `stale_after_s` | `300` | keep_fresh gate facade.py:291; status tone/⚠️ facade.py:402 |
 | `budget.cacheTtlS` | `cache_ttl_s` | `3600` | scheduler.anticipated_tokens warm/cold split scheduler.py:58-60 (core-side; feeds decide input) |
-| `pollS` | `poll_s` | `2.0` | harness meter loop harness.py:147 (r3) |
+| `pollS` | `poll_s` | `2.0` | harness meter loop harness.py:147 / harness.rs:364 |
 | `models.default` | `model_default` | `None` | `model_for` fallback types.py:195-197 |
-| `models.smol` | `model_smol` | `None` | harness `--smol` harness.py:117-118 (r3) |
+| `models.smol` | `model_smol` | `None` | harness `--smol` harness.py:117-118 / harness.rs:269-270 |
 | `models.hunt` | `model_hunt` | `None` | `model_for("hunt")` |
 | `models.fix` | `model_fix` | `None` | `model_for(kind != "hunt")` |
 | `backend.type` | `backend_type` | `"omp-scavenge"` | `make_backend` discriminator types.py:238-243; unknown → `ValueError(f"unknown backend_type: {v!r}")` |
@@ -366,14 +366,14 @@ UI dependency map (class names are load-bearing): container `#windows` index.htm
 65. `test_estimate_capacity_returns_max_spend_per_cycle` :453 — window_log rows for two completed 5h cycles (resets now−5h, now−10h); jobs 500_000 and 2_000_000 finished inside each → estimate == 2_000_000.
 66. `test_estimate_capacity_scoped_by_limit_id` :478 — completed 7d cycle + 1_000_000 job → estimate("anthropic:5h") None; estimate("anthropic:7d") == 1_000_000.
 
-### tests/test_server.py `TestUsageProberLoop` (5) — the loop lives server-side; port with daemon (round 3) or now if Rust serve adds the prober
+### tests/test_server.py `TestUsageProberLoop` (5) — the loop lives server-side; the Rust equivalent is the daemon's prober task (daemon.rs:224-239), so these port against `run_daemon`, not `serve`
 67. `test_runs_immediately_without_waiting_a_full_tick` :328 — tick monkeypatched to 3600 → exactly 1 keep_fresh call shortly after start.
 68. `test_ticks_again_after_the_configured_interval` :352 — tick 0.02 → ≥ 3 calls.
 69. `test_stops_promptly_when_the_stop_event_is_set` :374 — stop event → thread exits ≤ 2 s.
 70. `test_a_failed_tick_does_not_crash_the_loop` :390 — keep_fresh raising RuntimeError → loop survives, ≥ 2 calls.
 71. `test_default_tick_is_within_the_1_to_5_minute_range` :416 — `60.0 <= USAGE_PROBE_TICK_S <= 300.0` (actual 60.0, server.py:111).
 
-Also relevant, NOT backend-behavior tests: scheduler tests each define a local FakeBackend (`keep_fresh→False`, `status→""`, canned decide) — test_followups.py:41, test_recheck_status.py:37, test_run_fix_invariant.py:44, test_run_hunt_rehunt.py:91, test_engage_history_guard.py:34, test_fix_retry_give_up.py:43, test_override_wake.py:32 — the mock pattern Rust core tests will need in round 3. tests/test_types.py touches enums/statuses only (no backend config assertions).
+Also relevant, NOT backend-behavior tests: scheduler tests each define a local FakeBackend (`keep_fresh→False`, `status→""`, canned decide) — test_followups.py:41, test_recheck_status.py:37, test_run_fix_invariant.py:44, test_run_hunt_rehunt.py:91, test_engage_history_guard.py:34, test_fix_retry_give_up.py:43, test_override_wake.py:32 — the mock pattern the Rust core tests took over as `ScriptedBackend` (tests/support/mod.rs:297-340). tests/test_types.py touches enums/statuses only (no backend config assertions).
 
 ---
 
@@ -384,7 +384,7 @@ Also relevant, NOT backend-behavior tests: scheduler tests each define a local F
 | `decide()` | **none** (reads: running_estimate ×1, finished_since ×2, estimate_capacity ×2 in _unaccounted_fraction + ×1 per _frac_to_tokens call) | reads agent.db via read_windows |
 | `keep_fresh()` | `window_log` INSERT per window (always) + conditional `calibration_samples` INSERT — both via `_observe` (facade.py:287,306-346) | spawns `omp usage invalidate` then `omp usage` (facade.py:296-303); reads agent.db |
 | `status()` | **none** (reads ledger like decide + estimate_capacity per lid) | reads agent.db |
-| `run()` (r3) | none itself — scheduler's `_record_job` persists the RunResult (scheduler.py:88-116) | spawns omp worker; two read_windows snapshots; sets rr.usage_delta |
+| `run()` | none itself — scheduler's `_record_job` persists the RunResult (scheduler.py:88-116) | spawns omp worker; two read_windows snapshots; sets rr.usage_delta |
 
 No scheduler wake from the backend: `_wake` (server.py:90) is set by server POST handlers only. Denied-job rows + `deny` events are written by the scheduler callers, never by decide().
 
@@ -393,14 +393,14 @@ Clock call sites (`time.time()`):
 - facade._decide_inner :107 and facade._compute_headroom :186 (two reads inside one decide — a frozen Clock removes intra-call skew)
 - facade._observe :313; facade.status :354 + `time.strftime/localtime` :412 (**local timezone**, 12-h clock)
 - store `now_ms()` for observed_at in log_window_observation :960 / record_calibration_sample :993 and the `resets_at < now` bound in estimate_capacity :896 (types.py:90-91)
-- harness :111-147 (round 3): spawn time, gmtime spawn_iso, wallclock cap
+- harness :111-147 (Rust: harness.rs — spawn time :255-260 via `epoch_to_iso`, wallclock cap :359)
 Ramp/retry functions are already pure (take now_ms / resets_at as args) — keep them free functions.
 
 Rust recommendations:
 1. `trait Clock { fn now_ms(&self) -> f64 }` (or i64) as a field on the backend AND available to the store. Python tests run against the real clock with relative offsets and ±2000 ms tolerances (test_budget.py:208,255,308); with an injected fixed clock, Rust asserts exact values instead.
 2. Window source: `read_windows(db_path, now_ms) -> BTreeMap<String, WindowState>` pure, with the agent.db path a backend field; tests either point the path at a fixture DB (test_budget.py:425) or swap the source wholesale (test_budget.py:93; test_refresh_stale_probe.py:78-81). A `WindowSource` trait (or `fn windows(&self)` overridable seam) covers both.
 3. Prober exec: inject the command runner (`trait UsageProber` or a closure field) — tests assert exact argv and call ORDER, and the (124/127, never-panic) rc mapping of util.run_cmd:9-40.
-4. status() local-time text (`%I:%M %p` + `lstrip("0")`): chrono Local; TZ-dependent, no test pins it — do not burn it into unit-test golden strings.
+4. status() reset time — **decided against `chrono Local`**. Python's `%I:%M %p` + `lstrip("0")` renders in the *server's* timezone; the shipped `render_status` instead emits `resets <time data-ms="{resets_at}"></time> ({countdown})` (facade.rs:517-536) and the UI formats it in the *viewer's* timezone (StatusPage.svelte:35-45). That is both more correct for a daemon watched from elsewhere and deterministic, which is what lets tests/status_html_test.rs snapshot the whole fragment — a server-local 12-hour clock would make those snapshots machine-dependent. The `<time>` element is therefore the one field `render_status` does **not** html-escape (facade.rs:594), pinned by `limit_id_is_escaped_but_the_time_element_is_not` (status_html_test.rs:202-220).
 5. Hold windows in a BTreeMap everywhere: Python dict order (= insertion = SQL group order) decides which :7d window's reason string wins and status() sorts explicitly anyway.
 
 ---
@@ -412,7 +412,7 @@ deliberately unimplemented, so this section is a map rather than a plan.
 
 **Trait + data** (`src/backend.rs`): `JobClass`/`Verdict`/`Outlook` (:17-70); `SpendLedger`'s 7 methods (:76-113), implemented on `Store` over the sqlx pool (store.rs:1755-1862, SQL per §1.6); the `Prober` subprocess seam + `CmdProber` (:120-131); `Backend` itself (:139-161) with all four methods — `decide`, `keep_fresh`, `status_html`, `run`.
 
-**`omp_scavenge`** (`src/backends/omp_scavenge/`): `capacity.rs` (`read_windows`, the `ramp_7d`/`ramp_5h` + `retry_at_*` pair, `effective_used`), `facade.rs` (`impl Backend for OmpScavengeBackend`, facade.rs:400) including `_usage_snapshot` (facade.rs:336) taken either side of a worker run (facade.rs:634-660), and `harness.rs` (`run_worker` spawn+meter, `snapshot`/`discover` for the session JSONL, `ledger_usage`, and `kill_tree` SIGTERM→SIGKILL at harness.rs:183). `NullBackend` (backend.rs:164-197) remains for router tests only: its `run()` errors by construction, which is the point.
+**`omp_scavenge`** (`src/backends/omp_scavenge/`): `capacity.rs` (`read_windows`, the `ramp_7d`/`ramp_5h` + `retry_at_*` pair, `effective_used`), `facade.rs` (`impl Backend for OmpScavengeBackend`, facade.rs:606) including `_usage_snapshot_sync` (facade.rs:339) taken either side of a worker run (facade.rs:688-731), and `harness.rs` (`run_worker` spawn+meter :243, `snapshot`/`discover` for the session JSONL, `ledger_usage`, and the SIGTERM→SIGKILL group kill `util::kill_tree` (util.rs:65) at harness.rs:345,356,361). `NullBackend` (backend.rs:164-197) remains for router tests only: its `run()` errors by construction, which is the point.
 
 **Callers**: `src/scheduler.rs` has `pick_next`, `anticipated_tokens`, `record_job`, `run_cycle` and every runner (`run_hunt`, `run_recheck`, `run_fix`, `run_engage`, `run_harvest`, plus the repo-level `run_test_gap`/`run_dep_update`/`run_refactor`/`run_modernize`/`run_standards`) and `sync_prs`. `src/daemon.rs` has `run_daemon` (UI server task + usage-prober task + scheduler loop in one process), `acquire_lockfile`, `reconcile_and_log`, `describe_cycle` and `compute_sleep_s`, with `USAGE_PROBE_TICK_S = 60` (daemon.rs:18) probing `keep_fresh()` at startup and each tick (daemon.rs:224-238).
 
@@ -425,4 +425,4 @@ deliberately unimplemented, so this section is a map rather than a plan.
 2. `min_delta` in `estimate_capacity` is dead (unreferenced in store.py:884-921).
 3. Config keys `budget.deny5hAbove` / weekly-reserve don't exist (§3 flag); ramp math replaced them.
 4. `WindowState.stale` (capacity.py:58-60) is dead code — nothing references `.stale`; live checks use `cfg.stale_after_s`.
-5. `_frac_to_tokens` never consults `estimate_capacity("anthropic:7d")` (facade.py:214-220) while `_unaccounted_fraction` does (facade.py:94) — deliberate-looking asymmetry; port verbatim.
+5. ~~`_frac_to_tokens` never consults `estimate_capacity("anthropic:7d")` while `_unaccounted_fraction` does — deliberate-looking asymmetry; port verbatim.~~ **Retracted — this was never true.** `facade.py:224` reads `estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)`, the same derivation `_unaccounted_fraction` uses at `:99`; the ratio is the fallback for when there is no history to estimate from, not the rule. See §"frac_to_tokens" above. Struck rather than deleted because acting on it would change shipped behaviour, and a reader who remembers the claim should find its retraction rather than its absence.
