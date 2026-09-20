@@ -13,6 +13,128 @@ permissions:
   contents: read
 
 jobs:
+  # ── Rust backend (hunter-rs/) ──────────────────────────────────
+  rust:
+    name: Rust — lint + test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter-rs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: hunter-rs
+
+      # No dev.db step: build.rs regenerates it from migrations/ on every
+      # build, which is what sqlx::query! validates against.
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Same script `just lint` runs locally — `just` itself is not
+      # installed in this job, so both call the script rather than CI
+      # re-implementing the rules.
+      - name: SQL encapsulation
+        run: ./check-sql.sh
+
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: cargo-nextest
+
+      - name: Test
+        run: cargo nextest run --profile ci
+
+  # ── Line coverage ─────────────────────────────────────────────
+  # A ratchet, not a target. The floor sits just under the current
+  # number so an unrelated change cannot drift it downward unnoticed;
+  # raise it when a module gets covered, never lower it to go green.
+  #
+  # Coverage and mutation testing answer different questions and are
+  # both needed: coverage says whether a line RUNS, mutants says whether
+  # anything NOTICES when it changes. A module can score 90% coverage
+  # and still lose every mutant. Coverage is also what says where
+  # running mutants is worthwhile at all — mutating code no test
+  # executes just reports "untested" slowly.
+  #
+  # Mutation testing lives in its own workflow (mutants.yml) so its
+  # findings get a run of their own to read, rather than one row inside
+  # this one.
+  coverage:
+    name: Rust — line coverage
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter-rs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: hunter-rs
+
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: cargo-nextest,cargo-llvm-cov
+
+      - name: Coverage
+        run: cargo llvm-cov nextest --profile ci --summary-only --fail-under-lines 50
+
+
+  # ── Svelte frontend (hunter/ui-svelte/) ────────────────────────
+  frontend:
+    name: Frontend — lint + typecheck + test + build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hunter/ui-svelte
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hunter/ui-svelte/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: ESLint
+        run: npx eslint src/
+
+      # `npm run check`, never bare `svelte-check`: the script is
+      # `svelte-check --tsconfig ./tsconfig.app.json && tsc -p
+      # tsconfig.node.json`, and running only the first half leaves
+      # vite.config.ts untypechecked. Bare svelte-check is also how a
+      # weaker default config got used locally for several rounds --
+      # 104 files where the project config covers 127 -- reporting a
+      # clean tree for errors CI then failed on.
+      - name: Svelte check
+        run: npm run check
+
+      - name: Test
+        run: npx vitest run
+
+      - name: Build
+        run: npx vite build
   # ── Python hunter (hunter/) ────────────────────────────────────
   python:
     name: Python — lint + typecheck + test
@@ -44,29 +166,3 @@ jobs:
       - name: Test
         run: pytest tests/ -q
 
-  # ── Frontend (hunter/ui/) ──────────────────────────────────────
-  frontend:
-    name: Frontend — typecheck + build
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: hunter
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: hunter/package-lock.json
-
-      - name: Install deps
-        run: npm ci
-
-      - name: Typecheck
-        run: npx tsc --project ui/tsconfig.json
-
-      - name: Build
-        run: npx esbuild ui/src/app.ts --bundle --outfile=ui/app.js --sourcemap --target=es2022 --format=iife

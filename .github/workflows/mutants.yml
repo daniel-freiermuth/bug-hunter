@@ -1,0 +1,137 @@
+name: Mutants
+
+# Its own workflow, not a job inside CI: as a job it appeared only as one
+# row of the CI run, and the GitHub UI gives a sub-job no place to show a
+# long list of surviving mutants. A separate workflow gets its own run,
+# its own log, and its own history to compare against.
+#
+# Advisory: it reports surviving mutants and never fails the run. See the
+# job comment below for why, and for what has to happen before it gates.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Deliberately NOT sharing CI's concurrency group: a mutation run takes
+# far longer than the rest of CI, and cancelling it on every push is how
+# it ended up never finishing. It still cancels its own older runs.
+concurrency:
+  group: mutants-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Mutation testing ──────────────────────────────────────────
+  # Tests the mutants a change introduces, not the whole tree: a
+  # survivor means the suite cannot tell the new code from a broken
+  # version of it. Scope is "lines in the diff" plus, for any function
+  # the diff touches, the mutant that replaces that whole function --
+  # so a one-line change inside a large function is audited as the
+  # whole function, which is the point rather than a leak.
+  #
+  # On a long-lived branch "the diff" can be the entire codebase: this
+  # branch introduces all of hunter-rs, ~1838 mutants, hours of work.
+  # That is what the budget bounds -- by SHARDING, not by giving up. See
+  # the step below; an ordinary PR is a handful of mutants and runs
+  # whole.
+  mutants:
+    # ADVISORY, not a gate: it reports surviving mutants without failing
+    # the run. It was made advisory the day it was found to have been
+    # reporting success while running nothing -- `--in-diff` against the
+    # base branch means "the whole port" here, which blew the budget, and
+    # the over-budget path exited 0 with a notice. Printing real MISSED
+    # lines and being honest about not blocking is strictly better than a
+    # green tick that means nothing.
+    #
+    # It should become blocking once the surviving mutants are worked
+    # through: a 1/40 sample found 11, all in `compute_sleep_s` /
+    # `describe_cycle`, where the sleep between cycles can be replaced by
+    # a constant and its comparisons inverted with the suite still green.
+    # Until then a rotating shard would fail different runs for different
+    # reasons, which trains people to ignore it.
+    name: Mutation coverage of the diff (advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: hunter-rs
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          workspaces: hunter-rs
+
+      # No dev.db step: build.rs regenerates it from migrations/ on every
+      # build, which is what sqlx::query! validates against.
+      - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
+        with:
+          tool: cargo-nextest,cargo-mutants
+
+      - name: Mutants introduced by this PR
+        # Surviving mutants are reported, not enforced; see the job comment.
+        continue-on-error: true
+        env:
+          # Per-run ceiling, not a give-up threshold: a diff with more
+          # mutants than this is split into shards and one shard runs.
+          MAX_MUTANTS: "400"
+          BASE_REF: ${{ github.base_ref }}
+          # Rotates the shard so consecutive pushes cover different
+          # slices instead of re-testing the same one.
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          # --relative is load-bearing: without it git emits repo-relative
+          # paths (a/hunter-rs/src/...) while cargo-mutants runs inside the
+          # package and matches on src/..., so every mutant is filtered out
+          # and the job passes having tested nothing.
+          git diff --no-color --relative "origin/$BASE_REF"...HEAD -- . > /tmp/pr.diff
+
+          # Check the exit status: a failed --list is otherwise
+          # indistinguishable from an empty one, and the job would report
+          # success on a count of 0 having tested nothing.
+          if ! cargo mutants --in-diff /tmp/pr.diff --list > /tmp/mutants.list; then
+            echo "::error::cargo mutants --list failed; see the output above."
+            exit 1
+          fi
+          count=$(wc -l < /tmp/mutants.list)
+          echo "diff introduces $count mutants (budget: $MAX_MUTANTS)"
+
+          if [ "$count" -eq 0 ]; then
+            echo "::notice::No mutable code in this diff."
+            exit 0
+          fi
+
+          # Over budget used to `exit 0` with a notice, which made this
+          # job report success having run nothing -- on this branch, for
+          # its whole life, because `--in-diff` against the base branch
+          # means "the entire port" (1838 mutants against a budget of a
+          # few hundred). A gate whose skip path is indistinguishable
+          # from a pass is worse than no gate: it is cited as evidence.
+          #
+          # So instead of skipping, split into ceil(count / MAX_MUTANTS)
+          # shards and run exactly one, chosen by run number so
+          # successive pushes cover different slices. Bounded work every
+          # run, and every mutant is reachable over time.
+          shards=$(( (count + MAX_MUTANTS - 1) / MAX_MUTANTS ))
+          if [ "$shards" -le 1 ]; then
+            echo "$count mutants fits the budget; running all of them."
+            cargo mutants --test-tool nextest --in-diff /tmp/pr.diff \
+              -j 2 --colors never
+            exit $?
+          fi
+
+          # `--shard k/n` is zero-based: k in 0..n-1.
+          shard=$(( RUN_NUMBER % shards ))
+          echo "::notice::$count mutants > $MAX_MUTANTS; running shard \
+            $shard of $shards (~$(( count / shards )) mutants)."
+          cargo mutants --test-tool nextest --in-diff /tmp/pr.diff \
+            --shard "$shard/$shards" -j 2 --colors never

@@ -2,26 +2,46 @@
 set shell := ["bash", "-cu"]
 
 # Regenerate the schema-only dev DB from migrations (sqlx compile-time checks).
+#
+# Delegates to build.rs rather than replaying the .sql files here: build.rs
+# also stamps _sqlx_migrations, so every copy of dev.db is already at head
+# and tests never replay a migration over a schema that already has its
+# effects. A hand-applied dev.db dies on the first ALTER TABLE ADD COLUMN.
+#
+# The touch is what forces the rerun. build.rs declares only
+# rerun-if-changed=migrations, so with an unchanged tree cargo's fingerprint
+# stays fresh and deleting dev.db regenerates nothing.
 dev-db:
-    rm -f dev.db
-    for m in migrations/*.sql; do sqlite3 -bail dev.db < "$m" || exit 1; done
+    touch migrations/*.sql
+    cargo check --quiet
     @echo "dev.db regenerated from migrations"
 
-# Full lint: clippy + SQL encapsulation guarantee
+# Full lint: every gate CI runs before the tests, in CI's order.
+#
+# The flags are not decoration. `-D warnings` is what makes this agree
+# with CI: Cargo.toml sets `pedantic = "warn"`, so without it a pedantic
+# finding leaves this recipe at exit 0 and fails the push instead. And
+# `cargo fmt --check` belongs here for the same reason -- CI runs it as
+# its own step, so a recipe that skips it reports clean on a tree CI
+# rejects. A local gate that is weaker than the remote one is worse than
+# no local gate: it answers the question you asked it, wrongly.
 lint:
-    cargo clippy --all-targets
-    @echo "Checking SQL encapsulation..."
-    @! grep -rn '\.pool()' src/ | grep -v 'store\.rs' | grep -v '//' && echo "✓ pool() only in store.rs" || (echo "✗ pool() leaked outside store.rs" && exit 1)
-    @! grep -rn 'sqlx::query(' src/ | grep -v 'query!\|query_as!\|query_scalar!\|capacity\.rs\|//' && echo "✓ all queries compile-time checked" || (echo "✗ unchecked sqlx::query found" && exit 1)
-    @! grep -rn 'QueryBuilder' src/ | grep -v '//' && echo "✓ no QueryBuilder" || (echo "✗ QueryBuilder found" && exit 1)
-    @echo "All SQL guarantees hold."
+    cargo fmt --check
+    cargo clippy --all-targets -- -D warnings
+    ./check-sql.sh
 
 check:
     cargo check --all-targets
 
 # nextest-only: see .config/nextest.toml.
+#
+# `--profile ci` because that is what CI runs, and the two profiles are
+# not interchangeable: default stops at the first failure and kills a
+# test after 60s, ci reports every failure and allows 120s. Running the
+# default locally therefore both hides failures past the first and can
+# fail a slow test that CI passes.
 test:
-    cargo nextest run
+    cargo nextest run --profile ci
 
 # Mutation-test one module: does the suite notice when it breaks?
 mutants FILE:

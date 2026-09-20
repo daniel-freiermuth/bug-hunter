@@ -1,0 +1,63 @@
+# cargo-mutants configuration.
+#
+# A full run is ~1900 mutants and takes hours, so it is not a per-push
+# gate. Two ways to use it:
+#
+#   cargo mutants --test-tool nextest -j 4 --file src/<module>.rs
+#       Focused audit of one module. This is the useful one.
+#
+#   cargo mutants --test-tool nextest \
+#       --in-diff <(git diff --relative <remote>/master...HEAD -- .)
+#       Only the mutants your change introduces. Cheap enough for CI on
+#       a pull request.
+#
+#       `--relative` is load-bearing. Run from this directory, git writes
+#       paths as `a/hunter-rs/src/...` while cargo-mutants matches on
+#       `src/...`, so every mutant is filtered out and the run reports
+#       "No mutants to filter" -- which reads exactly like a clean audit.
+#       Verified: without it, `--list` prints nothing; with it, the same
+#       diff lists mutants. `.github/workflows/mutants.yml` says the same
+#       at its call site.
+#
+#       `<remote>` is `origin` on CI (actions/checkout names it that) but
+#       whatever you cloned with locally -- there is no `origin` in a
+#       working copy that was set up with a named remote, and the
+#       resulting "unknown revision" is a confusingly indirect way to
+#       arrive at an empty diff.
+#
+# What a surviving mutant means: the test suite cannot tell the mutated
+# code from the real code. Sometimes that is a missing test, sometimes
+# the mutant is genuinely equivalent — in which case the honest fix is
+# usually to delete the redundant code that made it equivalent, not to
+# add a test that cannot exist. Both happened on the first run here.
+
+# `playbook_contract_test` renders the REAL playbooks in ../hunter, and
+# `ui_contract_test` reads the REAL ../hunter/ui-svelte sources, neither of
+# which cargo-mutants copies (it takes the crate only). Left in, every
+# mutant run fails its baseline and tests nothing. Both are contract tests
+# between two directories rather than unit tests, so excluding them here
+# costs no mutation signal.
+additional_cargo_test_args = [
+    "-E",
+    "not binary(playbook_contract_test) and not binary(ui_contract_test)",
+]
+
+timeout_multiplier = 3.0
+minimum_test_timeout = 20
+
+# Excluded because mutating them produces noise rather than signal:
+exclude_globs = [
+    # Generated at build time; not hand-written logic.
+    "build.rs",
+    # Argument parsing with a single caller (the systemd unit). Mutants
+    # here are all "accepts a flag it should reject", which the usage
+    # string already documents and no test should be pinned to.
+    "src/main.rs",
+]
+
+# Trait method bodies that only forward, and Display impls, generate
+# mutants whose "correct" behaviour is untestable in isolation.
+exclude_re = [
+    "impl Display",
+    "fn fmt",
+]
