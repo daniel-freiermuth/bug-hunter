@@ -6,11 +6,11 @@ import contextlib
 import json
 import sqlite3
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from pathlib import Path
 
 from .types import (
     ACTIVE_STATUSES,
@@ -85,6 +85,32 @@ _FINDING_KEYS = (
     "evidence_plan",
     "introduced_by",
 )
+
+
+def repo_dir(repos_dir: Path, repo_id: int) -> Path:
+    """Directory holding a repo's clone and notes: ``<repos_dir>/repo-<id>``.
+
+    Keyed by id rather than name so that no filesystem rule -- case
+    folding, reserved device names, trailing dots, length limits -- can
+    turn two distinct repos into one directory or a valid name into an
+    unusable path.
+    """
+    return repos_dir / f"repo-{repo_id}"
+
+
+def _repo_row(row: sqlite3.Row) -> Row:
+    """A repo as the API serves it.
+
+    `deleted_at` is internal bookkeeping for two-phase deletion -- a row
+    carrying one is invisible to every read path anyway, so the column can
+    only ever be NULL here. `SELECT *` would still put the key in the
+    response, where hunter-rs (which selects an explicit column list) has
+    no such key: an additive difference, but the two daemons serve one
+    API and a rollback should not change the shape of a response.
+    """
+    d = dict(row)
+    d.pop("deleted_at", None)
+    return d
 
 
 def _rows(cur: sqlite3.Cursor) -> list[Row]:
@@ -243,6 +269,33 @@ class Store:
         self.db.execute("DROP INDEX IF EXISTS findings_fingerprint")
         self.db.commit()
 
+        # Clone directories are keyed by id (see repo_dir); rows written
+        # before that still point at repos/<name>. Mirrors hunter-rs
+        # migration 007 so a rollback agrees with the Rust daemon about
+        # where every clone lives -- they share one work_root, and a
+        # disagreement means re-cloning all of them.
+        #
+        # String surgery rather than rebuilding from a root, because
+        # work_root is not knowable from SQL. The WHERE guard makes it
+        # idempotent and leaves an operator-edited path alone; the
+        # directories themselves are moved by the deploy, since SQL cannot
+        # move files and a half-applied rename is worse than none. A repo
+        # whose directory was missed simply re-clones on its next job.
+        # An exact suffix comparison, NOT `path LIKE '%/' || name`: LIKE
+        # reads `_` and `%` in the *name* as wildcards, and the name rule
+        # allows underscores. A repo called `a_b` would match a path
+        # ending `/axb` and rewrite it -- the one thing the guard exists
+        # to prevent, since an unrecognised path was put there by hand.
+        self.db.execute(
+            "UPDATE repos"
+            " SET path = substr(path, 1, length(path) - length(name)) || 'repo-' || id"
+            " WHERE substr(path, length(path) - length(name)) = '/' || name"
+        )
+        self.db.commit()
+
+        # After the column migrations, not in schema.sql: schema.sql runs
+        # before them, and on an existing database `repos.deleted_at` does
+        # not exist yet at that point.
         self.db.execute(
             "CREATE INDEX IF NOT EXISTS repos_deleted_at ON repos(deleted_at)"
             " WHERE deleted_at IS NOT NULL"
@@ -373,14 +426,30 @@ class Store:
         self,
         name: str,
         url: str,
-        path: str,
+        repos_dir: Path | str,
         default_branch: str = "main",
         forge: str = "github",
     ) -> int:
+        """Insert a repo; its clone path is ``<repos_dir>/repo-<id>``.
+
+        Keyed by id, never by name: names that differ only in case are the
+        same directory on NTFS and APFS, Windows reserves CON/NUL/AUX,
+        strips trailing dots, and anything over 255 bytes is ENAMETOOLONG
+        at clone time rather than at add time. The name is display-only.
+
+        The path needs the id, so both statements share one transaction --
+        a row whose path never got written would be unusable.
+        """
         cur = self.db.execute(
             "INSERT INTO repos (name, url, path, forge, default_branch, added_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (name, url, str(path), forge, default_branch, now_ms()),
+            " VALUES (?,?,'',?,?,?)",
+            (name, url, forge, default_branch, now_ms()),
+        )
+        rid = cur.lastrowid
+        assert rid is not None
+        self.db.execute(
+            "UPDATE repos SET path = ? WHERE id = ?",
+            (str(repo_dir(Path(repos_dir), rid)), rid),
         )
         self.db.commit()
         assert cur.lastrowid is not None
@@ -388,12 +457,16 @@ class Store:
 
     def get_repo(self, key: int | str) -> Row | None:
         q = "id = ?" if isinstance(key, int) or str(key).isdigit() else "name = ?"
-        cur = self.db.execute(f"SELECT * FROM repos WHERE {q}", (key,))
+        # Flagged rows are invisible everywhere; only the reaper sees them.
+        cur = self.db.execute(f"SELECT * FROM repos WHERE {q} AND deleted_at IS NULL", (key,))
         r = cur.fetchone()
-        return dict(r) if r else None
+        return _repo_row(r) if r else None
 
     def list_repos(self) -> list[Row]:
-        return _rows(self.db.execute("SELECT * FROM repos ORDER BY name"))
+        return [
+            _repo_row(r)
+            for r in self.db.execute("SELECT * FROM repos WHERE deleted_at IS NULL ORDER BY name")
+        ]
 
     def set_last_hunt(self, repo_id: int, sha: str) -> None:
         self.db.execute(
@@ -417,52 +490,87 @@ class Store:
         )
         self.db.commit()
 
-    def delete_repo(self, repo_id: int) -> None:
-        """Remove a repo record. Refuses if findings or jobs still reference
+    def soft_delete_repo(self, repo_id: int) -> None:
+        """Flag a repo deleted. Refuses if findings or jobs still reference
         it -- delete their history first, or use update_repo(enabled=False)
-        to pause scheduling without losing data."""
-        n_findings = self.db.execute(
-            "SELECT COUNT(*) AS n FROM findings WHERE repo_id = ?", (repo_id,)
-        ).fetchone()["n"]
-        n_jobs = self.db.execute(
-            "SELECT COUNT(*) AS n FROM jobs WHERE repo_id = ?", (repo_id,)
-        ).fetchone()["n"]
-        if n_findings or n_jobs:
-            msg = (
-                f"repo {repo_id} has {n_findings} finding(s) and {n_jobs} job(s) -- "
-                "cannot delete without losing history; pause it instead"
+        to pause scheduling without losing data.
+
+        Phase one of two, mirroring hunter-rs. The row survives on purpose:
+        `id` is a rowid alias, so dropping it here would let the next
+        INSERT take that number while repos/repo-<id> is still being
+        removed, and removing a large clone is not instant. Keeping the row
+        is what reserves the id; reap_deleted_repos() finishes the job.
+
+        The count checks and the flag share one transaction, so a job
+        created concurrently cannot slip between them.
+        """
+        # BEGIN IMMEDIATE, not `with self.db`: the context manager only
+        # commits, it does not open a transaction, and sqlite3 starts one
+        # lazily on the first *write*. The counts below are reads, so
+        # without this another connection can insert a job between the
+        # check and the flag -- and the repo is then deleted out from
+        # under it, which surfaces later as forget_deleted_repo raising
+        # IntegrityError from a thread that has no handler for it.
+        # IMMEDIATE takes the write lock up front, so the check and the
+        # flag see one state.
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            n_findings = self.db.execute(
+                "SELECT COUNT(*) AS n FROM findings WHERE repo_id = ?", (repo_id,)
+            ).fetchone()["n"]
+            n_jobs = self.db.execute(
+                "SELECT COUNT(*) AS n FROM jobs WHERE repo_id = ?", (repo_id,)
+            ).fetchone()["n"]
+            if n_findings or n_jobs:
+                msg = (
+                    f"repo {repo_id} has {n_findings} finding(s) and {n_jobs} job(s) -- "
+                    "cannot delete without losing history; pause it instead"
+                )
+                raise ValueError(msg)
+            # The name is released now, not at reap time: repos.name is
+            # UNIQUE, so a flagged row would keep rejecting the name of a
+            # repo the operator has already been told is gone.
+            self.db.execute(
+                "UPDATE repos"
+                " SET deleted_at = ?, name = name || ' (deleted #' || id || ')'"
+                " WHERE id = ? AND deleted_at IS NULL",
+                (now_ms(), repo_id),
             )
-            raise ValueError(msg)
-        # Serialize against append_repo_note() on other threads/connections:
-        # both touch the same on-disk NOTES.md, and SQLite can reuse this
-        # repo_id after commit, so an interleaved append could recreate the
-        # file between our unlink and commit (or between commit and a
-        # would-be restore).
-        with self._NOTES_LOCK:
-            # Capture notes path before deleting the row.  SQLite can reuse
-            # INTEGER PRIMARY KEY ids, so a new repo could inherit stale notes.
-            # Delete the file while the DB row deletion is still uncommitted so
-            # we can rollback if file cleanup fails.
-            notes_path = self.cfg.work_root / "repos" / f"repo-{repo_id}" / "NOTES.md"
-            self.db.execute("DELETE FROM repos WHERE id = ?", (repo_id,))
-            # Save notes content so we can restore if commit fails
-            notes_backup = None
-            try:
-                if notes_path.exists():
-                    notes_backup = notes_path.read_bytes()
-                    notes_path.unlink()
-            except OSError:
-                self.db.rollback()
-                raise
-            try:
-                self.db.commit()
-            except Exception:
-                self.db.rollback()
-                # Restore notes file if commit fails
-                if notes_backup is not None:
-                    notes_path.parent.mkdir(parents=True, exist_ok=True)
-                    notes_path.write_bytes(notes_backup)
-                raise
+        except BaseException:
+            self.db.rollback()
+            raise
+        self.db.commit()
+
+    def repo_is_deleted(self, repo_id: int) -> bool:
+        """Is this id a repo that was deleted but not yet reclaimed?
+
+        Only the delete endpoint asks, so that retrying a request whose
+        response was lost is still a success rather than a 404.
+        """
+        row = self.db.execute(
+            "SELECT 1 FROM repos WHERE id = ? AND deleted_at IS NOT NULL", (repo_id,)
+        ).fetchone()
+        return row is not None
+
+    def deleted_repo_ids(self) -> list[int]:
+        """Ids awaiting reclamation, oldest first."""
+        return [
+            int(r["id"])
+            for r in _rows(
+                self.db.execute(
+                    "SELECT id FROM repos WHERE deleted_at IS NOT NULL ORDER BY deleted_at"
+                )
+            )
+        ]
+
+    def forget_deleted_repo(self, repo_id: int) -> None:
+        """Drop a flagged row once its directory is gone.
+
+        This is the moment the id becomes available again, so it must not
+        run before the filesystem is actually clean.
+        """
+        with self.db:
+            self.db.execute("DELETE FROM repos WHERE id = ? AND deleted_at IS NOT NULL", (repo_id,))
 
     # -- repo notes ----------------------------------------------------
     def repo_notes_path(self, repo_id: int) -> Path:
@@ -472,7 +580,7 @@ class Store:
             msg = f"repo {repo_id} not found"
             raise ValueError(msg)
         # Use repo_id for path stability (survives renames)
-        return self.cfg.work_root / "repos" / f"repo-{repo_id}" / "NOTES.md"
+        return repo_dir(self.cfg.work_root / "repos", repo_id) / "NOTES.md"
 
     _MAX_NOTES_CHARS = 4000  # prompt-injection safety + token budget
 
@@ -881,12 +989,27 @@ class Store:
         (prompt building, git operations, worktree setup) opened a real
         window where _cycle_lock was already held (the UI's "cycle
         running" indicator) but current_job() found nothing yet, showing
-        stale last-cycle text instead."""
+        stale last-cycle text instead.
+
+        Refuses (ValueError) when the repo has been soft-deleted. The
+        EXISTS check rides along with the INSERT rather than preceding it
+        because the scheduler read its repo row long before reaching here:
+        a delete landing in between passes any check-then-insert, and the
+        foreign key does not catch it either -- a flagged row is still
+        physically present. The job that slips through is worse than a
+        lost cycle: forget_deleted_repo is a plain DELETE, so one
+        referencing job wedges the repo half-deleted forever -- invisible
+        to every read path, unreapable, still accruing work."""
         cur = self.db.execute(
             "INSERT INTO jobs (kind, repo_id, finding_id, cap_tokens, state, started_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (kind, repo_id, finding_id, cap_tokens, state, now_ms()),
+            " SELECT ?,?,?,?,?,?"
+            " WHERE EXISTS (SELECT 1 FROM repos WHERE id = ? AND deleted_at IS NULL)",
+            (kind, repo_id, finding_id, cap_tokens, state, now_ms(), repo_id),
         )
+        if not cur.rowcount:
+            self.db.rollback()
+            msg = f"repo {repo_id} is deleted -- cannot start a {kind} job"
+            raise ValueError(msg)
         self.db.commit()
         assert cur.lastrowid is not None
         return cur.lastrowid

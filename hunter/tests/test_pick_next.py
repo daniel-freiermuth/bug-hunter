@@ -202,9 +202,9 @@ class TestPickNextRepoRotation:
     def test_never_run_job_types_picked_by_priority_not_alphabetically(
         self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
-        repo_path = tmp_path / "repo"
+        rid = store.add_repo("r", "https://r", tmp_path)
+        repo_path = Path(store.get_repo(rid)["path"])
         repo_path.mkdir()
-        rid = store.add_repo("r", "https://r", str(repo_path))
         store.set_last_hunt(rid, "deadbeef")  # hunt has run; others haven't
 
         kind, _target = pick_next(store, cfg)
@@ -224,7 +224,11 @@ class TestPickNextRepoRotation:
         before "hunt" alphabetically and both are tied at 0."""
         repo_path = tmp_path / "repo"
         repo_path.mkdir()  # already cloned (a denied hunt still clones first)
-        rid = store.add_repo("r", "https://r", str(repo_path))
+        rid = store.add_repo("r", "https://r", tmp_path)
+        # The store owns the clone location (repos/repo-<id>), so the
+        # fixture's repo moves to it rather than the row pointing at
+        # wherever the fixture happened to build it.
+        repo_path = repo_path.rename(store.get_repo(rid)["path"])
         # hunt was attempted and denied -- last_hunt_at is still unset, exactly
         # like every other never-run job type for this brand-new repo.
 
@@ -235,9 +239,9 @@ class TestPickNextRepoRotation:
     def test_oldest_last_run_wins_when_none_are_never_run(
         self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
-        repo_path = tmp_path / "repo"
+        rid = store.add_repo("r", "https://r", tmp_path)
+        repo_path = Path(store.get_repo(rid)["path"])
         repo_path.mkdir()
-        rid = store.add_repo("r", "https://r", str(repo_path))
         store.db.execute(
             "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
             " last_dep_update_at=?, last_refactor_at=?, last_modernization_at=? WHERE id=?",
@@ -278,9 +282,9 @@ class TestPickNextModernizationGate:
     def test_never_run_modernization_is_eligible_immediately(
         self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
-        repo_path = tmp_path / "repo"
+        rid = store.add_repo("r", "https://r", tmp_path)
+        repo_path = Path(store.get_repo(rid)["path"])
         repo_path.mkdir()
-        rid = store.add_repo("r", "https://r", str(repo_path))
         # Other four have all run; only modernization is never-run.
         store.db.execute(
             "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
@@ -295,9 +299,9 @@ class TestPickNextModernizationGate:
     def test_gated_out_within_interval_even_if_otherwise_stalest(
         self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
-        repo_path = tmp_path / "repo"
+        rid = store.add_repo("r", "https://r", tmp_path)
+        repo_path = Path(store.get_repo(rid)["path"])
         repo_path.mkdir()
-        rid = store.add_repo("r", "https://r", str(repo_path))
         recent = now_ms()
         # modernization ran a moment ago (well inside the 30-day interval);
         # the other four ran long before that -- would lose to modernization
@@ -315,9 +319,9 @@ class TestPickNextModernizationGate:
     def test_eligible_again_once_interval_has_elapsed(
         self, store: Store, cfg: Config, tmp_path: Path
     ) -> None:
-        repo_path = tmp_path / "repo"
+        rid = store.add_repo("r", "https://r", tmp_path)
+        repo_path = Path(store.get_repo(rid)["path"])
         repo_path.mkdir()
-        rid = store.add_repo("r", "https://r", str(repo_path))
         interval_ms = cfg.modernization_interval_days * 86_400_000
         long_ago = now_ms() - interval_ms - 1000
         # modernization last ran just over the interval ago -- it's the

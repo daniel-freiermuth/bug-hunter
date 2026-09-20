@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 
 import pytest
 
+from hunter import server
 from hunter.backends.omp_scavenge.capacity import WindowState
 from hunter.store import Store, _require_keys
 from hunter.types import Config, SchedulerStateDict, now_ms
@@ -86,25 +88,146 @@ class TestRepos:
 
     def test_delete_repo_with_no_history(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
-        store.delete_repo(rid)
+        store.soft_delete_repo(rid)
         assert store.get_repo(rid) is None
+        # Invisible, but still holding its id until its files are gone.
+        assert store.deleted_repo_ids() == [rid]
+        store.forget_deleted_repo(rid)
+        assert store.deleted_repo_ids() == []
 
     def test_delete_repo_refuses_with_findings(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
         store.upsert_finding(rid, _make_finding())
         with pytest.raises(ValueError, match="finding"):
-            store.delete_repo(rid)
+            store.soft_delete_repo(rid)
         assert store.get_repo(rid) is not None
 
     def test_delete_repo_refuses_with_jobs(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
         store.create_job("hunt", rid)
         with pytest.raises(ValueError, match="job"):
-            store.delete_repo(rid)
+            store.soft_delete_repo(rid)
         assert store.get_repo(rid) is not None
 
     def test_delete_repo_missing_is_noop(self, store: Store) -> None:
-        store.delete_repo(999)  # no rows affected, does not raise
+        store.soft_delete_repo(999)  # no rows affected, does not raise
+        assert store.deleted_repo_ids() == []
+
+    def test_create_job_refuses_a_soft_deleted_repo(self, store: Store) -> None:
+        """The scheduler picks a live repo, the operator deletes it
+        mid-cycle, and the runner reaches the job insert afterwards. The
+        foreign key is no defence -- the flagged row is still physically
+        there -- so a job written here would pin the repo half-deleted
+        forever: forget_deleted_repo is a plain DELETE and the FK refuses
+        it while any job references the row.
+        """
+        live = store.add_repo("live", "https://l", "/l")
+        doomed = store.add_repo("doomed", "https://d", "/d")
+        picked = store.get_repo(doomed)  # the scheduler's view, taken while live
+        assert picked is not None
+        store.soft_delete_repo(doomed)
+
+        with pytest.raises(ValueError, match=f"repo {doomed} is deleted"):
+            store.create_job("hunt", picked["id"], state="running")
+        assert store.list_jobs() == []
+        # Keyed on deleted_at, not on absence: a live repo still gets its job.
+        assert store.create_job("hunt", live, state="running") > 0
+
+        # And the deletion can still finish, because no job row is holding
+        # the id: the reaper's DELETE goes through instead of hitting the FK.
+        assert store.deleted_repo_ids() == [doomed]
+        store.forget_deleted_repo(doomed)
+        assert store.deleted_repo_ids() == []
+        assert store.get_repo(doomed) is None
+
+    def test_legacy_name_based_paths_are_rewritten_to_ids(self, tmp_path: Path) -> None:
+        """Rows written before clone dirs were keyed by id must converge.
+
+        Both daemons share one work_root, so if Python kept pointing at
+        repos/<name> while hunter-rs points at repos/repo-<id>, a
+        rollback would re-clone every repo. Mirrors migration 007.
+        """
+        cfg = Config(work_root=tmp_path, db_path=tmp_path / "t.db")
+        store = Store(cfg)
+        rid = store.add_repo("widget", "https://w", tmp_path / "repos")
+        # Put the row back the way the pre-migration code wrote it.
+        store.db.execute(
+            "UPDATE repos SET path = ? WHERE id = ?",
+            (str(tmp_path / "repos" / "widget"), rid),
+        )
+        store.db.commit()
+
+        reopened = Store(cfg)  # runs the migrations again
+        assert reopened.get_repo(rid)["path"] == str(tmp_path / "repos" / f"repo-{rid}")
+
+        # Idempotent: a second open must not mangle the already-migrated path.
+        assert Store(cfg).get_repo(rid)["path"] == str(tmp_path / "repos" / f"repo-{rid}")
+
+    def test_repo_is_deleted_only_while_reclamation_is_pending(self, tmp_path: Path) -> None:
+        cfg = Config(work_root=tmp_path, db_path=tmp_path / "t.db")
+        store = Store(cfg)
+        rid = store.add_repo("gone", "https://g", tmp_path / "repos")
+        assert store.repo_is_deleted(rid) is False
+        store.soft_delete_repo(rid)
+        assert store.repo_is_deleted(rid) is True
+        store.forget_deleted_repo(rid)
+        assert store.repo_is_deleted(rid) is False
+
+    def test_soft_delete_holds_the_write_lock_across_its_checks(self, tmp_path: Path) -> None:
+        """The history check and the flag must see one state.
+
+        `with self.db` only commits -- sqlite3 opens a transaction lazily
+        on the first write -- so the COUNT queries used to run outside any
+        transaction. A job inserted by another connection in that gap was
+        invisible to the check, and the repo got flagged anyway; the
+        deletion then failed much later, inside the reaper, as an
+        IntegrityError on a thread with no handler for it.
+        """
+        cfg = Config(work_root=tmp_path, db_path=tmp_path / "t.db")
+        store = Store(cfg)
+        rid = store.add_repo("r", "https://r", tmp_path / "repos")
+
+        other = Store(cfg)  # separate connection, as a handler thread has
+        started = threading.Event()
+        blocked: list[str] = []
+
+        class _Probe:
+            """Delegates to the real connection; probes for the write lock
+            from another connection while the history check is running."""
+
+            def __init__(self, real: object) -> None:
+                self._real = real
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._real, name)
+
+            def __enter__(self) -> object:
+                return self._real.__enter__()  # type: ignore[attr-defined]
+
+            def __exit__(self, *exc: object) -> object:
+                return self._real.__exit__(*exc)  # type: ignore[attr-defined]
+
+            def execute(self, sql: str, *args: object) -> object:
+                result = self._real.execute(sql, *args)  # type: ignore[attr-defined]
+                if sql.startswith("SELECT COUNT(*) AS n FROM findings"):
+                    started.set()
+                    try:
+                        other.db.execute("BEGIN IMMEDIATE")
+                        blocked.append("acquired")
+                        other.db.rollback()
+                    except sqlite3.OperationalError as exc:
+                        blocked.append(f"blocked: {exc}")
+                return result
+
+        store.db = _Probe(store.db)  # type: ignore[assignment]
+        store.soft_delete_repo(rid)
+
+        assert started.is_set(), "the check never ran"
+        assert blocked, "the probe never ran"
+        assert blocked[0].startswith("blocked"), (
+            "another connection acquired the write lock during the history "
+            f"check, so a job could have been inserted into the gap: {blocked}"
+        )
 
     def test_notes_lock_is_shared_across_store_instances(self, tmp_path: Path) -> None:
         """ThreadingHTTPServer creates one Store (and one SQLite connection)
@@ -116,26 +239,32 @@ class TestRepos:
         store2 = Store(cfg)
         assert store1._NOTES_LOCK is store2._NOTES_LOCK
 
-    def test_delete_repo_blocks_concurrent_append_repo_note(self, tmp_path: Path) -> None:
-        """A delete_repo() in flight must block append_repo_note() on a
-        different Store/connection until the deletion resolves. Without
-        this, a racing append can recreate NOTES.md between delete_repo's
-        unlink and commit -- and since repos.id can be reused, that file
-        could later be read as a *new* repo's notes.
+    def test_reclamation_blocks_concurrent_append_repo_note(self, tmp_path: Path) -> None:
+        """Reclaiming a deleted repo must block append_repo_note() on a
+        different Store/connection until it finishes.
+
+        Deletion is two-phase now, so the flag itself is atomic and needs
+        no protection. The dangerous window moved to reclamation: a note
+        written between the rmtree and the row deletion recreates the
+        directory after the reaper has decided it is gone, and the row is
+        then dropped with files still on disk -- exactly the state that
+        lets a later repo inherit them.
 
         Mirrors ThreadingHTTPServer: each handler thread gets its own
         Store (own SQLite connection), created in that thread.
         """
         cfg = Config(work_root=tmp_path, db_path=tmp_path / "test.db")
         setup_store = Store(cfg)
-        rid = setup_store.add_repo("r", "https://r", "/r")
+        rid = setup_store.add_repo("r", "https://r", tmp_path / "repos")
+        setup_store.append_repo_note(rid, "original note")
+        setup_store.soft_delete_repo(rid)
 
         order: list[str] = []
         release = threading.Event()
 
         class _SlowDb:
-            """Delegates to a real connection; blocks after the DELETE
-            statement so the test can observe delete_repo mid-transaction."""
+            """Delegates to a real connection; blocks after the row is
+            dropped so the test can observe reclamation mid-flight."""
 
             def __init__(self, real: object) -> None:
                 self._real = real
@@ -143,37 +272,43 @@ class TestRepos:
             def __getattr__(self, name: str) -> object:
                 return getattr(self._real, name)
 
+            # Dunders are looked up on the type, so __getattr__ never sees
+            # them; forget_deleted_repo uses `with self.db:`.
+            def __enter__(self) -> object:
+                return self._real.__enter__()  # type: ignore[attr-defined]
+
+            def __exit__(self, *exc: object) -> object:
+                return self._real.__exit__(*exc)  # type: ignore[attr-defined]
+
             def execute(self, query: str, *args: object) -> object:
                 result = self._real.execute(query, *args)  # type: ignore[attr-defined]
                 if query.startswith("DELETE FROM repos"):
-                    order.append("delete:entered")
+                    order.append("reap:entered")
                     release.wait(timeout=2)
-                    order.append("delete:resumed")
+                    order.append("reap:resumed")
                 return result
 
-        def do_delete() -> None:
-            store_a = Store(cfg)  # own connection, created in this thread
+        def do_reap() -> None:
+            store_a = Store(cfg)
             store_a.db = _SlowDb(store_a.db)  # type: ignore[assignment]
-            store_a.delete_repo(rid)
+            server.reap_repo(store_a, tmp_path / "repos", rid)
 
         def do_append() -> None:
-            store_b = Store(cfg)  # own connection, created in this thread
+            store_b = Store(cfg)
             with contextlib.suppress(ValueError):
                 store_b.append_repo_note(rid, "racy note")
             order.append("append:done")
 
-        t1 = threading.Thread(target=do_delete)
+        t1 = threading.Thread(target=do_reap)
         t1.start()
         for _ in range(200):
-            if "delete:entered" in order:
+            if "reap:entered" in order:
                 break
             time.sleep(0.01)
-        assert "delete:entered" in order, "delete_repo never reached its DELETE"
+        assert "reap:entered" in order, "reap_repo never reached its DELETE"
 
         t2 = threading.Thread(target=do_append)
         t2.start()
-        # append_repo_note must still be blocked on the shared lock while
-        # delete_repo holds it -- give it many chances to (wrongly) finish.
         for _ in range(20):
             assert "append:done" not in order
             time.sleep(0.01)
@@ -181,7 +316,7 @@ class TestRepos:
         release.set()
         t1.join(timeout=2)
         t2.join(timeout=2)
-        assert order.index("delete:resumed") < order.index("append:done")
+        assert order.index("reap:resumed") < order.index("append:done")
 
 
 # -- findings --------------------------------------------------------------
@@ -1035,7 +1170,9 @@ def test_standards_finding_round_trips_through_the_fallback(store: Store) -> Non
     NULL and served a standards finding with no category — silently
     dropping the one field that type exists to record.
     """
-    repo_id = store.add_repo("widget", "https://example.com/widget.git", "main")
+    repo_id = store.add_repo(
+        "widget", "https://example.com/widget.git", store.cfg.work_root / "repos"
+    )
     section = "Type safety / Domain types over primitives"
     fid, created = store.upsert_finding(
         repo_id,

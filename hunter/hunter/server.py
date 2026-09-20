@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -23,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 
 from pydantic import TypeAdapter
 
+from .store import repo_dir
 from .types import (
     FINDING_STATUSES,
     REASON_REQUIRED,
@@ -44,6 +46,8 @@ if TYPE_CHECKING:
     # means annotations referencing Store are never evaluated at runtime
     # either), so it can't reintroduce that problem -- it only lets mypy
     # replace the Any that used to stand in for Store's real shape below.
+    from pathlib import Path
+
     from .backend import Backend
     from .store import Store
 
@@ -495,6 +499,10 @@ class Handler(BaseHTTPRequestHandler):
 
                 store = Store(cfg)
                 _reconcile_and_log(store)
+                # Finish deletions whose inline reclamation failed: until
+                # the directory is gone the row must stay, so the id is
+                # reserved indefinitely if nothing retries.
+                reap_deleted_repos(store, cfg.work_root)
                 try:
                     scheduler.run_cycle(store, cfg, backend=backend)
                 except Exception:
@@ -596,6 +604,9 @@ class Handler(BaseHTTPRequestHandler):
         if "enabled" in body:
             fields["enabled"] = 1 if body["enabled"] else 0
         if "url" in body and isinstance(body["url"], str) and body["url"].strip():
+            if not valid_repo_url(body["url"].strip()):
+                self._error(400, "url must be http(s) or an ssh clone URL")
+                return
             fields["url"] = body["url"].strip()
         if (
             "default_branch" in body
@@ -626,6 +637,9 @@ class Handler(BaseHTTPRequestHandler):
         if not url:
             self._error(400, "name and url are required")
             return
+        if not valid_repo_url(url):
+            self._error(400, "url must be http(s) or an ssh clone URL")
+            return
         branch = body.get("branch")
         branch = branch.strip() if isinstance(branch, str) and branch.strip() else "main"
         forge = body.get("forge") or None
@@ -638,11 +652,10 @@ class Handler(BaseHTTPRequestHandler):
         if store.get_repo(name) is not None:
             self._error(409, f"repo {name!r} already exists")
             return
-        repo_path = (self.cfg.work_root / "repos" / name).resolve()
-        if not str(repo_path).startswith(str(self.cfg.work_root.resolve())):
-            self._error(400, "invalid repo name")
-            return
-        rid = store.add_repo(name, url, str(repo_path), branch, forge=forge)
+        # No containment check: the clone directory is repos/repo-<id>, so
+        # the name never reaches a path and cannot escape one.
+        rid = store.add_repo(name, url, self.cfg.work_root / "repos", branch, forge=forge)
+        repo_path = repo_dir(self.cfg.work_root / "repos", rid)
         store.log_event("repo", f"added {name} ({forge}) -> {repo_path}")
         self._json({"ok": True, "repo": store.get_repo(rid)}, 201)
 
@@ -655,10 +668,32 @@ class Handler(BaseHTTPRequestHandler):
         store = self._store()
         repo = store.get_repo(rid)
         if repo is None:
+            # Deleting something already deleted is not an error: a client
+            # that lost the first response and retried must not be told
+            # the repo never existed, and the retry usefully re-attempts
+            # reclamation. The window closes when reclamation does -- once
+            # the row is gone the id is indistinguishable from one that
+            # was never used, so that still 404s, as does an unknown id.
+            if store.repo_is_deleted(rid):
+                reap_repo(store, self.cfg.work_root / "repos", rid)
+                self._json({"ok": True})
+                return
             self._error(404, f"no repo {rid}")
             return
-        store.delete_repo(rid)
+        # Phase one: flag the row. After this the repo is gone from every
+        # read path, so a 200 is the truth even though files remain.
+        store.soft_delete_repo(rid)
         store.log_event("repo", f"deleted {repo['name']} (#{rid})")
+        # Phase two, attempted inline so the common case finishes before
+        # the response. Failure is not the caller's problem -- the repo is
+        # deleted -- it only leaves the id reserved until the next reap.
+        if not reap_repo(store, self.cfg.work_root / "repos", rid):
+            log.warning(
+                "repo %s deleted, but reclaiming %s failed; its id stays reserved"
+                " until the reaper retries",
+                rid,
+                repo_dir(self.cfg.work_root / "repos", rid),
+            )
         self._json({"ok": True})
 
     def _add_repo_note(self) -> None:
@@ -686,6 +721,71 @@ class Handler(BaseHTTPRequestHandler):
             "repo", f"note added to {repo['name']}" + (f" [{category}]" if category else "")
         )
         self._json({"ok": True, "notes": store.repo_notes(rid)}, 201)
+
+
+def valid_repo_url(url: str) -> bool:
+    """Reject URLs whose scheme would be dangerous to render as a link.
+
+    The UI puts a repo's url straight into an `href`, so `javascript:`,
+    `data:` and friends are an XSS vector. Mirrors hunter-rs's
+    `valid_repo_url`: anything without a scheme is fine (scp-style
+    `git@host:owner/repo.git` and bare paths both hit this), and a real
+    scheme must be http, https or ssh -- see the comment on the return
+    for why ssh belongs there.
+
+    A colon alone does not make a scheme -- RFC 3986 requires ALPHA
+    *(ALPHA / DIGIT / "+" / "-" / "."), so `git@host:owner/repo.git`
+    keeps its colon as part of a path.
+    """
+    head, sep, _ = url.partition(":")
+    if not sep:
+        return True
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.\-]*", head):
+        return True
+    # ssh is allowed because the rejection message promises it: the
+    # scp-like `git@host:path` form has no scheme and is accepted above,
+    # but the explicit `ssh://git@host/path` spelling is equally ordinary.
+    # What stays out is anything a browser would execute from an href.
+    return head.lower() in ("http", "https", "ssh")
+
+
+def reap_repo(store: Store, repos_dir: Path, repo_id: int) -> bool:
+    """Remove one flagged repo's directory, then drop its row.
+
+    Ordering is the whole point: the row is what stops SQLite reissuing
+    the id, so it may only go once nothing of the repo is left on disk.
+    Leaving it flagged is always safe -- the repo is already invisible and
+    the next pass retries. Returns False if the directory survived.
+    """
+    rdir = repo_dir(repos_dir, repo_id)
+    # Under the notes lock for the same reason append_repo_note takes it:
+    # a note written between the rmtree and the row deletion would
+    # recreate the directory *after* the reaper decided it was gone,
+    # leaving files behind with no row left to retry them.
+    with store._NOTES_LOCK:  # noqa: SLF001 (class-level lock, shared by every Store)
+        try:
+            shutil.rmtree(rdir)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        store.forget_deleted_repo(repo_id)
+    return True
+
+
+def reap_deleted_repos(store: Store, work_root: Path) -> int:
+    """Finish deletions left flagged by a crash or a failed reclamation."""
+    reaped = 0
+    for repo_id in store.deleted_repo_ids():
+        if reap_repo(store, work_root / "repos", repo_id):
+            reaped += 1
+        else:
+            log.warning(
+                "repo %s is flagged deleted but %s could not be removed; its id stays reserved",
+                repo_id,
+                repo_dir(work_root / "repos", repo_id),
+            )
+    return reaped
 
 
 class _Server(ThreadingHTTPServer):
@@ -969,9 +1069,9 @@ def _compute_sleep_s(store: Store, summary: Row) -> float:
             "SELECT COUNT(*) FROM findings WHERE status = 'queued'"
         ).fetchone()[0]
         job_produced_findings = summary.get("ingest", {}).get("inserted", 0) > 0
-        enabled_repos = store.db.execute("SELECT COUNT(*) FROM repos WHERE enabled = 1").fetchone()[
-            0
-        ]
+        enabled_repos = store.db.execute(
+            "SELECT COUNT(*) FROM repos WHERE enabled = 1 AND deleted_at IS NULL"
+        ).fetchone()[0]
         if queued_fixes > 0:
             sleep_s = 0
         elif job_produced_findings:
@@ -1071,6 +1171,10 @@ def daemon(cfg: Config) -> None:
             try:
                 store = Store(cfg)
                 _reconcile_and_log(store)
+                # Finish deletions whose inline reclamation failed: until
+                # the directory is gone the row must stay, so the id is
+                # reserved indefinitely if nothing retries.
+                reap_deleted_repos(store, cfg.work_root)
                 summary = scheduler.run_cycle(store, cfg, backend=backend)
                 sleep_s = _compute_sleep_s(store, summary)
                 state_label, detail = _describe_cycle(summary)
