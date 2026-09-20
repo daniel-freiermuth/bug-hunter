@@ -3,10 +3,28 @@ Description=Idle-Token Bug Hunter — daemon (UI + budget-gated scheduler)
 After=network-online.target
 
 [Service]
-WorkingDirectory=<project-root>/hunter
-ExecStart=/usr/bin/uv run python3 -m hunter daemon
+WorkingDirectory=<project-root>/hunter-rs
+ExecStart=<project-root>/hunter-rs/target/release/hunter --root <project-root>/hunter
 Restart=on-failure
 RestartSec=30
+
+# SIGTERM means "finish the current cycle, then stop" in both daemons, so
+# the stop timeout has to cover a cycle that is running a worker. The
+# caps are hunt 1800s and fix 2700s of wall clock, so systemd's default
+# (10s here) turned every stop during a cycle into a SIGKILL -- the exact
+# mid-cycle death that handling SIGTERM is meant to avoid. Orphaned rows
+# are repaired by reconcile_and_log on the next start either way; this
+# just stops us relying on that.
+TimeoutStopSec=3000
+
+# systemd's default KillMode=control-group SIGTERMs every process in the
+# cgroup, which includes the omp worker -- it runs in its own process
+# group but the same cgroup, so the default undoes the timeout above by
+# killing the very run we are waiting to finish, wasting the tokens it has
+# already spent. `mixed` sends the SIGTERM to the daemon alone and lets it
+# wind the worker down; the final SIGKILL after TimeoutStopSec still goes
+# to the whole cgroup, so nothing can outlive the stop.
+KillMode=mixed
 
 [Install]
 WantedBy=default.target
