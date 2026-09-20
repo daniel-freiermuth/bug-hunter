@@ -36,7 +36,9 @@ Body parsing `_body_json` (server.py:171-181): reads exactly `Content-Length` by
 | malformed JSON | `json.JSONDecodeError` | `400 {"error": "Expecting value: line 1 column 1 (char 0)"}` (or whichever decode message) |
 | valid JSON, not an object (array/string/number) | `TypeError("body must be a JSON object")` (server.py:178-180) | **`500 {"error": "internal error"}`** — TypeError is NOT caught by the 400 branch |
 | `store.delete_repo` refusal (see §8) | `ValueError` from store.py:258-264 | `400` with the store's message |
-| non-string `name` on `/api/repos`, non-string truthy `reason` on `/api/verdict` | `AttributeError` (`.strip()` on non-str, server.py:614, 455) | `500 {"error": "internal error"}` |
+| non-string truthy `reason` on `/api/verdict` | `AttributeError` (`.strip()` on a non-str, server.py:461 — no `isinstance` guard there) | `500 {"error": "internal error"}` |
+
+A non-string `name` on `/api/repos` used to belong in that row and no longer does: `_add_repo` guards with `raw.strip() if isinstance(raw, str) else ""` (server.py:631-632), so `{"name": 123}` becomes the empty string and is refused by the name rule. Both daemons answer `400 {"error": "invalid repo name"}` — Python because the empty string fails the regex (server.py:634-636), Rust because `as_str` on a non-string yields `""` (server.rs:942-950). Observed on the Python side: `{"name": 123}`, `{"name": {"a": 1}}` and `{"name": null}` each return exactly `b'{"error": "invalid repo name"}'` with status 400. The two daemons agree on status and on the JSON document, but **not byte-for-byte**: `json.dumps` writes `{"error": "invalid repo name"}` with a space after the colon and serde_json writes the compact `{"error":"invalid repo name"}` (observed live: the Rust daemon answers an unknown route with `{"error":"not found"}`). Compare parsed JSON in tests, never raw bytes.
 
 **Python quirk to decide on**: `isinstance(True, int)` is `True`, so JSON `true`/`false` passes every `isinstance(fid, int)` check and is treated as id 1/0. The Rust port should accept only actual integers; no client sends booleans (app.ts always sends numbers).
 
@@ -177,14 +179,26 @@ Handler `_update_repo` (server.py:582-608).
 2. no repo -> `404 {"error": "no repo <rid>"}` (server.py:589-592). `get_repo` (store.py:220-224) — int key -> `WHERE id = ?`.
 3. Field extraction (server.py:593-601), silently skipping anything invalid:
    - `enabled` present (any JSON type) -> coerced `1 if truthy else 0`.
-   - `url` only if a string that is non-empty after `.strip()` -> stripped value.
+   - `url` only if a string that is non-empty after `.strip()` -> stripped value, which must then pass the repo URL rule below. This is the one field in this handler that *rejects* rather than skips: a bad scheme is a `400`, not a dropped field (server.rs:808-818).
    - `default_branch` same rule.
    - `forge` only if literally `"github"` or `"gitlab"`.
 4. No field survived -> `400 {"error": "no valid fields to update"}` (server.py:602-604). (So `{"id":1,"forge":"bitbucket"}` yields this, not a forge-specific error.)
 
+**Repo URL rule** — `valid_repo_url` (server.rs:870-893; server.py:726-748). Both daemons enforce the same rule, and the two implementations were compared clause by clause: Python's `url.partition(":")` / `re.fullmatch(r"[A-Za-z][A-Za-z0-9+.\-]*", head)` / `head.lower() in ("http", "https", "ssh")` (server.py:739-748) is the same decision as Rust's `find(':')` / scheme charset check / `["http", "https", "ssh"].iter().any(|s| scheme.eq_ignore_ascii_case(s))` (server.rs:871-892). They must not drift: the two servers share a work root and a database, so a URL one accepts and the other refuses turns a rollback into a behaviour change. The rule, in order:
+1. No `:` anywhere -> accepted (server.rs:871-873; server.py:739-741). A bare path is a legal clone source.
+2. There is a `:`, but the text before it is not an RFC 3986 scheme — scheme = ALPHA followed by ALPHA/DIGIT/`+`/`-`/`.` — -> accepted (server.rs:875-883; server.py:742-743). This is what keeps scp-like clone URLs working: in `git@github.com:acme/widget.git` the prefix is `git@github.com`, and `@` is not scheme-legal, so the colon is path syntax, not a scheme.
+3. There is a scheme -> it must be `http`, `https` or `ssh`, matched case-insensitively (server.rs:890-892; server.py:748). `https://host/x.git`, `HTTPS://host/x.git`, `ssh://git@host/x.git` and `SSH://git@host/x.git` are all accepted; `JavaScript:alert(1)` is not.
+4. Any other scheme — `javascript:`, `data:`, `vbscript:` — -> `400 {"error": "url must be http(s) or an ssh clone URL"}` (`ApiError::BadRequest` -> `StatusCode::BAD_REQUEST`, server.rs:100; `self._error(400, ...)` server.py:608, :641).
+
+**Both spellings of an ssh clone URL are accepted**: the scheme-less scp-like `git@host:owner/repo.git` (no scheme, so it passes the first test) and the explicit `ssh://git@host/owner/repo.git` (`ssh` is in the allow-list alongside `http`/`https`, case-insensitively in both daemons). The guard exists to keep a URL that a browser would *execute* out of an `href` — `javascript:`, `data:`, `vbscript:` — not to restrict transports.
+
+This was drafted the other way round, when the allow-list was `http`/`https` only and the explicit `ssh://` form was refused by a message that claimed to permit it. The code was the wrong side of that: the allow-list now includes `ssh`.
+
+The gate is on the write because `repo.url` is rendered as an `<a href>` by the UI, so a stored `javascript:` URL executes on click; validating once at the write is cheaper than escaping every read (server.rs:857-869, server.py:727-733). It guards both write paths in both daemons with the identical message — update (server.rs:811-815; server.py:607-609, before the value reaches `fields`) and add (server.rs:960-963; server.py:640-642, after the non-empty check) — and is pinned on both sides: tests/post_test.rs:812-843 (add: the three executable schemes plus mixed-case `JavaScript:` rejected; `https`, `http`, scp-like `git@github.com:acme/widget.git` and explicit `ssh://git@github.com/acme/widget.git` accepted) and :847-864 (update path); `hunter/tests/test_server.py:546-578` walks the same table against `valid_repo_url`, including `SSH://git@host/x.git` accepted and `ftp://example.com/x.git` rejected — the allow-list is exactly those three schemes, not "anything that is not executable".
+
 **Writes**: `update_repo(rid, **fields)` -> dynamic `UPDATE repos SET <k> = ?, ... WHERE id = ?` + commit; allowed columns `{name, url, default_branch, forge, enabled}` else ValueError (store.py:236-249 — `name` is store-allowed but the handler never sends it). No `updated_at` (column doesn't exist). Then `log_event("repo", f"updated {repo['name']}: {action}")` where `action = ", ".join(f"{k}={v}")` over post-coercion values, e.g. `updated myrepo: enabled=1` (server.py:606-607; no finding_id/job_id).
 
-**Success**: `200 {"ok": true, "repo": <refreshed get_repo(rid) row>}` (server.py:608) — `SELECT * FROM repos`, i.e. **all** columns including the 5 migration-added `last_*_at` ones (round-1 contract: /api/repos vs summary repo shape difference).
+**Success**: `200 {"ok": true, "repo": <refreshed get_repo(rid) row>}` (server.py:625) — every `repos` column except `deleted_at`, which `_repo_row` strips on the way out (store.py:101-113, 453-458): the 10 schema columns plus the 6 migration-added `last_*_at` ones. Identical shape to a `/api/repos` element (API-CONTRACT.md §7); `/api/summary.repos` is the one that differs.
 
 **UI** (app.ts:745-755): only `toggleRepo` -> `{id, enabled: boolean}`. Non-200 -> `alert("update repo failed: ...")`; `refresh()`. url/default_branch/forge updates have no UI caller today.
 
@@ -192,28 +206,28 @@ Handler `_update_repo` (server.py:582-608).
 
 ## 7. POST /api/repos — add repo
 
-Handler `_add_repo` (server.py:610-640).
+Handler `_add_repo` (server.py:627-660).
 
 **Request**: `{"name": str, "url": str, "branch"?: str, "forge"?: "github"|"gitlab"}`.
 
 **Validation order**:
-1. `name = body.get('name','').strip()` (server.py:613-614) — non-string name crashes -> 500 (§0.2).
-2. Empty or failing `re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.\-]*', name)` -> `400 {"error": "invalid repo name"}` (server.py:616-618). First char alnum/underscore; then alnum, `_`, `.`, `-`. No `/`, so traversal is doubly blocked (regex + step 7). Pinned by tests/test_server.py:422-503 (bad: `../../etc`, `/etc/passwd`, `..`, `a/../../../b`, `repos/../../x`; good: `my-repo_1.0`).
-3. `url`: taken only if `isinstance(str)`, stripped; empty -> `400 {"error": "name and url are required"}` (server.py:615, 619-621).
-4. `branch`: `"main"` unless a non-blank string (server.py:622-623).
-5. `forge = body.get("forge") or None`; if None -> `detect_forge(url)` (server.py:624-626): host via `^https?://([^/]+)` else `^git@([^:]+):` else literal `"gitlab.com"`; lowercased host containing `"github"` -> `github`, containing `"gitlab"` -> `gitlab`, else **`github`** (forge.py:501-519). So detection never fails — only an *explicit* bad forge does.
-6. `forge not in FORGE_NAMES` (`("github", "gitlab")`, forge.py:493-498) -> `400 {"error": "unknown forge 'bitbucket' (choose from github, gitlab)"}` (repr-quoted, server.py:627-629).
-7. Duplicate: `get_repo(name) is not None` -> `409 {"error": "repo 'x' already exists"}` (repr-quoted, server.py:631-633). **Gotcha**: `get_repo` routes all-digit keys to `WHERE id = ?` (store.py:221), so a repo *named* `"123"` dupe-checks against repo **id** 123 — a preexisting oddity the regex permits; port as-is.
-8. `repo_path = (cfg.work_root / 'repos' / name).resolve()`; if `str(repo_path)` doesn't start with `str(cfg.work_root.resolve())` -> `400 {"error": "invalid repo name"}` (server.py:634-637). Defense-in-depth vs. absolute-name replacement via pathlib `/`.
+1. `raw = body.get("name")`; `name = raw.strip() if isinstance(raw, str) else ""` (server.py:631-632). A non-string name is **not** a crash — it becomes `""` and falls into step 2's `400 {"error": "invalid repo name"}`, the same answer Rust gives (§0.2).
+2. Empty or failing `re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.\-]*', name)` -> `400 {"error": "invalid repo name"}` (server.py:634-636; server.rs:948-950). First char alnum/underscore; then alnum, `_`, `.`, `-`. No `/`. This is the only name rule there is — see step 8. Pinned by tests/test_server.py:489-516 (bad: `../../etc`, `/etc/passwd`, `..`, `a/../../../b`, `repos/../../x`) and :518-543 (good: `my-repo_1.0`, which also asserts the handler hands the store the repos *directory*, not a name-derived path).
+3. `url`: taken only if `isinstance(str)`, stripped; empty -> `400 {"error": "name and url are required"}` (server.py:633, 637-638; server.rs:951-959). The stripped value then goes through the **repo URL rule** (§6) -> `400 {"error": "url must be http(s) or an ssh clone URL"}` on a scheme outside the allow-list (server.py:640-642; server.rs:960-963), before `branch`/`forge` are looked at.
+4. `branch`: `"main"` unless a non-blank string (server.py:643-644).
+5. `forge = body.get("forge") or None`; if None -> `detect_forge(url)` (server.py:645-647): host via `^https?://([^/]+)` else `^git@([^:]+):` else literal `"gitlab.com"` (forge.py:501-509); lowercased host containing `"github"` -> `github`, containing `"gitlab"` -> `gitlab`, else **`github`** (forge.py:512-519). So detection never fails — only an *explicit* bad forge does.
+6. `forge not in FORGE_NAMES` (`("github", "gitlab")`, forge.py:494-498) -> `400 {"error": "unknown forge 'bitbucket' (choose from github, gitlab)"}` (repr-quoted, server.py:648-650).
+7. Duplicate: `get_repo(name) is not None` -> `409 {"error": "repo 'x' already exists"}` (repr-quoted, server.py:651-654). **Gotcha**: `get_repo` routes all-digit keys to `WHERE id = ?` (store.py:453-458), so a repo *named* `"123"` dupe-checks against repo **id** 123 — a preexisting oddity the regex permits; port as-is.
+8. **No containment check** — there is nothing left to contain. The clone directory is `<work_root>/repos/repo-<id>`, derived from the id SQLite issues, so the handler passes `cfg.work_root / "repos"` to `add_repo` and never joins the name to a path at all (server.py:655-657; server.rs:1004-1014). The step 2 regex is therefore the *entire* name rule, and traversal is structurally impossible rather than filtered: a name of `../../etc` is refused by the regex, and would address no path even if it were not. Earlier revisions resolved `work_root / 'repos' / name` and required the result to be a prefix match under `work_root`; that check went with its premise.
 
-**Writes**: `add_repo(name, url, str(repo_path), branch, forge=forge)` -> `INSERT INTO repos (name, url, path, forge, default_branch, added_at) VALUES (?,?,?,?,?,?)` with `added_at = now_ms()` + commit, returns `lastrowid` (store.py:203-218). `enabled` defaults to 1, `last_hunt_*` NULL (schema.sql:5-16). Then `log_event("repo", f"added {name} ({forge}) -> {repo_path}")` (server.py:639).
+**Writes**: `add_repo(name, url, cfg.work_root / "repos", branch, forge=forge)` (server.py:657) -> one transaction, two statements, because the path needs the id the INSERT has not issued yet: `INSERT INTO repos (name, url, path, forge, default_branch, added_at) VALUES (?,?,'',?,?,?)` with `added_at = now_ms()`, then `UPDATE repos SET path = ? WHERE id = ?` with `repo_dir(repos_dir, rid)` = `<repos_dir>/repo-<id>`; commit; returns `lastrowid` (store.py:420-451, `repo_dir` at store.py:90-98). A row whose `path` never got written would be unusable, hence the single transaction. `enabled` defaults to 1, `last_hunt_*` and `deleted_at` NULL (schema.sql:5-26). Then `log_event("repo", f"added {name} ({forge}) -> {repo_path}")` with `repo_path = repo_dir(cfg.work_root / 'repos', rid)` (server.py:658-659); Rust builds the same message from `Store::repo_dir` (server.rs:1016-1027).
 
-**Success**: `201 {"ok": true, "repo": <get_repo(rid) full row>}` (server.py:640).
+**Success**: `201 {"ok": true, "repo": <get_repo(rid) row>}` (server.py:660) — the §6 shape: every `repos` column except `deleted_at`.
 
 **NO git clone happens here.** The clone is deferred to the scheduler:
 - `pick_next` selects kind `hunt` for a repo whose `path` doesn't exist ("not cloned yet -> hunt does the clone", scheduler.py:1896-1897).
 - `run_hunt`: `rpath.parent.mkdir(parents=True, exist_ok=True)` then `run_cmd(["git", "clone", repo["url"], str(rpath)], timeout=600)` (default cwd); rc != 0 -> `log_event("error", f"hunt {rname}: clone failed: {out[-300:]}")` and cycle summary `{"error": f"clone failed: {out[-300:]}"}` (scheduler.py:151-157). `run_recheck` has the identical clone block with message prefix `recheck #{fid}:` (scheduler.py:377-387). Other kinds refuse with `log_event("error", f"{kind} {rname}: repo not cloned")` / `{"error": "repo not cloned"}` (scheduler.py:568-570, 705-707).
-- Path layout: clone at `<work_root>/repos/<name>` (server.py:634); NOTES.md at `<work_root>/repos/repo-<id>/NOTES.md` — **id-based, a different directory than the clone** (store.py:269-277).
+- Path layout: everything a repo owns lives under `<work_root>/repos/repo-<id>` — the clone itself and `NOTES.md` beside it. Keyed by id, never by name: names differing only in case are one directory on NTFS and APFS, Windows reserves `CON`/`NUL`/`AUX` and strips trailing dots, and anything past 255 bytes is `ENAMETOOLONG` raised at clone time rather than at add time. The name never reaches a path, so traversal is structurally impossible rather than filtered, and renaming a repo moves no files. Migration 007 rewrote the deployed rows; the clone at `repos/<name>` and the split between clone and notes directory are both historical.
 
 **UI** (app.ts:766-793): sends `{name, url, branch, forge}` where branch defaults `"main"` client-side too and `forge` is `undefined` when the select is empty (key dropped by JSON.stringify -> server auto-detects). Expects **201**; failure -> `toast("add repo failed: " + (r.body?.error || r.status))`; success clears the dialog, `toast('repo "<name>" added', false)`, `refresh()`.
 
@@ -228,11 +242,16 @@ Handler `_delete_repo` (server.py:642-655).
 **Validation order**:
 1. non-int id -> `400 {"error": "id must be an integer"}` (server.py:645-647).
 2. no repo -> `404 {"error": "no repo <rid>"}` (server.py:649-652).
-3. `store.delete_repo(rid)` (store.py:251-266) counts `SELECT COUNT(*) FROM findings WHERE repo_id = ?` and `SELECT COUNT(*) FROM jobs WHERE repo_id = ?`; if either > 0 raises `ValueError` -> **`400`** with exactly: `repo <rid> has <n> finding(s) and <m> job(s) -- cannot delete without losing history; pause it instead` (store.py:255-264; do_POST maps it, server.py:445-446).
+3. `soft_delete_repo(rid)` counts `SELECT COUNT(*) FROM findings WHERE repo_id = ?` and `SELECT COUNT(*) FROM jobs WHERE repo_id = ?`; if either > 0 -> **`400`** with exactly: `repo <rid> has <n> finding(s) and <m> job(s) -- cannot delete without losing history; pause it instead`. Both counts and the flag below share one transaction, so a job created concurrently cannot land between the check and the flag.
 
-**What is deleted**: only `DELETE FROM repos WHERE id = ?` + commit (store.py:265-266). **Nothing on the filesystem** — the clone dir `<work_root>/repos/<name>`, any worktrees, and `<work_root>/repos/repo-<id>/NOTES.md` are all left in place. events rows referencing the repo's findings can't exist (findings count was 0), but repo-kind events mentioning it by name remain.
+**Deletion is two-phase, in both daemons.** `repos.id` is a rowid alias, so SQLite may hand the number to the next `INSERT` the instant the row disappears — while a multi-gigabyte clone is still being removed. The row is what reserves the id, so it outlives the files.
 
-**Then**: `log_event("repo", f"deleted {repo['name']} (#{rid})")` (server.py:654).
+- **Phase one (synchronous, inside the request)**: `UPDATE repos SET deleted_at = <now>, name = name || ' (deleted #' || id || ')'`. Every repo read path filters `deleted_at IS NULL`, so the repo is gone from the API immediately. The name is released here, not in phase two: `repos.name` is `UNIQUE`, and a flagged row would otherwise keep rejecting the name of a repo the operator has already been told is gone.
+- **Phase two (`reap_repo`)**: remove `<work_root>/repos/repo-<id>` entirely — clone, `NOTES.md`, any worktrees under it — and only then `DELETE` the row. That delete is the moment the id becomes reusable, so it must not run first. Missing directory is success. Reclamation holds the notes lock, because a note written between the `rmtree` and the row delete would recreate the directory after the reaper had passed it.
+
+Phase two is attempted inline so the common case completes before the response, but **its failure is not the caller's failure**: the response is still `200 {"ok": true}`, a warning naming the path is logged, and the id simply stays reserved until the reaper retries (daemon startup and every cycle). A crash between the phases is safe for the same reason.
+
+**Then**: exactly one `log_event("repo", "deleted <name> (#<rid>)")`, written after phase one. One deletion, one event — pinned by `deleting_a_repo_logs_exactly_one_event`.
 
 **Success**: `200 {"ok": true}` — no embedded object (server.py:655).
 
