@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from hunter import server
 from hunter.backends.omp_scavenge.capacity import WindowState
 from hunter.store import Store, _require_keys
 from hunter.types import Config, SchedulerStateDict, now_ms
@@ -86,25 +87,30 @@ class TestRepos:
 
     def test_delete_repo_with_no_history(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
-        store.delete_repo(rid)
+        store.soft_delete_repo(rid)
         assert store.get_repo(rid) is None
+        # Invisible, but still holding its id until its files are gone.
+        assert store.deleted_repo_ids() == [rid]
+        store.forget_deleted_repo(rid)
+        assert store.deleted_repo_ids() == []
 
     def test_delete_repo_refuses_with_findings(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
         store.upsert_finding(rid, _make_finding())
         with pytest.raises(ValueError, match="finding"):
-            store.delete_repo(rid)
+            store.soft_delete_repo(rid)
         assert store.get_repo(rid) is not None
 
     def test_delete_repo_refuses_with_jobs(self, store: Store) -> None:
         rid = store.add_repo("r", "https://r", "/r")
         store.create_job("hunt", rid)
         with pytest.raises(ValueError, match="job"):
-            store.delete_repo(rid)
+            store.soft_delete_repo(rid)
         assert store.get_repo(rid) is not None
 
     def test_delete_repo_missing_is_noop(self, store: Store) -> None:
-        store.delete_repo(999)  # no rows affected, does not raise
+        store.soft_delete_repo(999)  # no rows affected, does not raise
+        assert store.deleted_repo_ids() == []
 
     def test_notes_lock_is_shared_across_store_instances(self, tmp_path: Path) -> None:
         """ThreadingHTTPServer creates one Store (and one SQLite connection)
@@ -116,26 +122,32 @@ class TestRepos:
         store2 = Store(cfg)
         assert store1._NOTES_LOCK is store2._NOTES_LOCK
 
-    def test_delete_repo_blocks_concurrent_append_repo_note(self, tmp_path: Path) -> None:
-        """A delete_repo() in flight must block append_repo_note() on a
-        different Store/connection until the deletion resolves. Without
-        this, a racing append can recreate NOTES.md between delete_repo's
-        unlink and commit -- and since repos.id can be reused, that file
-        could later be read as a *new* repo's notes.
+    def test_reclamation_blocks_concurrent_append_repo_note(self, tmp_path: Path) -> None:
+        """Reclaiming a deleted repo must block append_repo_note() on a
+        different Store/connection until it finishes.
+
+        Deletion is two-phase now, so the flag itself is atomic and needs
+        no protection. The dangerous window moved to reclamation: a note
+        written between the rmtree and the row deletion recreates the
+        directory after the reaper has decided it is gone, and the row is
+        then dropped with files still on disk -- exactly the state that
+        lets a later repo inherit them.
 
         Mirrors ThreadingHTTPServer: each handler thread gets its own
         Store (own SQLite connection), created in that thread.
         """
         cfg = Config(work_root=tmp_path, db_path=tmp_path / "test.db")
         setup_store = Store(cfg)
-        rid = setup_store.add_repo("r", "https://r", "/r")
+        rid = setup_store.add_repo("r", "https://r", tmp_path / "repos")
+        setup_store.append_repo_note(rid, "original note")
+        setup_store.soft_delete_repo(rid)
 
         order: list[str] = []
         release = threading.Event()
 
         class _SlowDb:
-            """Delegates to a real connection; blocks after the DELETE
-            statement so the test can observe delete_repo mid-transaction."""
+            """Delegates to a real connection; blocks after the row is
+            dropped so the test can observe reclamation mid-flight."""
 
             def __init__(self, real: object) -> None:
                 self._real = real
@@ -143,37 +155,43 @@ class TestRepos:
             def __getattr__(self, name: str) -> object:
                 return getattr(self._real, name)
 
+            # Dunders are looked up on the type, so __getattr__ never sees
+            # them; forget_deleted_repo uses `with self.db:`.
+            def __enter__(self) -> object:
+                return self._real.__enter__()  # type: ignore[attr-defined]
+
+            def __exit__(self, *exc: object) -> object:
+                return self._real.__exit__(*exc)  # type: ignore[attr-defined]
+
             def execute(self, query: str, *args: object) -> object:
                 result = self._real.execute(query, *args)  # type: ignore[attr-defined]
                 if query.startswith("DELETE FROM repos"):
-                    order.append("delete:entered")
+                    order.append("reap:entered")
                     release.wait(timeout=2)
-                    order.append("delete:resumed")
+                    order.append("reap:resumed")
                 return result
 
-        def do_delete() -> None:
-            store_a = Store(cfg)  # own connection, created in this thread
+        def do_reap() -> None:
+            store_a = Store(cfg)
             store_a.db = _SlowDb(store_a.db)  # type: ignore[assignment]
-            store_a.delete_repo(rid)
+            server.reap_repo(store_a, tmp_path / "repos", rid)
 
         def do_append() -> None:
-            store_b = Store(cfg)  # own connection, created in this thread
+            store_b = Store(cfg)
             with contextlib.suppress(ValueError):
                 store_b.append_repo_note(rid, "racy note")
             order.append("append:done")
 
-        t1 = threading.Thread(target=do_delete)
+        t1 = threading.Thread(target=do_reap)
         t1.start()
         for _ in range(200):
-            if "delete:entered" in order:
+            if "reap:entered" in order:
                 break
             time.sleep(0.01)
-        assert "delete:entered" in order, "delete_repo never reached its DELETE"
+        assert "reap:entered" in order, "reap_repo never reached its DELETE"
 
         t2 = threading.Thread(target=do_append)
         t2.start()
-        # append_repo_note must still be blocked on the shared lock while
-        # delete_repo holds it -- give it many chances to (wrongly) finish.
         for _ in range(20):
             assert "append:done" not in order
             time.sleep(0.01)
@@ -181,7 +199,7 @@ class TestRepos:
         release.set()
         t1.join(timeout=2)
         t2.join(timeout=2)
-        assert order.index("delete:resumed") < order.index("append:done")
+        assert order.index("reap:resumed") < order.index("append:done")
 
 
 # -- findings --------------------------------------------------------------

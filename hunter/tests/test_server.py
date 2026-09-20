@@ -533,6 +533,11 @@ class TestAddRepoPathTraversal:
         assert responses
         assert responses[0][0] == 201
         assert len(add_repo_calls) == 1
-        name, _url, path_str, _branch = add_repo_calls[0][:4]
+        name, _url, repos_dir, _branch = add_repo_calls[0][:4]
         assert name == "my-repo_1.0"
-        assert Path(path_str) == (cfg.work_root / "repos" / "my-repo_1.0").resolve()  # type: ignore[arg-type]
+        # The handler hands over the repos *directory*; the store picks
+        # repo-<id> inside it. The name is never part of a path, which is
+        # what makes traversal structurally impossible rather than merely
+        # filtered -- and is also why two names differing only in case
+        # cannot collide on a case-insensitive filesystem.
+        assert Path(repos_dir) == cfg.work_root / "repos"  # type: ignore[arg-type]

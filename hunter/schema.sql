@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS repos (
   last_dep_update_at INTEGER,
   last_refactor_at  INTEGER,
   last_modernization_at INTEGER,
-  last_standards_at INTEGER
+  last_standards_at INTEGER,
+  deleted_at    INTEGER                    -- flagged for reclamation; see soft_delete_repo
 );
 
 CREATE TABLE IF NOT EXISTS findings (

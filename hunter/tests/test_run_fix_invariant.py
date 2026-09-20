@@ -105,7 +105,11 @@ def _make_repo(tmp_path: Path) -> tuple[Path, Path]:
 
 def _setup(store: Store, tmp_path: Path) -> dict[str, Any]:
     upstream_path, repo_path = _make_repo(tmp_path)
-    repo_id = store.add_repo("repo", str(upstream_path), str(repo_path), default_branch="main")
+    repo_id = store.add_repo("repo", str(upstream_path), tmp_path, default_branch="main")
+    # The store owns the clone location (repos/repo-<id>), so the
+    # fixture's repo moves to it rather than the row pointing at
+    # wherever the fixture happened to build it.
+    repo_path = repo_path.rename(store.get_repo(repo_id)["path"])
     fid, _ = store.upsert_finding(repo_id, _make_finding())
     store.set_status(fid, "queued")
     finding = store.get_finding(fid)

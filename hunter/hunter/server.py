@@ -13,16 +13,19 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, TypedDict, cast
 from urllib.parse import parse_qs, urlparse
 
 from pydantic import TypeAdapter
 
+from .store import repo_dir
 from .types import (
     FINDING_STATUSES,
     REASON_REQUIRED,
@@ -44,6 +47,8 @@ if TYPE_CHECKING:
     # means annotations referencing Store are never evaluated at runtime
     # either), so it can't reintroduce that problem -- it only lets mypy
     # replace the Any that used to stand in for Store's real shape below.
+    from pathlib import Path
+
     from .backend import Backend
     from .store import Store
 
@@ -638,11 +643,10 @@ class Handler(BaseHTTPRequestHandler):
         if store.get_repo(name) is not None:
             self._error(409, f"repo {name!r} already exists")
             return
-        repo_path = (self.cfg.work_root / "repos" / name).resolve()
-        if not str(repo_path).startswith(str(self.cfg.work_root.resolve())):
-            self._error(400, "invalid repo name")
-            return
-        rid = store.add_repo(name, url, str(repo_path), branch, forge=forge)
+        # No containment check: the clone directory is repos/repo-<id>, so
+        # the name never reaches a path and cannot escape one.
+        rid = store.add_repo(name, url, self.cfg.work_root / "repos", branch, forge=forge)
+        repo_path = repo_dir(self.cfg.work_root / "repos", rid)
         store.log_event("repo", f"added {name} ({forge}) -> {repo_path}")
         self._json({"ok": True, "repo": store.get_repo(rid)}, 201)
 
@@ -657,8 +661,20 @@ class Handler(BaseHTTPRequestHandler):
         if repo is None:
             self._error(404, f"no repo {rid}")
             return
-        store.delete_repo(rid)
+        # Phase one: flag the row. After this the repo is gone from every
+        # read path, so a 200 is the truth even though files remain.
+        store.soft_delete_repo(rid)
         store.log_event("repo", f"deleted {repo['name']} (#{rid})")
+        # Phase two, attempted inline so the common case finishes before
+        # the response. Failure is not the caller's problem -- the repo is
+        # deleted -- it only leaves the id reserved until the next reap.
+        if not reap_repo(store, self.cfg.work_root / "repos", rid):
+            log.warning(
+                "repo %s deleted, but reclaiming %s failed; its id stays reserved"
+                " until the reaper retries",
+                rid,
+                repo_dir(self.cfg.work_root / "repos", rid),
+            )
         self._json({"ok": True})
 
     def _add_repo_note(self) -> None:
@@ -686,6 +702,45 @@ class Handler(BaseHTTPRequestHandler):
             "repo", f"note added to {repo['name']}" + (f" [{category}]" if category else "")
         )
         self._json({"ok": True, "notes": store.repo_notes(rid)}, 201)
+
+
+def reap_repo(store: Store, repos_dir: Path, repo_id: int) -> bool:
+    """Remove one flagged repo's directory, then drop its row.
+
+    Ordering is the whole point: the row is what stops SQLite reissuing
+    the id, so it may only go once nothing of the repo is left on disk.
+    Leaving it flagged is always safe -- the repo is already invisible and
+    the next pass retries. Returns False if the directory survived.
+    """
+    rdir = repo_dir(repos_dir, repo_id)
+    # Under the notes lock for the same reason append_repo_note takes it:
+    # a note written between the rmtree and the row deletion would
+    # recreate the directory *after* the reaper decided it was gone,
+    # leaving files behind with no row left to retry them.
+    with store._NOTES_LOCK:  # noqa: SLF001 (class-level lock, shared by every Store)
+        try:
+            shutil.rmtree(rdir)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        store.forget_deleted_repo(repo_id)
+    return True
+
+
+def reap_deleted_repos(store: Store, work_root: Path) -> int:
+    """Finish deletions left flagged by a crash or a failed reclamation."""
+    reaped = 0
+    for repo_id in store.deleted_repo_ids():
+        if reap_repo(store, work_root / "repos", repo_id):
+            reaped += 1
+        else:
+            log.warning(
+                "repo %s is flagged deleted but %s could not be removed; its id stays reserved",
+                repo_id,
+                repo_dir(work_root / "repos", repo_id),
+            )
+    return reaped
 
 
 class _Server(ThreadingHTTPServer):
@@ -969,9 +1024,9 @@ def _compute_sleep_s(store: Store, summary: Row) -> float:
             "SELECT COUNT(*) FROM findings WHERE status = 'queued'"
         ).fetchone()[0]
         job_produced_findings = summary.get("ingest", {}).get("inserted", 0) > 0
-        enabled_repos = store.db.execute("SELECT COUNT(*) FROM repos WHERE enabled = 1").fetchone()[
-            0
-        ]
+        enabled_repos = store.db.execute(
+            "SELECT COUNT(*) FROM repos WHERE enabled = 1 AND deleted_at IS NULL"
+        ).fetchone()[0]
         if queued_fixes > 0:
             sleep_s = 0
         elif job_produced_findings:
