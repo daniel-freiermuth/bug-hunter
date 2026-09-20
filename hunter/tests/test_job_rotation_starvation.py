@@ -53,9 +53,9 @@ class TestJobRotationStarvation:
     def test_persistent_failure_does_not_monopolize_the_rotation(
         self, store: Store, cfg: Config, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        repo_path = tmp_path / "repo"
+        rid = store.add_repo("r", "https://r", tmp_path)
+        repo_path = Path(store.get_repo(rid)["path"])
         repo_path.mkdir()
-        rid = store.add_repo("r", "https://r", str(repo_path))
         # test_gap succeeded once, long ago -- now the stalest of the four,
         # so pick_next picks it first. dep_update/refactor are more recent
         # (already had their turn); hunt is freshest of all.
@@ -99,9 +99,9 @@ class TestJobRotationStarvation:
         is the anti-starvation safety net, distinct from _run_analysis_job's
         own success-gated timestamp update which governs normal retry
         cadence for THIS kind."""
-        repo_path = tmp_path / "repo"
+        rid = store.add_repo("r", "https://r", tmp_path)
+        repo_path = Path(store.get_repo(rid)["path"])
         repo_path.mkdir()
-        rid = store.add_repo("r", "https://r", str(repo_path))
         store.db.execute(
             "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
             " last_dep_update_at=?, last_refactor_at=?, last_modernization_at=? WHERE id=?",
@@ -134,9 +134,9 @@ class TestJobRotationStarvation:
         """A worker that finishes 'done' with output, but every candidate is
         rejected as invalid, must still bump last_test_gap_at for the same
         anti-starvation reason."""
-        repo_path = tmp_path / "repo"
+        rid = store.add_repo("r", "https://r", tmp_path)
+        repo_path = Path(store.get_repo(rid)["path"])
         repo_path.mkdir()
-        rid = store.add_repo("r", "https://r", str(repo_path))
         store.db.execute(
             "UPDATE repos SET last_hunt_at=?, last_test_gap_at=?,"
             " last_dep_update_at=?, last_refactor_at=?, last_modernization_at=? WHERE id=?",
