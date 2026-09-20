@@ -2,19 +2,24 @@
 set shell := ["bash", "-cu"]
 
 # Regenerate the schema-only dev DB from migrations (sqlx compile-time checks).
+#
+# Delegates to build.rs rather than replaying the .sql files here: build.rs
+# also stamps _sqlx_migrations, so every copy of dev.db is already at head
+# and tests never replay a migration over a schema that already has its
+# effects. A hand-applied dev.db dies on the first ALTER TABLE ADD COLUMN.
+#
+# The touch is what forces the rerun. build.rs declares only
+# rerun-if-changed=migrations, so with an unchanged tree cargo's fingerprint
+# stays fresh and deleting dev.db regenerates nothing.
 dev-db:
-    rm -f dev.db
-    for m in migrations/*.sql; do sqlite3 -bail dev.db < "$m" || exit 1; done
+    touch migrations/*.sql
+    cargo check --quiet
     @echo "dev.db regenerated from migrations"
 
-# Full lint: clippy + SQL encapsulation guarantee
+# Full lint: clippy + SQL encapsulation guarantee (shared with CI).
 lint:
     cargo clippy --all-targets
-    @echo "Checking SQL encapsulation..."
-    @! grep -rn '\.pool()' src/ | grep -v 'store\.rs' | grep -v '//' && echo "✓ pool() only in store.rs" || (echo "✗ pool() leaked outside store.rs" && exit 1)
-    @! grep -rn 'sqlx::query(' src/ | grep -v 'query!\|query_as!\|query_scalar!\|capacity\.rs\|//' && echo "✓ all queries compile-time checked" || (echo "✗ unchecked sqlx::query found" && exit 1)
-    @! grep -rn 'QueryBuilder' src/ | grep -v '//' && echo "✓ no QueryBuilder" || (echo "✗ QueryBuilder found" && exit 1)
-    @echo "All SQL guarantees hold."
+    ./check-sql.sh
 
 check:
     cargo check --all-targets

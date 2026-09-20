@@ -1,0 +1,91 @@
+# CodeRabbit skips a PR entirely past 100 files, and this one is a port:
+# it adds a whole crate and a whole frontend at once. Rather than split the
+# review and lose the cross-cutting findings, exclude files that carry no
+# review signal.
+#
+# The bar for exclusion is "produced by a tool, never edited by hand" —
+# scaffolder output, vite's build output, and proptest's seed file.
+# Reviewing generated files reviews their generator's output while the
+# input sits reviewable next door. Everything the port actually decided
+# stays listed, including tsconfig.app.json, eslint.config.js and
+# vite.config.ts, which were modified by hand after scaffolding.
+#
+# Prose is deliberately NOT excluded. Docs-vs-code drift has been one of
+# the more productive finding categories on this PR: a UI rewrite recorded
+# as using a framework it never adopted, a decision section contradicting
+# its own status line, contract rows describing status codes the handler
+# does not return. Buying file budget by hiding documentation would trade
+# away review signal that is working.
+reviews:
+  path_filters:
+    - "!hunter/ui-svelte/.gitignore"
+    - "!hunter/ui-svelte/.vscode/extensions.json"
+    - "!hunter/ui-svelte/svelte.config.js"
+    - "!hunter/ui-svelte/tsconfig.json"
+    - "!hunter/ui-svelte/tsconfig.node.json"
+    # This file.
+    - "!.coderabbit.yaml"
+
+    # `hunter/ui/` is vite's outDir (ui-svelte/vite.config.ts:15): the
+    # daemon serves a committed bundle so that deploying is `cargo build`
+    # plus a restart, with no node toolchain on the box. Everything below
+    # is emitted by `vite build` — the hashed asset pair changes name on
+    # every rebuild, and index.html/the icons are copied verbatim from
+    # ui-svelte/. Reviewing them reviews the compiler's output, and the
+    # input is already reviewable in ui-svelte/src.
+    #
+    # The two *deletions* under hunter/ui/ (src/app.ts, tsconfig.json) are
+    # the retired hand-written UI and stay listed: that removal is a real
+    # decision, not build output.
+    - "!hunter/ui/assets/**"
+    - "!hunter/ui/index.html"
+    - "!hunter/ui/favicon.svg"
+    - "!hunter/ui/icons.svg"
+
+    # Same file, before vite copies it. An icon sprite has no review
+    # surface in either location.
+    - "!hunter/ui-svelte/public/favicon.svg"
+    - "!hunter/ui-svelte/public/icons.svg"
+
+    # Written by proptest itself when a property fails: a list of seeds,
+    # replayed by the suite. Hand-editing it would only delete coverage.
+    - "!hunter-rs/tests/properties_test.proptest-regressions"
+
+    # Every migration here is applied to the live database. sqlx
+    # checksums them on startup, so changing one byte gives "migration N
+    # was previously applied but has been modified" and the daemon
+    # refuses to boot -- which is not theoretical: it happened this week,
+    # to me, appending one line to 009. A comment on these files cannot
+    # be acted on by editing them; a defect found in one is fixed by a
+    # *new* migration, which is reviewable.
+    #
+    # This is a moving line, not a fixed one, and the condition is "has
+    # been reviewed AND is applied" -- not merely applied. Deploying a
+    # migration the same day it is written does not make it reviewed, so
+    # a migration stays off this list until it has been through a review
+    # pass. 010 is deliberately absent: it was written in the round that
+    # added this block and has not been reviewed yet.
+    - "!hunter-rs/migrations/001_initial_schema.sql"
+    - "!hunter-rs/migrations/002_fingerprint_type_unique.sql"
+    - "!hunter-rs/migrations/003_findings_drop_legacy_fingerprint_unique.sql"
+    - "!hunter-rs/migrations/004_findings_add_standard_section.sql"
+    - "!hunter-rs/migrations/005_events_finding_id_index.sql"
+    - "!hunter-rs/migrations/006_jobs_finished_at_index.sql"
+    - "!hunter-rs/migrations/007_repo_paths_keyed_by_id.sql"
+    - "!hunter-rs/migrations/008_repos_deleted_at.sql"
+    - "!hunter-rs/migrations/009_repos_autoincrement.sql"
+
+    # The retired hand-rolled UI. Both entries are deletions; the
+    # replacement is in ui-svelte/ and fully reviewable. Reviewing the
+    # removal of code that no longer exists has no outcome.
+    - "!hunter/ui/src/app.ts"
+    - "!hunter/ui/tsconfig.json"
+
+    # Repo plumbing and runner configuration, thin on review surface:
+    # ignore globs, the DATABASE_URL that points sqlx's compile-time
+    # checks at dev.db, and nextest's retry/timeout profiles.
+    # `.cargo/mutants.toml` is NOT excluded -- it configures a CI gate,
+    # so weakening it is exactly the kind of change worth catching.
+    - "!hunter-rs/.gitignore"
+    - "!hunter-rs/.cargo/config.toml"
+    - "!hunter-rs/.config/nextest.toml"
