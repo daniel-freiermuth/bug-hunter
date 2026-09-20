@@ -19,18 +19,41 @@ human-triage-surviving bugs (exp1: 5/5); token costs are measurable and
 cappable externally (exp1b: ~60k/fix, ~150k/hunt, ~32k session floor); window
 state is readable from omp's local mirror (exp2). Evidence: `../EXPERIMENT-*.md`.
 
-### Phase 1 — Single-user hunter v1 (current, live)
+### Phase 1 — Single-user hunter v1 (superseded by Phase 2)
 Python 3.14 stdlib-only daemon: scheduler + `Backend` facade (budget gate +
 externally-metered `omp -p` workers, omp specifics confined to
 `backends/omp_scavenge/`) + SQLite + triage UI on :8377. 317 tests green as
 of 2026-09-06. Runs as a systemd user service. It works; it earned the next
-phase.
+phase. The Rust port has since taken over the service; this entry stands
+as the record of what it replaced.
 
-### Phase 2 — Rust port, feature parity (next)
+### Phase 2 — Rust port, feature parity (in progress)
 Port the daemon to Rust, single-user, same behavior, same DB file, same
 playbooks. Exit criterion: the Rust binary runs the full cycle (sync → engage
 → fix → hunt) against the live `data/hunter.db` for a week with no regression
 vs the Python daemon; Python daemon is then retired.
+
+Retirement is a single mechanical commit once that week has passed, and is
+worth spelling out because the interim state has a cost: `hunter/hunter/`
+(~7k lines) and `hunter/tests/` (~8k) are not executed in production but
+are still gated by CI, so defects get reported and fixed there. That is
+the price of keeping a rollback and it is paid knowingly — a fallback
+only counts as one while it still works, so the fixes are the point, not
+waste. What the interim buys is the option to fall back; what it costs is
+attention spent on code that will be deleted.
+
+What retirement removes: `hunter/hunter/`, `hunter/tests/`, `schema.sql`,
+`pyproject.toml`/`uv.lock`, and the `python` CI job. `hunter/` itself
+stays — it is the daemon's root (`config.json`, `data/`, `playbooks/`,
+`ui/`, `ui-svelte/`).
+
+One test dies with it and should not be replaced: `test_schema_parity.py`
+compares Python's schema construction against Rust's migrations, and that
+oracle is exactly what retirement discards. The property still worth
+holding is asserted Rust-side and more strongly by
+`hunter-rs/tests/migration_states_test.rs` — every reachable migration
+state rolls forward to head, converging on identical schema with its rows
+intact.
 
 ### Phase 3 — Service-ification
 Auth (GitHub OAuth), tenancy (user ownership everywhere), per-user Claude
@@ -165,7 +188,7 @@ still needs tests and review in any language.
 | Repo access | GitHub App installation tokens | kills the global `gh` credential model |
 | TLS / edge | Caddy reverse proxy | the binary stays plain HTTP on localhost |
 | UI v1 | Svelte SPA against a clean JSON API | novelty budget goes to the backend; one unknown at a time |
-| UI styling | Tailwind, adopted *with* the Svelte rewrite | supersedes the earlier plan to migrate the vanilla-TS UI to Tailwind first (§8.1) |
+| UI styling | hand-written CSS custom properties | Tailwind was planned with the Svelte rewrite (§8.1) but not adopted; the token system carried over as-is |
 | UI later | Leptos experiment allowed | affordable *because* the JSON API boundary makes the UI swappable in a weekend |
 | Sandbox | rootless podman per job | §5.3 |
 | Backup | Litestream-style SQLite replication | Phase 4 |
@@ -176,6 +199,27 @@ contract (headless `omp -p`, session-JSONL metering, SIGTERM at cap,
 kill-safe incremental output), the systemd unit approach, and the 317 Python
 tests — which are the behavioral spec, ported module-by-module alongside each
 component.
+
+**Web system, consolidated (2026-09-06).** axum is the decided web layer,
+not a default. Rationale against the field:
+- *actix-web:* mature/fast but middleware is its own world; axum middleware
+  is plain `tower::Service`, so sessions/auth/rate-limit/tracing compose
+  from one shared ecosystem. Performance is irrelevant at our request
+  rates. tokio-team maintenance.
+- *Rocket:* slower cadence, thinner corpus — fails the AI-median criterion
+  (§3.2) that motivated the pivot.
+- *Loco / Rails-likes:* magic + young + thin corpus; wrong on all three axes.
+- *Leptos full-stack:* rejected for v1 (§3, §7.3).
+- Deciding argument is §3.2 itself: axum+sqlx+serde is the best-represented
+  corner of the Rust corpus — for an AI-maintained codebase that's a primary
+  criterion, not a tiebreaker.
+
+Supporting crates: `tower-http` (static files, compression, trace),
+`tower-sessions` with a SQLite-backed store in the same DB file (Phase 3),
+`oauth2` (Phase 3), `tracing`/`tracing-subscriber`, `rust-embed` later for
+single-file deploy. The daemon shape survives unchanged: axum is a tower
+service on tokio, so "UI server + scheduler loop in one process" becomes
+"axum router + scheduler task in one binary" — same systemd unit model.
 
 ---
 
@@ -414,12 +458,106 @@ the `Backend` protocol (`backend.py`: `decide()` / `run()` / `keep_fresh()`
 
 ---
 
-## 6. Port plan (Phase 2, dependency order)
+## 6. Port plan (Phase 2, in rounds)
 
-Each step ports the module *and* its test suite; tests are the spec. The Rust
-binary and the Python daemon can run side-by-side against the live DB during
-transition (SQLite WAL is multi-process) — cut over component-wise, e.g. Rust
-`serve` first while Python still schedules.
+Each round ported modules *and* their test suites; tests are the spec.
+The Rust binary and the Python daemon ran side-by-side against the live DB
+during the transition (SQLite WAL is multi-process), and cutover was
+per-component. That is finished: every round below is DONE, the Python
+daemon was stopped, and the Rust binary owns :8377 and the database (see
+the Round 3 entry). The plan is kept as the record of how it was done.
+
+### Round 1 — validate the web system, read-only — **DONE 2026-09-06**
+
+Front-loads the layer with the most operator-unknowns (axum stack, sqlx vs
+the real schema, side-by-side operation) at zero risk: no writes, the
+Python daemon keeps scheduling.
+
+1. Scaffold `hunter-rs/` (layout decided, §7.7): single bin crate, modules
+   mirroring the Python layout (`types`, `store`, `backend`,
+   `backends/omp_scavenge`, `runner`, `forge`, `scheduler`, `server`).
+   No workspace split until earned.
+2. sqlx against the live `data/hunter.db`; offline query metadata
+   (`cargo sqlx prepare`) so builds never need a live DB.
+3. Port **types** + **store read paths** with tests.
+4. axum serving the existing read-only JSON API + the current vanilla-TS
+   UI on :8378.
+
+**Exit criterion — MET 2026-09-06:** the vanilla UI loads fully from the
+Rust binary (:8378) against the live DB beside the running Python daemon:
+1103 finding cards, all views live, zod passes, zero console errors;
+scripts/parity.sh 8/8 endpoints PASS vs :8377. 9 Rust tests green, clippy
+clean. Notes: dev.db (schema-only, via Python Store init) backs sqlx
+compile-time checks — `just dev-db` regenerates; `cargo sqlx prepare`
+offline metadata deferred until CI exists. Round-1 stubs in /api/summary
+(backend_status_html, cycle_running=false, next_candidate=null,
+activity_status variants Working/Paused/Ready unreachable) are marked
+with round-2 comments in server.rs. Accepted deviations from Python:
+param validation returns 400 not 500; last_cycle uses a direct SQL
+lookup, not a 500-event window; Store is read-only at the connection
+level (cannot write the live DB).
+
+### Round 2 — writes + budget brain — **DONE 2026-09-13**
+Store write paths (triage verdicts, notes, repo registration), all 9 POST
+endpoints, `Backend` trait + omp_scavenge capacity math (decide/keep_fresh/
+status_html), scheduler pick_next + anticipated_tokens. Cycle/override
+forwarded to Python daemon via reqwest shim (temporary, round 3 deletes).
+
+**Exit criterion — MET 2026-09-13:** 123 tests green (28 capacity, 45
+facade, 19 post, 11 store-write, 11 scheduler, 4 server, 5 store-read);
+parity 8/8 vs Python on live DB; real backend status bars (5h/7d windows,
+ramp markers, availability), real pick_next candidate with budget decision,
+full POST flow (add/delete repo round-tripped, cycle forwarding 409-busy
+from running Python daemon). Accepted deviations: UTC in notes timestamps
+(Python used local), UTC in status reset time (flagged for round 3),
+param validation returns 400 not 500, non-object JSON body returns 400
+not leaked 500.
+
+### Round 3 — the daemon — **DONE 2026-09-14**
+Runner (harness: subprocess spawn, JSONL metering, SIGTERM at cap),
+forge (GitHub/GitLab via gh/glab CLI), playbooks (template rendering),
+ingest (findings JSON validation + fingerprint dedup), all scheduler
+executors (run_hunt/recheck/fix/engage/harvest/sync_prs + generic
+_run_analysis_job for test_gap/dep_update/refactor/modernization),
+daemon loop (axum + scheduler + usage prober as tokio tasks, lockfile,
+reconcile, compute_sleep, describe_cycle), CLI `daemon` subcommand.
+
+**Exit criterion — INITIAL PASS 2026-09-14:** Python daemon stopped,
+Rust daemon started on :8377, ran a full cycle (PR sync across 77 repos
++ refactor job on harbour-sim, worker metered + killed at cap, ingest
+ran), UI loaded 1109 cards with zero console errors, real backend
+status bars. 173 tests green, zero todo!()s in 8069 lines of Rust.
+One-week parity run starts now (Phase 2 exit criterion = §1).
+
+---
+
+## 6b. Svelte UI rewrite — **DONE 2026-09-14**
+
+Migration 2 per §4/§8.1: vanilla-TS SPA (1560 lines, 1 file) replaced by
+Svelte 5 (runes) + Vite. Tailwind was *not* adopted — styling stayed
+hand-written CSS with the existing custom-property token system
+(`hunter/ui-svelte/src/app.css`). Source at `hunter/ui-svelte/`,
+production build outputs to `hunter/ui/` (where the Rust binary serves it).
+
+Components: App shell with sidebar nav + hash routing, StatusPage (backend
+window bars via {@html}, exhaustive activity_status switch, Run Cycle
+button), FindingCard (severity/confidence/category/status badges, verdict/
+recheck/override actions, expandable detail panel), FilterBar (dropdown
+checkbox groups for repo/type/class/severity, confidence slider, sort
+selector), InboxPage/KanbanPage/AllFindingsPage (three views of the same
+finding data with independent filters), ReposPage (list + add/remove/toggle
++ notes), StatsPage (totals + by-kind + by-finding tables), LogPage
+(events + jobs tables with kind/state badges).
+
+Reactive API store (HunterStore class with $state runes, 5s polling,
+lazy detail/notes fetching). TS types manually maintained (typeshare was
+tried but rejected — can't handle i64, serde flatten, internally-tagged
+enums). Format helpers shared across components.
+
+Build: 90KB JS + 25KB CSS gzipped to 29KB + 5KB. All 7 views render
+with live data, zero console errors, dark theme matching the original.
+
+### Module notes (dependency order)
 
 1. **types** → domain structs: `FindingStatus` etc. as enums with typed
    transitions; `Config` via serde. Kill `Row` — no dict-shaped core.
@@ -430,8 +568,11 @@ transition (SQLite WAL is multi-process) — cut over component-wise, e.g. Rust
 3. **backend protocol + omp_scavenge** → `Backend` trait (`decide`/`run`/
    `keep_fresh`), `Outlook`/`Granted`/`Denied` as enums, capacity math
    (ramps, unaccounted-token tracking) ported test-first — it's pure logic
-   and spec-rich; proves the pattern. Diagnostics cross as *data*, not HTML
-   (settles §8.1's open question as option 2).
+   and spec-rich; proves the pattern. Decisions cross as *data* (`Outlook`),
+   diagnostics as *presentation*: §8.1's open question closed the other way —
+   `status()` stayed an HTML fragment (`Backend::status_html`), because typing
+   the payload would have put one backend's window vocabulary into the shared
+   contract. The coupling is paid for with a byte-exact spec instead.
 4. **runner** → the subtle one: spawn, ledger discovery (session-file reuse
    quirk!), live tailing, SIGTERM-at-cap, kill-safety.
 5. **forge** → serde-typed GitHub/GitLab responses; GitHub App tokens replace
@@ -443,9 +584,11 @@ transition (SQLite WAL is multi-process) — cut over component-wise, e.g. Rust
    duplication. New job kinds (PR review) become a descriptor entry, not a
    copy. Structure the loop for per-repo parallelism (§5.2) even if capped
    at 1.
-7. **server** → axum from scratch (it's being redesigned for auth anyway);
-   UI initially unchanged (current vanilla-TS SPA talks to the same JSON
-   endpoints), Svelte+Tailwind rewrite follows as its own step.
+7. **server** → axum from scratch, but *first* in the round order (see
+   round 1): read-only API parity validates the stack early; auth redesign
+   comes in Phase 3. UI initially unchanged (current vanilla-TS SPA talks
+   to the same JSON endpoints); Svelte rewrite follows as its own
+   step.
 
 Invariants that MUST survive the port (all currently enforced and tested):
 - Workers never push to a repo's default branch (infra guard, not prompt-only).
@@ -468,35 +611,39 @@ Invariants that MUST survive the port (all currently enforced and tested):
 |---|---|---|
 | 1 | BYO subscription as the funding model | **Leaning yes** (argued §5.1); confirm before Phase 3 code |
 | 2 | ToS-gray of hosting others' Anthropic tokens | Open; invite-only mitigates; revisit before strangers |
-| 3 | Svelte vs Leptos for the UI rewrite | Svelte for v1 decided; Leptos experiment deferred until JSON API is stable |
+| 3 | Svelte vs Leptos for the UI rewrite | **Svelte decided, reinforced 2026-09-06.** Leptos author declared the framework feature-complete and "lightly maintained going forward" (leptos-rs/leptos#4707, May 2026; maintainers sought, none onboarded as of July). Svelte wins on iteration speed (HMR vs 30–90s rebuilds), corpus (§3.2 cuts for Svelte here — Leptos corpus is thin and split across 0.5/0.6/0.7 idioms), governance (paid Vercel team), and architectural fit (Leptos server functions would dissolve the JSON API boundary). Leptos's one big win — end-to-end shared Rust types — is ~80% recoverable by generating TS types from the serde structs (typeshare/schemars). Experiment downgraded: revisit only if governance improves. |
 | 4 | `gh` CLI → GitHub App: during port (step 5) or Phase 3 | Open; seam kept either way |
 | 5 | Webhooks vs polling threshold | Defer to Phase 4; polling fine at current repo counts |
 | 6 | Keep omp vs Claude Agent SDK for workers | Keep omp; revisit only if the coupling (§5.4) keeps hurting — trait makes it cheap |
-| 7 | Repo layout: new `hunter-rs/` beside `hunter/`, or cargo workspace at root | Decide at scaffold time |
-| 8 | Tailwind on the *current* UI before the port | **No** — superseded; adopt Tailwind with the Svelte rewrite (§8.1) |
+| 7 | Repo layout | **Decided:** `hunter-rs/` beside `hunter/`, single bin crate, no workspace until earned (§6 round 1) |
+| 8 | Tailwind on the *current* UI before the port | **No** — superseded; Tailwind was to arrive with the Svelte rewrite (§8.1), but in the event was never adopted |
 
 ---
 
 ## 8. Nearer-term items (pre-existing living-doc entries, reconciled with the pivot)
 
 ### 8.1 UI: Tailwind CSS + `status() -> data, not HTML`
-**Status:** superseded / resolved by the port plan.
+**Status:** closed. Both halves were decided against what this section
+proposed, so it is kept as the record of why.
 
-Previously decided: migrate the hand-rolled ~300-line CSS to Tailwind on the
-current vanilla-TS UI. The Rust pivot changes the calculus — migrating the
-current UI to Tailwind and then rewriting it in Svelte pays the migration
-twice. Tailwind arrives *with* the Svelte rewrite (port step 7); the token
-system (spacing/type scale, radii, shadows) maps into `tailwind.config.js`
-so the visual identity survives.
+**Tailwind: dropped.** The plan was to migrate the hand-rolled ~300-line
+CSS to Tailwind, and then to fold that into the Svelte rewrite rather than
+pay the migration twice. The rewrite (§6b) happened; Tailwind did not. The
+existing token system (spacing/type scale, radii, shadows) already carried
+the visual identity, and porting it into a framework config bought nothing
+a rewrite was not already delivering. `hunter/ui-svelte` is plain CSS.
 
-The dependent question — backend `status() -> str` (HTML fragment) — is
-settled by the port as the previously-identified endgame (option 2): the
-backend emits typed data (`BudgetDimension[]`-style), the client renders it.
-Rationale unchanged: the HTML fragment couples backend to CSS class names,
-can't be validated at the schema boundary (`z.string()`), is the only
-non-data-driven panel, and blocks Tailwind's scanner. In the Rust `Backend`
-trait, diagnostics cross the boundary as serde data from day one. Until the
-port, the Python `status() -> str` stays as-is — no interim work.
+**`status() -> data`: not adopted either.** The argument for it stands —
+an HTML fragment couples the backend to CSS class names and cannot be
+validated at the schema boundary beyond `z.string()`. It lost to a
+stronger constraint: the backend, not the core, owns what its status
+means, and the set of window dimensions a backend reports is its own
+vocabulary. Typing that at the boundary would have put one backend's
+shape into the shared contract. So the fragment stays, and the coupling is
+handled by *specifying* it: BACKEND-CONTRACT §2.3 pins the markup to the
+character, and `status_html_test` snapshots nine states against it. The UI
+injects it with `{@html}` and owns the stylesheet those class names
+resolve against.
 
 ### 8.2 Scheduler: job-level cost tracking and reporting
 **Status:** idea; lands as a UI story in Phase 3/4 (§2 Operations).

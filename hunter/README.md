@@ -1,5 +1,18 @@
 # hunter — Idle-Token Bug Hunter
 
+> **The Python daemon in `hunter/` is no longer what runs.** The service
+> executes the Rust binary (`hunter-rs/`), which owns `data/hunter.db` and
+> applies its own migrations. This package is retained only as a rollback
+> until the Phase 2 exit criterion in `future.md` is met — a week of the
+> Rust daemon against the live database with no regression — and is then
+> deleted. Until then it is expected to keep working: a rollback nobody
+> has kept correct is not a rollback. So fix defects found here — just
+> triage them as fallback defects rather than outages, since nothing in
+> production executes this code.
+>
+> Everything else under `hunter/` is live: `config.json`, `data/`,
+> `playbooks/`, `ui/` and `ui-svelte/`. It is the daemon's root directory.
+
 Self-hosted [detail.dev](https://detail.dev)-style code analysis pipeline
 funded by spare Claude-subscription capacity. Register a repo; hunter finds
 bugs, test gaps, outdated dependencies, mechanical refactors, and
