@@ -1,8 +1,12 @@
 pub mod backend;
 pub mod backends;
 pub mod config;
+pub mod dep_scan;
 pub mod domain;
 pub mod forge;
+pub mod ingest;
+pub mod playbooks;
+pub mod scheduler;
 pub mod store;
 pub mod types;
 pub mod util;
