@@ -1633,28 +1633,42 @@ pub async fn run_fix(
     let br = branch.clone();
     let db2 = db.clone();
     let (rc, out) = tokio::task::spawn_blocking(move || {
-        let (rc, out) = run_cmd_sync(
-            &[
-                "git",
-                "-C",
-                &rps,
-                "worktree",
-                "add",
-                "-b",
-                &br,
-                &wts,
-                &format!("origin/{db2}"),
-            ],
-            30,
-        );
-        if rc != 0 {
+        let add = |start_point: &str| {
             run_cmd_sync(
-                &["git", "-C", &rps, "worktree", "add", "-b", &br, &wts, &db2],
+                &[
+                    "git",
+                    "-C",
+                    &rps,
+                    "worktree",
+                    "add",
+                    "-b",
+                    &br,
+                    &wts,
+                    start_point,
+                ],
                 30,
             )
-        } else {
-            (rc, out)
+        };
+        let (rc, out) = add(&format!("origin/{db2}"));
+        if rc == 0 {
+            return (rc, out);
         }
+        let (rc, out) = add(&db2);
+        if rc == 0 {
+            return (rc, out);
+        }
+        // A prior attempt can leave the branch behind with its worktree
+        // gone: the branch is only deleted on the path where the worktree
+        // directory still exists. `worktree add -b` then fails with
+        // "a branch named ... already exists" on every later cycle, which
+        // is a retry loop no amount of waiting resolves — observed
+        // 2026-09-15, broken only by restarting the daemon. The branch
+        // belongs to this finding and its work was abandoned when the
+        // attempt failed, so reclaiming the name is safe: a finding whose
+        // branch reached a PR is `pr_open` and never re-enters `fix`.
+        run_cmd_sync(&["git", "-C", &rps, "worktree", "prune"], 30);
+        run_cmd_sync(&["git", "-C", &rps, "branch", "-D", &br], 30);
+        add(&format!("origin/{db2}"))
     })
     .await
     .unwrap_or((127, "spawn error".to_owned()));
