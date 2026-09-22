@@ -573,8 +573,9 @@ with live data, zero console errors, dark theme matching the original.
    `status()` stayed an HTML fragment (`Backend::status_html`), because typing
    the payload would have put one backend's window vocabulary into the shared
    contract. The coupling is paid for with a byte-exact spec instead.
-4. **runner** → the subtle one: spawn, ledger discovery (session-file reuse
-   quirk!), live tailing, SIGTERM-at-cap, kill-safety.
+4. **runner** → the subtle one: spawn into a private `--session-dir` (omp's
+   `autoResume` otherwise resumes the cwd's previous session and re-caches
+   it), live tailing, SIGTERM-at-cap, kill-safety.
 5. **forge** → serde-typed GitHub/GitLab responses; GitHub App tokens replace
    `gh` CLI ambient auth (may land as a Phase 3 follow-up; keep the seam).
 6. **scheduler** → port = refactor: the copy-pasted `run_*` skeletons
