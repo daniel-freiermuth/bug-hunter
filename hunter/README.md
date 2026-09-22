@@ -10,8 +10,9 @@
 > triage them as fallback defects rather than outages, since nothing in
 > production executes this code.
 >
-> Everything else under `hunter/` is live: `config.json`, `data/`,
-> `playbooks/`, `ui/` and `ui-svelte/`. It is the daemon's root directory.
+> Everything else under `hunter/` is live: local `config.json`, `data/`,
+> `playbooks/`, generated `ui/`, and `ui-svelte/`. It is the daemon's root
+> directory.
 
 Self-hosted [detail.dev](https://detail.dev)-style code analysis pipeline
 funded by spare Claude-subscription capacity. Register a repo; hunter finds
@@ -245,10 +246,8 @@ hunter/
 └── util.py         shared subprocess wrapper
 
 playbooks/          worker prompt templates (one per job kind, see table above)
-ui/
-├── index.html       page shell + styles
-├── src/app.ts       the entire frontend (strict TS, zod-validated network boundary)
-└── tsconfig.json
+ui/                 generated Vite bundle (ignored; build before serving)
+ui-svelte/          tracked Svelte source
 schema.sql           SQLite schema (source of truth; store.py migrates existing DBs)
 config.json          runtime config (§ Configuration)
 tests/               pytest suite, one file per module/behavior
