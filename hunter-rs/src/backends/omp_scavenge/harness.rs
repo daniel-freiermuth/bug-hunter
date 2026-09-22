@@ -1,13 +1,10 @@
 //! Worker runner — spawns headless omp, meters its ledger, kills at cap.
 //!
-//! Port of `hunter/backends/omp_scavenge/harness.py`. The cap design (exp1b):
-//! never trust harness cooperation. The worker's session JSONL is written
-//! live under ~/.omp/agent/sessions/; we watch it and SIGTERM the process
-//! group at the token threshold.
+//! Port of `hunter/backends/omp_scavenge/harness.py`. Each worker receives
+//! a private OMP session directory so its meter can never observe another
+//! session's ledger.
 
-use std::collections::HashMap;
 use std::fs;
-use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -18,19 +15,6 @@ use crate::config::Config;
 use crate::types::RunResult;
 use crate::util::kill_tree;
 
-// ---------------------------------------------------------------------------
-// Sessions directory
-// ---------------------------------------------------------------------------
-
-/// Resolve the omp sessions directory: `$OMP_HOME/agent/sessions` or
-/// `~/.omp/agent/sessions`.
-pub fn omp_sessions_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("OMP_HOME") {
-        return PathBuf::from(home).join("agent/sessions");
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-    PathBuf::from(home).join(".omp/agent/sessions")
-}
 
 // ---------------------------------------------------------------------------
 // Ledger metering (harness.py:27-55)
@@ -89,81 +73,44 @@ pub fn ledger_usage(session_file: &Path, since_iso: &str) -> (i64, i64) {
     (tokens, calls)
 }
 
-// ---------------------------------------------------------------------------
-// Session-file discovery (harness.py:58-87)
-// ---------------------------------------------------------------------------
 
-/// Snapshot of all `*.jsonl` files under `sessions_dir/*/*.jsonl` with their
-/// byte sizes. Errors → empty map.
-pub fn snapshot(sessions_dir: &Path) -> HashMap<PathBuf, u64> {
-    let mut result = HashMap::new();
-    let Ok(entries) = fs::read_dir(sessions_dir) else {
-        return result;
-    };
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let Ok(sub) = fs::read_dir(entry.path()) else {
-            continue;
-        };
-        for sub_entry in sub.flatten() {
-            let path = sub_entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
-                && let Ok(meta) = path.metadata()
-            {
-                result.insert(path, meta.len());
+/// A worker gets an exclusive OMP session directory.  Unlike the shared
+/// default session tree, every JSONL below this directory belongs to this
+/// worker, so no fuzzy cwd matching or growth heuristic is needed.
+fn worker_session_dir(cfg: &Config) -> std::io::Result<PathBuf> {
+    let nonce = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let dir = cfg
+        .work_root
+        .join("sessions")
+        .join(format!("worker-{}-{nonce}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Find the worker's own session ledger in its exclusive directory.
+fn private_session_file(dir: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            candidates.push(path);
+        } else if entry.file_type().ok().is_some_and(|kind| kind.is_dir()) {
+            for child in fs::read_dir(path).ok()?.flatten() {
+                let path = child.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+                    candidates.push(path);
+                }
             }
         }
     }
-    result
+    candidates
+        .into_iter()
+        .max_by_key(|path| path.metadata().ok().and_then(|metadata| metadata.modified().ok()))
 }
 
-/// Find the worker's ledger: a file that appeared OR grew since the
-/// `before` snapshot. Fuzzy-matches the cwd slug against parent-dir names;
-/// falls back to most-recently-modified candidate.
-pub fn discover<S: BuildHasher>(
-    before: &HashMap<PathBuf, u64, S>,
-    sessions_dir: &Path,
-    cwd: &Path,
-) -> Option<PathBuf> {
-    let current = snapshot(sessions_dir);
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    for (path, size) in &current {
-        match before.get(path) {
-            None => candidates.push(path.clone()),
-            Some(&old_size) if *size > old_size => candidates.push(path.clone()),
-            _ => {}
-        }
-    }
-    if candidates.is_empty() {
-        return None;
-    }
-    // Fuzzy slug match: join cwd components with '-'
-    let slug = cwd.to_string_lossy().replace('/', "-");
-    let slug = slug.trim_matches('-');
-    let matches: Vec<&PathBuf> = candidates
-        .iter()
-        .filter(|p| {
-            let pn = p
-                .parent()
-                .and_then(|par| par.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            let pn = pn.trim_matches('-');
-            pn.contains(slug) || slug.contains(pn)
-        })
-        .collect();
-    let pool: &[&PathBuf] = if matches.is_empty() {
-        // re-collect candidates as refs
-        &candidates.iter().collect::<Vec<_>>()
-    } else {
-        &matches
-    };
-    pool.iter()
-        .max_by_key(|p| p.metadata().ok().and_then(|m| m.modified().ok()))
-        .map(|p| (*p).clone())
-}
 
 // ---------------------------------------------------------------------------
 // ISO timestamp helper (replaces Python time.strftime + gmtime)
@@ -248,9 +195,22 @@ pub fn run_worker(
     max_wall_s: i64,
     model: Option<&str>,
 ) -> RunResult {
-    let sessions_dir = omp_sessions_dir();
-    let before = snapshot(&sessions_dir);
     let t0 = Instant::now();
+    let session_dir = match worker_session_dir(cfg) {
+        Ok(dir) => dir,
+        Err(err) => {
+            return RunResult {
+                exit_code: Some(127),
+                killed_reason: Some("unmetered".to_owned()),
+                tokens_new: 0,
+                calls: 0,
+                session_file: None,
+                duration_s: 0.0,
+                stdout_tail: format!("creating worker session directory failed: {err}"),
+                usage_delta: None,
+            };
+        }
+    };
 
     let spawn_iso = {
         let epoch_s = SystemTime::now()
@@ -263,6 +223,7 @@ pub fn run_worker(
     // Build command: [omp_bin, "-p", prompt] + optional flags
     let mut cmd = Command::new(&cfg.omp_bin);
     cmd.arg("-p").arg(prompt);
+    cmd.arg(format!("--session-dir={}", session_dir.display()));
     if let Some(m) = model {
         cmd.arg(format!("--model={m}"));
     }
@@ -330,7 +291,7 @@ pub fn run_worker(
     loop {
         let exited = matches!(proc.try_wait(), Ok(Some(_)));
         if session.is_none() {
-            session = discover(&before, &sessions_dir, cwd);
+            session = private_session_file(&session_dir);
         }
         if let Some(ref sess) = session {
             let (t, c) = ledger_usage(sess, &spawn_iso);
@@ -356,7 +317,7 @@ pub fn run_worker(
             tracing::warn!(
                 "harness: no session ledger under {} after {}s — \
                  killing worker rather than running it unmetered",
-                sessions_dir.display(),
+                session_dir.display(),
                 cfg.session_grace_s
             );
             killed = Some("unmetered".to_owned());
@@ -393,7 +354,7 @@ pub fn run_worker(
             "harness: worker exited after {:.1}s with no session ledger under {} — \
              token spend unmetered",
             t0.elapsed().as_secs_f64(),
-            sessions_dir.display()
+            session_dir.display()
         );
     }
 

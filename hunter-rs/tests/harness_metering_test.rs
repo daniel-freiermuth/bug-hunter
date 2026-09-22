@@ -99,20 +99,20 @@ impl Fixture {
             .to_owned()
     }
 
-    /// Shell that writes an omp-style session ledger under `$OMP_HOME`,
-    /// one assistant record per `(input, output, cacheWrite)` triple.
-    ///
-    /// The timestamp comes from `date -u` inside the worker, because
-    /// `run_worker` only counts records at or after the second it spawned
-    /// the worker in. A fixture with a hardcoded past timestamp meters
-    /// zero and looks exactly like the unmetered case.
+    /// Shell that writes an OMP-style session ledger into the private
+    /// `--session-dir` supplied by the harness.
     fn ledger_sh(&self, records: &[(i64, i64, i64)]) -> String {
-        let dir = self.sessions.join(self.slug());
-        let file = dir.join("session-01.jsonl");
-        let mut sh = format!(
-            "mkdir -p '{dir}'\nTS=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')\n",
-            dir = dir.display()
-        );
+        let mut sh = concat!(
+            "session_dir=''\n",
+            "for arg in \"$@\"; do\n",
+            "  case \"$arg\" in --session-dir=*) session_dir=${arg#--session-dir=} ;; esac\n",
+            "done\n",
+            "test -n \"$session_dir\" || exit 90\n",
+            "mkdir -p \"$session_dir\"\n",
+            "file=\"$session_dir/session-01.jsonl\"\n",
+            "TS=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')\n",
+        )
+        .to_owned();
         for &(input, output, cache_write) in records {
             let record = serde_json::json!({
                 "timestamp": "@TS@",
@@ -127,10 +127,7 @@ impl Fixture {
             })
             .to_string()
             .replace("@TS@", "%s");
-            sh.push_str(&format!(
-                "printf '{record}\\n' \"$TS\" >> '{file}'\n",
-                file = file.display()
-            ));
+            sh.push_str(&format!("printf '{record}\\n' \"$TS\" >> \"$file\"\n"));
         }
         sh
     }
@@ -183,17 +180,15 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
     );
     assert!(res.stdout_tail.contains("worker-done"));
 
-    // The worker is spawned with the prompt and the requested model; the
-    // ledger is found because the worker really was handed `cwd`.
-    assert_eq!(
-        fx.bins.calls_to("omp"),
-        vec![vec![
-            "omp".to_owned(),
-            "-p".to_owned(),
-            PROMPT.to_owned(),
-            "--model=test-model".to_owned(),
-        ]]
+    let calls = fx.bins.calls_to("omp");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0][..3], ["omp", "-p", PROMPT]);
+    assert!(
+        calls[0].iter().any(|arg| arg.starts_with("--session-dir=")),
+        "worker must receive an exclusive session directory: {:?}",
+        calls[0]
     );
+    assert!(calls[0].contains(&"--model=test-model".to_owned()));
 }
 
 /// The regression a review round found: the worker exited 0, promptly, and
@@ -220,10 +215,9 @@ fn worker_without_a_ledger_is_flagged_unmetered_despite_exit_zero() {
     assert_eq!(res.session_file, None);
 }
 
-/// A ledger written *before* the worker spawned is not this worker's
-/// spend. `discover` only accepts files that appeared or grew, so a
-/// pre-existing, untouched ledger leaves the run unmetered rather than
-/// billing it someone else's tokens.
+/// A shared default-session ledger, even for the same checkout, must never
+/// be attributed to this worker. Only its freshly allocated
+/// `--session-dir` is eligible for metering.
 #[test]
 fn stale_ledger_from_an_earlier_run_is_not_counted() {
     let fx = Fixture::new("stale-ledger");
