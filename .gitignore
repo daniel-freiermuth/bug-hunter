@@ -11,6 +11,7 @@ hunter/data/hunter.db-shm
 hunter/data/hunter.db-wal
 hunter/data/repos/
 hunter/data/wt/
+hunter/data/sessions/
 hunter/data/hunter.lock
 hunter/node_modules/
 hunter/ui/
