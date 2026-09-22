@@ -9,3 +9,4 @@ exp2/**
 hunter/data/
 __pycache__/
 hunter/ui/
+hunter/config.json
