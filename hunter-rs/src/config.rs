@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::backends::omp_scavenge::LlmProvider;
 use anyhow::Context;
 use serde::Deserialize;
 
@@ -62,6 +63,8 @@ struct RawModels {
 struct RawBackend {
     #[serde(rename = "type")]
     kind: Option<String>,
+    #[serde(rename = "llmProvider")]
+    llm_provider: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -114,6 +117,8 @@ pub struct Config {
     pub model_fix: Option<String>,
     /// backend.type discriminator; only "omp-scavenge" exists.
     pub backend_type: String,
+    pub llm_provider: LlmProvider,
+
     pub hunt_cap_tokens: i64,
     pub hunt_max_wall_s: i64,
     pub hunt_max_findings: i64,
@@ -259,6 +264,16 @@ impl Config {
         )?;
         let standards_interval_days =
             whole_days("standards.intervalDays", raw.standards.interval_days)?;
+        let llm_provider = match raw.backend.llm_provider.as_deref() {
+            None | Some("anthropic") => LlmProvider::Anthropic,
+            Some("openai-codex") => LlmProvider::OpenAiCodex,
+            Some(provider) => {
+                anyhow::bail!(
+                    "{}: backend.llmProvider must be 'anthropic' or 'openai-codex' (got {provider:?})",
+                    cfg_path.display()
+                );
+            }
+        };
 
         Ok(Self {
             root: root.to_owned(),
@@ -279,6 +294,7 @@ impl Config {
                 .backend
                 .kind
                 .unwrap_or_else(|| "omp-scavenge".to_owned()),
+            llm_provider,
             hunt_cap_tokens,
             hunt_max_wall_s,
             hunt_max_findings: raw.hunt.max_findings.unwrap_or(8),

@@ -3,7 +3,10 @@
 //! `read_windows` takes the agent.db path explicitly (tests point it at a
 //! fixture).
 
+use super::provider::LlmProvider;
+use sqlx::Row;
 use std::collections::BTreeMap;
+
 use std::path::Path;
 
 /// THE tunable: human headroom at 5h-window start (`capacity.HEADROOM_MS`).
@@ -46,6 +49,14 @@ pub fn default_agent_db() -> std::path::PathBuf {
 /// logged here. A missing file or a row-less table is not a failure and
 /// stays silent.
 pub fn read_windows(agent_db: &Path, now_ms: i64) -> BTreeMap<String, WindowState> {
+    read_windows_for(agent_db, LlmProvider::Anthropic, now_ms)
+}
+
+pub fn read_windows_for(
+    agent_db: &Path,
+    provider: LlmProvider,
+    now_ms: i64,
+) -> BTreeMap<String, WindowState> {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::error!(
             agent_db = %agent_db.display(),
@@ -53,7 +64,7 @@ pub fn read_windows(agent_db: &Path, now_ms: i64) -> BTreeMap<String, WindowStat
         );
         return BTreeMap::new();
     };
-    match handle.block_on(read_windows_async(agent_db, now_ms)) {
+    match handle.block_on(read_windows_async(agent_db, provider, now_ms)) {
         Ok(windows) => windows,
         Err(err) => {
             tracing::error!(
@@ -71,11 +82,10 @@ pub fn read_windows(agent_db: &Path, now_ms: i64) -> BTreeMap<String, WindowStat
 /// cycles, drops expired per-model-class rows.
 async fn read_windows_async(
     agent_db: &Path,
+    provider: LlmProvider,
     now_ms: i64,
 ) -> Result<BTreeMap<String, WindowState>, Box<dyn std::error::Error + Send + Sync>> {
-    use sqlx::Row;
     use sqlx::sqlite::SqliteConnectOptions;
-
     if !agent_db.exists() {
         return Ok(BTreeMap::new());
     }
@@ -85,16 +95,19 @@ async fn read_windows_async(
         .read_only(true);
     let pool = sqlx::SqlitePool::connect_with(opts).await?;
 
-    // Runtime query: reads external omp agent.db whose schema isn't available at compile time.
+    let limits = provider.windows();
     let rows = sqlx::query(
         "SELECT limit_id, used_fraction, status, resets_at, recorded_at \
          FROM ( \
            SELECT limit_id, used_fraction, status, resets_at, recorded_at, \
                   ROW_NUMBER() OVER (PARTITION BY limit_id ORDER BY recorded_at DESC) AS rn \
            FROM usage_history \
-           WHERE limit_id LIKE 'anthropic:%' \
+           WHERE provider = ? AND limit_id IN (?, ?) \
          ) WHERE rn = 1",
     )
+    .bind(provider.name())
+    .bind(limits.short.limit_id)
+    .bind(limits.long.limit_id)
     .fetch_all(&pool)
     .await?;
 
@@ -124,11 +137,12 @@ async fn read_windows_async(
             // Truthy resets_at (> 0) that has expired (<= now_ms).
             // Some(0) is falsy like Python's `not resets_at`.
             Some(r) if r > 0 && r <= now_ms => {
-                // Determine period for account-wide lids; per-model-class → drop.
-                let period = match limit_id.as_str() {
-                    "anthropic:5h" => FIVE_H_MS,
-                    "anthropic:7d" => WEEK_MS,
-                    _ => continue, // per-model-class / unrecognized → drop
+                let period = if limit_id == limits.short.limit_id {
+                    limits.short.period_ms
+                } else if limit_id == limits.long.limit_id {
+                    limits.long.period_ms
+                } else {
+                    continue;
                 };
                 // Roll forward: advance resets_at by period until > now,
                 // recording each step as the current cycle's start.

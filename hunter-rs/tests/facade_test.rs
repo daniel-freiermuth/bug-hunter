@@ -50,6 +50,7 @@ fn cfg_with(stale_after_s: f64, omp_bin: &str) -> Config {
         model_hunt: None,
         model_fix: None,
         backend_type: "omp-scavenge".to_owned(),
+        llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
         hunt_cap_tokens: 200_000,
         hunt_max_wall_s: 1800,
         hunt_max_findings: 8,
@@ -1571,4 +1572,33 @@ async fn test_7d_prio_override_cap_excludes_the_anticipated_job() {
         "prio cap {cap} should be (1.0 − used .60) × 10M = 4000000; counting \
          the anticipated 200k against the job gives 3800000 instead"
     );
+}
+
+/// Codex uses the shared two-window scavenging policy with its own OMP
+/// limit IDs; its warning status retains the reported fraction.
+#[tokio::test]
+async fn codex_high_short_window_usage_denies() {
+    let mut config = cfg();
+    config.llm_provider = hunter::backends::omp_scavenge::LlmProvider::OpenAiCodex;
+    let backend = make_backend_with(FakeLedger::new(0, 0), config, FakeProber::new(0));
+    let now = now_ms();
+    let mut windows = BTreeMap::new();
+    windows.insert(
+        "openai-codex:primary".to_owned(),
+        ws("openai-codex:primary", 0.94, "warning", now + HOUR_MS, 60.0),
+    );
+    windows.insert(
+        "openai-codex:secondary".to_owned(),
+        ws(
+            "openai-codex:secondary",
+            0.15,
+            "ok",
+            now + WEEK_MS / 2,
+            60.0,
+        ),
+    );
+
+    let outlook = backend.decide_with_windows(&windows, 0).await.unwrap();
+    assert!(is_denied(&outlook.normal));
+    assert!(reason(&outlook.normal).contains("5h"));
 }

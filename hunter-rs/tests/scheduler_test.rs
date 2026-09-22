@@ -60,6 +60,7 @@ fn test_config(cache_ttl_s: f64) -> Config {
         model_hunt: None,
         model_fix: None,
         backend_type: "omp-scavenge".to_owned(),
+        llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
         hunt_cap_tokens: 200_000,
         hunt_max_wall_s: 1800,
         hunt_max_findings: 8,

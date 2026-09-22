@@ -9,21 +9,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::capacity::{
-    self, FIVE_H_MS, HEADROOM_MS, WEEK_MS, WindowState, effective_used, ramp_5h, ramp_7d,
-    retry_at_5h, retry_at_7d,
+    self, FIVE_H_MS, HEADROOM_MS, WEEK_MS, WindowState, ramp_5h, ramp_7d, retry_at_5h, retry_at_7d,
 };
+use super::provider::LlmProvider;
+
 use crate::backend::SpendLedger;
 use crate::backend::{Backend, JobClass, Outlook, Prober, Verdict};
 use crate::config::Config;
 
 /// 200 k ≈ 10% of a 5h window (`facade._TOK_PER_FRAC_5H`).
 const TOK_PER_FRAC_5H: f64 = 2_000_000.0;
-/// 5h / 7d period ratio ≈ 0.0297619 (`facade._5H_7D_RATIO`).
+/// 5h / 7d period ratio ≈ 0.0297619.
 const RATIO_5H_7D: f64 = FIVE_H_MS as f64 / WEEK_MS as f64;
-
-/// Calibration horizons: iteration order "5h" then "7d" (`facade._CALIBRATION_DURATIONS_MS`).
-const CALIBRATION_HORIZONS: &[(&str, i64)] = &[("5h", FIVE_H_MS), ("7d", WEEK_MS)];
-
 /// All Anthropic-specific vocabulary (5h/7d windows, ramp math, probe
 /// staleness) is confined to this type.
 pub struct OmpScavengeBackend {
@@ -127,12 +124,13 @@ impl OmpScavengeBackend {
     ) -> anyhow::Result<Reservation> {
         let running = self.ledger.running_estimate().await?;
 
+        let limits = self.cfg.llm_provider.windows();
         let fallback = windows.values().map(|w| w.recorded_at).min().unwrap_or(0);
         let probe_at_5h = windows
-            .get("anthropic:5h")
+            .get(limits.short.limit_id)
             .map_or(fallback, |w| w.recorded_at);
         let probe_at_7d = windows
-            .get("anthropic:7d")
+            .get(limits.long.limit_id)
             .map_or(fallback, |w| w.recorded_at);
 
         let base = running + anticipated;
@@ -141,13 +139,13 @@ impl OmpScavengeBackend {
 
         let cap_5h = self
             .ledger
-            .estimate_capacity("anthropic:5h")
+            .estimate_capacity(limits.short.limit_id)
             .await?
             .filter(|&v| v > 0.0)
             .unwrap_or(TOK_PER_FRAC_5H);
         let cap_7d = self
             .ledger
-            .estimate_capacity("anthropic:7d")
+            .estimate_capacity(limits.long.limit_id)
             .await?
             .filter(|&v| v > 0.0)
             .unwrap_or(cap_5h / RATIO_5H_7D);
@@ -168,6 +166,7 @@ impl OmpScavengeBackend {
 
     /// Single verdict: 7d ramps first, then 5h (`facade.OmpScavengeBackend._decide_inner`).
     fn decide_inner(
+        provider: LlmProvider,
         windows: &BTreeMap<String, WindowState>,
         resv: Reservation,
         prio: bool,
@@ -180,69 +179,68 @@ impl OmpScavengeBackend {
             };
         }
 
-        // 7d pass — BTreeMap order = ascending limit_id; first over-ramp
-        // :7d lid wins the reason string.
-        for (lid, w) in windows {
-            if !lid.contains(":7d") {
+        // Long-window pass. Anthropic's per-model-class weekly limits remain
+        // active constraints; Codex has one named long window.
+        let limits = provider.windows();
+        for (lid, window) in windows {
+            let is_long = match provider {
+                LlmProvider::Anthropic => lid.contains(":7d"),
+                LlmProvider::OpenAiCodex => lid == limits.long.limit_id,
+            };
+            if !is_long {
                 continue;
             }
-            // Skip if not exhausted and used_fraction is None.
-            if w.status.as_deref() != Some("exhausted") && w.used_fraction.is_none() {
-                continue;
-            }
-            // Belt-and-braces: skip expired cycles.
-            if let Some(r) = w.resets_at
-                && r > 0
-                && r <= now_ms
+            if let Some(resets_at) = window.resets_at
+                && resets_at > 0
+                && resets_at <= now_ms
             {
                 continue;
             }
+            let Some(reported) = provider.effective_used(window) else {
+                continue;
+            };
+            let effective_used = reported + resv.gate_7d;
+            let allowed = ramp_7d(window.resets_at, now_ms);
+            if effective_used < allowed {
+                continue;
+            }
 
-            let elapsed_frac = ramp_7d(w.resets_at, now_ms);
-            let eff = effective_used(w, resv.gate_7d);
-
-            if eff >= elapsed_frac {
-                let is_exhausted = w.status.as_deref() == Some("exhausted");
-                let retry = if is_exhausted {
-                    w.resets_at.map(|r| r as f64)
-                } else {
-                    retry_at_7d(w.resets_at, eff)
-                };
-                let u = eff - resv.gate_7d;
-                let reason = format!(
-                    "{lid}: used {u:.2} + unaccounted {res:.2} = {eff:.2} >= ramp {elapsed_frac:.2}",
-                    res = resv.gate_7d
+            let exhausted = matches!(provider, LlmProvider::Anthropic)
+                && window.status.as_deref() == Some("exhausted");
+            let retry_at = if exhausted {
+                window.resets_at.map(|reset| reset as f64)
+            } else {
+                retry_at_7d(window.resets_at, effective_used)
+            };
+            let reason = format!(
+                "{lid}: used {reported:.2} + unaccounted {res:.2} = {effective_used:.2} >= ramp {allowed:.2}",
+                res = resv.gate_7d
+            );
+            if prio && !exhausted {
+                // Headroom for THIS job, so the reservation it is
+                // measured against must not already contain it.
+                let cap = Self::frac_to_tokens(
+                    (1.0 - (reported + resv.budget_7d)).max(0.0),
+                    "7d",
+                    resv.cap_5h,
+                    resv.cap_7d,
                 );
-
-                if prio && !is_exhausted {
-                    // Headroom for THIS job, so the reservation it is
-                    // measured against must not already contain it.
-                    let headroom_frac = (1.0 - effective_used(w, resv.budget_7d)).max(0.0);
-                    let cap = Self::frac_to_tokens(headroom_frac, "7d", resv.cap_5h, resv.cap_7d);
-                    if cap <= 0 {
-                        return Verdict::Denied {
-                            reason,
-                            retry_at: retry,
-                        };
-                    }
+                if cap > 0 {
                     return Verdict::Granted {
                         cap_tokens: Some(cap),
                         reason: format!("prio override ({reason})"),
                     };
                 }
-                return Verdict::Denied {
-                    reason,
-                    retry_at: retry,
-                };
             }
+            return Verdict::Denied { reason, retry_at };
         }
 
         // 5h pass.
-        if let Some(w5) = windows.get("anthropic:5h")
-            && (w5.status.as_deref() == Some("exhausted") || w5.used_fraction.is_some())
+        if let Some(w5) = windows.get(limits.short.limit_id)
+            && let Some(reported) = provider.effective_used(w5)
             && let Some(allowed) = ramp_5h(w5.resets_at, now_ms)
         {
-            let eff = effective_used(w5, resv.gate_5h);
+            let eff = reported + resv.gate_5h;
             if eff >= allowed {
                 let is_exhausted = w5.status.as_deref() == Some("exhausted");
                 let retry = if is_exhausted {
@@ -250,16 +248,14 @@ impl OmpScavengeBackend {
                 } else {
                     retry_at_5h(w5.resets_at, eff)
                 };
-                let u = eff - resv.gate_5h;
                 let reason = format!(
-                    "5h: used {u:.2} + unaccounted {res:.2} = {eff:.2} >= ramp {allowed:.2}",
+                    "5h: used {reported:.2} + unaccounted {res:.2} = {eff:.2} >= ramp {allowed:.2}",
                     res = resv.gate_5h
                 );
 
                 if prio && !is_exhausted {
-                    // Headroom for THIS job, so the reservation it is
-                    // measured against must not already contain it.
-                    let headroom_frac = (1.0 - effective_used(w5, resv.budget_5h)).max(0.0);
+                    // Same as the 7d arm: the cap is this job's budget.
+                    let headroom_frac = (1.0 - (reported + resv.budget_5h)).max(0.0);
                     let cap = Self::frac_to_tokens(headroom_frac, "5h", resv.cap_5h, resv.cap_7d);
                     if cap <= 0 {
                         return Verdict::Denied {
@@ -282,19 +278,21 @@ impl OmpScavengeBackend {
 
         // All passed — compute headroom (fresh now_ms: second clock read).
         let headroom_now = crate::util::now_ms();
-        let headroom = Self::compute_headroom(windows, resv, prio, headroom_now);
+        let headroom = Self::compute_headroom(provider, windows, resv, prio, headroom_now);
         Verdict::Granted {
             cap_tokens: headroom,
             reason: "ok".to_owned(),
         }
     }
 
-    /// Min headroom in tokens across windows (`facade.OmpScavengeBackend._compute_headroom`).
+    /// Min headroom in tokens across windows
+    /// (`facade.OmpScavengeBackend._compute_headroom`).
     ///
     /// Measured against `budget_*` (see [`Reservation`]): this headroom is
     /// what the anticipated job is allowed to spend, not what is left once
-    /// it has spent.
+    /// it has spent it.
     fn compute_headroom(
+        provider: LlmProvider,
         windows: &BTreeMap<String, WindowState>,
         resv: Reservation,
         prio: bool,
@@ -302,77 +300,90 @@ impl OmpScavengeBackend {
     ) -> Option<i64> {
         let mut caps: Vec<i64> = Vec::new();
 
-        for (lid, w) in windows {
-            if w.used_fraction.is_none() {
+        let limits = provider.windows();
+        for (lid, window) in windows {
+            let Some(used) = provider.effective_used(window) else {
                 continue;
-            }
-            if lid.contains(":7d") {
+            };
+            let is_long = match provider {
+                LlmProvider::Anthropic => lid.contains(":7d"),
+                LlmProvider::OpenAiCodex => lid == limits.long.limit_id,
+            };
+            if is_long {
                 let ceiling = if prio {
                     1.0
                 } else {
-                    ramp_7d(w.resets_at, now_ms)
+                    ramp_7d(window.resets_at, now_ms)
                 };
-                let frac = (ceiling - effective_used(w, resv.budget_7d)).max(0.0);
-                let tok = Self::frac_to_tokens(frac, "7d", resv.cap_5h, resv.cap_7d);
-                caps.push(tok);
-            } else if lid.contains(":5h")
-                && let Some(allowed) = ramp_5h(w.resets_at, now_ms)
+                caps.push(Self::frac_to_tokens(
+                    (ceiling - used - resv.budget_7d).max(0.0),
+                    "7d",
+                    resv.cap_5h,
+                    resv.cap_7d,
+                ));
+            } else if lid == limits.short.limit_id
+                && let Some(ceiling) = ramp_5h(window.resets_at, now_ms)
             {
-                let ceiling = if prio { 1.0 } else { allowed };
-                let frac = (ceiling - effective_used(w, resv.budget_5h)).max(0.0);
-                let tok = Self::frac_to_tokens(frac, "5h", resv.cap_5h, resv.cap_7d);
-                caps.push(tok);
+                let ceiling = if prio { 1.0 } else { ceiling };
+                caps.push(Self::frac_to_tokens(
+                    (ceiling - used - resv.budget_5h).max(0.0),
+                    "5h",
+                    resv.cap_5h,
+                    resv.cap_7d,
+                ));
             }
         }
 
         caps.iter().copied().min()
     }
 
-    /// Log observations + record calibration (`facade.OmpScavengeBackend._observe`).
+    /// Log observations and calibrate the selected provider's two windows.
     async fn observe(&self, windows: &BTreeMap<String, WindowState>) -> anyhow::Result<()> {
         let now = crate::util::now_ms();
+        let limits = self.cfg.llm_provider.windows();
 
-        for w in windows.values() {
-            // Determine calibration horizon: "5h" then "7d" in iteration
-            // order; no lid contains both substrings.
-            let horizon = CALIBRATION_HORIZONS
-                .iter()
-                .find(|(h, _)| w.limit_id.contains(&format!(":{h}")))
-                .copied();
+        for window in windows.values() {
+            let horizon = if window.limit_id == limits.short.limit_id {
+                Some(limits.short.period_ms)
+            } else if window.limit_id == limits.long.limit_id {
+                Some(limits.long.period_ms)
+            } else {
+                None
+            };
 
-            // Calibration: requires horizon + resets_at + used_fraction all
-            // present, a previous observation in the same cycle, fraction
-            // increased, and within the period.
-            if let Some((_h_name, h_dur)) = horizon
-                && let (Some(resets), Some(used_frac)) = (w.resets_at, w.used_fraction)
-                && let Some((prev_obs, prev_frac)) = self
+            if let Some(period_ms) = horizon
+                && let (Some(resets), Some(used_fraction)) =
+                    (window.resets_at, window.used_fraction)
+                && let Some((previous_observation, previous_fraction)) = self
                     .ledger
-                    .last_window_observation(&w.limit_id, resets)
+                    .last_window_observation(&window.limit_id, resets)
                     .await?
-                && used_frac > prev_frac
-                && (now - prev_obs) <= h_dur
+                && used_fraction > previous_fraction
+                && (now - previous_observation) <= period_ms
             {
-                let tok = self.ledger.finished_between(prev_obs, now).await?;
-                if tok > 0 {
+                let tokens = self
+                    .ledger
+                    .finished_between(previous_observation, now)
+                    .await?;
+                if tokens > 0 {
                     self.ledger
                         .record_calibration_sample(
-                            &w.limit_id,
+                            &window.limit_id,
                             Some(resets),
-                            used_frac - prev_frac,
-                            tok,
+                            used_fraction - previous_fraction,
+                            tokens,
                         )
                         .await?;
                 }
             }
 
-            // ALWAYS log observation.
             self.ledger
                 .log_window_observation(
-                    &w.limit_id,
-                    w.used_fraction,
-                    w.status.as_deref(),
-                    w.resets_at,
-                    w.age_s,
+                    &window.limit_id,
+                    window.used_fraction,
+                    window.status.as_deref(),
+                    window.resets_at,
+                    window.age_s,
                 )
                 .await?;
         }
@@ -382,14 +393,12 @@ impl OmpScavengeBackend {
 
     /// Max `used_fraction` across 7d windows, or None (`facade.OmpScavengeBackend._usage_snapshot`).
     /// Blocking — meant for `spawn_blocking`.
-    fn _usage_snapshot_sync(agent_db: &std::path::Path) -> Option<f64> {
+    fn _usage_snapshot_sync(agent_db: &std::path::Path, provider: LlmProvider) -> Option<f64> {
         let now = crate::util::now_ms();
-        let windows = capacity::read_windows(agent_db, now);
+        let windows = capacity::read_windows_for(agent_db, provider, now);
         windows
-            .iter()
-            .filter(|(k, _)| k.contains(":7d"))
-            .filter_map(|(_, w)| w.used_fraction)
-            .reduce(f64::max)
+            .get(provider.windows().long.limit_id)
+            .and_then(|window| provider.effective_used(window))
     }
 }
 
@@ -398,6 +407,7 @@ impl OmpScavengeBackend {
 impl OmpScavengeBackend {
     /// Testing seam: runs decide logic on pre-built windows (skips
     /// `read_windows`).  Not part of the Backend trait.
+    #[allow(clippy::similar_names)]
     pub async fn decide_with_windows(
         &self,
         windows: &BTreeMap<String, WindowState>,
@@ -407,7 +417,7 @@ impl OmpScavengeBackend {
         let resv = self
             .unaccounted_fraction(windows, anticipated_tokens)
             .await?;
-        let normal = Self::decide_inner(windows, resv, false, now);
+        let normal = Self::decide_inner(self.cfg.llm_provider, windows, resv, false, now);
 
         let prioritized = match &normal {
             Verdict::Granted {
@@ -417,7 +427,8 @@ impl OmpScavengeBackend {
                 // Normal granted → prioritized = normal, with possible
                 // prio-headroom upgrade (fresh now_ms).
                 let prio_now = crate::util::now_ms();
-                let prio_headroom = Self::compute_headroom(windows, resv, true, prio_now);
+                let prio_headroom =
+                    Self::compute_headroom(self.cfg.llm_provider, windows, resv, true, prio_now);
                 match (prio_headroom, normal_cap) {
                     (Some(ph), None) => Verdict::Granted {
                         cap_tokens: Some(ph),
@@ -432,7 +443,7 @@ impl OmpScavengeBackend {
             }
             Verdict::Denied { .. } => {
                 // Normal denied → compute prioritized with prio=true.
-                Self::decide_inner(windows, resv, true, now)
+                Self::decide_inner(self.cfg.llm_provider, windows, resv, true, now)
             }
         };
 
@@ -451,8 +462,8 @@ impl OmpScavengeBackend {
     /// the wall-clock read that derives `age_s`.
     pub fn is_fresh(&self, windows: &BTreeMap<String, WindowState>) -> bool {
         windows
-            .get("anthropic:5h")
-            .is_some_and(|w5| w5.age_s <= self.cfg.stale_after_s)
+            .get(self.cfg.llm_provider.windows().short.limit_id)
+            .is_some_and(|short| short.age_s <= self.cfg.stale_after_s)
     }
 }
 
@@ -469,6 +480,7 @@ pub const NO_WINDOW_DATA: &str = r#"<div class="scv-note">No window data availab
 /// `decide_with_windows` and `is_fresh` elsewhere in this file.
 pub struct StatusInputs {
     pub now_ms: i64,
+    pub provider: LlmProvider,
     pub windows: BTreeMap<String, WindowState>,
     pub unaccounted_5h: f64,
     pub unaccounted_7d: f64,
@@ -479,11 +491,9 @@ pub struct StatusInputs {
 
 /// Render the budget window bars (BACKEND-CONTRACT.md §2.3).
 ///
-/// The class names are load-bearing against the `:global(.scv-*)` rules in
-/// `hunter/ui-svelte/src/pages/StatusPage.svelte` -- not `hunter/ui/`, which
-/// is generated build output -- and the UI injects this as raw HTML, so the
-/// markup is the contract. A new class needs a rule there too. Pinned by
-/// `tests/status_html_test.rs`.
+/// The class names are load-bearing against the stylesheet in
+/// `hunter/ui/index.html`, and the UI injects this as raw HTML, so the
+/// markup is the contract. Pinned by `tests/status_html_test.rs`.
 #[allow(
     clippy::too_many_lines,
     reason = "one HTML template expressed as sequential `write!` calls; the \
@@ -497,34 +507,45 @@ pub fn render_status(inputs: &StatusInputs) -> String {
     }
     let mut fragments: Vec<String> = Vec::new();
 
+    let limits = inputs.provider.windows();
     for (lid, w) in &inputs.windows {
-        let label = format!("{} window", lid.replace("anthropic:", ""));
-
+        let is_short = lid == limits.short.limit_id;
+        let is_long = match inputs.provider {
+            LlmProvider::Anthropic => lid.contains(":7d"),
+            LlmProvider::OpenAiCodex => lid == limits.long.limit_id,
+        };
+        let label = if is_short {
+            "5h window".to_owned()
+        } else if matches!(inputs.provider, LlmProvider::Anthropic) && lid != limits.long.limit_id {
+            format!("{} window", lid.replace("anthropic:", ""))
+        } else if is_long {
+            "7d window".to_owned()
+        } else {
+            format!("{lid} window")
+        };
         let used_pct = match w.used_fraction {
             Some(f) => format!("{:.0}%", f * 100.0),
             None => "?".to_owned(),
         };
 
-        // Dimension select.
-        let (unacct, ramp_val, elapsed_frac): (f64, Option<f64>, Option<f64>) =
-            if lid.contains(":5h") {
-                let r = ramp_5h(w.resets_at, inputs.now_ms);
-                let ef = match w.resets_at {
-                    Some(ra) if ra > inputs.now_ms => {
-                        Some((FIVE_H_MS as f64 - (ra - inputs.now_ms) as f64) / FIVE_H_MS as f64)
-                    }
-                    _ => None,
-                };
-                (inputs.unaccounted_5h, r, ef)
-            } else if lid.contains(":7d") {
-                (
-                    inputs.unaccounted_7d,
-                    Some(ramp_7d(w.resets_at, inputs.now_ms)),
-                    None,
-                )
-            } else {
-                (0.0, None, None)
+        let (unacct, ramp_val, elapsed_frac): (f64, Option<f64>, Option<f64>) = if is_short {
+            let ramp = ramp_5h(w.resets_at, inputs.now_ms);
+            let elapsed = match w.resets_at {
+                Some(reset) if reset > inputs.now_ms => {
+                    Some((FIVE_H_MS as f64 - (reset - inputs.now_ms) as f64) / FIVE_H_MS as f64)
+                }
+                _ => None,
             };
+            (inputs.unaccounted_5h, ramp, elapsed)
+        } else if is_long {
+            (
+                inputs.unaccounted_7d,
+                Some(ramp_7d(w.resets_at, inputs.now_ms)),
+                None,
+            )
+        } else {
+            (0.0, None, None)
+        };
 
         // fill_pct: round-half-to-even (Python's round()), clamped 0..100.
         let fill_pct =
@@ -659,37 +680,38 @@ impl Backend for OmpScavengeBackend {
     async fn decide(&self, anticipated_tokens: i64) -> anyhow::Result<Outlook> {
         let now = crate::util::now_ms();
         let db = self.agent_db.clone();
-        let windows = tokio::task::spawn_blocking(move || capacity::read_windows(&db, now)).await?;
+        let provider = self.cfg.llm_provider;
+        let windows =
+            tokio::task::spawn_blocking(move || capacity::read_windows_for(&db, provider, now))
+                .await?;
         self.decide_with_windows(&windows, anticipated_tokens).await
     }
 
     async fn keep_fresh(&self) -> anyhow::Result<bool> {
         let now = crate::util::now_ms();
         let db = self.agent_db.clone();
-        let windows = tokio::task::spawn_blocking(move || capacity::read_windows(&db, now)).await?;
+        let provider = self.cfg.llm_provider;
+        let windows =
+            tokio::task::spawn_blocking(move || capacity::read_windows_for(&db, provider, now))
+                .await?;
 
-        // _observe ALWAYS (observations + calibration logged even when fresh).
         self.observe(&windows).await?;
-
-        // Staleness gate on anthropic:5h only: fresh → no probe.
-        // Missing 5h (or no windows at all) → not fresh → probe.
         if self.is_fresh(&windows) {
             return Ok(false);
         }
 
-        // Probe: invalidate then read (two spawn_blocking calls).
         {
             let omp = self.cfg.omp_bin.clone();
             let prober = self.prober.clone();
+            let provider_name = self.cfg.llm_provider.name();
             tokio::task::spawn_blocking(move || {
-                // rc ignored (best-effort cache bust).
                 prober.run(
                     &[
                         omp.as_str(),
                         "usage",
                         "invalidate",
                         "--provider",
-                        "anthropic",
+                        provider_name,
                     ],
                     15,
                 );
@@ -699,8 +721,9 @@ impl Backend for OmpScavengeBackend {
 
         let omp = self.cfg.omp_bin.clone();
         let prober = self.prober.clone();
+        let provider_name = self.cfg.llm_provider.name();
         let (rc, _out) = tokio::task::spawn_blocking(move || {
-            prober.run(&[omp.as_str(), "usage", "--provider", "anthropic"], 30)
+            prober.run(&[omp.as_str(), "usage", "--provider", provider_name], 30)
         })
         .await?;
 
@@ -710,8 +733,10 @@ impl Backend for OmpScavengeBackend {
     async fn status_html(&self) -> anyhow::Result<String> {
         let now_ms = crate::util::now_ms();
         let db = self.agent_db.clone();
+        let provider = self.cfg.llm_provider;
         let windows =
-            tokio::task::spawn_blocking(move || capacity::read_windows(&db, now_ms)).await?;
+            tokio::task::spawn_blocking(move || capacity::read_windows_for(&db, provider, now_ms))
+                .await?;
 
         if windows.is_empty() {
             return Ok(NO_WINDOW_DATA.to_owned());
@@ -719,7 +744,6 @@ impl Backend for OmpScavengeBackend {
 
         // anticipated=0: bars show observable state, not gate's hypothetical.
         let resv = self.unaccounted_fraction(&windows, 0).await?;
-
         let mut capacities = BTreeMap::new();
         for lid in windows.keys() {
             capacities.insert(lid.clone(), self.ledger.estimate_capacity(lid).await?);
@@ -727,6 +751,7 @@ impl Backend for OmpScavengeBackend {
 
         Ok(render_status(&StatusInputs {
             now_ms,
+            provider: self.cfg.llm_provider,
             windows,
             unaccounted_5h: resv.gate_5h,
             unaccounted_7d: resv.gate_7d,
@@ -743,11 +768,10 @@ impl Backend for OmpScavengeBackend {
         max_wall_s: i64,
         job_class: JobClass,
     ) -> anyhow::Result<crate::types::RunResult> {
-        // Usage-delta sandwich (`facade.OmpScavengeBackend.run`): snapshot the max 7d
-        // used_fraction before and after run_worker.
         let pre = {
             let db = self.agent_db.clone();
-            tokio::task::spawn_blocking(move || Self::_usage_snapshot_sync(&db)).await?
+            let provider = self.cfg.llm_provider;
+            tokio::task::spawn_blocking(move || Self::_usage_snapshot_sync(&db, provider)).await?
         };
 
         let model = self
@@ -771,11 +795,12 @@ impl Backend for OmpScavengeBackend {
 
         let post = {
             let db = self.agent_db.clone();
-            tokio::task::spawn_blocking(move || Self::_usage_snapshot_sync(&db)).await?
+            let provider = self.cfg.llm_provider;
+            tokio::task::spawn_blocking(move || Self::_usage_snapshot_sync(&db, provider)).await?
         };
 
         rr.usage_delta = match (pre, post) {
-            (Some(p), Some(q)) => Some(q - p),
+            (Some(before), Some(after)) => Some(after - before),
             _ => None,
         };
         Ok(rr)

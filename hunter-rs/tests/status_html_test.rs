@@ -73,6 +73,7 @@ impl Case {
         }
         render_status(&StatusInputs {
             now_ms: NOW,
+            provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
             windows: map,
             unaccounted_5h: self.unaccounted_5h,
             unaccounted_7d: self.unaccounted_7d,

@@ -311,7 +311,8 @@ column docs — most have inline comments explaining *why*, not just *what*):
   "fix":   { "capNewTokens": 150000, "maxWallS": 2700 },
   "budget": { "deny5hAbove": 0.85, "staleAfterS": 300 },
   "serve": { "port": 8377 },
-  "models": { "default": "opus", "smol": "sonnet", "hunt": null, "fix": null }
+  "models": { "default": "gpt-5.6-terra", "smol": "gpt-5.6-sol", "hunt": null, "fix": null },
+  "backend": { "type": "omp-scavenge", "llmProvider": "openai-codex" }
 }
 ```
 
@@ -321,10 +322,11 @@ column docs — most have inline comments explaining *why*, not just *what*):
 - `budget.deny5hAbove` / `staleAfterS` — see § Budget policy.
 - `models` — fuzzy names, anything omp's `--model` flag accepts. `default`
   applies to all workers; `smol` is for lightweight helper tasks; `hunt`/
-  `fix` override per job family; `null` inherits omp's own configured
-  default. Anthropic tracks per-model-class weekly limits
-  (`anthropic:7d:<class>`), so splitting hunt and fix across model classes
-  taps two separate budgets.
+  `fix` override per job family; `null` inherits `default`.
+- `backend.llmProvider` selects the OMP quota source. `anthropic` (the
+  default) and `openai-codex` both use the same short/long-window scavenging
+  ramps but map to their provider's OMP usage records. It must match the
+  provider selected by `models`.
 
 ## Development
 
