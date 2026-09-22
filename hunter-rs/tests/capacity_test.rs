@@ -300,6 +300,31 @@ async fn test_read_windows_drops_expired_model_class() {
     assert_eq!(keys, vec!["anthropic:7d"]);
 }
 
+/// An ACTIVE per-model-class row is read like the account-wide ones.
+/// `decide` gates on every `:7d` window it is handed, so a reader that
+/// fetched only `anthropic:5h` and `anthropic:7d` would silently stop
+/// enforcing the per-model weekly limit.
+#[tokio::test]
+async fn test_read_windows_keeps_active_model_class() {
+    let now = now_ms();
+    let dir = TempDir::new("cap-model-class-active");
+    let resets = Some(now + WEEK_MS / 2);
+    let db_path = make_agent_db(
+        &dir,
+        &[
+            ("anthropic:7d", Some(0.3), "ok", resets, now - 60_000),
+            ("anthropic:7d:fable", Some(0.96), "ok", resets, now - 60_000),
+        ],
+    )
+    .await;
+    let windows = tokio::task::spawn_blocking(move || read_windows(&db_path, now))
+        .await
+        .unwrap();
+    let keys: Vec<&String> = windows.keys().collect();
+    assert_eq!(keys, vec!["anthropic:7d", "anthropic:7d:fable"]);
+    assert_eq!(windows["anthropic:7d:fable"].used_fraction, Some(0.96));
+}
+
 /// §4 item 24: expired 5h window rolled forward.
 #[tokio::test]
 async fn test_read_windows_rolls_forward_expired_5h() {
