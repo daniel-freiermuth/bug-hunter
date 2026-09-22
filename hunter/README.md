@@ -49,6 +49,7 @@ authenticated for whatever repos you register. Python 3.13+ is needed only
 for the rollback daemon in this package.
 
 ```sh
+cp hunter/config.anthropic.example.json hunter/config.json  # or config.openai-codex.example.json
 (cd hunter/ui-svelte && npm ci)           # once per checkout, and after a dependency change
 cd hunter-rs
 just build                                # UI bundle (ui-svelte/ -> hunter/ui/) + release binary
@@ -257,14 +258,13 @@ hunter/
 │                   run_harvest/run_recheck/pick_next/run_cycle
 ├── server.py       ThreadingHTTPServer + JSON API + serves ui/
 └── util.py         shared subprocess wrapper
-
 playbooks/          worker prompt templates (one per job kind, see table above)
 ui/                 generated Vite bundle (ignored; built by `just build` in hunter-rs/)
 ui-svelte/          tracked Svelte source
 schema.sql           this package's schema; store.py migrates existing DBs. The live
                      database is migrated by hunter-rs/migrations, and the two converge
 config.json          runtime config (§ Configuration)
-tests/               pytest suite, one file per module/behavior
+tests/               pytest suite, one file per behavior/module
 ```
 
 Each analysis/action kind follows the same shape: build a prompt from a
@@ -300,21 +300,19 @@ column docs — most have inline comments explaining *why*, not just *what*):
 
 ## Configuration
 
-`config.json`:
+Copy the provider-matched template to the ignored `config.json`:
 
-```jsonc
-{
-  "workRoot": "data",           // repo clones, worktrees, job output
-  "dbPath": "data/hunter.db",
-  "ompBin": "omp",
-  "hunt":  { "capNewTokens": 200000, "maxWallS": 1800, "maxFindings": 8 },
-  "fix":   { "capNewTokens": 150000, "maxWallS": 2700 },
-  "budget": { "deny5hAbove": 0.85, "staleAfterS": 300 },
-  "serve": { "port": 8377 },
-  "models": { "default": "gpt-5.6-terra", "smol": "gpt-5.6-sol", "hunt": null, "fix": null },
-  "backend": { "type": "omp-scavenge", "llmProvider": "openai-codex" }
-}
+```sh
+# Anthropic
+cp config.anthropic.example.json config.json
+
+# OpenAI Codex
+cp config.openai-codex.example.json config.json
 ```
+
+The templates share operational settings but pair the provider with compatible
+worker models. Do not commit `config.json`; it selects the credentials and
+quota source for one installation.
 
 - `hunt`/`fix` caps apply to their whole job family (hunt also covers
   test\_gap/dep\_update/refactor/modernization/recheck; fix also covers

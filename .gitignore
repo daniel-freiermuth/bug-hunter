@@ -17,3 +17,4 @@ hunter/ui/
 # venv for the Python daemon, and the editable install's metadata.
 hunter/.venv/
 *.egg-info/
+hunter/config.json
