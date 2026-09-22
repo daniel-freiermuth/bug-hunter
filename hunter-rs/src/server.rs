@@ -40,6 +40,9 @@ pub struct SchedulerHandle {
     /// Set by the loop for the duration of a cycle. Drives `cycle_running`,
     /// the "working" activity status, and the busy check on manual triggers.
     pub running: Arc<AtomicBool>,
+    /// Prevents new scheduler cycles; an already-running worker is allowed
+    /// to finish and remains visible as running.
+    pub paused: Arc<AtomicBool>,
     /// Interrupts the loop's sleep so the next cycle starts immediately.
     /// A notify delivered mid-cycle is held as a permit, so a trigger is
     /// never lost -- it just lands on the following iteration.
@@ -214,6 +217,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stats", get(stats))
         .route("/api/verdict", post(verdict))
         .route("/api/cycle", post(cycle))
+        .route("/api/scheduler", post(set_scheduler_paused))
         .route("/api/recheck", post(recheck))
         .route("/api/unqueue", post(unqueue))
         .route("/api/override", post(override_))
@@ -262,6 +266,7 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
     let backend_status_html = state.backend.status_html().await?;
     // True only while the loop is inside a cycle.
     let cycle_running = state.scheduler.running.load(Ordering::SeqCst);
+    let scheduler_paused = state.scheduler.paused.load(Ordering::SeqCst);
 
     // "What's next" preview (`server.Handler._summary`): only when nothing is
     // running, from the SAME pick_next/decide the scheduler itself uses.
@@ -342,6 +347,7 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
         repos,
         last_cycle,
         cycle_running,
+        scheduler_paused,
         current_job,
         next_candidate,
         scheduler_state,
@@ -703,11 +709,30 @@ async fn verdict(
 /// permit and runs on the following iteration rather than being dropped.
 async fn cycle(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
     post_gate(&headers)?;
+    if state.scheduler.paused.load(Ordering::SeqCst) {
+        return Ok(error_body(StatusCode::CONFLICT, "paused"));
+    }
     if state.scheduler.running.load(Ordering::SeqCst) {
         return Ok(error_body(StatusCode::CONFLICT, "busy"));
     }
     state.scheduler.wake.notify_one();
     Ok((StatusCode::ACCEPTED, Json(json!({ "started": true }))).into_response())
+}
+
+async fn set_scheduler_paused(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    post_gate(&headers)?;
+    let body = parse_object(&raw)?;
+    let paused = body
+        .get("paused")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::BadRequest("paused must be a boolean".to_owned()))?;
+    state.scheduler.paused.store(paused, Ordering::SeqCst);
+    state.scheduler.wake.notify_one();
+    Ok(Json(json!({ "paused": paused })).into_response())
 }
 
 // -- POST /api/recheck, /api/unqueue (contract §§3,4) --------------------------

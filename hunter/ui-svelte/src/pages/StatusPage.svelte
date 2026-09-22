@@ -5,6 +5,21 @@
 
   let btnText = $state("Run Cycle");
   let btnDisabled = $state(false);
+  let schedulerBusy = $state(false);
+
+  async function toggleScheduler() {
+    if (!store.summary) return;
+    schedulerBusy = true;
+    try {
+      await post("/api/scheduler", { paused: !store.summary.scheduler_paused });
+      await store.refresh();
+    } catch (err) {
+      console.error("scheduler control request failed", err);
+    } finally {
+      schedulerBusy = false;
+    }
+  }
+
 
   async function runCycle() {
     btnDisabled = true;
@@ -63,12 +78,22 @@
       <!-- Cycle control card -->
       <div class="dash-card cycle-card">
         <button
+          class="scheduler-btn"
+          class:paused={store.summary.scheduler_paused}
+          disabled={schedulerBusy}
+          onclick={toggleScheduler}
+          aria-label={store.summary.scheduler_paused ? "Resume hunter" : "Pause hunter"}
+        >
+          <span class="scheduler-icon">{store.summary.scheduler_paused ? "▶" : "⏸"}</span>
+          <span>{store.summary.scheduler_paused ? "Resume hunter" : "Pause hunter"}</span>
+        </button>
+        <button
           class="cycle-btn"
           class:ready={activityKind === "ready" && !btnDisabled && !store.summary.cycle_running}
-          disabled={btnDisabled || store.summary.cycle_running}
+          disabled={btnDisabled || store.summary.cycle_running || store.summary.scheduler_paused}
           onclick={runCycle}
         >
-          {store.summary.cycle_running ? "cycle running\u2026" : btnText}
+          {store.summary.cycle_running ? "cycle running…" : btnText}
         </button>
         {#if store.summary.last_cycle}
           <div class="last-cycle">
@@ -197,20 +222,37 @@
     min-width: 180px;
   }
 
-  /* ── Cycle button ───────────────────────────────────────────── */
-  .cycle-btn {
-    padding: 0.5rem 1.25rem;
+  .scheduler-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    min-width: 180px;
+    padding: 0.875rem 1.25rem;
     border-radius: var(--radius-md);
-    background: var(--accent);
+    background: var(--bad);
     color: var(--bg);
+    font-size: 1rem;
+    font-weight: 700;
+  }
+  .scheduler-btn:hover:not(:disabled) { filter: brightness(1.12); }
+  .scheduler-btn:disabled { opacity: 0.55; cursor: default; }
+  .scheduler-btn.paused { background: var(--ok); }
+  .scheduler-icon { font-size: 1.25rem; line-height: 1; }
+
+  .cycle-btn {
+    margin-top: 0.625rem;
+    padding: 0.375rem 0.75rem;
+    border-radius: var(--radius-md);
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
     font-weight: 600;
-    font-size: 0.875rem;
+    font-size: 0.75rem;
   }
-  .cycle-btn:hover:not(:disabled) { background: var(--accent-hover); }
+  .cycle-btn:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
   .cycle-btn:disabled { opacity: 0.45; cursor: default; }
-  .cycle-btn.ready {
-    animation: readyPulse 2s ease-in-out infinite;
-  }
+  .cycle-btn.ready { animation: readyPulse 2s ease-in-out infinite; }
 
   .last-cycle {
     font-size: 0.75rem;

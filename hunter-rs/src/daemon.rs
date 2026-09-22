@@ -215,6 +215,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     });
 
     let cycle_running = Arc::new(AtomicBool::new(false));
+    let scheduler_paused = Arc::new(AtomicBool::new(false));
     let wake = Arc::new(Notify::new());
 
     let state = AppState {
@@ -224,6 +225,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         repo_notes: repo_notes.clone(),
         scheduler: crate::server::SchedulerHandle {
             running: cycle_running.clone(),
+            paused: scheduler_paused.clone(),
             wake: wake.clone(),
         },
     };
@@ -307,8 +309,22 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // Scheduler loop
     let mut stop = false;
     while !stop {
-        let sleep_s: f64;
+        if scheduler_paused.load(Ordering::SeqCst) {
+            let _ = store
+                .set_scheduler_state("paused", "scheduler paused by operator", None)
+                .await;
+            // The shared shutdown latch, not a private `ctrl_c()`: that saw
+            // only SIGINT, so `systemctl stop` (SIGTERM) on a paused daemon
+            // went unanswered until systemd's stop timeout killed it.
+            tokio::select! {
+                () = wake.notified() => {},
+                _ = shutdown_rx.changed() => {},
+            }
+            stop = *shutdown_rx.borrow();
+            continue;
+        }
 
+        let sleep_s: f64;
         cycle_running.store(true, Ordering::SeqCst);
         let cycle_result: anyhow::Result<CycleSummary> = async {
             reconcile_and_log(&store).await?;
