@@ -11,6 +11,8 @@ set shell := ["bash", "-cu"]
 # The touch is what forces the rerun. build.rs declares only
 # rerun-if-changed=migrations, so with an unchanged tree cargo's fingerprint
 # stays fresh and deleting dev.db regenerates nothing.
+
+# Regenerate the schema-only dev DB from migrations.
 dev-db:
     touch migrations/*.sql
     cargo check --quiet
@@ -50,3 +52,23 @@ mutants FILE:
 # Run the daemon against the local hunter/ root.
 run:
     cargo run -- --root ../hunter
+
+# Build both halves of what the daemon serves.
+#
+# The UI bundle is generated and untracked, and the daemon reads it from
+# `hunter/ui/` at request time -- so a binary built without it serves a
+# working API behind a 404 page. Keeping the two builds in one recipe is
+# what stops that being something to remember.
+#
+# Restarting is deliberately NOT here: what restarts the daemon is
+# `systemctl --user restart hunter.service` (unit in hunter/hunter.service),
+# and a recipe that reaches into the service manager hides which of the
+# two failed and assumes the machine it runs on is the one serving.
+#
+# `npm ci` is deliberately absent: it wipes node_modules and costs a
+# minute. Run it yourself after a dependency change.
+
+# Build the UI bundle and the release binary.
+build:
+    cd ../hunter/ui-svelte && npx vite build
+    cargo build --release

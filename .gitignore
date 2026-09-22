@@ -16,6 +16,4 @@ hunter/data/wt/
 hunter/data/sessions/
 hunter/data/hunter.lock
 hunter/node_modules/
-hunter/ui/app.js
-hunter/ui/app.js.map
-hunter/ui/assets/
+hunter/ui/

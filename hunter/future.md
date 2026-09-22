@@ -646,6 +646,40 @@ character, and `status_html_test` snapshots nine states against it. The UI
 injects it with `{@html}` and owns the stylesheet those class names
 resolve against.
 
+### 8.1b Serve the UI bundle from the binary
+**Status:** idea; do it after the Rust port merges.
+
+The bundle used to be committed, which meant a generated artefact in the
+tree, a rebuilt hash in every deploy commit, and a permanent conflict for
+any branch that tried to stop tracking it. That is fixed: `hunter/ui/` is
+generated and ignored.
+
+What the fix leaves behind is an ordering trap. The daemon reads
+`ui_dir/index.html` from disk per request (server.rs:451), so a restart
+without a build serves a working API behind a 404 page — which is exactly
+what happened the moment the untracking commit landed on this branch. The
+mitigation is `just build`, which builds both halves so neither can be
+forgotten; restarting stays a separate, explicit `systemctl --user restart
+hunter.service`. That is a convention, not a guarantee: restarting without
+building first still breaks the UI, and so does a fresh clone.
+
+Embedding removes the class rather than documenting it. `include_dir!`
+(or `rust-embed`) compiles `hunter/ui/` into the binary, `cargo build`
+becomes the single build step, `ui_dir` and its path-traversal guard
+(server.rs:466-470) disappear, and there is no directory to be missing.
+
+Costs, none of them blocking:
+- `build.rs` has to run `vite build` first, or the bundle has to be built
+  before `cargo build` — trading a runtime ordering trap for a build-time
+  one, except this one fails loudly at compile time.
+- Rebuilding the binary to change a stylesheet. `hunter-rs` builds in
+  ~30 s, and the UI is not iterated on in production.
+- Dev ergonomics: keep `vite dev` with its API proxy for the edit loop, as
+  now; embedding concerns the shipped artefact only.
+
+Blocked on nothing except merge order: doing it before the port lands
+means rebasing it under every review round.
+
 ### 8.2 Scheduler: job-level cost tracking and reporting
 **Status:** idea; lands as a UI story in Phase 3/4 (§2 Operations).
 
