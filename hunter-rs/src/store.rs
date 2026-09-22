@@ -2110,11 +2110,10 @@ impl crate::backend::SpendLedger for Store {
     async fn estimate_capacity(&self, limit_id: &str) -> sqlx::Result<Option<f64>> {
         // Newest completed cycles considered (store.py sample_limit=200).
         const SAMPLE_LIMIT: i64 = 200;
-        let period_ms: i64 = match limit_id {
-            "anthropic:5h" => 18_000_000,
-            "anthropic:7d" => 604_800_000,
-            // Per-model-class / unknown lids have no known period.
-            _ => return Ok(None),
+        // Per-model-class / unknown lids have no known period.
+        let Some(period_ms) = crate::backends::omp_scavenge::LlmProvider::window_period(limit_id)
+        else {
+            return Ok(None);
         };
         let now = now_ms();
         // One statement, not one per cycle. Previously this fetched up to
