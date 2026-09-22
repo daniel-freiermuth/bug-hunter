@@ -54,6 +54,8 @@ pub async fn ingest_findings(
     repo_id: i64,
     findings_path: &Path,
     finding_type: Option<FindingType>,
+    job: Option<i64>,
+    source_finding: Option<i64>,
 ) -> IngestResult {
     let mut result = IngestResult::default();
     let text = match std::fs::read_to_string(findings_path) {
@@ -66,8 +68,8 @@ pub async fn ingest_findings(
                         "ingest: unreadable findings file {}: {e}",
                         findings_path.display()
                     ),
-                    None,
-                    None,
+                    job,
+                    source_finding,
                 )
                 .await;
             result.invalid = 1;
@@ -84,8 +86,8 @@ pub async fn ingest_findings(
                         "ingest: unreadable findings file {}: {e}",
                         findings_path.display()
                     ),
-                    None,
-                    None,
+                    job,
+                    source_finding,
                 )
                 .await;
             result.invalid = 1;
@@ -100,8 +102,8 @@ pub async fn ingest_findings(
                     "ingest: findings root is not a list in {}",
                     findings_path.display()
                 ),
-                None,
-                None,
+                job,
+                source_finding,
             )
             .await;
         result.invalid = 1;
@@ -120,13 +122,13 @@ pub async fn ingest_findings(
             let Ok(ft) = raw.parse::<FindingType>() else {
                 result.invalid += 1;
                 let truncated = serde_json::to_string(f).unwrap_or_default();
-                let truncated: String = truncated.chars().take(300).collect();
+                let truncated: String = truncated.chars().take(2000).collect();
                 let _ = store
                     .log_event(
                         "error",
                         &format!("ingest: entry {i} has unknown/missing type {raw:?}: {truncated}"),
-                        None,
-                        None,
+                        job,
+                        source_finding,
                     )
                     .await;
                 continue;
@@ -197,13 +199,13 @@ pub async fn ingest_findings(
         if let Some(problem) = problem {
             result.invalid += 1;
             let truncated = serde_json::to_string(f).unwrap_or_default();
-            let truncated: String = truncated.chars().take(300).collect();
+            let truncated: String = truncated.chars().take(2000).collect();
             let _ = store
                 .log_event(
                     "error",
                     &format!("ingest: entry {i} invalid ({problem}): {truncated}"),
-                    None,
-                    None,
+                    job,
+                    source_finding,
                 )
                 .await;
             continue;
@@ -300,8 +302,8 @@ pub async fn ingest_findings(
                     .log_event(
                         "error",
                         &format!("ingest: upsert failed for entry {i}: {e}"),
-                        None,
-                        None,
+                        job,
+                        source_finding,
                     )
                     .await;
                 result.invalid += 1;

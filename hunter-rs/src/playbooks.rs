@@ -367,6 +367,11 @@ pub fn build_engage_prompt(
     slots.insert("FEEDBACK", feedback_blocks(pr, 8000));
     slots.insert("CHECKS", checks_lines(pr));
     slots.insert("ATTENTION", attention);
+    slots.insert(
+        "PR_NUMBER",
+        ps.pr_number
+            .map_or_else(|| "?".to_owned(), |n| n.to_string()),
+    );
     slots.insert("REPO_NOTES", notes);
     render(&template, &slots)
 }

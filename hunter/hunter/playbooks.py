@@ -232,6 +232,13 @@ def build_engage_prompt(
             "FEEDBACK": _escape_braces(_feedback_blocks(pr)),
             "CHECKS": _escape_braces(_checks_lines(pr.get("statusCheckRollup"))),
             "ATTENTION": attention or "(none recorded)",
+            # engage.md asks the worker to tag deferred follow-ups with the
+            # PR they came from. hunter-rs supplies this slot; without it
+            # here the playbook renders with a literal {{PR_NUMBER}} and
+            # _render refuses the prompt outright, so every engage job on
+            # the Python daemon would fail. `?` mirrors the Rust fallback
+            # for a PR whose number is not recorded.
+            "PR_NUMBER": pr.get("number") or "?",
             "REPO_NOTES": notes,
         },
     )

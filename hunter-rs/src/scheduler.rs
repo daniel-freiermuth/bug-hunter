@@ -437,7 +437,13 @@ pub async fn record_job(
     Ok(state)
 }
 
-/// Ingest FOLLOW-UPS.json from a worktree if the worker wrote one (scheduler.py:113-139).
+/// Ingest a worker's `FOLLOW-UPS.json`, returning what happened so the
+/// caller can put it in the cycle summary. Rejections used to be visible
+/// only as per-entry `ingest:` error events — the summary carried no
+/// `ingest` block and the event below fired only when something was
+/// inserted, so a harvest whose every follow-up was rejected logged
+/// "harvested" and nothing else (observed 2026-09-12 and 2026-09-22:
+/// four `test_gap` follow-ups silently dropped).
 async fn ingest_followups(
     store: &Store,
     repo_id: i64,
@@ -445,23 +451,26 @@ async fn ingest_followups(
     fid: i64,
     job: i64,
     kind: &str,
-) {
+) -> Option<crate::ingest::IngestResult> {
     let followups_path = worktree.join("FOLLOW-UPS.json");
     if !followups_path.exists() {
-        return;
+        return None;
     }
-    let counts = ingest_findings(store, repo_id, &followups_path, None).await;
-    if counts.inserted > 0 {
-        let _ = store.log_event(
-            kind,
-            &format!(
-                "#{fid}: +{} follow-up(s) filed from deferred/superseded work ({} dup / {} invalid)",
-                counts.inserted, counts.duplicates, counts.invalid
-            ),
-            Some(job),
-            Some(fid),
-        ).await;
+    let counts = ingest_findings(store, repo_id, &followups_path, None, Some(job), Some(fid)).await;
+    if counts.inserted > 0 || counts.invalid > 0 || counts.duplicates > 0 {
+        let _ = store
+            .log_event(
+                kind,
+                &format!(
+                    "#{fid}: +{} follow-up(s) filed from deferred/superseded work ({} dup / {} invalid)",
+                    counts.inserted, counts.duplicates, counts.invalid
+                ),
+                Some(job),
+                Some(fid),
+            )
+            .await;
     }
+    Some(counts)
 }
 
 /// Blocking git command wrapper for use inside `spawn_blocking`.
@@ -847,7 +856,15 @@ pub async fn run_hunt(
     };
 
     if out_path.exists() {
-        let counts = ingest_findings(store, rid, &out_path, Some(FindingType::Bug)).await;
+        let counts = ingest_findings(
+            store,
+            rid,
+            &out_path,
+            Some(FindingType::Bug),
+            Some(job),
+            None,
+        )
+        .await;
         let _ = store
             .log_event(
                 "hunt",
@@ -1340,7 +1357,15 @@ async fn run_analysis_job(
     };
 
     if out_path.exists() {
-        let counts = ingest_findings(store, rid, &out_path, Some(spec.finding_type)).await;
+        let counts = ingest_findings(
+            store,
+            rid,
+            &out_path,
+            Some(spec.finding_type),
+            Some(job),
+            None,
+        )
+        .await;
         let _ = store
             .log_event(
                 kind.as_str(),
@@ -1458,6 +1483,8 @@ pub async fn run_dep_update(
                 repo.id,
                 &out_path,
                 Some(FindingType::DepUpdate),
+                None,
+                None,
             )
             .await;
             let _ = store
@@ -2744,7 +2771,7 @@ pub async fn run_engage(
                 Some(fid),
             )
             .await;
-        ingest_followups(store, repo.id, &worktree, fid, job, "engage").await;
+        summary.ingest = ingest_followups(store, repo.id, &worktree, fid, job, "engage").await;
         let rps = rpath.to_string_lossy().to_string();
         let wts = worktree.to_string_lossy().to_string();
         let _ = tokio::task::spawn_blocking(move || {
@@ -3123,7 +3150,7 @@ pub async fn run_harvest(
         .unwrap_or(JobState::Failed);
 
     // Ingest follow-ups before dropping worktree
-    ingest_followups(store, repo.id, &worktree, fid, job, "harvest").await;
+    let followups = ingest_followups(store, repo.id, &worktree, fid, job, "harvest").await;
     let rps = rpath.to_string_lossy().to_string();
     let wts = worktree.to_string_lossy().to_string();
     let _ = tokio::task::spawn_blocking(move || {
@@ -3140,6 +3167,7 @@ pub async fn run_harvest(
         job_id: Some(job),
         state: Some(state),
         pr_number: Some(pr_number),
+        ingest: followups,
         ..Default::default()
     };
     if state != JobState::Done {

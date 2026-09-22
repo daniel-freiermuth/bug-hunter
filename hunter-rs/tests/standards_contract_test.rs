@@ -64,6 +64,8 @@ async fn ingest_one(
         repo_id,
         Path::new(&path),
         Some(FindingType::Standards),
+        None,
+        None,
     )
     .await;
     (dir, store, res, repo_id)
