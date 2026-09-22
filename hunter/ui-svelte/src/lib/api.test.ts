@@ -17,6 +17,7 @@ function bodyFor(path: string): unknown {
         repos: [],
         last_cycle: null,
         cycle_running: false,
+        scheduler_paused: false,
         current_job: null,
         next_candidate: null,
         scheduler_state: null,

@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::Notify;
 
 use crate::backend::Backend;
@@ -22,6 +23,23 @@ const USAGE_PROBE_TICK_S: u64 = 60;
 /// SIGKILL.
 const UI_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 const PR_SYNC_INTERVAL_S: f64 = 300.0; // 5 min, matching Python
+
+/// Install a signal handler now; `None` (logged) if the OS refuses.
+fn install_signal(kind: SignalKind, name: &str) -> Option<Signal> {
+    signal(kind)
+        .inspect_err(|e| tracing::error!("cannot install {name} handler: {e}"))
+        .ok()
+}
+
+/// The next delivery of `sig`; never, if its handler failed to install.
+async fn next_signal(sig: Option<Signal>) {
+    match sig {
+        Some(mut sig) => {
+            sig.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
 
 /// Exclusive lockfile on <`work_root>/hunter.lock` (`server._acquire_lockfile`).
 /// Returns the open File (holds the lock while alive).
@@ -215,6 +233,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     });
 
     let cycle_running = Arc::new(AtomicBool::new(false));
+    let scheduler_paused = Arc::new(AtomicBool::new(false));
     let wake = Arc::new(Notify::new());
 
     let state = AppState {
@@ -224,6 +243,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         repo_notes: repo_notes.clone(),
         scheduler: crate::server::SchedulerHandle {
             running: cycle_running.clone(),
+            paused: scheduler_paused.clone(),
             wake: wake.clone(),
         },
     };
@@ -242,19 +262,19 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // ran would be dropped on the floor; latching it here means the next
     // wait observes it. Both SIGTERM (systemctl stop) and SIGINT stop the
     // daemon, matching the single stop event in server.py.
+    //
+    // Both handlers are installed here, synchronously, not inside the
+    // task: a spawned task may not have run yet when the UI below starts
+    // answering, and until a handler is installed SIGTERM keeps its default
+    // action and kills the process outright instead of stopping it cleanly.
+    // (`ctrl_c()` is no substitute: it installs only when first polled.)
+    let sigterm = install_signal(SignalKind::terminate(), "SIGTERM");
+    let sigint = install_signal(SignalKind::interrupt(), "SIGINT");
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let signal_handle = tokio::spawn(async move {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .inspect_err(|e| tracing::error!("cannot install SIGTERM handler: {e}"))
-            .ok();
-        let name = if let Some(term) = sigterm.as_mut() {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => "SIGINT",
-                _ = term.recv() => "SIGTERM",
-            }
-        } else {
-            tokio::signal::ctrl_c().await.ok();
-            "SIGINT"
+        let name = tokio::select! {
+            () = next_signal(sigint) => "SIGINT",
+            () = next_signal(sigterm) => "SIGTERM",
         };
         tracing::info!("received {name}: finishing current cycle, then stopping");
         shutdown_tx.send_replace(true);
@@ -307,8 +327,31 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     // Scheduler loop
     let mut stop = false;
     while !stop {
-        let sleep_s: f64;
+        // Not atomic with the `cycle_running.store(true)` below, on
+        // purpose. A pause stored between the two (a window of a few
+        // instructions, no await in it) lets one cycle start after the
+        // handler has answered `{"paused": true}`. That outcome looks
+        // exactly like a pause arriving just after the cycle started,
+        // which the feature already allows: a running cycle always
+        // finishes, and the summary shows paused with the cycle still
+        // running. A lock shared with the handler would close a window
+        // nobody can see.
+        if scheduler_paused.load(Ordering::SeqCst) {
+            let _ = store
+                .set_scheduler_state("paused", "scheduler paused by operator", None)
+                .await;
+            // The shared shutdown latch, not a private `ctrl_c()`: that saw
+            // only SIGINT, so `systemctl stop` (SIGTERM) on a paused daemon
+            // went unanswered until systemd's stop timeout killed it.
+            tokio::select! {
+                () = wake.notified() => {},
+                _ = shutdown_rx.changed() => {},
+            }
+            stop = *shutdown_rx.borrow();
+            continue;
+        }
 
+        let sleep_s: f64;
         cycle_running.store(true, Ordering::SeqCst);
         let cycle_result: anyhow::Result<CycleSummary> = async {
             reconcile_and_log(&store).await?;

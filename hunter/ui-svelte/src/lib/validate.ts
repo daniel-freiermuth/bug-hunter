@@ -86,6 +86,9 @@ export function isSummary(v: unknown): v is Summary {
   if (!hasActivityFields(v.activity_status)) return false;
   if (typeof v.backend_status_html !== "string") return false;
   if (!isObject(v.counts) || !isObject(v.type_counts)) return false;
+  // The pause button sends `!scheduler_paused`; a missing flag reads as
+  // "running", so a paused daemon could only ever be told to pause again.
+  if (typeof v.scheduler_paused !== "boolean") return false;
   // Keyed, not merely records: `ReposPage` renders
   // `{#each repos as repo (repo.id)}`. It also reads `r.url` and
   // `r.added_at` off every entry to build a repo's identity, and three

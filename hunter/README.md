@@ -203,6 +203,7 @@ JSON routes — the UI's only client, but usable directly. Served by axum
 | GET | `/api/stats` | Aggregate stats |
 | POST | `/api/verdict` | Set a finding's triage status (queue for fix, wontfix, reject, note) |
 | POST | `/api/cycle` | Trigger one scheduler cycle immediately |
+| POST | `/api/scheduler` | Pause or resume automatic scheduler cycles (`{"paused": boolean}`); a running job is allowed to finish |
 | POST | `/api/recheck` | Queue a finding for recheck |
 | POST | `/api/unqueue` | Pull a finding back out of the fix queue |
 | POST | `/api/override` | Set/clear a finding's budget override (`once` \| `exempt`) |

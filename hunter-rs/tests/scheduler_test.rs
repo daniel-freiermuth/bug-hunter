@@ -349,6 +349,7 @@ async fn summary_paused_on_denied_candidate() {
         repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         scheduler: hunter::server::SchedulerHandle {
             running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             wake: std::sync::Arc::new(tokio::sync::Notify::new()),
         },
     };
