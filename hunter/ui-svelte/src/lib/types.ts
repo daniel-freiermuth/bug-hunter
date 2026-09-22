@@ -140,6 +140,7 @@ export interface Summary {
   repos: Repo[];
   last_cycle: Event | null;
   cycle_running: boolean;
+  scheduler_paused: boolean;
   current_job: Job | null;
   next_candidate: NextCandidate | null;
   scheduler_state: SchedulerState | null;

@@ -13,6 +13,7 @@ const summary = {
   repos: [],
   last_cycle: null,
   cycle_running: false,
+  scheduler_paused: false,
   current_job: null,
   next_candidate: null,
   scheduler_state: null,
@@ -35,6 +36,12 @@ describe("isSummary", () => {
     expect(isSummary({ ...summary, activity_status: null })).toBe(false);
     // Present but without the discriminant every branch in StatusPage reads.
     expect(isSummary({ ...summary, activity_status: {} })).toBe(false);
+  });
+
+  it("rejects a missing or non-boolean scheduler_paused", () => {
+    expect(isSummary({ ...summary, scheduler_paused: undefined })).toBe(false);
+    expect(isSummary({ ...summary, scheduler_paused: null })).toBe(false);
+    expect(isSummary({ ...summary, scheduler_paused: "false" })).toBe(false);
   });
 
   // StatusPage's branches read these with no `?.`, so a body that claims

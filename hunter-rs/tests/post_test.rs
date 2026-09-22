@@ -151,6 +151,7 @@ async fn test_state() -> TestState {
             repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             scheduler: hunter::server::SchedulerHandle {
                 running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 wake: Arc::new(tokio::sync::Notify::new()),
             },
         },
@@ -1484,4 +1485,89 @@ async fn a_url_that_looks_like_a_git_option_is_refused() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "body: {body}");
+}
+
+// -- /api/scheduler (pause / resume) ---------------------------------------------
+
+async fn summary_paused(state: &AppState) -> bool {
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    v["scheduler_paused"]
+        .as_bool()
+        .expect("/api/summary must report scheduler_paused")
+}
+
+/// Pausing is a round trip the dashboard can see: the flag the daemon
+/// loop reads, the summary field the button renders from, and the refusal
+/// of a manual cycle while paused -- then all three undone by resuming.
+#[tokio::test]
+async fn pausing_and_resuming_the_scheduler_round_trips() {
+    let state = test_state().await;
+    assert!(
+        !summary_paused(&state).await,
+        "a fresh daemon is not paused"
+    );
+
+    let (status, body) = post(&state, "/api/scheduler", json!({ "paused": true })).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body, json!({ "paused": true }));
+    assert!(
+        state
+            .scheduler
+            .paused
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the flag the daemon loop reads must be set"
+    );
+    assert!(
+        summary_paused(&state).await,
+        "the dashboard must see the pause"
+    );
+
+    let (status, body) = post(&state, "/api/cycle", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body, json!({ "error": "paused" }));
+
+    let (status, body) = post(&state, "/api/scheduler", json!({ "paused": false })).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body, json!({ "paused": false }));
+    assert!(
+        !state
+            .scheduler
+            .paused
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
+    assert!(!summary_paused(&state).await);
+}
+
+/// Only a JSON boolean pauses. A truthy string must not, and must not be
+/// read as a resume either: the flag stays where it was.
+#[tokio::test]
+async fn a_non_boolean_pause_request_is_refused() {
+    let state = test_state().await;
+    for body in [
+        json!({ "paused": "yes" }),
+        json!({ "paused": 1 }),
+        json!({}),
+    ] {
+        let (status, got) = post(&state, "/api/scheduler", body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {got}");
+        assert_eq!(got, json!({ "error": "paused must be a boolean" }));
+    }
+    assert!(
+        !state
+            .scheduler
+            .paused
+            .load(std::sync::atomic::Ordering::SeqCst)
+    );
 }
