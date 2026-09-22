@@ -95,11 +95,31 @@ Title: {{PR_TITLE}}
   reasoning instead of PR-REPLY.md, and commit nothing new.
 - FOLLOW-UPS.json at the worktree root, NOT COMMITTED, OPTIONAL — write
   ALONGSIDE WITHDRAW.md when step 3's re-check found the underlying goal is
-  now MORE achievable (not just "something changed"). Same schema as
-  apply_improvement.md's FOLLOW-UPS.json (a JSON array; each entry sets its
-  own "type" — usually "dep_update" here, since this is typically "the
-  same package could now go further", with ecosystem/package/
-  current_version/latest_version fields rather than modernization's
-  current_approach/proposed_approach). The scheduler ingests it into the
-  finding queue right after withdrawing, so the opportunity becomes a
-  fresh, triage-able finding instead of a closed PR nobody re-reads.
+  now MORE achievable (not just "something changed"). The scheduler ingests
+  it into the finding queue right after withdrawing, so the opportunity
+  becomes a fresh, triage-able finding instead of a closed PR nobody
+  re-reads.
+
+  A JSON array. Every entry sets its own `"type"`
+  (bug | dep_update | test_gap | refactor | modernization | standards) plus
+  the common fields `fingerprint`
+  ("{{REPO_NAME}}:path/file.ext:short-slug"), `file`, `severity`,
+  `confidence`, `summary`, `detail`, and
+  `"introduced_by": "deferred from PR #{{PR_NUMBER}}"`. Each type ALSO has
+  REQUIRED fields, and an entry that omits one — or gets its shape wrong —
+  is rejected at ingest: the follow-up is lost, not queued.
+  - `bug`: `bug_class`, exactly one of
+    `boundary|error-path|race|contract-drift|leak|logic`. No other value is
+    accepted — do not invent one.
+  - `dep_update` (the usual one here, "the same package could now go
+    further"): `ecosystem`, `package`, `current_version`, `latest_version`,
+    `update_type`.
+  - `test_gap`: `missing_tests` — a NON-EMPTY JSON ARRAY of strings, e.g.
+    `["error path: invalid input", "boundary: empty array"]`, NOT a string
+    containing a list — and `test_file`.
+  - `refactor`: `smell_type`, `suggested_refactor`.
+  - `modernization`: `modernization_class`, `current_approach`,
+    `proposed_approach`.
+  - `standards`: `standard_section` (the heading it violates, e.g.
+    "Type safety / Domain types over primitives"), `current_approach`,
+    `proposed_approach`.

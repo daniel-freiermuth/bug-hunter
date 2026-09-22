@@ -299,6 +299,68 @@ fn harvest_prompt_renders() {
     assert_usable("harvest", &prompt);
 }
 
+/// `harvest` and `engage` are the playbooks whose workers INVENT findings
+/// of any type, and `ingest` rejects an entry that omits (or misshapes) a
+/// required field for its type — the follow-up is dropped, not queued,
+/// and only a truncated `ingest:` error event survives. Seven such losses
+/// are on record: four `test_gap` entries without a usable `missing_tests`
+/// (2026-09-12, 2026-09-22) and three `bug` entries with no `bug_class`
+/// (2026-09-18, 2026-09-22), each because the playbook spelled out the
+/// shapes for some types and not others — engage did not spell out any,
+/// it pointed at a "same schema as `apply_improvement.md`" that does not
+/// exist. The instructions and the validator have to agree field by field.
+///
+/// Scope is derived, not listed: every playbook that offers
+/// `FOLLOW-UPS.json` is held to this.
+#[test]
+fn followup_playbooks_name_every_required_field_they_ask_workers_to_emit() {
+    let dir = root().join("playbooks");
+    let mut checked = 0;
+    for entry in std::fs::read_dir(&dir).expect("read playbooks").flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        // The template, not a rendered prompt: rendering splices the
+        // source finding's own JSON in, which mentions every column and
+        // would make these assertions pass whatever the instructions say.
+        let template = std::fs::read_to_string(&path).expect("read playbook");
+        if !template.contains("FOLLOW-UPS.json") {
+            continue;
+        }
+        checked += 1;
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        // The exhaustive list, not a hand-written one: a type added to
+        // `FindingType` without matching playbook instructions is exactly
+        // the failure this test exists to catch.
+        for ft in FindingType::ALL {
+            for field in hunter::ingest::type_required_fields(ft) {
+                assert!(
+                    template.contains(field),
+                    "{name} offers {ft} follow-ups but never names its required field {field:?}"
+                );
+            }
+        }
+        // `bug` has no entry in `type_required_fields`: ingest validates
+        // `bug_class` and its enum separately. Workers that had to guess
+        // invented "missing-guard", "stale-selector", "unchecked-index".
+        assert!(
+            template.contains("bug_class"),
+            "{name} offers bug follow-ups but never names bug_class"
+        );
+        for bc in hunter::domain::BugClass::ALL {
+            assert!(
+                template.contains(&bc.to_string()),
+                "{name} must name the valid bug_class {bc}"
+            );
+        }
+    }
+    assert!(
+        checked >= 2,
+        "expected harvest and engage to offer FOLLOW-UPS.json, found {checked}"
+    );
+}
+
 /// Guards against a playbook being added without a builder, or renamed
 /// out from under one — either of which only shows up as a job failing
 /// at runtime.

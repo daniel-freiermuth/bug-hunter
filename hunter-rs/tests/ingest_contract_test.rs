@@ -48,9 +48,15 @@ async fn ingest_severity(raw: &str) -> (TempDir, Store, hunter::ingest::IngestRe
     }]);
     let path = dir.join("findings.json");
     std::fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
-    let res =
-        hunter::ingest::ingest_findings(&store, repo_id, Path::new(&path), Some(FindingType::Bug))
-            .await;
+    let res = hunter::ingest::ingest_findings(
+        &store,
+        repo_id,
+        Path::new(&path),
+        Some(FindingType::Bug),
+        None,
+        None,
+    )
+    .await;
     (dir, store, res)
 }
 
@@ -124,7 +130,8 @@ async fn a_non_bug_entry_cannot_smuggle_in_a_bug_class() {
     }]);
     let path = dir.join("findings.json");
     std::fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
-    let res = hunter::ingest::ingest_findings(&store, repo_id, Path::new(&path), None).await;
+    let res =
+        hunter::ingest::ingest_findings(&store, repo_id, Path::new(&path), None, None, None).await;
     assert_eq!(res.inserted, 1, "a valid refactor entry is still accepted");
 
     let all = store

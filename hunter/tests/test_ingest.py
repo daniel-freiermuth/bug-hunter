@@ -601,3 +601,45 @@ def test_bug_type_does_not_require_type_specific_fields(env: tuple[Store, int, P
     entries = [_make_finding()]
     result = ingest_findings(store, repo_id, _write_findings(fdir, entries), finding_type="bug")
     assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+
+
+def _standards_entry(**overrides: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "fingerprint": "std-001",
+        "type": "standards",
+        "severity": "medium",
+        "confidence": 0.8,
+        "summary": "error handling diverges from the documented standard",
+        "file": "foo.py",
+        "standard_section": "Error handling",
+        "current_approach": "bare except",
+        "proposed_approach": "typed errors",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_a_standards_follow_up_is_ingested(env: tuple[Store, int, Path]) -> None:
+    """The engage and harvest playbooks offer `standards` as a follow-up type.
+
+    The Rust daemon ingests it; the Python rollback reads the same
+    playbooks, so rejecting it here dropped such follow-ups -- the
+    worktree is gone after ingest, so nothing would retry them.
+    """
+    store, repo_id, fdir = env
+    result = ingest_findings(store, repo_id, _write_findings(fdir, [_standards_entry()]), None)
+    assert result == {"inserted": 1, "duplicates": 0, "invalid": 0}
+    (row,) = store.list_findings(finding_type="standards")
+    assert row["standard_section"] == "Error handling"
+
+
+@pytest.mark.parametrize("missing", ["standard_section", "current_approach", "proposed_approach"])
+def test_a_standards_entry_missing_a_required_field_is_invalid(
+    env: tuple[Store, int, Path], missing: str
+) -> None:
+    """Same required fields as hunter-rs ingest.rs, so neither daemon stores a NULL column."""
+    store, repo_id, fdir = env
+    entry = _standards_entry()
+    del entry[missing]
+    result = ingest_findings(store, repo_id, _write_findings(fdir, [entry]), None)
+    assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
