@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from .store import Store
 
 
-_KNOWN_FINDING_TYPES = ("bug", "dep_update", "test_gap", "refactor", "modernization")
+_KNOWN_FINDING_TYPES = ("bug", "dep_update", "test_gap", "refactor", "modernization", "standards")
 
 # Storage columns that are specific to each non-bug finding type (see
 # store.upsert_finding's INSERT column list) and that the corresponding
@@ -29,6 +29,7 @@ _TYPE_REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "test_gap": ("missing_tests", "test_file"),
     "refactor": ("smell_type", "suggested_refactor"),
     "modernization": ("modernization_class", "current_approach", "proposed_approach"),
+    "standards": ("standard_section", "current_approach", "proposed_approach"),
 }
 _LIST_REQUIRED_FIELDS = frozenset({"missing_tests"})
 

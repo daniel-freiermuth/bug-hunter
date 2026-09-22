@@ -316,13 +316,15 @@ async fn ingest_findings_valid_dup_invalid() {
     ]);
     std::fs::write(&tmp, content.to_string()).unwrap();
 
-    let result = hunter::ingest::ingest_findings(&store, 1, &tmp, Some(FindingType::Bug)).await;
+    let result =
+        hunter::ingest::ingest_findings(&store, 1, &tmp, Some(FindingType::Bug), None, None).await;
     assert_eq!(result.inserted, 2);
     assert_eq!(result.duplicates, 0);
     assert_eq!(result.invalid, 2); // string + bad bug_class
 
     // Ingest again: same entries -> duplicates
-    let result2 = hunter::ingest::ingest_findings(&store, 1, &tmp, Some(FindingType::Bug)).await;
+    let result2 =
+        hunter::ingest::ingest_findings(&store, 1, &tmp, Some(FindingType::Bug), None, None).await;
     assert_eq!(result2.inserted, 0);
     assert_eq!(result2.duplicates, 2);
 }
@@ -354,7 +356,9 @@ async fn ingest_findings_test_gap_type() {
     ]);
     std::fs::write(&tmp, content.to_string()).unwrap();
 
-    let result = hunter::ingest::ingest_findings(&store, 1, &tmp, Some(FindingType::TestGap)).await;
+    let result =
+        hunter::ingest::ingest_findings(&store, 1, &tmp, Some(FindingType::TestGap), None, None)
+            .await;
     assert_eq!(result.inserted, 1);
     assert_eq!(result.invalid, 1); // missing_tests not a list
 }

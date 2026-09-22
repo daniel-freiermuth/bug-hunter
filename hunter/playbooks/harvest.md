@@ -74,8 +74,9 @@ genuinely remains open.
   it into the finding queue, so each item becomes a normal, triage-able
   finding instead of prose buried in a merged PR nobody re-reads. Empty
   array or omit the file entirely otherwise. Each entry MUST set its own
-  "type" (bug | dep_update | test_gap | refactor | modernization) to
-  whichever shape actually fits, e.g. for a leftover cleanup item:
+  "type" (bug | dep_update | test_gap | refactor | modernization |
+  standards) to whichever shape actually fits, e.g. for a leftover
+  cleanup item:
   ```json
   {
     "type": "refactor",
@@ -90,6 +91,18 @@ genuinely remains open.
     "introduced_by": "deferred from PR #{{PR_NUMBER}}"
   }
   ```
-  (dep_update entries use ecosystem/package/current_version/latest_version;
-  modernization entries use modernization_class/current_approach/
-  proposed_approach — see apply_improvement.md for both full shapes.)
+  Every type has REQUIRED fields beyond the common ones, and an entry that
+  omits one is rejected at ingest — the finding is lost, not queued:
+  - `test_gap`: `missing_tests` — a NON-EMPTY JSON ARRAY of strings, e.g.
+    `["error path: invalid input", "boundary: empty array"]`, NOT a string
+    containing a list — and `test_file`.
+  - `dep_update`: `ecosystem`, `package`, `current_version`,
+    `latest_version`, `update_type`.
+  - `refactor`: `smell_type`, `suggested_refactor`.
+  - `modernization`: `modernization_class`, `current_approach`,
+    `proposed_approach`.
+  - `standards`: `standard_section` (the heading it violates, e.g.
+    "Type safety / Domain types over primitives"), `current_approach`,
+    `proposed_approach`.
+  - `bug`: `bug_class`, exactly one of
+    `boundary|error-path|race|contract-drift|leak|logic`.
