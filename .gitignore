@@ -11,6 +11,9 @@ hunter/data/hunter.db-shm
 hunter/data/hunter.db-wal
 hunter/data/repos/
 hunter/data/wt/
+# One private omp session directory per worker run; pruned to the newest
+# SESSIONS_RETAINED by the harness itself.
+hunter/data/sessions/
 hunter/data/hunter.lock
 hunter/node_modules/
 hunter/ui/app.js

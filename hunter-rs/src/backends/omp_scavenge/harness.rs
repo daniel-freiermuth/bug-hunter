@@ -2,15 +2,24 @@
 //!
 //! Port of `hunter/backends/omp_scavenge/harness.py`. The cap design (exp1b):
 //! never trust harness cooperation. The worker's session JSONL is written
-//! live under ~/.omp/agent/sessions/; we watch it and SIGTERM the process
-//! group at the token threshold.
+//! live under a private per-run directory; we watch it and SIGTERM the
+//! process group at the token threshold.
+//!
+//! Every run gets its own `--session-dir`. That is not tidiness: omp's
+//! `autoResume` setting (global config, on by default for this operator)
+//! makes a bare `omp -p` continue the newest session for the same cwd
+//! whenever no session flag or session directory is passed. A worker that
+//! resumes re-caches the whole prior transcript on its first call — the
+//! observed cost was 508 709 `cacheWrite` tokens on call #1 for a repo
+//! whose session had accumulated 290 calls since 2026-09-06, which trips
+//! any cap before the worker does a single useful thing. Passing an
+//! explicit, empty session directory is what makes each job start cold.
 
-use std::collections::HashMap;
 use std::fs;
-use std::hash::BuildHasher;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,14 +31,69 @@ use crate::util::kill_tree;
 // Sessions directory
 // ---------------------------------------------------------------------------
 
-/// Resolve the omp sessions directory: `$OMP_HOME/agent/sessions` or
-/// `~/.omp/agent/sessions`.
-pub fn omp_sessions_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("OMP_HOME") {
-        return PathBuf::from(home).join("agent/sessions");
+/// How many worker transcripts to keep under `<work_root>/sessions`.
+///
+/// One directory per run, never reused, so without a bound this grows for
+/// the life of the deployment — at the observed job rate a few thousand
+/// transcripts a year, each tens of megabytes. Keeping the most recent N
+/// leaves enough to debug a failure that was noticed days later, which is
+/// what these are read for once metering is done with them.
+const SESSIONS_RETAINED: usize = 50;
+
+/// Root for per-run session directories: `<work_root>/sessions`.
+///
+/// Hunter's own data, under hunter's own work root — NOT the operator's
+/// `~/.omp/agent/sessions`. A directory per run in the shared tree grows
+/// without bound inside a directory a human also uses, and nothing else
+/// prunes it. Being easy to find is served just as well by a documented
+/// path we control.
+pub fn sessions_root(work_root: &Path) -> PathBuf {
+    work_root.join("sessions")
+}
+
+/// Private session directory for one worker run. The cwd slug is omp's own
+/// naming (`/` → `-`), suffixed with the spawn instant and a process-local
+/// counter so two runs in the same worktree — retries of the same job —
+/// never share a directory and so never resume one another.
+fn run_session_dir(work_root: &Path, cwd: &Path, spawn_ms: u128) -> PathBuf {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let slug = cwd.to_string_lossy().replace('/', "-");
+    let slug = slug.trim_matches('-').to_owned();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    sessions_root(work_root).join(format!("{slug}--{spawn_ms}-{seq}"))
+}
+
+/// Drop all but the newest [`SESSIONS_RETAINED`] run directories.
+///
+/// Called before a run creates its own, so the live directory is never a
+/// candidate. Best effort throughout: a transcript that cannot be removed
+/// is a disk-space problem, not a reason to refuse the job that was about
+/// to start.
+pub fn prune_sessions(work_root: &Path) -> usize {
+    let root = sessions_root(work_root);
+    let Ok(entries) = fs::read_dir(&root) else {
+        return 0;
+    };
+    let mut dirs: Vec<(SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|e| {
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((modified, e.path()))
+        })
+        .collect();
+    if dirs.len() <= SESSIONS_RETAINED {
+        return 0;
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_owned());
-    PathBuf::from(home).join(".omp/agent/sessions")
+    // Newest first, then drop the tail.
+    dirs.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    let mut removed = 0;
+    for (_, path) in dirs.drain(SESSIONS_RETAINED..) {
+        if fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 // ---------------------------------------------------------------------------
@@ -37,11 +101,10 @@ pub fn omp_sessions_dir() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// Sum "new" tokens (input + output + cacheWrite) and call count from a
-/// session JSONL file, optionally filtering to records at or after
-/// `since_iso` (lexicographic compare on the `timestamp` field).
+/// session JSONL file.
 ///
-/// `OSError` / IO errors → (0, 0).
-pub fn ledger_usage(session_file: &Path, since_iso: &str) -> (i64, i64) {
+/// IO errors → (0, 0).
+pub fn ledger_usage(session_file: &Path) -> (i64, i64) {
     let Ok(file) = fs::File::open(session_file) else {
         return (0, 0);
     };
@@ -57,12 +120,6 @@ pub fn ledger_usage(session_file: &Path, since_iso: &str) -> (i64, i64) {
             Ok(v) => v,
             Err(_) => continue, // partial trailing line mid-write
         };
-        if !since_iso.is_empty() {
-            let ts = rec.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
-            if ts < since_iso {
-                continue;
-            }
-        }
         let Some(msg) = rec.get("message").and_then(|v| v.as_object()) else {
             continue;
         };
@@ -89,108 +146,33 @@ pub fn ledger_usage(session_file: &Path, since_iso: &str) -> (i64, i64) {
     (tokens, calls)
 }
 
-// ---------------------------------------------------------------------------
-// Session-file discovery (harness.py:58-87)
-// ---------------------------------------------------------------------------
-
-/// Snapshot of all `*.jsonl` files under `sessions_dir/*/*.jsonl` with their
-/// byte sizes. Errors → empty map.
-pub fn snapshot(sessions_dir: &Path) -> HashMap<PathBuf, u64> {
-    let mut result = HashMap::new();
-    let Ok(entries) = fs::read_dir(sessions_dir) else {
-        return result;
-    };
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
-        }
-        let Ok(sub) = fs::read_dir(entry.path()) else {
-            continue;
-        };
-        for sub_entry in sub.flatten() {
-            let path = sub_entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl")
-                && let Ok(meta) = path.metadata()
-            {
-                result.insert(path, meta.len());
-            }
-        }
-    }
-    result
-}
-
-/// Find the worker's ledger: a file that appeared OR grew since the
-/// `before` snapshot. Fuzzy-matches the cwd slug against parent-dir names;
-/// falls back to most-recently-modified candidate.
-pub fn discover<S: BuildHasher>(
-    before: &HashMap<PathBuf, u64, S>,
-    sessions_dir: &Path,
-    cwd: &Path,
-) -> Option<PathBuf> {
-    let current = snapshot(sessions_dir);
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    for (path, size) in &current {
-        match before.get(path) {
-            None => candidates.push(path.clone()),
-            Some(&old_size) if *size > old_size => candidates.push(path.clone()),
-            _ => {}
-        }
-    }
-    if candidates.is_empty() {
+/// Meter a worker's whole private session directory: every `*.jsonl` omp
+/// wrote for this run, summed. One file is the norm; summing rather than
+/// picking one means an extra transcript (a nested session) is counted as
+/// spend instead of silently discounted.
+///
+/// Returns `None` until the directory holds at least one ledger — that is
+/// the "not metered yet" signal `run_worker` waits on, and kills on.
+fn ledger_dir_usage(run_dir: &Path) -> Option<(PathBuf, i64, i64)> {
+    let mut files: Vec<PathBuf> = fs::read_dir(run_dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl"))
+        .collect();
+    if files.is_empty() {
         return None;
     }
-    // Fuzzy slug match: join cwd components with '-'
-    let slug = cwd.to_string_lossy().replace('/', "-");
-    let slug = slug.trim_matches('-');
-    let matches: Vec<&PathBuf> = candidates
-        .iter()
-        .filter(|p| {
-            let pn = p
-                .parent()
-                .and_then(|par| par.file_name())
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
-            let pn = pn.trim_matches('-');
-            pn.contains(slug) || slug.contains(pn)
-        })
-        .collect();
-    let pool: &[&PathBuf] = if matches.is_empty() {
-        // re-collect candidates as refs
-        &candidates.iter().collect::<Vec<_>>()
-    } else {
-        &matches
-    };
-    pool.iter()
-        .max_by_key(|p| p.metadata().ok().and_then(|m| m.modified().ok()))
-        .map(|p| (*p).clone())
-}
-
-// ---------------------------------------------------------------------------
-// ISO timestamp helper (replaces Python time.strftime + gmtime)
-// ---------------------------------------------------------------------------
-
-/// Convert epoch seconds to "YYYY-MM-DDTHH:MM:SS.000Z" (UTC).
-/// Uses the Howard Hinnant civil-from-days algorithm.
-#[allow(clippy::many_single_char_names)]
-fn epoch_to_iso(secs: u64) -> String {
-    let s = secs % 60;
-    let mi = (secs / 60) % 60;
-    let h = (secs / 3600) % 24;
-    let days = (secs / 86400) as i64;
-
-    // Civil date from days since 1970-01-01
-    let z = days + 719_468;
-    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-
-    format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}.000Z")
+    // omp names sessions by creation instant, so sorting by name puts the
+    // run's first — the one worth recording as `session_file`.
+    files.sort();
+    let (mut tokens, mut calls) = (0, 0);
+    for f in &files {
+        let (t, c) = ledger_usage(f);
+        tokens += t;
+        calls += c;
+    }
+    Some((files.swap_remove(0), tokens, calls))
 }
 
 // ---------------------------------------------------------------------------
@@ -255,25 +237,37 @@ pub fn run_worker(
     max_wall_s: i64,
     model: Option<&str>,
 ) -> RunResult {
-    let sessions_dir = omp_sessions_dir();
-    let before = snapshot(&sessions_dir);
     let t0 = Instant::now();
-
-    let spawn_iso = {
-        let epoch_s = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        epoch_to_iso(epoch_s)
-    };
+    let spawn_ms = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    prune_sessions(&cfg.work_root);
+    let run_dir = run_session_dir(&cfg.work_root, cwd, spawn_ms);
+    if let Err(e) = fs::create_dir_all(&run_dir) {
+        // Without a private directory the worker would fall back to omp's
+        // cwd-keyed session and resume it. Refusing is cheaper than the
+        // half-megatoken first call that follows.
+        return RunResult {
+            exit_code: Some(127),
+            killed_reason: Some("unmetered".to_owned()),
+            tokens_new: 0,
+            calls: 0,
+            session_file: None,
+            duration_s: 0.0,
+            stdout_tail: format!("session dir {} unusable: {e}", run_dir.display()),
+            usage_delta: None,
+        };
+    }
 
     // Build command: [omp_bin, "-p", prompt] + optional flags
     let mut cmd = Command::new(&cfg.omp_bin);
     cmd.arg("-p").arg(prompt);
+    cmd.arg(format!("--session-dir={}", run_dir.display()));
     if let Some(m) = model {
         cmd.arg(format!("--model={m}"));
     }
-    if let Some(ref smol) = cfg.model_smol {
+    if let Some(smol) = &cfg.model_smol {
         cmd.arg(format!("--smol={smol}"));
     }
 
@@ -336,11 +330,8 @@ pub fn run_worker(
 
     loop {
         let exited = matches!(proc.try_wait(), Ok(Some(_)));
-        if session.is_none() {
-            session = discover(&before, &sessions_dir, cwd);
-        }
-        if let Some(ref sess) = session {
-            let (t, c) = ledger_usage(sess, &spawn_iso);
+        if let Some((path, t, c)) = ledger_dir_usage(&run_dir) {
+            session = Some(path);
             tokens = t;
             calls = c;
         }
@@ -363,7 +354,7 @@ pub fn run_worker(
             tracing::warn!(
                 "harness: no session ledger under {} after {}s — \
                  killing worker rather than running it unmetered",
-                sessions_dir.display(),
+                run_dir.display(),
                 cfg.session_grace_s
             );
             killed = Some("unmetered".to_owned());
@@ -381,8 +372,8 @@ pub fn run_worker(
     let exit_code = proc.wait().ok().and_then(|s| s.code());
 
     // Final ledger read after exit.
-    if let Some(ref sess) = session {
-        let (t, c) = ledger_usage(sess, &spawn_iso);
+    if let Some((path, t, c)) = ledger_dir_usage(&run_dir) {
+        session = Some(path);
         tokens = t;
         calls = c;
     }
@@ -400,7 +391,7 @@ pub fn run_worker(
             "harness: worker exited after {:.1}s with no session ledger under {} — \
              token spend unmetered",
             t0.elapsed().as_secs_f64(),
-            sessions_dir.display()
+            run_dir.display()
         );
     }
 
@@ -428,14 +419,6 @@ pub fn run_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_epoch_to_iso_known_dates() {
-        // 1970-01-01T00:00:00.000Z
-        assert_eq!(epoch_to_iso(0), "1970-01-01T00:00:00.000Z");
-        // 2026-01-01T00:00:00.000Z = 1767225600
-        assert_eq!(epoch_to_iso(1_767_225_600), "2026-01-01T00:00:00.000Z");
-    }
 
     #[test]
     fn test_tail_str_snaps_to_char_boundary() {

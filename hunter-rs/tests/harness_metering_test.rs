@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! `run_worker` end to end — metering, the unmetered verdict, output drain.
 //!
-//! `harness_test.rs` covers the pieces (`ledger_usage`, `snapshot`,
-//! `discover`, `kill_tree`) in isolation. Nothing covered the function that
+//! `harness_test.rs` covers the pieces (`ledger_usage`, `kill_tree`) in
+//! isolation. Nothing covered the function that
 //! wires them together, which is where the accounting invariant lives:
 //!
 //! > a run whose token spend could not be measured must never be recorded
@@ -16,11 +16,12 @@
 //! `scheduler::job_state` maps `Some(_)` to `JobState::Killed`, and only
 //! `None` + exit 0 to `JobState::Done`.
 //!
-//! The seams: `cfg.omp_bin` is looked up on `PATH` (`FakeBins`), and
-//! `omp_sessions_dir()` reads `$OMP_HOME` from the daemon's own
-//! environment (`OmpHome`). Without the second one these tests would read
-//! the developer's real `~/.omp/agent/sessions`, where a live omp session
-//! is writing.
+//! The seam: `cfg.omp_bin` is looked up on `PATH` (`FakeBins`). Session
+//! directories need no sandboxing any more — they hang off
+//! `cfg.work_root`, which is already a scratch directory, rather than the
+//! operator's `~/.omp/agent/sessions`. `$OMP_HOME` is still redirected so
+//! that a worker which ignores `--session-dir` writes into the scratch
+//! tree instead of the developer's real one.
 
 mod support;
 
@@ -48,7 +49,7 @@ const CHUNK_CHARS: usize = 1024;
 // Fixture
 // ---------------------------------------------------------------------------
 
-/// A scripted `omp` on `PATH`, an empty sessions tree, and a worktree.
+/// A scripted `omp` on `PATH`, a sandboxed `$OMP_HOME`, and a worktree.
 ///
 /// Field order is drop order: `OMP_HOME` is restored first, then `PATH`
 /// and the process-wide lock, then the scratch directory goes away.
@@ -56,7 +57,6 @@ struct Fixture {
     _home: support::EnvGuard,
     bins: FakeBins,
     _dir: TempDir,
-    sessions: PathBuf,
     cwd: PathBuf,
     cfg: Config,
 }
@@ -66,8 +66,7 @@ impl Fixture {
         let bins = FakeBins::acquire(label); // take the lock before touching env
         let dir = TempDir::new(label);
         let omp_home = dir.subdir("omp-home");
-        let sessions = omp_home.join("agent/sessions");
-        std::fs::create_dir_all(&sessions).expect("create sessions dir");
+        std::fs::create_dir_all(omp_home.join("agent/sessions")).expect("create sessions dir");
         let cwd = dir.subdir("work");
         // Scoped through FakeBins: it owns the process-env lock, so taking
         // one is what licenses mutating the environment at all.
@@ -83,63 +82,46 @@ impl Fixture {
             _home: home,
             bins,
             _dir: dir,
-            sessions,
             cwd,
             cfg,
         }
     }
 
-    /// omp's own naming: the worker's cwd with `/` turned into `-`. Using
-    /// the real slug exercises `discover`'s fuzzy match rather than its
-    /// most-recently-modified fallback.
-    fn slug(&self) -> String {
-        self.cwd
-            .to_string_lossy()
-            .replace('/', "-")
-            .trim_matches('-')
-            .to_owned()
-    }
-
-    /// Shell that writes an omp-style session ledger under `$OMP_HOME`,
-    /// one assistant record per `(input, output, cacheWrite)` triple.
-    ///
-    /// The timestamp comes from `date -u` inside the worker, because
-    /// `run_worker` only counts records at or after the second it spawned
-    /// the worker in. A fixture with a hardcoded past timestamp meters
-    /// zero and looks exactly like the unmetered case.
-    fn ledger_sh(&self, records: &[(i64, i64, i64)]) -> String {
-        let dir = self.sessions.join(self.slug());
-        let file = dir.join("session-01.jsonl");
-        let mut sh = format!(
-            "mkdir -p '{dir}'\nTS=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')\n",
-            dir = dir.display()
-        );
-        for &(input, output, cache_write) in records {
-            let record = serde_json::json!({
-                "timestamp": "@TS@",
-                "message": {
-                    "role": "assistant",
-                    "usage": {
-                        "input": input,
-                        "output": output,
-                        "cacheWrite": cache_write,
-                    },
-                },
-            })
-            .to_string()
-            .replace("@TS@", "%s");
-            let _ = writeln!(
-                sh,
-                "printf '{record}\\n' \"$TS\" >> '{file}'",
-                file = file.display()
-            );
-        }
-        sh
-    }
-
     fn run(&self, cap_tokens: i64, max_wall_s: i64) -> RunResult {
         harness::run_worker(&self.cfg, &self.cwd, PROMPT, cap_tokens, max_wall_s, None)
     }
+}
+
+/// Shell that writes an omp-style session ledger into the private session
+/// directory this run was handed, one assistant record per
+/// `(input, output, cacheWrite)` triple. Resolving `--session-dir` from
+/// argv is the point: a worker that ignored the flag would write where
+/// nothing looks.
+fn ledger_sh(records: &[(i64, i64, i64)]) -> String {
+    let mut sh = "SDIR=\"\"\nfor a in \"$@\"; do\n  case \"$a\" in \
+                  --session-dir=*) SDIR=\"${a#--session-dir=}\";; esac\ndone\n\
+                  mkdir -p \"$SDIR\"\nTS=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')\n"
+        .to_owned();
+    for &(input, output, cache_write) in records {
+        let record = serde_json::json!({
+            "timestamp": "@TS@",
+            "message": {
+                "role": "assistant",
+                "usage": {
+                    "input": input,
+                    "output": output,
+                    "cacheWrite": cache_write,
+                },
+            },
+        })
+        .to_string()
+        .replace("@TS@", "%s");
+        let _ = writeln!(
+            sh,
+            "printf '{record}\\n' \"$TS\" >> \"$SDIR/session-01.jsonl\""
+        );
+    }
+    sh
 }
 
 /// Shell emitting `chunks` repeats of `CHUNK_CHARS` copies of `ch` on
@@ -166,7 +148,7 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
         "omp",
         &format!(
             "{ledger}printf 'worker-done\\n'\nexit 0",
-            ledger = fx.ledger_sh(&[(1000, 200, 50), (3000, 400, 350)])
+            ledger = ledger_sh(&[(1000, 200, 50), (3000, 400, 350)])
         ),
     );
 
@@ -185,16 +167,27 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
     );
     assert!(res.stdout_tail.contains("worker-done"));
 
-    // The worker is spawned with the prompt and the requested model; the
-    // ledger is found because the worker really was handed `cwd`.
-    assert_eq!(
-        fx.bins.calls_to("omp"),
-        vec![vec![
-            "omp".to_owned(),
-            "-p".to_owned(),
-            PROMPT.to_owned(),
-            "--model=test-model".to_owned(),
-        ]]
+    // The worker is spawned with the prompt, the requested model, and a
+    // session directory of its own — the flag that stops omp's
+    // `autoResume` from continuing this cwd's previous session.
+    let calls = fx.bins.calls_to("omp");
+    let argv = calls.first().expect("omp was invoked");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(argv[..3], ["omp", "-p", PROMPT]);
+    assert!(
+        argv.contains(&"--model=test-model".to_owned()),
+        "got {argv:?}"
+    );
+    let sdir = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("--session-dir="))
+        .expect("worker handed a session dir");
+    assert!(
+        std::path::Path::new(sdir).starts_with(
+            hunter::backends::omp_scavenge::harness::sessions_root(&fx.cfg.work_root,)
+        ),
+        "worker transcripts belong under <work_root>/sessions, not in the \
+         operator's own omp session tree, got {sdir}"
     );
 }
 
@@ -222,36 +215,35 @@ fn worker_without_a_ledger_is_flagged_unmetered_despite_exit_zero() {
     assert_eq!(res.session_file, None);
 }
 
-/// A ledger written *before* the worker spawned is not this worker's
-/// spend. `discover` only accepts files that appeared or grew, so a
-/// pre-existing, untouched ledger leaves the run unmetered rather than
-/// billing it someone else's tokens.
+/// The bug this flag exists for: omp's `autoResume` continues the newest
+/// session for the same cwd whenever no session directory is passed, so
+/// back-to-back jobs in one worktree used to reopen one ever-growing
+/// transcript and re-cache it — half a million `cacheWrite` tokens on
+/// call #1, past any cap, before the worker did anything. Two runs from
+/// the same cwd must therefore meter independently and never share a
+/// session directory.
 #[test]
-fn stale_ledger_from_an_earlier_run_is_not_counted() {
-    let fx = Fixture::new("stale-ledger");
-    let dir = fx.sessions.join(fx.slug());
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("session-01.jsonl"),
-        format!(
-            "{}\n",
-            serde_json::json!({
-                "timestamp": "2999-01-01T00:00:00.000Z",
-                "message": {
-                    "role": "assistant",
-                    "usage": {"input": 90_000, "output": 1, "cacheWrite": 1},
-                },
-            })
-        ),
-    )
-    .unwrap();
-    fx.bins.script("omp", "exit 0");
+fn consecutive_runs_in_one_cwd_never_share_a_session_dir() {
+    let fx = Fixture::new("private-session-dir");
+    fx.bins.script(
+        "omp",
+        &format!("{ledger}exit 0", ledger = ledger_sh(&[(1000, 200, 50)])),
+    );
 
-    let res = fx.run(1_000_000, 30);
+    let first = fx.run(1_000_000, 30);
+    let second = fx.run(1_000_000, 30);
 
-    assert_eq!(res.tokens_new, 0, "another run's ledger is not our spend");
-    assert_eq!(res.session_file, None);
-    assert_eq!(res.killed_reason.as_deref(), Some("unmetered"));
+    assert_eq!(first.tokens_new, 1250);
+    assert_eq!(
+        second.tokens_new, 1250,
+        "the second run meters its own spend, not its own plus the first's"
+    );
+    assert_eq!(second.calls, 1);
+    let (a, b) = (
+        first.session_file.expect("first ledger"),
+        second.session_file.expect("second ledger"),
+    );
+    assert_ne!(a, b, "each run owns its session directory");
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +287,7 @@ fn cap_kill_fires_while_the_worker_is_still_running() {
         "omp",
         &format!(
             "{ledger}sleep 10",
-            ledger = fx.ledger_sh(&[(400_000, 50_000, 50_000)])
+            ledger = ledger_sh(&[(400_000, 50_000, 50_000)])
         ),
     );
 
@@ -352,7 +344,7 @@ fn oversized_output_on_both_pipes_does_not_deadlock() {
         "omp",
         &format!(
             "{ledger}{out}printf 'STDOUT-END\\n'\n{err}printf 'STDERR-END\\n' >&2\nexit 0",
-            ledger = fx.ledger_sh(&[(4000, 200, 42)]),
+            ledger = ledger_sh(&[(4000, 200, 42)]),
             out = emit_sh('a', chunks, 1),
             err = emit_sh('b', chunks, 2),
         ),
@@ -499,7 +491,7 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
         "omp",
         &format!(
             "{ledger}sleep 30 &\nprintf 'worker-done\\n'\nexit 0",
-            ledger = fx.ledger_sh(&[(1000, 200, 50)])
+            ledger = ledger_sh(&[(1000, 200, 50)])
         ),
     );
 
@@ -516,5 +508,59 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
         res.stdout_tail.contains("worker-done"),
         "output captured before the group was reaped: {:?}",
         res.stdout_tail
+    );
+}
+
+/// Worker transcripts are bounded, and the newest survive.
+///
+/// One directory per run, never reused, so without pruning this grows for
+/// the life of the deployment — thousands of transcripts a year at the
+/// observed job rate, each tens of megabytes. Pruning runs before a run
+/// creates its own directory, so the live one is never a candidate.
+#[test]
+fn old_worker_transcripts_are_pruned_newest_first() {
+    let dir = support::TempDir::new("prune");
+    let work_root = dir.path().join("work");
+    let root = hunter::backends::omp_scavenge::harness::sessions_root(&work_root);
+    std::fs::create_dir_all(&root).unwrap();
+
+    // 60 runs, aged explicitly. Creation order is NOT reliable as age
+    // order: filesystems differ in mtime resolution, and on CI's the
+    // whole loop lands inside one tick, which makes "the oldest ten" an
+    // arbitrary ten. Stamping each directory a minute apart is what makes
+    // this test about pruning rather than about the filesystem.
+    let base = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    for i in 0..60u64 {
+        let d = root.join(format!("run-{i:03}"));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("session.jsonl"), "{}").unwrap();
+        let when = base + std::time::Duration::from_secs(i * 60);
+        std::fs::File::open(&d)
+            .and_then(|f| f.set_modified(when))
+            .expect("stamp the run directory");
+    }
+
+    let removed = hunter::backends::omp_scavenge::harness::prune_sessions(&work_root);
+    assert_eq!(removed, 10, "60 transcripts, 50 retained");
+
+    let left: std::collections::HashSet<_> = std::fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left.len(), 50);
+    assert!(
+        left.contains("run-059") && left.contains("run-010"),
+        "the newest must survive"
+    );
+    assert!(
+        !left.contains("run-000") && !left.contains("run-009"),
+        "the oldest must go"
+    );
+
+    // Idempotent: a second pass at the bound removes nothing.
+    assert_eq!(
+        hunter::backends::omp_scavenge::harness::prune_sessions(&work_root),
+        0
     );
 }

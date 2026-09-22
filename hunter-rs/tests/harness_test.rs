@@ -1,7 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Harness tests — JSONL ledger parsing, session discovery, `kill_tree`.
+//! Harness tests — JSONL ledger parsing and `kill_tree`.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -29,29 +28,9 @@ fn test_ledger_usage_sums_tokens() {
         ),
     )
     .unwrap();
-    let (tokens, calls) = harness::ledger_usage(&file, "");
+    let (tokens, calls) = harness::ledger_usage(&file);
     assert_eq!(tokens, 525); // (100+50+25) + (200+100+50)
     assert_eq!(calls, 2);
-}
-
-#[test]
-fn test_ledger_usage_since_filter() {
-    let dir = TempDir::new("lu-since");
-    let file = dir.join("test.jsonl");
-    fs::write(
-        &file,
-        concat!(
-            r#"{"timestamp":"2026-07-23T15:00:00.000Z","message":{"role":"assistant","usage":{"input":100,"output":50,"cacheWrite":0}}}"#,
-            "\n",
-            r#"{"timestamp":"2026-07-23T16:00:00.000Z","message":{"role":"assistant","usage":{"input":200,"output":100,"cacheWrite":0}}}"#,
-            "\n",
-        ),
-    )
-    .unwrap();
-    // Only the second record passes the filter (>= 15:30)
-    let (tokens, calls) = harness::ledger_usage(&file, "2026-07-23T15:30:00.000Z");
-    assert_eq!(tokens, 300);
-    assert_eq!(calls, 1);
 }
 
 #[test]
@@ -68,7 +47,7 @@ fn test_ledger_usage_skips_non_assistant() {
         ),
     )
     .unwrap();
-    let (tokens, calls) = harness::ledger_usage(&file, "");
+    let (tokens, calls) = harness::ledger_usage(&file);
     // Only the assistant record counts
     assert_eq!(tokens, 15);
     assert_eq!(calls, 1);
@@ -88,7 +67,7 @@ fn test_ledger_usage_handles_malformed_json() {
         ),
     )
     .unwrap();
-    let (tokens, calls) = harness::ledger_usage(&file, "");
+    let (tokens, calls) = harness::ledger_usage(&file);
     // Only the valid record counts
     assert_eq!(tokens, 175);
     assert_eq!(calls, 1);
@@ -97,7 +76,7 @@ fn test_ledger_usage_handles_malformed_json() {
 #[test]
 fn test_ledger_usage_missing_file() {
     let (tokens, calls) =
-        harness::ledger_usage(&PathBuf::from("/nonexistent/path/does-not-exist.jsonl"), "");
+        harness::ledger_usage(&PathBuf::from("/nonexistent/path/does-not-exist.jsonl"));
     assert_eq!((tokens, calls), (0, 0));
 }
 
@@ -106,7 +85,7 @@ fn test_ledger_usage_empty_file() {
     let dir = TempDir::new("lu-empty");
     let file = dir.join("empty.jsonl");
     fs::write(&file, "").unwrap();
-    let (tokens, calls) = harness::ledger_usage(&file, "");
+    let (tokens, calls) = harness::ledger_usage(&file);
     assert_eq!((tokens, calls), (0, 0));
 }
 
@@ -119,112 +98,8 @@ fn test_ledger_usage_no_usage_field() {
         r#"{"timestamp":"2026-07-23T15:00:00.000Z","message":{"role":"assistant","content":"hi"}}"#,
     )
     .unwrap();
-    let (tokens, calls) = harness::ledger_usage(&file, "");
+    let (tokens, calls) = harness::ledger_usage(&file);
     assert_eq!((tokens, calls), (0, 0));
-}
-
-// ============================================================
-// snapshot
-// ============================================================
-
-#[test]
-fn test_snapshot_finds_jsonl_files() {
-    let dir = TempDir::new("snap");
-    let sub = dir.subdir("session-slug");
-    fs::write(sub.join("a.jsonl"), "line1\n").unwrap();
-    fs::write(sub.join("b.jsonl"), "line1\nline2\n").unwrap();
-    fs::write(sub.join("c.txt"), "ignored").unwrap();
-
-    let snap = harness::snapshot(dir.path());
-    assert_eq!(snap.len(), 2);
-    assert!(snap.contains_key(&sub.join("a.jsonl")));
-    assert!(snap.contains_key(&sub.join("b.jsonl")));
-}
-
-#[test]
-fn test_snapshot_nonexistent_dir() {
-    let snap = harness::snapshot(&PathBuf::from("/nonexistent/sessions/dir"));
-    assert!(snap.is_empty());
-}
-
-// ============================================================
-// discover
-// ============================================================
-
-#[test]
-fn test_discover_finds_new_file() {
-    let dir = TempDir::new("disc-new");
-    let sub = dir.subdir("some-slug");
-
-    let before: HashMap<PathBuf, u64> = HashMap::new();
-
-    // Create a new file after snapshot
-    fs::write(sub.join("session.jsonl"), r#"{"a":1}"#).unwrap();
-
-    let result = harness::discover(&before, dir.path(), std::path::Path::new("/tmp/my-project"));
-    assert!(result.is_some());
-    assert_eq!(
-        result.unwrap().file_name().unwrap().to_str().unwrap(),
-        "session.jsonl"
-    );
-}
-
-#[test]
-fn test_discover_finds_grown_file() {
-    let dir = TempDir::new("disc-grow");
-    let sub = dir.subdir("proj-slug");
-
-    let file_path = sub.join("session.jsonl");
-    fs::write(&file_path, "short").unwrap();
-
-    // Snapshot with original size
-    let before: HashMap<PathBuf, u64> = [(file_path.clone(), 5)].into();
-
-    // File grows
-    fs::write(&file_path, "short and now longer").unwrap();
-
-    let result = harness::discover(&before, dir.path(), std::path::Path::new("/tmp/work"));
-    assert_eq!(result, Some(file_path));
-}
-
-#[test]
-fn test_discover_no_changes() {
-    let dir = TempDir::new("disc-none");
-    let sub = dir.subdir("slug");
-    let fp = sub.join("s.jsonl");
-    fs::write(&fp, "data").unwrap();
-    let before: HashMap<PathBuf, u64> = [(fp, 4)].into();
-
-    let result = harness::discover(&before, dir.path(), std::path::Path::new("/work"));
-    assert!(result.is_none());
-}
-
-#[test]
-fn test_discover_prefers_cwd_match() {
-    let dir = TempDir::new("disc-pref");
-    let sub_a = dir.subdir("other-project");
-    let sub_b = dir.subdir("my-cool-project");
-
-    let before: HashMap<PathBuf, u64> = HashMap::new();
-
-    // Both appear after snapshot
-    fs::write(sub_a.join("s.jsonl"), "data").unwrap();
-    // Small delay so mtime differs
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    fs::write(sub_b.join("s.jsonl"), "data").unwrap();
-
-    // cwd slug contains "my-cool-project", so sub_b should be preferred
-    let result = harness::discover(
-        &before,
-        dir.path(),
-        std::path::Path::new("/home/me/my-cool-project"),
-    );
-    assert!(result.is_some());
-    let chosen = result.unwrap();
-    assert!(
-        chosen.to_string_lossy().contains("my-cool-project"),
-        "expected cwd-matching file, got {chosen:?}"
-    );
 }
 
 // ============================================================
