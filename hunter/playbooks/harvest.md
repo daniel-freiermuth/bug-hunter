@@ -90,6 +90,15 @@ genuinely remains open.
     "introduced_by": "deferred from PR #{{PR_NUMBER}}"
   }
   ```
-  (dep_update entries use ecosystem/package/current_version/latest_version;
-  modernization entries use modernization_class/current_approach/
-  proposed_approach — see apply_improvement.md for both full shapes.)
+  Every type has REQUIRED fields beyond the common ones, and an entry that
+  omits one is rejected at ingest — the finding is lost, not queued:
+  - `test_gap`: `missing_tests` — a NON-EMPTY JSON ARRAY of strings, e.g.
+    `["error path: invalid input", "boundary: empty array"]`, NOT a string
+    containing a list — and `test_file`.
+  - `dep_update`: `ecosystem`, `package`, `current_version`,
+    `latest_version`, `update_type`.
+  - `refactor`: `smell_type`, `suggested_refactor`.
+  - `modernization`: `modernization_class`, `current_approach`,
+    `proposed_approach`.
+  - `bug`: `bug_class`, exactly one of
+    `boundary|error-path|race|contract-drift|leak|logic`.
