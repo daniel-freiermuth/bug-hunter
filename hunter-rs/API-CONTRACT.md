@@ -148,6 +148,8 @@ Handler then embeds per-row (server.py:372-384):
 
 `id:int, type:str, repo_id:int, fingerprint:str, file:str|null (in practice "" default at insert, store.py:341), symbol:str|null, line:int|null, severity:str ("high"|"medium"|"low"), confidence:float, summary:str, detail:str|null, status:str, pr_url:str|null, created_at:int, updated_at:int, bug_class:str|null, evidence_plan:str|null, introduced_by:str|null, rung_achieved:int|null, verdict_reason:str|null, budget_override:str|null ("once"|"exempt"|null), fix_attempts:int, last_fix_failure:str|null, recheck_attempts:int, last_recheck_failure:str|null, ecosystem:str|null, package:str|null, current_version:str|null, latest_version:str|null, update_type:str|null, security_advisory:str|null, missing_tests:str|null (JSON-encoded array stored as TEXT — served as a string, NEVER json.loads'd), test_file:str|null, smell_type:str|null, suggested_refactor:str|null, modernization_class:str|null, current_approach:str|null, proposed_approach:str|null, standard_section:str|null` + computed `category`, `timeline`, conditional `needs_attention`.
 
+The table also carries `found_by_job` (migration 011, §11), and no findings response does: Rust names its columns and never selects it, and Python's `SELECT *` reads are filtered through `_public_finding`, which pops it (store.py:843-861, applied at :861 and :910). That provenance is served the other way round, as `produced_finding_ids` on `/api/jobs` (§6).
+
 ---
 
 ## 5. GET /api/finding
@@ -176,6 +178,10 @@ SELECT j.*, r.name AS repo_name FROM jobs j
 ```
 Response: `200`, JSON array. Row = all 17 `jobs` columns + `repo_name:str`:
 `id:int, kind:str, repo_id:int, finding_id:int|null, state:str (queued|running|done|failed|killed|denied), pid:int|null, session_file:str|null, cap_tokens:int|null, tokens_new:int|null, calls:int|null, exit_code:int|null, killed_reason:str|null, notes:str|null, model:str|null, usage_delta:float|null, started_at:int|null, finished_at:int|null` (schema.sql:73-93).
+
+Each entry carries one key that is not a `jobs` column: `produced_finding_ids: int[]` — the findings this job brought into existence. It comes from one correlated subquery, `(SELECT group_concat(f.id) FROM findings f WHERE f.found_by_job = j.id)` split on `,`, rather than a query per job: this feeds a 50-row table that polls, so an N+1 here would be 50 extra round trips every few seconds (store.py:1200-1226; store.rs:954-990).
+**Always present.** `group_concat` returns NULL for a job that produced nothing — the common case, every fix, recheck and engage job — and both daemons render that as `[]`, never null and never an absent key, so a client cannot end up distinguishing "produced nothing" from "not reported" (types.rs:197-213). The subquery has no `ORDER BY`, so the order within the list is whatever the scan produced, not a promise.
+The key is unique to this endpoint: `/api/summary.current_job` (store.py:1243-1280) and `/api/finding.jobs` (store.py:1228-1241) select the jobs columns alone.
 Note: jobs whose repo row was deleted would vanish (INNER JOIN) — moot in practice because `delete_repo` refuses while jobs reference the repo (store.py:246-263).
 
 ---
@@ -202,7 +208,7 @@ Handler: server.py:230-232 -> `_repo_notes(qs)` (server.py:328-338).
 | no repo with that id | `404 {"error": "no repo <id>"}` (server.py:334-336) |
 | ok | `200 {"notes": "<string>"}` (server.py:338) |
 
-Notes are **not in the DB**: read from `<work_root>/repos/repo-<id>/NOTES.md` (`repo_notes_path`, store.py:269-276). Missing file -> `""`. Files longer than 4000 chars are truncated to the **tail** 4000 chars with prefix `"...(older notes truncated)...\n"` (`repo_notes`, store.py:278-294, `_MAX_NOTES_CHARS = 4000`).
+Notes are **not in the DB**: read from `<work_root>/notes/repo-<id>.md` (`repo_notes_path`, store.py:703-727; Rust `Store::notes_path`, store.rs:476-478). Beside the clones, not inside one: the file used to live at `repos/repo-<id>/NOTES.md`, where a worker doing a broad `git add` would commit the operator's private notes into a pull request, and where writing the first note created `repos/repo-<id>/` as a side effect — a directory with no `origin`, which `sync_repo` then reads as an already-cloned repo and refuses to work in, permanently. Notes left at the old path are moved on daemon startup (`migrate_repo_notes`, server.py:786-825; server.rs:1158-1195). Missing file -> `""`. Files longer than 4000 chars are truncated to the **tail** 4000 chars with prefix `"...(older notes truncated)...\n"` (`repo_notes`, store.py:731-745, `_MAX_NOTES_CHARS = 4000` at store.py:729).
 
 ---
 
@@ -297,6 +303,7 @@ ALTER TABLE pr_state ADD COLUMN harvest_attempts INTEGER NOT NULL DEFAULT 0;  --
 ALTER TABLE pr_state ADD COLUMN last_harvest_failure TEXT;                    -- also in schema.sql
 ALTER TABLE pr_state ADD COLUMN head_sha TEXT;                                -- also in schema.sql
 ALTER TABLE pr_state ADD COLUMN addressed_head_sha TEXT;                      -- also in schema.sql
+ALTER TABLE findings ADD COLUMN found_by_job INTEGER;                         -- also in schema.sql
 ```
 
 Every column in that list is *also* declared in `schema.sql`, so a fresh Python
@@ -307,16 +314,19 @@ list is the only thing that adds them. The Rust port's migrations must cover
 both paths — `hunter/tests/test_schema_parity.py` asserts the two systems agree
 from a fresh install *and* from an upgrade.
 
-Two things about `repos` do **not** follow that pattern:
+Three things do **not** follow that pattern:
 
 - The partial index `repos_deleted_at ON repos(deleted_at) WHERE deleted_at IS NOT NULL` is **not** in `schema.sql`, and cannot be: `schema.sql` runs before the ALTERs, and on a pre-existing database `repos.deleted_at` does not exist yet at that point. Python creates it after the ALTER loop instead (store.py:291-298); hunter-rs creates it in migration 008 next to the column (008_repos_deleted_at.sql:21, :27-28) and again after the rebuild in 009, because dropping a table drops its indexes (009_repos_autoincrement.sql:104-105).
 - `repos.id` is `INTEGER PRIMARY KEY AUTOINCREMENT` in `schema.sql` (:9), but AUTOINCREMENT cannot be added by an ALTER — it needs a table rebuild (009_repos_autoincrement.sql:32), and the probe-and-ALTER list deliberately has none. So this one does **not** converge on its own: a fresh Python install gets it from `schema.sql`, an existing database gets it from hunter-rs migration 009, and a Python-only installation that predates 009 keeps plain rowid-alias ids — which reuse a deleted repo's id, with the consequences §7 describes. A rebuild sitting in the probe-and-ALTER list would be a much riskier thing than the ALTERs around it, and the deployed database is migrated by the Rust daemon, which is the rollback path that matters here.
+- The partial index `findings_found_by_job ON findings(found_by_job) WHERE found_by_job IS NOT NULL` is not in `schema.sql` either, and cannot be, for the same reason as `repos_deleted_at`: on a pre-existing database `findings.found_by_job` does not exist when `schema.sql` runs. Python creates it after the ALTER loop, and after the findings rebuild that would drop it (store.py:538-548); hunter-rs creates it in migration 011 beside the column (011_findings_found_by_job.sql:24-25). Partial because the column is NULL for every finding ingested before provenance was recorded, and those are exactly the rows no job will ever be looked up by.
+
+`findings.found_by_job` is **not API surface**, in either daemon — same treatment as `repos.deleted_at` (§7), and for the same reason: Python reads findings with `SELECT *` while Rust names its columns, so an internal column would otherwise land in one daemon's responses and not the other's. Python pops it in `_public_finding` (store.py:843-861); Rust's `Finding` has no such field. `/api/jobs` reports the same fact from the other side, as `produced_finding_ids` (§6). It is also not a foreign key to `jobs(id)`: jobs are pruned on a retention policy that knows nothing about findings, and a finding must outlive the job that found it rather than block its cleanup (011_findings_found_by_job.sql:19-21).
 
 Also: `DROP INDEX IF EXISTS findings_fingerprint` cleanup on every open (store.py:269-270). PRAGMAs: `journal_mode = WAL`, `foreign_keys = ON` (schema.sql:2-3).
 
 Tables (schema.sql): `repos` (:5-26), `findings` (:28-83 + 5 indexes :84-88), `jobs` (:90-109 + 2 indexes :110-112), `window_log` (:115-123), `calibration_samples` (:135-142), `events` (:144-151 + index :152), `pr_state` (:156-199), `scheduler_state` (:206-212, single row `CHECK (id = 1)`).
 
-**There is no `repo_notes` table** — repo notes are Markdown files under `<work_root>/repos/repo-<id>/NOTES.md` (store.py:571-578).
+**There is no `repo_notes` table** — repo notes are Markdown files at `<work_root>/notes/repo-<id>.md`, one per repo, outside the clone directories (store.py:703-727; store.rs:476-478).
 
 Tables the read-only API touches: `findings`, `repos`, `jobs`, `events`, `pr_state`, `scheduler_state`. (`window_log`/`calibration_samples` are backend-internal.)
 
@@ -329,7 +339,7 @@ Paths are resolved relative to `PROJECT_ROOT` (the `hunter/` dir containing the 
 | config key | Config field | default | used by serve path for |
 |---|---|---|---|
 | `serve.port` | `serve_port` | `8377` (types.py:187,223) | listen port; bind host is hardcoded `127.0.0.1` (server.py:697) |
-| `workRoot` | `work_root` | `"data"` | `hunter.lock` lockfile (server.py:70), `repos/repo-<id>/NOTES.md` (store.py:276) |
+| `workRoot` | `work_root` | `"data"` | `hunter.lock` lockfile (server.py:70), repo clones `repos/repo-<id>` (store.py:105-113), repo notes `notes/repo-<id>.md` (store.py:727) |
 | `dbPath` | `db_path` | `"data/hunter.db"` | SQLite database (store.py:116-117) |
 | — (constant) | `UI_DIR` | `PROJECT_ROOT / "ui"` (types.py:20) | static files + index.html |
 
