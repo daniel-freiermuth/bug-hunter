@@ -348,3 +348,75 @@ class TestGitHubEnterpriseHosts:
         assert gh.parse_pr_url("https://github.com/a/w/pull/7") == ("a/w", 7)
         assert gh.ssh_url("https://github.corp.com/a/w") == "git@github.corp.com:a/w.git"
         assert gh.ssh_url("https://github.com/a/w") == "git@github.com:a/w.git"
+
+
+class TestCaseInsensitiveScheme:
+    """A URL scheme is case-insensitive per RFC 3986.
+
+    valid_repo_url agrees -- it lowercases before checking its
+    allow-list, so HTTPS://github.com/... is stored. When the parsers
+    folded case only there, the scheme stayed inside the authority,
+    parsing fell through to the scp-like branch and the host read as
+    "HTTPS". That has no "github" label, so the repo was filed as
+    GitLab and every PR operation on it ran glab against a GitHub
+    remote.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "HTTPS://github.com/Acme/Widget.git",
+            "Https://github.com/Acme/Widget.git",
+            "HTTP://github.com/Acme/Widget.git",
+            "SSH://git@github.com/Acme/Widget.git",
+            "Ssh://git@github.com:22/Acme/Widget.git",
+        ],
+    )
+    def test_github_detect_and_owner_repo(self, url: str) -> None:
+        assert _extract_host(url) == "github.com", url
+        assert detect_forge(url) == "github", url
+        # The path is case-sensitive even though the scheme is not:
+        # `gh -R acme/widget` names a different repo from Acme/Widget.
+        assert GitHubForge().owner_repo(url) == "Acme/Widget", url
+
+    def test_github_parse_pr_url_and_ssh_url(self) -> None:
+        gh = GitHubForge()
+        assert gh.parse_pr_url("HTTPS://github.com/Acme/Widget/pull/7") == ("Acme/Widget", 7)
+        assert gh.parse_pr_url("Https://github.corp.com/Acme/Widget/pull/7") == (
+            "github.corp.com/Acme/Widget",
+            7,
+        )
+        assert gh.ssh_url("HTTPS://github.com/Acme/Widget") == "git@github.com:Acme/Widget.git"
+        assert (
+            gh.ssh_url("Https://github.corp.com/Acme/Widget.git")
+            == "git@github.corp.com:Acme/Widget.git"
+        )
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "HTTPS://gitlab.example.com/Group/Sub/Widget.git",
+            "Http://gitlab.example.com/Group/Sub/Widget.git",
+            "Ssh://git@gitlab.example.com:2222/Group/Sub/Widget.git",
+        ],
+    )
+    def test_gitlab_detect(self, url: str) -> None:
+        assert _extract_host(url) == "gitlab.example.com", url
+        assert detect_forge(url) == "gitlab", url
+
+    def test_gitlab_url_helpers(self) -> None:
+        gl = GitLabForge("gitlab.example.com")
+        url = "HTTPS://gitlab.example.com/Group/Sub/Widget.git"
+        assert gl.owner_repo(url) == "Group/Sub/Widget"
+        assert gl.parse_pr_url("HTTPS://gitlab.example.com/Group/Widget/-/merge_requests/42") == (
+            "Group/Widget",
+            42,
+        )
+        assert (
+            gl.ssh_url("Https://gitlab.example.com/Group/Sub/Widget")
+            == "git@gitlab.example.com:Group/Sub/Widget.git"
+        )
+
+    def test_a_bare_scheme_word_is_not_a_scheme(self) -> None:
+        # Only `<scheme>://` folds; the `://` is still required.
+        assert _extract_host("HTTPSgithub.com/Acme/Widget") == ""

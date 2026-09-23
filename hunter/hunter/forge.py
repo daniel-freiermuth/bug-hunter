@@ -92,9 +92,27 @@ class Forge:
 # ---------------------------------------------------------------------------
 
 
+def _scheme_is(url: str, scheme: str) -> bool:
+    """Whether `url` carries `scheme://`, compared without regard to case.
+
+    Schemes are case-insensitive per RFC 3986, and `valid_repo_url`
+    agrees -- it lowercases before checking its allow-list, so
+    `HTTPS://github.com/...` is stored. Comparing case-sensitively left
+    the scheme inside the authority, so parsing fell through to the
+    scp-like branch and read `HTTPS` as the host: no "github" label, so
+    the repo was filed as GitLab and every PR operation on it ran `glab`
+    against a GitHub remote.
+    """
+    return url[: len(scheme) + 3].lower() == f"{scheme}://"
+
+
 def _url_path(url: str) -> str:
-    """Path half of a git remote URL, for every form the API accepts."""
-    m = re.match(r"^(?:https?|ssh)://[^/]+(/.*)$", url)
+    """Path half of a git remote URL, for every form the API accepts.
+
+    Only the scheme folds case. The path carries the owner/repo slug,
+    which is case-sensitive.
+    """
+    m = re.match(r"^(?i:https?|ssh)://[^/]+(/.*)$", url)
     if m:
         return m.group(1)
     m = re.match(r"^[^/:]+:(.*)$", url)
@@ -145,7 +163,7 @@ class GitHubForge(Forge):
     def ssh_url(self, https_url: str) -> str:
         # Enterprise hosts too: rewriting a self-hosted GitHub remote to
         # github.com would push an internal repo at the public forge.
-        if not https_url.startswith("https://"):
+        if not _scheme_is(https_url, "https"):
             return https_url
         host = _extract_host(https_url)
         if not is_github_host(host):
@@ -157,7 +175,7 @@ class GitHubForge(Forge):
         return self._slug(url)
 
     def parse_pr_url(self, url: str) -> tuple[str, int] | None:
-        if not url.startswith("https://"):
+        if not _scheme_is(url, "https"):
             return None
         host = _extract_host(url)
         if not is_github_host(host):
@@ -286,28 +304,38 @@ class GitLabForge(Forge):
         self.host = host
         self._self_hosted = host != "gitlab.com"
 
-    def _host_re(self) -> str:
-        return re.escape(self.host)
+    def _origin_re(self) -> str:
+        """``https://<host>``, matched without regard to case.
+
+        Scheme and host are both case-insensitive per RFC 3986, and
+        `valid_repo_url` admits `HTTPS://...` because it lowercases
+        before checking its allow-list. The group stops before the
+        path, which carries the case-sensitive project slug.
+        """
+        return f"(?i:https://{re.escape(self.host)})"
+
+    def _scp_re(self) -> str:
+        """``git@<host>``, the scp-like remote form, host case folded."""
+        return f"(?i:git@{re.escape(self.host)})"
 
     # -- URL helpers --------------------------------------------------------
 
     def ssh_url(self, https_url: str) -> str:
-        m = re.match(rf"^https://{self._host_re()}/(.+?)(?:\.git)?/?$", https_url)
+        m = re.match(rf"^{self._origin_re()}/(.+?)(?:\.git)?/?$", https_url)
         if m:
             return f"git@{self.host}:{m.group(1)}.git"
         return https_url
 
     def owner_repo(self, url: str) -> str | None:
         m = re.match(
-            rf"^(?:https://{self._host_re()}/|git@{self._host_re()}:)"
-            r"(.+?)(?:\.git)?/?$",
+            rf"^(?:{self._origin_re()}/|{self._scp_re()}:)(.+?)(?:\.git)?/?$",
             url,
         )
         return m.group(1) if m else None
 
     def parse_pr_url(self, url: str) -> tuple[str, int] | None:
         m = re.match(
-            rf"^https://{self._host_re()}/(.+?)/-/merge_requests/(\d+)",
+            rf"^{self._origin_re()}/(.+?)/-/merge_requests/(\d+)",
             url,
         )
         return (m.group(1), int(m.group(2))) if m else None
@@ -565,7 +593,7 @@ def _extract_host(url: str) -> str:
     added over ssh ran every PR operation through
     `glab --hostname github.com`.
     """
-    m = re.match(r"^(?:https?|ssh)://([^/]+)", url)
+    m = re.match(r"^(?i:https?|ssh)://([^/]+)", url)
     if m:
         authority = m.group(1)
     else:
