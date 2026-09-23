@@ -184,9 +184,9 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
 
     let store = Arc::new(Store::connect(&cfg.db_path).await?);
     // Finish any deletion interrupted by a crash or a locked directory.
-    // A flagged repo is already invisible, but its id stays reserved
-    // until its files are gone, so this is what eventually returns the id
-    // to circulation.
+    // A flagged repo is already invisible, but its row is what records
+    // that `repos/repo-<id>` is still on disk, so it may only be dropped
+    // once those files are gone -- which is what this does.
     let reaped = crate::server::reap_deleted_repos(&store, &cfg.work_root).await;
     if reaped > 0 {
         tracing::info!("reclaimed {reaped} repo director(ies) left by earlier deletions");

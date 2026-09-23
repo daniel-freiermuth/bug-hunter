@@ -257,12 +257,12 @@ async fn failed_close_marks_the_attention_addressed_so_it_stops_being_repicked()
 
 /// A clone directory belonging to a different repository is refused.
 ///
-/// Ids are reused by SQLite, so `repos/repo-<id>` can be inherited. The
-/// delete handler now removes the directory, but a leftover from a failed
-/// delete — or anything an operator put there — would otherwise be used
-/// as-is: `sync_repo` skips cloning whenever the path exists, so the
-/// daemon would hunt one project's code, file the findings against
-/// another, and push to whichever URL the database named.
+/// `repos/repo-<id>` is derived from the id, so a delete whose directory
+/// removal failed — or anything an operator put there — leaves a clone at
+/// the path a later repo would use, and it would otherwise be used as-is:
+/// `sync_repo` skips cloning whenever the path exists, so the daemon would
+/// hunt one project's code, file the findings against another, and push to
+/// whichever URL the database named.
 #[tokio::test]
 async fn a_clone_of_a_different_repository_is_refused() {
     let dir = TempDir::new("wrong-origin");
@@ -272,7 +272,7 @@ async fn a_clone_of_a_different_repository_is_refused() {
     let repos_root = dir.path().join("repos");
     std::fs::create_dir_all(&repos_root).unwrap();
     // Registered under a URL that is *not* the origin of the checkout
-    // sitting at its path — exactly the state an id handover leaves.
+    // sitting at its path — exactly the state a leftover directory leaves.
     let rid = store
         .add_repo(
             "widget",

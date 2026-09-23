@@ -528,11 +528,13 @@ impl Store {
     /// instead") when findings or jobs reference the repo; else flags the
     /// row `deleted_at = now`, which removes it from every read path.
     ///
-    /// Phase one of two. The row deliberately survives: `id` is a rowid
-    /// alias, so deleting it immediately would let the next INSERT take
-    /// that number while `repos/repo-<id>` is still being removed -- and
-    /// removing a large clone is not instant. Keeping the row is what
-    /// reserves the id. [`reap_deleted_repos`] does the rest.
+    /// Phase one of two. The row deliberately survives its own deletion:
+    /// it is the only record that `repos/repo-<id>` is still on disk, and
+    /// removing a large clone is not instant. [`reap_deleted_repos`]
+    /// removes the directory and drops the row only once that succeeded,
+    /// so an interrupted or refused removal leaves a flagged row the next
+    /// pass retries instead of a directory nothing owns -- and `sync_repo`
+    /// treats any directory at that path as an existing clone.
     ///
     /// The count checks and the flag share one transaction, so a job or
     /// finding created concurrently cannot slip in between them.

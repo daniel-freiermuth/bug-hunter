@@ -515,9 +515,10 @@ async fn sync_repo(
 ) -> Result<(), String> {
     if rpath.exists() {
         // The directory already exists, so the clone is skipped -- which is
-        // only safe if it is a clone of *this* repo. Ids are reused, so a
-        // directory left behind by a deleted repo would otherwise be hunted
-        // under the new repo's identity and pushed to the new repo's URL.
+        // only safe if it is a clone of *this* repo. `repos/repo-<id>` is
+        // derived from the id, so a directory a failed reclamation left
+        // behind would otherwise be hunted under a later repo's identity
+        // and pushed to that repo's URL.
         // Deletion now removes the directory, so reaching here means
         // something outside the daemon put it there: refuse rather than
         // guess.
