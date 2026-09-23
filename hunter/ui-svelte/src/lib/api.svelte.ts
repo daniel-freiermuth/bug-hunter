@@ -8,7 +8,8 @@ import {
   isEventList, isFindingDetail, isFindingList, isJobList, isStats, isSummary,
 } from "./validate";
 
-const POLL_MS = 5000;
+/** Dashboard poll period. Exported so a test can drive the timer by it. */
+export const POLL_MS = 5000;
 
 // ---------------------------------------------------------------------------
 // Fetch wrapper
@@ -73,6 +74,17 @@ class HunterStore {
   // write state.
   #refreshGeneration = 0;
 
+  // Set for the duration of a *poll* refresh only. The timer fires every
+  // POLL_MS whether or not the previous tick came back, so once a refresh
+  // outlasts the interval — slow daemon, or five requests queued behind the
+  // browser's per-origin connection limit — each tick supersedes the one
+  // still running and every result is dropped by the generation check. The
+  // dashboard then freezes with `error` still null, which is the worst
+  // failure available: App.svelte's "may be stale" banner keys off `error`,
+  // so frozen data reads as live. A mutation refresh is deliberately not
+  // gated — a user action must supersede a slow poll, never queue behind it.
+  #pollInFlight = false;
+
   // Bumped only where the polled state above is actually replaced, so a
   // superseded or failing refresh neither invalidates caches nor wakes
   // subscribers. Nothing on the read path calls refresh(), so observing this
@@ -130,10 +142,20 @@ class HunterStore {
     }
   }
 
+  async #poll() {
+    if (this.#pollInFlight) return;
+    this.#pollInFlight = true;
+    try {
+      await this.refresh();
+    } finally {
+      this.#pollInFlight = false;
+    }
+  }
+
   startPolling() {
-    this.refresh();
+    this.#poll();
     if (!this.#interval) {
-      this.#interval = setInterval(() => this.refresh(), POLL_MS);
+      this.#interval = setInterval(() => this.#poll(), POLL_MS);
     }
   }
 
