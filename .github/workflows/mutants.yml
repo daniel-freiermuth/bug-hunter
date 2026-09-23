@@ -55,7 +55,10 @@ jobs:
     name: Mutation coverage of the diff (advisory)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Above the step timeout below. A job timeout cancels the run and
+    # marks it failed, which continue-on-error cannot absorb, so the job
+    # limit must never be the one that fires.
+    timeout-minutes: 45
     defaults:
       run:
         working-directory: hunter-rs
@@ -80,6 +83,12 @@ jobs:
       - name: Mutants introduced by this PR
         # Surviving mutants are reported, not enforced; see the job comment.
         continue-on-error: true
+        # A step timeout counts as a step failure, so continue-on-error
+        # absorbs it and the advisory contract holds even when a shard of
+        # MAX_MUTANTS mutants -- each a rebuild plus a nextest run -- runs
+        # long. Without this the run would go red for being slow, which is
+        # exactly what "never fails the run" promised it would not do.
+        timeout-minutes: 35
         env:
           # Per-run ceiling, not a give-up threshold: a diff with more
           # mutants than this is split into shards and one shard runs.
