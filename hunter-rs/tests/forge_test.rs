@@ -414,3 +414,99 @@ fn github_enterprise_hosts_survive_the_whole_chain() {
         "an unrecognised host must be handed back untouched, not rewritten"
     );
 }
+
+/// A URL scheme is case-insensitive (RFC 3986) and `valid_repo_url`
+/// agrees — it lowercases before checking its allow-list, so
+/// `HTTPS://github.com/...` is stored with a 201.
+///
+/// When the parsers folded case only there, the scheme stayed inside
+/// the authority, parsing fell through to the scp-like branch and the
+/// host read as `HTTPS`. That has no `github` label, so the repo was
+/// filed as GitLab and every PR operation on it ran `glab` against a
+/// GitHub remote.
+#[test]
+fn uppercase_scheme_still_detects_github() {
+    for url in [
+        "HTTPS://github.com/Acme/Widget.git",
+        "Https://github.com/Acme/Widget.git",
+        "HTTP://github.com/Acme/Widget.git",
+        "SSH://git@github.com/Acme/Widget.git",
+        "Ssh://git@github.com:22/Acme/Widget.git",
+    ] {
+        assert_eq!(url_host(url), Some("github.com"), "url_host({url})");
+        assert_eq!(detect_forge(url), ForgeName::Github, "detect_forge({url})");
+    }
+}
+
+/// The path is case-sensitive even though the scheme is not: `gh -R
+/// acme/widget` names a different repo from `Acme/Widget`.
+#[test]
+fn uppercase_scheme_keeps_the_owner_repo_case() {
+    let gh = GitHubForge;
+    for url in [
+        "HTTPS://github.com/Acme/Widget.git",
+        "HTTP://github.com/Acme/Widget.git",
+        "Ssh://git@github.com:22/Acme/Widget.git",
+    ] {
+        assert_eq!(
+            gh.owner_repo(url),
+            Some(("Acme".to_owned(), "Widget".to_owned())),
+            "owner_repo({url})"
+        );
+    }
+
+    let gl = GitLabForge;
+    for url in [
+        "HTTPS://gitlab.example.com/Group/Sub/Widget.git",
+        "Http://gitlab.example.com/Group/Sub/Widget.git",
+        "Ssh://git@gitlab.example.com:2222/Group/Sub/Widget.git",
+    ] {
+        assert_eq!(detect_forge(url), ForgeName::Gitlab, "detect_forge({url})");
+        assert_eq!(
+            gl.owner_repo(url),
+            Some(("Group/Sub".to_owned(), "Widget".to_owned())),
+            "owner_repo({url})"
+        );
+    }
+}
+
+#[test]
+fn uppercase_scheme_parses_pr_urls() {
+    let gh = GitHubForge;
+    assert_eq!(
+        gh.parse_pr_url("HTTPS://github.com/Acme/Widget/pull/7"),
+        Some(("Acme/Widget".to_owned(), 7))
+    );
+    assert_eq!(
+        gh.parse_pr_url("Https://github.corp.com/Acme/Widget/pull/7"),
+        Some(("github.corp.com/Acme/Widget".to_owned(), 7))
+    );
+    assert_eq!(
+        GitLabForge.parse_pr_url("HTTPS://gitlab.example.com/Group/Widget/-/merge_requests/42"),
+        Some(("Group/Widget".to_owned(), 42))
+    );
+}
+
+#[test]
+fn uppercase_scheme_rewrites_to_ssh() {
+    let gh = GitHubForge;
+    assert_eq!(
+        gh.ssh_url("HTTPS://github.com/Acme/Widget"),
+        "git@github.com:Acme/Widget.git"
+    );
+    assert_eq!(
+        gh.ssh_url("Https://github.corp.com/Acme/Widget.git"),
+        "git@github.corp.com:Acme/Widget.git"
+    );
+    assert_eq!(
+        GitLabForge.ssh_url("Https://gitlab.example.com/Group/Sub/Widget"),
+        "git@gitlab.example.com:Group/Sub/Widget.git"
+    );
+}
+
+/// Only `<scheme>://` folds; the `://` is still required, so a bare
+/// `HTTPS` word is not a scheme.
+#[test]
+fn a_scheme_word_without_a_separator_is_not_a_scheme() {
+    assert_eq!(url_host("HTTPSgithub.com/Acme/Widget"), None);
+}
