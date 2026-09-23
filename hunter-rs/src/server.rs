@@ -858,7 +858,7 @@ async fn update_repo(
     if let Some(new_url) = fields.url.as_deref()
         && new_url != repo.url
     {
-        repoint_clone_origin(&state, rid, &repo.url, new_url).await;
+        repoint_clone_origin(rid, Path::new(&repo.path), &repo.url, new_url).await;
     }
     state
         .store
@@ -890,8 +890,14 @@ async fn update_repo(
 /// missing or unreadable clone is not an error — the next cycle clones
 /// it fresh. Failure is logged for the operator rather than surfaced to
 /// the caller, whose write did succeed.
-async fn repoint_clone_origin(state: &AppState, rid: i64, old_url: &str, new_url: &str) {
-    let dir = Store::repo_dir(&state.config.work_root.join("repos"), rid);
+async fn repoint_clone_origin(rid: i64, dir: &Path, old_url: &str, new_url: &str) {
+    // `repo.path`, not a path derived from the id. They agree for every
+    // row migration 007 rewrote, but 007 deliberately left alone any
+    // path that did not end in the repo's name — an operator-edited one
+    // — and the scheduler syncs whatever `repo.path` says. Deriving the
+    // directory here would repoint nothing for those rows and leave the
+    // old origin exactly where `sync_repo` looks, which is the permanent
+    // refusal this function exists to prevent.
     if !dir.join(".git").exists() {
         return;
     }
