@@ -220,19 +220,21 @@ async fn current_job_populates_finding_keys_only_with_a_finding() {
 #[test]
 fn repo_notes_missing_short_and_truncated() {
     let work_root = unique_temp_path("hunter-notes-test", "");
-    let notes_dir = work_root.join("repos").join("repo-1");
-    std::fs::create_dir_all(&notes_dir).unwrap();
+    // Built by the production path helper rather than by hand: notes have
+    // moved out of the clone once already.
+    let notes_file = Store::notes_path(&work_root, 1);
+    std::fs::create_dir_all(notes_file.parent().unwrap()).unwrap();
 
     // Missing file -> "".
     assert_eq!(Store::repo_notes(&work_root, 2), "");
 
     // Short file passes through untouched.
-    std::fs::write(notes_dir.join("NOTES.md"), "short note").unwrap();
+    std::fs::write(&notes_file, "short note").unwrap();
     assert_eq!(Store::repo_notes(&work_root, 1), "short note");
 
     // >4000 chars -> prefix + exactly the tail 4000 chars.
     let content = "abcde".repeat(1000); // 5000 chars
-    std::fs::write(notes_dir.join("NOTES.md"), &content).unwrap();
+    std::fs::write(&notes_file, &content).unwrap();
     let notes = Store::repo_notes(&work_root, 1);
     let prefix = "...(older notes truncated)...\n";
     assert!(notes.starts_with(prefix));
@@ -241,6 +243,38 @@ fn repo_notes_missing_short_and_truncated() {
     assert_eq!(tail, &content[1000..]);
 
     std::fs::remove_dir_all(&work_root).ok();
+}
+
+/// The SQL of `Store::{name}`, read out of `src/store.rs` itself.
+///
+/// `sqlx::query_scalar!` needs a string literal, so the two ledger
+/// queries cannot be lifted into a `const` that both the daemon and a
+/// test could use. Copying them into the test instead produces a test
+/// of the copy: the previous version of this one planned its own SQL
+/// and stayed green while the predicate it exists to protect was
+/// deleted from the real query.
+///
+/// Reading the literal back out of the source is the link that has no
+/// copy. Anchoring on `async fn <name>(` and the first raw string after
+/// it survives rustfmt, comment rewrites and renamed bindings — the
+/// query text itself is inside a raw literal, which no formatter
+/// touches. Renaming the function or changing the literal's delimiter
+/// does break it, and both panic here by name rather than passing.
+fn production_sql(name: &str) -> String {
+    const SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/store.rs"));
+    let after_fn = SOURCE
+        .split_once(&format!("async fn {name}("))
+        .unwrap_or_else(|| panic!("src/store.rs has no `async fn {name}(`"))
+        .1;
+    let from_literal = after_fn
+        .split_once("r#\"")
+        .unwrap_or_else(|| panic!("no raw-string SQL after `async fn {name}(`"))
+        .1;
+    from_literal
+        .split_once("\"#")
+        .unwrap_or_else(|| panic!("unterminated raw-string SQL in `{name}`"))
+        .0
+        .to_owned()
 }
 
 /// The ledger's window sums must be able to use `jobs_finished_at`.
@@ -254,7 +288,8 @@ fn repo_notes_missing_short_and_truncated() {
 /// the endpoint the UI polls every five seconds. Nothing else would fail.
 ///
 /// So assert the plan, not the result: these two queries must SEARCH
-/// using the index, never SCAN.
+/// using the index, never SCAN. The queries are the daemon's own, taken
+/// from `src/store.rs` by `production_sql`.
 #[tokio::test]
 async fn ledger_window_sums_use_the_finished_at_index() {
     let (path, pool) = fresh_db().await;
@@ -281,31 +316,26 @@ async fn ledger_window_sums_use_the_finished_at_index() {
     }
     sqlx::query("ANALYZE").execute(&pool).await.unwrap();
 
-    for (label, sql) in [
-        (
-            "finished_since",
-            "SELECT COALESCE(SUM(tokens_new), 0) FROM jobs \
-             WHERE state != 'running' AND finished_at > 1 AND tokens_new IS NOT NULL",
-        ),
-        (
-            "finished_between",
-            "SELECT COALESCE(SUM(tokens_new), 0) FROM jobs \
-             WHERE state != 'running' AND finished_at > 1 AND finished_at <= 9999999 \
-             AND tokens_new IS NOT NULL",
-        ),
-    ] {
-        let plan: Vec<String> =
-            sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .iter()
-                .map(|r| r.get::<String, _>("detail"))
-                .collect();
+    for name in ["finished_since", "finished_between"] {
+        let sql = production_sql(name);
+        // Bound, not substituted: the planner sees the statement the
+        // daemon prepares, and a literal in place of a parameter is a
+        // different statement to plan.
+        let mut explain = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")));
+        for _ in 0..sql.matches('?').count() {
+            explain = explain.bind(1_000_000i64);
+        }
+        let plan: Vec<String> = explain
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>("detail"))
+            .collect();
         let plan = plan.join(" | ");
         assert!(
             plan.contains("USING INDEX jobs_finished_at"),
-            "{label} should use the partial index, planned as: {plan}"
+            "{name} should use the partial index, planned as: {plan}\nSQL: {sql}"
         );
     }
 

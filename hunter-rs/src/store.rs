@@ -454,6 +454,29 @@ impl Store {
         repos_dir.join(format!("repo-{repo_id}"))
     }
 
+    /// Where a repo's notes live: `<work_root>/notes/repo-<id>.md`.
+    ///
+    /// Outside the clone, and deliberately so. Notes used to be written
+    /// to `repos/repo-<id>/NOTES.md`, which put them inside the working
+    /// tree of a real git checkout, with two consequences.
+    ///
+    /// The file showed up as untracked in the clone, so any worker doing
+    /// a broad `git add` would commit the operator's private notes into
+    /// a pull request.
+    ///
+    /// And writing a note created `repos/repo-<id>/` as a side effect.
+    /// `sync_repo` treats an existing path as an already-cloned repo and
+    /// checks its `origin`; a directory holding only notes has no origin
+    /// to read, so it refused to work there — permanently, since nothing
+    /// removes it. Adding a note to a repo before its first cycle was
+    /// enough to make that repo uncloneable for good.
+    ///
+    /// Keyed by id for the same reason as the clone directory: the name
+    /// is whatever the operator typed.
+    pub fn notes_path(work_root: &Path, repo_id: i64) -> PathBuf {
+        work_root.join("notes").join(format!("repo-{repo_id}.md"))
+    }
+
     /// INSERT INTO repos (name, url, path, forge, `default_branch`, `added_at`);
     /// returns new id. `path` is `<repos_dir>/repo-<id>`, so it can only be
     /// written once the id exists — both statements share a transaction to
@@ -644,7 +667,7 @@ impl Store {
         Ok(())
     }
 
-    /// Append to <`work_root>/repos/repo`-<id>/NOTES.md (creating dir +
+    /// Append to [`Store::notes_path`] (creating dir +
     /// header "# Notes: {`repo_name}\n\nLast` updated: YYYY-MM-DD\n\n" on
     /// first write), entry "## {category}\n" (when Some) +
     /// "- [{YYYY-MM-DD HH:MM}] {note}\n\n" (UTC — Python wrote local
@@ -658,9 +681,10 @@ impl Store {
         category: Option<&str>,
     ) -> std::io::Result<String> {
         use std::fmt::Write;
-        let dir = work_root.join("repos").join(format!("repo-{repo_id}"));
-        std::fs::create_dir_all(&dir)?;
-        let path = dir.join("NOTES.md");
+        let path = Self::notes_path(work_root, repo_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let (date, hhmm) = utc_date_time();
         let mut entry = String::new();
         if !path.exists() {
@@ -741,14 +765,11 @@ impl Store {
             .map(|row| row.is_some())
     }
 
-    /// NOT in the DB: reads <`work_root>/repos/repo`-<id>/NOTES.md, "" when
-    /// missing, tail-truncated to 4000 chars with the
+    /// NOT in the DB: reads [`Store::notes_path`], "" when missing,
+    /// tail-truncated to 4000 chars with the
     /// "...(older notes truncated)...\n" prefix (store.py:278-294).
     pub fn repo_notes(work_root: &Path, repo_id: i64) -> String {
-        let path = work_root
-            .join("repos")
-            .join(format!("repo-{repo_id}"))
-            .join("NOTES.md");
+        let path = Self::notes_path(work_root, repo_id);
         let Ok(text) = std::fs::read_to_string(&path) else {
             return String::new();
         };

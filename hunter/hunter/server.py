@@ -499,9 +499,10 @@ class Handler(BaseHTTPRequestHandler):
 
                 store = Store(cfg)
                 _reconcile_and_log(store)
+                migrate_repo_notes(cfg.work_root)
                 # Finish deletions whose inline reclamation failed: until
-                # the directory is gone the row must stay, so the id is
-                # reserved indefinitely if nothing retries.
+                # the directory is gone the row must stay, so the files
+                # sit there indefinitely if nothing retries.
                 reap_deleted_repos(store, cfg.work_root)
                 try:
                     scheduler.run_cycle(store, cfg, backend=backend)
@@ -751,10 +752,11 @@ def valid_repo_url(url: str) -> bool:
 def reap_repo(store: Store, repos_dir: Path, repo_id: int) -> bool:
     """Remove one flagged repo's directory, then drop its row.
 
-    Ordering is the whole point: the row is what stops SQLite reissuing
-    the id, so it may only go once nothing of the repo is left on disk.
-    Leaving it flagged is always safe -- the repo is already invisible and
-    the next pass retries. Returns False if the directory survived.
+    Ordering is the whole point: the row is what marks the directory as
+    still owned, so it may only go once nothing of the repo is left on
+    disk. Leaving it flagged is always safe -- the repo is already
+    invisible and the next pass retries. Returns False if the directory
+    survived.
     """
     rdir = repo_dir(repos_dir, repo_id)
     # Under the notes lock for the same reason append_repo_note takes it:
@@ -768,8 +770,59 @@ def reap_repo(store: Store, repos_dir: Path, repo_id: int) -> bool:
             pass
         except OSError:
             return False
+        # Notes live outside the clone, so the rmtree above does not take
+        # them with it. Left behind they are the operator's private
+        # context for a repo that no longer exists.
+        try:
+            (repos_dir.parent / "notes" / f"repo-{repo_id}.md").unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
         store.forget_deleted_repo(repo_id)
     return True
+
+
+def migrate_repo_notes(work_root: Path) -> int:
+    """Move notes written under the old layout out of the clone directories.
+
+    Notes used to live at repos/repo-<id>/NOTES.md, inside the working
+    tree of a real checkout. Any installation that wrote a note before
+    this changed still has one there, where it is both committable by a
+    worker and invisible to the reader, which now looks beside the
+    clones. One pass at startup, and a no-op from then on.
+
+    Never overwrites: a note already at the new path is the current one.
+    """
+    repos_dir = work_root / "repos"
+    if not repos_dir.is_dir():
+        return 0
+    moved = 0
+    for entry in repos_dir.iterdir():
+        if not entry.name.startswith("repo-"):
+            continue
+        try:
+            repo_id = int(entry.name.removeprefix("repo-"))
+        except ValueError:
+            continue
+        old = entry / "NOTES.md"
+        if not old.is_file():
+            continue
+        new = work_root / "notes" / f"repo-{repo_id}.md"
+        if new.exists():
+            continue
+        new.parent.mkdir(parents=True, exist_ok=True)
+        # Copy-then-remove rather than rename: the two paths can sit on
+        # different filesystems once repos/ is a mount of its own, where
+        # rename raises OSError(EXDEV).
+        try:
+            shutil.copyfile(old, new)
+            old.unlink()
+        except OSError:
+            continue
+        moved += 1
+        log.info("moved repo %s notes out of its clone directory", repo_id)
+    return moved
 
 
 def reap_deleted_repos(store: Store, work_root: Path) -> int:
@@ -780,7 +833,8 @@ def reap_deleted_repos(store: Store, work_root: Path) -> int:
             reaped += 1
         else:
             log.warning(
-                "repo %s is flagged deleted but %s could not be removed; its id stays reserved",
+                "repo %s is flagged deleted but %s could not be removed; "
+                "its row stays until the reaper retries",
                 repo_id,
                 repo_dir(work_root / "repos", repo_id),
             )
@@ -1170,9 +1224,10 @@ def daemon(cfg: Config) -> None:
             try:
                 store = Store(cfg)
                 _reconcile_and_log(store)
+                migrate_repo_notes(cfg.work_root)
                 # Finish deletions whose inline reclamation failed: until
-                # the directory is gone the row must stay, so the id is
-                # reserved indefinitely if nothing retries.
+                # the directory is gone the row must stay, so the files
+                # sit there indefinitely if nothing retries.
                 reap_deleted_repos(store, cfg.work_root)
                 summary = scheduler.run_cycle(store, cfg, backend=backend)
                 sleep_s = _compute_sleep_s(store, summary)

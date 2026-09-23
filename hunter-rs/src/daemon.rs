@@ -183,11 +183,17 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     let _lockfile = acquire_lockfile(&cfg.work_root)?;
 
     let store = Arc::new(Store::connect(&cfg.db_path).await?);
+    // One mutex for the whole process, shared by the HTTP handlers and
+    // the reaper passes below: it exists to keep a note append from
+    // recreating a file that reclamation is removing, which only works
+    // if both sides take the same lock.
+    let repo_notes = Arc::new(tokio::sync::Mutex::new(()));
     // Finish any deletion interrupted by a crash or a locked directory.
     // A flagged repo is already invisible, but its row is what records
     // that `repos/repo-<id>` is still on disk, so it may only be dropped
     // once those files are gone -- which is what this does.
-    let reaped = crate::server::reap_deleted_repos(&store, &cfg.work_root).await;
+    crate::server::migrate_repo_notes(&cfg.work_root);
+    let reaped = crate::server::reap_deleted_repos(&store, &cfg.work_root, &repo_notes).await;
     if reaped > 0 {
         tracing::info!("reclaimed {reaped} repo director(ies) left by earlier deletions");
     }
@@ -210,7 +216,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         store: store.clone(),
         config: Arc::new(cfg.clone()),
         backend: backend.clone(),
-        repo_notes: Arc::new(tokio::sync::Mutex::new(())),
+        repo_notes: repo_notes.clone(),
         scheduler: crate::server::SchedulerHandle {
             running: cycle_running.clone(),
             wake: wake.clone(),
@@ -302,7 +308,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         cycle_running.store(true, Ordering::SeqCst);
         let cycle_result: anyhow::Result<CycleSummary> = async {
             reconcile_and_log(&store).await?;
-            crate::server::reap_deleted_repos(&store, &cfg.work_root).await;
+            crate::server::reap_deleted_repos(&store, &cfg.work_root, &repo_notes).await;
             let summary = crate::scheduler::run_cycle(&store, &cfg, &*backend, None).await;
             Ok(summary)
         }

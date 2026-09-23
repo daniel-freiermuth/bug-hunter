@@ -855,6 +855,11 @@ async fn update_repo(
         return Err(ApiError::BadRequest("no valid fields to update".to_owned()));
     }
     state.store.update_repo(rid, &fields).await?;
+    if let Some(new_url) = fields.url.as_deref()
+        && new_url != repo.url
+    {
+        repoint_clone_origin(&state, rid, &repo.url, new_url).await;
+    }
     state
         .store
         .log_event(
@@ -866,6 +871,61 @@ async fn update_repo(
         .await?;
     let refreshed = fetch_repo(&state.store, rid).await?;
     Ok(Json(json!({ "ok": true, "repo": refreshed })).into_response())
+}
+
+/// Point an existing clone at the repo's new URL.
+///
+/// `sync_repo` refuses to work in a directory whose `origin` is not the
+/// repo's URL — correctly, since that is how it recognises somebody
+/// else's checkout sitting at the path. But changing the URL through
+/// this endpoint used to leave the clone on the old origin, which turned
+/// that safety check into a permanent block: every hunt, fix and recheck
+/// for the repo failed until an operator deleted the directory by hand.
+///
+/// Only when the clone still carries the OLD url. An origin that is
+/// neither the old nor the new URL is exactly the case the refusal
+/// exists for, so it is left alone to trip it.
+///
+/// Best-effort: the update itself has already been committed, and a
+/// missing or unreadable clone is not an error — the next cycle clones
+/// it fresh. Failure is logged for the operator rather than surfaced to
+/// the caller, whose write did succeed.
+async fn repoint_clone_origin(state: &AppState, rid: i64, old_url: &str, new_url: &str) {
+    let dir = Store::repo_dir(&state.config.work_root.join("repos"), rid);
+    if !dir.join(".git").exists() {
+        return;
+    }
+    let dir_s = dir.to_string_lossy().into_owned();
+    let (rc, out) = {
+        let d = dir_s.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::util::run_cmd(&["git", "-C", &d, "remote", "get-url", "origin"], 30)
+        })
+        .await
+        .unwrap_or((127, "spawn error".to_owned()))
+    };
+    if rc != 0 {
+        return;
+    }
+    if out.trim() != old_url {
+        tracing::warn!(
+            "repo {rid} url changed but {dir_s} has origin {} -- left as is;              remove the directory to re-clone",
+            out.trim()
+        );
+        return;
+    }
+    let new = new_url.to_owned();
+    let (rc, out) = tokio::task::spawn_blocking(move || {
+        crate::util::run_cmd(
+            &["git", "-C", &dir_s, "remote", "set-url", "origin", &new],
+            30,
+        )
+    })
+    .await
+    .unwrap_or((127, "spawn error".to_owned()));
+    if rc != 0 {
+        tracing::warn!("repo {rid} url changed but its clone origin could not be updated: {out}");
+    }
 }
 
 // -- POST /api/repos (contract §7) -----------------------------------------------
@@ -1035,17 +1095,43 @@ async fn add_repo(
 /// row accounts for and no pass will ever revisit. Leaving it flagged is
 /// always safe — the repo is already invisible, and the next pass tries
 /// again.
-pub async fn reap_repo(store: &Store, repos_dir: &Path, rid: i64) -> std::io::Result<()> {
+pub async fn reap_repo(
+    store: &Store,
+    repos_dir: &Path,
+    rid: i64,
+    notes_lock: &tokio::sync::Mutex<()>,
+) -> std::io::Result<()> {
+    // Taken here rather than by the callers, because there are two of
+    // them and only one used to hold it: the delete handler did, but the
+    // reaper pass that runs at startup and before every cycle did not.
+    // An append interleaving with that pass recreates the notes file
+    // after the reaper has walked past it, and the row is dropped a
+    // moment later — leaving a file for a repo that no longer exists and
+    // nothing that will ever retry it. Python takes the lock inside its
+    // reaper for the same reason.
+    let _guard = notes_lock.lock().await;
     let dir = Store::repo_dir(repos_dir, rid);
     // `tokio::fs`, not `std::fs`: removing a clone is explicitly not
     // instant — that slowness is the whole reason deletion is two-phase —
-    // and the synchronous call blocks a tokio worker for its duration. In
-    // the delete handler it does so while holding the `repo_notes` mutex,
-    // so every note append queues behind a multi-gigabyte rmtree.
+    // and the synchronous call blocks a tokio worker for its duration,
+    // here while holding the notes mutex, so every append would queue
+    // behind a multi-gigabyte rmtree.
     match tokio::fs::remove_dir_all(&dir).await {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
+    }
+    // Notes live outside the clone, so removing the clone does not take
+    // them with it. Left behind they would be read by whatever repo next
+    // holds this id -- which AUTOINCREMENT makes unlikely, but the file
+    // is the operator's private context either way and deletion is
+    // supposed to mean deletion.
+    if let Some(work_root) = repos_dir.parent() {
+        match tokio::fs::remove_file(Store::notes_path(work_root, rid)).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
     }
     store
         .forget_deleted_repo(rid)
@@ -1054,13 +1140,65 @@ pub async fn reap_repo(store: &Store, repos_dir: &Path, rid: i64) -> std::io::Re
     Ok(())
 }
 
+/// Move notes written under the old layout out of the clone directories.
+///
+/// Notes used to live at `repos/repo-<id>/NOTES.md`, inside the working
+/// tree of a real checkout. Any installation that wrote a note before
+/// this changed still has one there, where it is both committable by a
+/// worker and invisible to the reader, which now looks beside the
+/// clones. One pass at startup, and a no-op from then on.
+///
+/// Never overwrites: a note already at the new path is the current one.
+pub fn migrate_repo_notes(work_root: &Path) -> usize {
+    let repos_dir = work_root.join("repos");
+    let Ok(entries) = std::fs::read_dir(&repos_dir) else {
+        return 0;
+    };
+    let mut moved = 0;
+    for entry in entries.flatten() {
+        let Some(rid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.strip_prefix("repo-"))
+            .and_then(|n| n.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        let old = entry.path().join("NOTES.md");
+        if !old.is_file() {
+            continue;
+        }
+        let new = Store::notes_path(work_root, rid);
+        if new.exists() {
+            continue;
+        }
+        if let Some(parent) = new.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            continue;
+        }
+        // Copy-then-remove rather than rename: the two paths can sit on
+        // different filesystems once `repos/` is a mount of its own,
+        // where rename fails with EXDEV.
+        if std::fs::copy(&old, &new).is_ok() && std::fs::remove_file(&old).is_ok() {
+            moved += 1;
+            tracing::info!("moved repo {rid} notes out of its clone directory");
+        }
+    }
+    moved
+}
+
 /// Finish any deletion left flagged by a crash or a failed reclamation.
-pub async fn reap_deleted_repos(store: &Store, work_root: &Path) -> usize {
+pub async fn reap_deleted_repos(
+    store: &Store,
+    work_root: &Path,
+    notes_lock: &tokio::sync::Mutex<()>,
+) -> usize {
     let repos_dir = work_root.join("repos");
     let ids = store.deleted_repo_ids().await.unwrap_or_default();
     let mut reaped = 0;
     for id in ids {
-        match reap_repo(store, &repos_dir, id).await {
+        match reap_repo(store, &repos_dir, id, notes_lock).await {
             Ok(()) => reaped += 1,
             Err(e) => tracing::warn!(
                 "repo {id} is flagged deleted but {} could not be removed ({e}); \
@@ -1080,7 +1218,9 @@ async fn delete_repo(
     post_gate(&headers)?;
     let body = parse_object(&raw)?;
     let rid = require_int(&body, "id", "id must be an integer")?;
-    let _guard = state.repo_notes.lock().await;
+    // Not `_guard`: this one is released explicitly below, before
+    // reclamation takes the same lock itself.
+    let guard = state.repo_notes.lock().await;
     let repos_dir = state.config.work_root.join("repos");
     let Some(repo) = state.store.get_repo_by_id(rid).await? else {
         // Deleting something already deleted is not an error. A client
@@ -1092,7 +1232,8 @@ async fn delete_repo(
         // gone the row is gone, and that id is then indistinguishable
         // from one that was never used.
         if state.store.repo_is_deleted(rid).await? {
-            let _ = reap_repo(&state.store, &repos_dir, rid).await;
+            drop(guard);
+            let _ = reap_repo(&state.store, &repos_dir, rid, &state.repo_notes).await;
             return Ok(Json(json!({ "ok": true })).into_response());
         }
         return Err(ApiError::NotFound(format!("no repo {rid}")));
@@ -1116,7 +1257,11 @@ async fn delete_repo(
     // actually frees the id. A failure here is not an error for the
     // caller — the repo *is* deleted — it just leaves the files on disk
     // until the reaper retries on the next cycle.
-    if let Err(e) = reap_repo(&state.store, &repos_dir, rid).await {
+    // The guard goes before reclamation, which now takes the lock
+    // itself: holding it here as well would deadlock, and the row is
+    // already flagged, so an append can no longer resolve this repo.
+    drop(guard);
+    if let Err(e) = reap_repo(&state.store, &repos_dir, rid, &state.repo_notes).await {
         tracing::warn!(
             "repo {rid} deleted, but reclaiming {} failed ({e}); \
              its files stay until the reaper retries",

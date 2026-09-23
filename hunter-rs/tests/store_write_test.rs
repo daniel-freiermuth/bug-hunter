@@ -655,9 +655,10 @@ fn append_repo_note_header_category_and_entry_format() {
     assert!(notes.contains("\n## perf\n- ["));
     assert!(notes.contains("] categorized\n\n"));
 
-    // Bounded re-read is what the POST handler returns.
-    let on_disk =
-        std::fs::read_to_string(work_root.join("repos").join("repo-7").join("NOTES.md")).unwrap();
+    // Bounded re-read is what the POST handler returns. Through
+    // `notes_path`, not a hand-built path: notes moved out of the clone
+    // once already, and a literal here would have to be found again.
+    let on_disk = std::fs::read_to_string(Store::notes_path(&work_root, 7)).unwrap();
     assert_eq!(notes, on_disk);
 
     std::fs::remove_dir_all(&work_root).ok();
