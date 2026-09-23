@@ -1,17 +1,15 @@
 exp1/**
 exp2/**
 *.pyc
-hunter/data/out/*
+# Everything the daemon writes at runtime. A directory, not a list of
+# paths: enumerating them meant a new one (notes/) was tracked by
+# default, and an operator's private repo notes were committed.
+# That includes sessions/: one private omp session directory per worker
+# run, pruned to the newest SESSIONS_RETAINED by the harness itself.
+hunter/data/
 __pycache__/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
-hunter/data/hunter.db
-hunter/data/hunter.db-shm
-hunter/data/hunter.db-wal
-hunter/data/repos/
-hunter/data/wt/
-hunter/data/sessions/
-hunter/data/hunter.lock
 hunter/node_modules/
 hunter/ui/
