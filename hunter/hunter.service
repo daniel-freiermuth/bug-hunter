@@ -4,6 +4,8 @@ After=network-online.target
 
 [Service]
 WorkingDirectory=<project-root>/hunter-rs
+# `ui/` is generated and intentionally untracked; build it before serving.
+ExecStartPre=/usr/bin/env npm --prefix <project-root>/hunter/ui-svelte run build
 ExecStart=<project-root>/hunter-rs/target/release/hunter --root <project-root>/hunter
 Restart=on-failure
 RestartSec=30
