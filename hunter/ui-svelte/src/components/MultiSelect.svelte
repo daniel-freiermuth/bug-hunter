@@ -1,53 +1,33 @@
 <script lang="ts">
-  import { SvelteSet } from "svelte/reactivity";
-  import * as sel from "../lib/selection";
+  import type { Filter } from "../lib/filter.svelte";
 
   let {
     label,
     options,
-    selected,
+    filter,
   }: {
     label: string;
     options: string[];
-    selected: SvelteSet<string>;
+    filter: Filter;
   } = $props();
 
   let open = $state(false);
   let container: HTMLDivElement | undefined = $state();
 
-  // Membership, not size -- see lib/selection.ts for why `selected` is not
-  // a subset of `options`. Pinned by lib/selection.test.ts.
-  const allSelected = $derived(sel.allSelected(options, selected));
-  const noneSelected = $derived(sel.noneSelected(options, selected));
-  const filtering = $derived(!allSelected);
+  // All three states come from the filter and the options on offer, so
+  // the checkboxes cannot disagree with what is actually filtered.
+  const allSelected = $derived(filter.allSelected(options));
+  const noneSelected = $derived(filter.noneSelected(options));
 
   // Trigger label: show what's selected when filtering.
   const triggerLabel = $derived.by(() => {
-    if (!filtering) return label;
+    if (allSelected) return label;
     if (noneSelected) return `${label}: none`;
-    const names = options.filter(o => selected.has(o));
+    const names = options.filter(o => filter.accepts(o));
     const joined = names.join(", ");
     if (names.length <= 3 && joined.length <= 30) return joined;
     return `${label} (${names.length})`;
   });
-
-  // Mutate the set in place, never reassign it: the SvelteSet instance is
-  // itself the reactive value, so replacing it costs the parent its
-  // subscription and forces a redundant `$state` wrapper on every caller.
-  function toggle(value: string) {
-    if (selected.has(value)) selected.delete(value);
-    else selected.add(value);
-  }
-
-  function toggleAll() {
-    if (allSelected) {
-      // All checked → clear everything.
-      selected.clear();
-    } else {
-      // Unchecked or indeterminate → select all.
-      for (const option of options) selected.add(option);
-    }
-  }
 
   function handleClickOutside(e: MouseEvent) {
     if (container && !container.contains(e.target as Node)) {
@@ -66,7 +46,7 @@
 <div class="multi-select" bind:this={container}>
   <button
     class="trigger"
-    class:has-filter={filtering}
+    class:has-filter={!allSelected}
     onclick={() => { open = !open; }}
     aria-expanded={open}
     type="button"
@@ -84,7 +64,7 @@
           type="checkbox"
           checked={allSelected}
           indeterminate={!allSelected && !noneSelected}
-          onchange={toggleAll}
+          onchange={() => filter.toggleAll(options)}
         />
         All
       </label>
@@ -93,8 +73,8 @@
         <label class="option">
           <input
             type="checkbox"
-            checked={selected.has(opt)}
-            onchange={() => toggle(opt)}
+            checked={filter.accepts(opt)}
+            onchange={() => filter.toggle(opt, options)}
           />
           {opt}
         </label>

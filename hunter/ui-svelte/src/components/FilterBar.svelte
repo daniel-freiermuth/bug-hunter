@@ -1,8 +1,7 @@
 <script lang="ts">
   import type { Finding } from "../lib/types";
   import { SEV_RANK } from "../lib/format";
-  import { SvelteSet } from "svelte/reactivity";
-  import { absorb, needsSelector, reselect } from "../lib/selection";
+  import { Filter, needsSelector } from "../lib/filter.svelte";
   import MultiSelect from "./MultiSelect.svelte";
 
   let {
@@ -26,52 +25,25 @@
   const severities = $derived([...new Set(findings.map((f) => f.severity))].sort((a, b) => (SEV_RANK[b] ?? 0) - (SEV_RANK[a] ?? 0)));
   const statuses = $derived([...new Set(findings.map((f) => f.status))].sort());
 
-  // -- Filter selections (Svelte 5 runes) -----------------------------------
-  // `const`, mutated in place: a SvelteSet is itself the reactive value, so
-  // it needs no `$state` wrapper and must never be reassigned.
-  const selectedRepos = new SvelteSet<string>();
-  const selectedTypes = new SvelteSet<string>();
-  const selectedCategories = new SvelteSet<string>();
-  const selectedSeverities = new SvelteSet<string>();
-  const selectedStatuses = new SvelteSet<string>();
+  // -- Filter selections -----------------------------------------------------
+  // `const`, mutated in place: a Filter is itself the reactive value, so it
+  // needs no `$state` wrapper and must never be reassigned. Each starts
+  // unfiltered, which is what makes a dimension show new options as they
+  // arrive without any bookkeeping of what has been seen before.
+  const repoFilter = new Filter();
+  const typeFilter = new Filter();
+  const categoryFilter = new Filter();
+  const severityFilter = new Filter();
+  const statusFilter = new Filter();
   let minConfidence = $state(0);
   let sortBy = $state("severity");
 
-  // Options this component has ever seen, per dimension. An option showing
-  // up for the first time is selected automatically so new data cannot
-  // silently hide itself; an option the user deselected is already known,
-  // so it is never re-added behind their back. (A repo label changing from
-  // "unknown" to its real name is simply a new option, and is absorbed.)
-  const known = {
-    repos: new Set<string>(),
-    types: new Set<string>(),
-    categories: new Set<string>(),
-    severities: new Set<string>(),
-    statuses: new Set<string>(),
-  };
-
-  // absorb / reselect / needsSelector live in lib/selection.ts, shared
-  // with MultiSelect and pinned by lib/selection.test.ts.
-
-  $effect(() => {
-    absorb(repos, known.repos, selectedRepos);
-    absorb(types, known.types, selectedTypes);
-    absorb(categories, known.categories, selectedCategories);
-    absorb(severities, known.severities, selectedSeverities);
-    if (showStatus) absorb(statuses, known.statuses, selectedStatuses);
-  });
-
   export function clearFilters() {
-    // Reset from `known`, not from the options present right now. An
-    // option that has since vanished stays in `known`, so absorbing it
-    // again when it returns is a no-op — selecting only what is currently
-    // present would leave it permanently deselected, and its findings
-    // hidden, for a user who just asked to clear every filter.
-    reselect(selectedRepos, known.repos);
-    reselect(selectedTypes, known.types);
-    reselect(selectedCategories, known.categories);
-    reselect(selectedSeverities, known.severities);
-    if (showStatus) reselect(selectedStatuses, known.statuses);
+    repoFilter.reset();
+    typeFilter.reset();
+    categoryFilter.reset();
+    severityFilter.reset();
+    statusFilter.reset();
     minConfidence = 0;
   }
 
@@ -79,12 +51,12 @@
   const filtered = $derived.by(() => {
     let out = findings;
 
-    out = out.filter((f) => selectedRepos.has(repoNames.get(f.repo_id) ?? "unknown"));
-    out = out.filter((f) => selectedTypes.has(f.type));
-    out = out.filter((f) => f.category == null || selectedCategories.has(f.category));
-    out = out.filter((f) => selectedSeverities.has(f.severity));
+    out = out.filter((f) => repoFilter.accepts(repoNames.get(f.repo_id) ?? "unknown"));
+    out = out.filter((f) => typeFilter.accepts(f.type));
+    out = out.filter((f) => f.category == null || categoryFilter.accepts(f.category));
+    out = out.filter((f) => severityFilter.accepts(f.severity));
     if (showStatus) {
-      out = out.filter((f) => selectedStatuses.has(f.status));
+      out = out.filter((f) => statusFilter.accepts(f.status));
     }
     if (minConfidence > 0) {
       out = out.filter((f) => f.confidence >= minConfidence / 100);
@@ -127,24 +99,24 @@
 </script>
 
 <div class="filter-bar">
-  {#if needsSelector(repos, selectedRepos)}
-    <MultiSelect label="Repo" options={repos} selected={selectedRepos} />
+  {#if needsSelector(repos, repoFilter)}
+    <MultiSelect label="Repo" options={repos} filter={repoFilter} />
   {/if}
 
-  {#if needsSelector(types, selectedTypes)}
-    <MultiSelect label="Type" options={types} selected={selectedTypes} />
+  {#if needsSelector(types, typeFilter)}
+    <MultiSelect label="Type" options={types} filter={typeFilter} />
   {/if}
 
-  {#if needsSelector(categories, selectedCategories)}
-    <MultiSelect label="Class" options={categories} selected={selectedCategories} />
+  {#if needsSelector(categories, categoryFilter)}
+    <MultiSelect label="Class" options={categories} filter={categoryFilter} />
   {/if}
 
-  {#if needsSelector(severities, selectedSeverities)}
-    <MultiSelect label="Severity" options={severities} selected={selectedSeverities} />
+  {#if needsSelector(severities, severityFilter)}
+    <MultiSelect label="Severity" options={severities} filter={severityFilter} />
   {/if}
 
-  {#if showStatus && needsSelector(statuses, selectedStatuses)}
-    <MultiSelect label="Status" options={statuses} selected={selectedStatuses} />
+  {#if showStatus && needsSelector(statuses, statusFilter)}
+    <MultiSelect label="Status" options={statuses} filter={statusFilter} />
   {/if}
 
   <div class="control">
