@@ -1,10 +1,15 @@
 <script lang="ts">
   import { store } from "../lib/api.svelte";
   import type { Job } from "../lib/types";
-  import { ts, ktok, dur } from "../lib/format";
+  import { ts, datetime, ktok, dur } from "../lib/format";
 
   let events = $derived(store.events);
   let jobs = $derived(store.jobs);
+
+  // Full precision for the tooltip; the column itself stays narrow.
+  function exact(ms: number | null): string {
+    return ms ? new Date(ms).toLocaleString() : "";
+  }
 
   // A hunt can turn up a dozen findings; listing them all would push the
   // rest of the row off the table. The remainder stays reachable as a
@@ -119,6 +124,7 @@
             <thead>
               <tr>
                 <th class="th-ts">ID</th>
+                <th class="th-started">Started</th>
                 <th class="th-kind">Kind</th>
                 <th>Repo</th>
                 <th class="th-kind">Finding</th>
@@ -133,6 +139,13 @@
               {#each jobs as job (job.id)}
                 <tr>
                   <td class="cell-ts">#{job.id}</td>
+                  <!-- Date and time, not the bare time the events table
+                       above uses: 50 jobs routinely span several days, so
+                       "2:05 PM" alone would be ambiguous. The exact
+                       instant, to the second, is in the tooltip. -->
+                  <td class="cell-started" title={exact(job.started_at)}>
+                    {datetime(job.started_at)}
+                  </td>
                   <td class="cell-kind">{job.kind}</td>
                   <td class="cell-small">{job.repo_name}</td>
                   <td class="cell-links">
@@ -267,6 +280,12 @@
     width: 7rem;
   }
   .th-ts { width: 7rem; }
+  .th-started { width: 9rem; }
+  .cell-started {
+    color: var(--text-dim);
+    font-size: 0.6875rem;
+    white-space: nowrap;
+  }
 
   .cell-kind {
     color: var(--accent);
