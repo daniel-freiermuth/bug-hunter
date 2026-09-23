@@ -49,20 +49,21 @@
 
   let repos = $derived(store.summary?.repos ?? []);
 
-  // A repo id identifies a repo only among the repos alive at the same
-  // moment. `repos.id` is `INTEGER PRIMARY KEY` with no AUTOINCREMENT, so it
-  // aliases the rowid and SQLite hands the highest freed one to the next
-  // INSERT: delete the newest repo, add another, and it is issued the same
-  // id. Every collection below is keyed by that id, and `repoNotesCache`
-  // is never invalidated by anything — so the replacement repo would open
-  // its notes panel showing the deleted repo's notes, with no request made
-  // and nothing on screen saying the content is not its own.
+  // Every collection below is keyed by repo id, and `repoNotesCache` is
+  // never invalidated by anything else, so a stale entry would open a
+  // notes panel showing another repo's notes with no request made and
+  // nothing on screen saying the content is not its own.
   //
-  // Invalidating on *identity* rather than on the id disappearing: the id
-  // does not disappear in the case that matters. Delete and re-add between
-  // two polls and the client only ever sees id 15 followed by id 15, so an
-  // absence check never fires. It also covers the repo being replaced by
-  // the daemon or another tab, which no local delete handler would see.
+  // The daemon no longer reissues a freed id (`repos.id` is AUTOINCREMENT
+  // since migration 009), which removes the sharpest version of that —
+  // delete a repo, add another, receive the same id. What remains is the
+  // case a local delete handler cannot see at all: the repo being
+  // replaced by the daemon or from another tab, where the client observes
+  // only a row whose contents changed.
+  //
+  // So the cache is invalidated on *identity*, not on the id
+  // disappearing. An absence check would not fire for a replacement, and
+  // identity costs nothing extra here.
   function repoIdentity(r: Repo): string {
     return `${r.url}\u0000${r.added_at}`;
   }
@@ -350,11 +351,16 @@
                   last hunt: {datetime(repo.last_hunt_at)}
                 </div>
               </div>
+              <!-- Every action here repeats once per repo, so the visible verb
+                   on its own names N identical buttons in a screen reader's
+                   button list — including the destructive one. The repo name
+                   belongs in the accessible name, not in the visible label. -->
               <div class="repo-actions">
                 <button
                   onclick={() => toggleNotes(repo.id)}
                   class="notes-btn"
                   aria-expanded={expandedNotes.has(repo.id)}
+                  aria-label="Notes for {repo.name}"
                 >
                   Notes {expandedNotes.has(repo.id) ? '▾' : '▸'}
                 </button>
@@ -363,12 +369,14 @@
                   class="toggle-btn"
                   class:is-pausing={repo.enabled}
                   class:is-resuming={!repo.enabled}
+                  aria-label="{repo.enabled ? 'Pause' : 'Resume'} {repo.name}"
                 >
                   {repo.enabled ? 'Pause' : 'Resume'}
                 </button>
                 <button
                   onclick={() => removeRepo(repo)}
                   class="remove-btn"
+                  aria-label="Remove {repo.name}"
                 >
                   Remove
                 </button>
@@ -389,7 +397,13 @@
                   {/if}
                   <!-- Add note form -->
                   <div class="note-form">
+                    <!-- The ids carry the repo id because this form is inside
+                         the per-repo loop and several panels can be open at
+                         once: a constant id would repeat down the page and
+                         every label would point at the first repo's field. -->
+                    <label for="note-text-{repo.id}" class="note-label">Note</label>
                     <textarea
+                      id="note-text-{repo.id}"
                       placeholder="Add a note…"
                       value={newNoteText.get(repo.id) ?? ""}
                       oninput={(e: Event) => {
@@ -398,9 +412,11 @@
                       class="note-input"
                     ></textarea>
                     <div class="note-actions">
+                      <label for="note-category-{repo.id}" class="note-label">Category</label>
                       <input
+                        id="note-category-{repo.id}"
                         type="text"
-                        placeholder="Category (optional)"
+                        placeholder="optional"
                         value={newNoteCategory.get(repo.id) ?? ""}
                         oninput={(e: Event) => {
                           newNoteCategory.set(repo.id, (e.target as HTMLInputElement).value);
@@ -411,6 +427,9 @@
                         onclick={() => addNote(repo.id)}
                         disabled={notesSaving.has(repo.id)}
                         class="submit-btn"
+                        aria-label={notesSaving.has(repo.id)
+                          ? `Saving note for ${repo.name}`
+                          : `Add note to ${repo.name}`}
                       >
                         {notesSaving.has(repo.id) ? "Saving…" : "Add Note"}
                       </button>
@@ -797,6 +816,11 @@
   }
   .note-category::placeholder { color: rgba(136, 136, 136, 0.45); }
   .note-category:focus { border-color: var(--accent); outline: none; }
+
+  .note-label {
+    color: var(--text-dim);
+    font-size: 0.6875rem;
+  }
 
   /* ── Responsive ──────────────────────────────────────────────── */
   @media (max-width: 600px) {
