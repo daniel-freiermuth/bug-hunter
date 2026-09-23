@@ -3,9 +3,9 @@
 //! `NullBackend` over a WRITABLE tempdir copy of dev.db, with a scheduler
 //! handle standing in for the daemon's loop.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::Ordering;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -15,17 +15,27 @@ use hunter::store::Store;
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
-static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
+mod support;
 
-/// Fresh scratch dir per test (no tempfile dep; leaked in temp on purpose).
-fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "hunter-rs-post-test-{}-{}",
-        std::process::id(),
-        DIR_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(dir.join("ui")).unwrap();
-    dir
+/// `AppState` plus the scratch directory its files live in.
+///
+/// Field order is the contract: Rust drops fields in declaration order,
+/// so `state` — and with it the `Store`'s open SQLite pool — is gone
+/// before `_dir` removes the database out from under it.
+///
+/// `Deref` keeps every call site writing `&state`, and means the guard
+/// can only be dropped by dropping the state it came with.
+struct TestState {
+    state: AppState,
+    _dir: support::TempDir,
+}
+
+impl std::ops::Deref for TestState {
+    type Target = AppState;
+
+    fn deref(&self) -> &AppState {
+        &self.state
+    }
 }
 
 /// Refuse to run when this process can write through a read-only
@@ -46,21 +56,16 @@ fn scratch_dir() -> PathBuf {
 /// caller's `repos/` is untouched whether this passes or panics — which
 /// is also why it must be called BEFORE the caller's own chmod.
 fn require_enforced_permissions() {
-    let dir = std::env::temp_dir().join(format!(
-        "hunter-rs-perm-probe-{}-{}",
-        std::process::id(),
-        DIR_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    let probe = support::TempDir::new("perm-probe");
+    let dir = probe.path();
+    let mut perms = std::fs::metadata(dir).unwrap().permissions();
     perms.set_readonly(true);
-    std::fs::set_permissions(&dir, perms).unwrap();
+    std::fs::set_permissions(dir, perms).unwrap();
     let wrote = std::fs::write(dir.join("probe"), "x").is_ok();
-    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    let mut perms = std::fs::metadata(dir).unwrap().permissions();
     #[allow(clippy::permissions_set_readonly_false)]
     perms.set_readonly(false);
-    std::fs::set_permissions(&dir, perms).unwrap();
-    std::fs::remove_dir_all(&dir).ok();
+    std::fs::set_permissions(dir, perms).unwrap();
     assert!(
         !wrote,
         "this process writes through a read-only directory (running as \
@@ -108,11 +113,12 @@ async fn seeded_store(dir: &Path) -> Store {
     Store::connect(&db).await.unwrap()
 }
 
-async fn test_state() -> AppState {
-    let dir = scratch_dir();
-    let store = seeded_store(&dir).await;
+async fn test_state() -> TestState {
+    let dir = support::TempDir::new("post");
+    dir.subdir("ui");
+    let store = seeded_store(dir.path()).await;
     let config = Config {
-        root: dir.clone(),
+        root: dir.path().to_path_buf(),
         work_root: dir.join("data"),
         db_path: dir.join("hunter.db"),
         serve_port: 0,
@@ -137,15 +143,18 @@ async fn test_state() -> AppState {
         modernization_interval_days: 30,
         standards_interval_days: 30,
     };
-    AppState {
-        store: Arc::new(store),
-        config: Arc::new(config),
-        backend: Arc::new(hunter::backend::NullBackend),
-        repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        scheduler: hunter::server::SchedulerHandle {
-            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            wake: Arc::new(tokio::sync::Notify::new()),
+    TestState {
+        state: AppState {
+            store: Arc::new(store),
+            config: Arc::new(config),
+            backend: Arc::new(hunter::backend::NullBackend),
+            repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            scheduler: hunter::server::SchedulerHandle {
+                running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                wake: Arc::new(tokio::sync::Notify::new()),
+            },
         },
+        _dir: dir,
     }
 }
 
@@ -1336,5 +1345,100 @@ async fn changing_the_url_leaves_an_unrelated_clone_untouched() {
         out.trim(),
         "https://example.com/someone-else.git",
         "an unrelated checkout must not be rewritten -- that refusal is the point"
+    );
+}
+
+/// The clone that gets repointed is the one the scheduler actually uses.
+///
+/// Migration 007 left any path that did not end in the repo's name
+/// exactly as it was — an operator-edited one — and every scheduler
+/// runner syncs `repo.path`. A repoint that derived the directory from
+/// the id would rewrite nothing for such a row while `sync_repo` kept
+/// finding the old origin, which is the permanent refusal this is meant
+/// to avoid.
+#[tokio::test]
+async fn the_repoint_follows_an_operator_edited_path() {
+    let state = test_state().await;
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "moved", "url": "https://example.com/old.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let rid = body["repo"]["id"].as_i64().expect("new repo id");
+
+    // A clone somewhere the id does not name, recorded on the row.
+    let custom = state.config.work_root.join("elsewhere").join("checkout");
+    std::fs::create_dir_all(&custom).unwrap();
+    let cs = custom.to_string_lossy().to_string();
+    for argv in [
+        vec!["git", "-C", &cs, "init", "-q"],
+        vec![
+            "git",
+            "-C",
+            &cs,
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/old.git",
+        ],
+    ] {
+        let (rc, out) = hunter::util::run_cmd(&argv, 30);
+        assert_eq!(rc, 0, "fixture: {argv:?} failed: {out}");
+    }
+    // Straight to the column: no production code path sets a custom
+    // path, which is the point -- these rows predate the id layout.
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state.config.db_path.to_string_lossy()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE repos SET path = ?1 WHERE id = ?2")
+        .bind(&cs)
+        .bind(rid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let (status, body) = post(
+        &state,
+        "/api/repo",
+        json!({ "id": rid, "url": "https://example.com/new.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (_, out) = hunter::util::run_cmd(&["git", "-C", &cs, "remote", "get-url", "origin"], 30);
+    assert_eq!(
+        out.trim(),
+        "https://example.com/new.git",
+        "the clone named by repo.path is the one the scheduler syncs"
+    );
+}
+
+/// The scratch directory does not outlive the test that made it.
+///
+/// Each state carries a copy of `dev.db` plus whatever the POSTs wrote
+/// under `work_root`; left behind, a full run of this suite deposits one
+/// directory per test in the system temp dir, which on this machine is a
+/// tmpfs shared with every build. It filled twice in one day, and a
+/// truncated file mid-checkout is how that failure presents — nowhere
+/// near the tests that caused it.
+#[tokio::test]
+async fn the_scratch_dir_is_removed_with_the_state() {
+    let root = {
+        let state = test_state().await;
+        // Writes so the directory is not merely the db copy.
+        let (status, _) = post(&state, "/api/repo/notes", json!({ "id": 1, "note": "x" })).await;
+        assert_eq!(status, StatusCode::CREATED);
+        state.config.root.clone()
+    };
+    assert!(
+        !root.exists(),
+        "{} outlived its test and leaks into the temp dir",
+        root.display()
     );
 }

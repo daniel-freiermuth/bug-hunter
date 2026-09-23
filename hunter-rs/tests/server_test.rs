@@ -4,9 +4,8 @@
 //! (seeded writable, then reopened read-only — same helper pattern as the
 //! store tests, deliberately duplicated rather than shared).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
@@ -16,17 +15,27 @@ use hunter::store::Store;
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
-static DIR_SEQ: AtomicU32 = AtomicU32::new(0);
+mod support;
 
-/// Fresh scratch dir per test (no tempfile dep; leaked in temp on purpose).
-fn scratch_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "hunter-rs-server-test-{}-{}",
-        std::process::id(),
-        DIR_SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(dir.join("ui")).unwrap();
-    dir
+/// `AppState` plus the scratch directory its files live in.
+///
+/// Field order is the contract: Rust drops fields in declaration order,
+/// so `state` — and with it the `Store`'s open SQLite pool — is gone
+/// before `_dir` removes the database out from under it.
+///
+/// `Deref` keeps every call site writing `&state`, and means the guard
+/// can only be dropped by dropping the state it came with.
+struct TestState {
+    state: AppState,
+    _dir: support::TempDir,
+}
+
+impl std::ops::Deref for TestState {
+    type Target = AppState;
+
+    fn deref(&self) -> &AppState {
+        &self.state
+    }
 }
 
 /// Copy dev.db into `dir`, seed one repo + one finding + one event through
@@ -62,11 +71,12 @@ async fn seeded_store(dir: &Path) -> Store {
     Store::connect_read_only(&db).await.unwrap()
 }
 
-async fn test_state() -> AppState {
-    let dir = scratch_dir();
-    let store = seeded_store(&dir).await;
+async fn test_state() -> TestState {
+    let dir = support::TempDir::new("server");
+    dir.subdir("ui");
+    let store = seeded_store(dir.path()).await;
     let config = Config {
-        root: dir.clone(),
+        root: dir.path().to_path_buf(),
         work_root: dir.join("data"),
         db_path: dir.join("hunter.db"),
         serve_port: 0,
@@ -92,16 +102,19 @@ async fn test_state() -> AppState {
         modernization_interval_days: 30,
         standards_interval_days: 30,
     };
-    AppState {
-        store: Arc::new(store),
-        config: Arc::new(config),
-        backend: Arc::new(hunter::backend::NullBackend),
-        // Read-only GET tests; no cycle is triggered from here.
-        repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        scheduler: hunter::server::SchedulerHandle {
-            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+    TestState {
+        state: AppState {
+            store: Arc::new(store),
+            config: Arc::new(config),
+            backend: Arc::new(hunter::backend::NullBackend),
+            // Read-only GET tests; no cycle is triggered from here.
+            repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            scheduler: hunter::server::SchedulerHandle {
+                running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                wake: std::sync::Arc::new(tokio::sync::Notify::new()),
+            },
         },
+        _dir: dir,
     }
 }
 
@@ -295,4 +308,26 @@ async fn a_foreign_host_header_cannot_read_findings() {
             "Host {host} must be served"
         );
     }
+}
+
+/// The scratch directory does not outlive the test that made it.
+///
+/// Each state carries a copy of `dev.db`; left behind, a full run of this
+/// suite deposits one directory per test in the system temp dir, which on
+/// this machine is a tmpfs shared with every build. It filled twice in one
+/// day, and a truncated file mid-checkout is how that failure presents —
+/// nowhere near the tests that caused it.
+#[tokio::test]
+async fn the_scratch_dir_is_removed_with_the_state() {
+    let root = {
+        let state = test_state().await;
+        let root = state.config.root.clone();
+        assert!(root.join("hunter.db").exists(), "fixture: db was created");
+        root
+    };
+    assert!(
+        !root.exists(),
+        "{} outlived its test and leaks into the temp dir",
+        root.display()
+    );
 }
