@@ -11,6 +11,14 @@
   let showReasonPrompt = $state<string | null>(null); // "rejected" | "wontfix" | null
   let busy = $state(false);
 
+  // "PR #7" where the URL ends in a number, both forges' shape
+  // (/pull/7, /merge_requests/7). Anything else keeps the generic label
+  // rather than showing a wrong number -- the full URL is the tooltip.
+  function prLabel(url: string): string {
+    const n = /\/(\d+)\/?$/.exec(url);
+    return n ? `PR #${n[1]}` : "PR";
+  }
+
   function statusBadgeClass(status: string): string {
     switch (status) {
       case "new": return "status-new";
@@ -121,6 +129,25 @@
     {/if}
     {#if finding.needs_attention}
       <span class="attn-badge" title="Needs attention">⚠ {finding.needs_attention}</span>
+    {/if}
+    <!-- In the header, not just in the detail panel: once a finding has a
+         PR, that PR is the thing you want -- open ones to review, merged
+         ones to see what shipped -- and needing to expand the card made
+         the most common next step the least reachable.
+         Only linked when it parses as http(s) -- the URL is scraped from
+         `gh`/`glab` stdout, so the detail panel still shows anything else
+         as plain text rather than making it clickable. -->
+    {#if finding.pr_url && isHttpUrl(finding.pr_url)}
+      <a
+        class="pr-chip"
+        class:pr-chip-live={finding.status === "pr_open" || finding.status === "merged"}
+        href={finding.pr_url}
+        target="_blank"
+        rel="noopener"
+        title={finding.pr_url}
+      >
+        {prLabel(finding.pr_url)} ↗
+      </a>
     {/if}
     <span class="status-pill {statusBadgeClass(finding.status)}">
       {finding.status}
@@ -341,6 +368,33 @@
     border-radius: 99px;
     background: rgba(238, 85, 68, 0.12);
     color: var(--sev-high);
+  }
+
+  /* Muted only where the PR led nowhere -- a rejected finding's PR is a
+     dead end. An open PR is waiting on you and a merged one is the
+     record of what actually shipped; both stay prominent. */
+  .pr-chip {
+    font-size: 0.625rem;
+    font-weight: 600;
+    padding: 0.05rem 0.4rem;
+    border-radius: 99px;
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .pr-chip:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .pr-chip-live {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .pr-chip-live:hover {
+    background: var(--accent);
+    color: var(--bg);
   }
 
   .status-pill {
