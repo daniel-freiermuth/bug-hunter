@@ -92,28 +92,83 @@ class Forge:
 # ---------------------------------------------------------------------------
 
 
+def _url_path(url: str) -> str:
+    """Path half of a git remote URL, for every form the API accepts."""
+    m = re.match(r"^(?:https?|ssh)://[^/]+(/.*)$", url)
+    if m:
+        return m.group(1)
+    m = re.match(r"^[^/:]+:(.*)$", url)
+    return m.group(1) if m else ""
+
+
+def is_github_host(host: str) -> bool:
+    """Whether `host` is a GitHub instance.
+
+    github.com, an Enterprise Server install (which by convention
+    carries a "github" label, as in github.corp.com), or Enterprise
+    Cloud's <org>.ghe.com. Labels, not substrings, so notgithub.com
+    does not qualify.
+
+    One definition of "is GitHub", shared with detect_forge: a host
+    classified as GitHub that the GitHub operations then reject is how
+    every PR action for an Enterprise repo failed to parse its slug.
+    """
+    labels = host.lower().split(".")
+    return "github" in labels or labels[-2:] == ["ghe", "com"]
+
+
 class GitHubForge(Forge):
     name = "github"
 
-    _URL_RE = re.compile(
-        r"^(?:https://github\.com/|git@github\.com:)"
-        r"([^/]+)/(.+?)(?:\.git)?/?$"
-    )
-    _PR_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+)/pull/(\d+)")
+    _PR_PATH_RE = re.compile(r"^([^/]+/[^/]+)/pull/(\d+)")
+
+    @staticmethod
+    def _slug(url: str) -> str | None:
+        """`[HOST/]OWNER/REPO`, gh's -R form, or None if not a GitHub URL.
+
+        Host-qualified for Enterprise, because `gh -R owner/repo` would
+        ask github.com about a repo that only exists on the internal
+        instance. Bare for github.com, which is what every existing
+        caller and stored slug already looks like.
+        """
+        host = _extract_host(url)
+        if not is_github_host(host):
+            return None
+        path = _url_path(url).strip("/").removesuffix(".git")
+        owner, _, repo = path.partition("/")
+        if not owner or not repo:
+            return None
+        if host.lower() == "github.com":
+            return f"{owner}/{repo}"
+        return f"{host.lower()}/{owner}/{repo}"
 
     def ssh_url(self, https_url: str) -> str:
-        m = re.match(r"^https://github\.com/([^/]+)/(.+?)(?:\.git)?/?$", https_url)
-        if m:
-            return f"git@github.com:{m.group(1)}/{m.group(2)}.git"
-        return https_url
+        # Enterprise hosts too: rewriting a self-hosted GitHub remote to
+        # github.com would push an internal repo at the public forge.
+        if not https_url.startswith("https://"):
+            return https_url
+        host = _extract_host(https_url)
+        if not is_github_host(host):
+            return https_url
+        path = _url_path(https_url).strip("/").removesuffix(".git")
+        return f"git@{host}:{path}.git" if path else https_url
 
     def owner_repo(self, url: str) -> str | None:
-        m = self._URL_RE.match(url)
-        return f"{m.group(1)}/{m.group(2)}" if m else None
+        return self._slug(url)
 
     def parse_pr_url(self, url: str) -> tuple[str, int] | None:
-        m = self._PR_RE.match(url)
-        return (m.group(1), int(m.group(2))) if m else None
+        if not url.startswith("https://"):
+            return None
+        host = _extract_host(url)
+        if not is_github_host(host):
+            return None
+        m = self._PR_PATH_RE.match(_url_path(url).lstrip("/"))
+        if not m:
+            return None
+        slug = m.group(1)
+        if host.lower() != "github.com":
+            slug = f"{host.lower()}/{slug}"
+        return (slug, int(m.group(2)))
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -499,24 +554,54 @@ FORGE_NAMES: tuple[str, ...] = tuple(_FORGES)
 
 
 def _extract_host(url: str) -> str:
-    """Extract hostname from a git remote URL."""
-    m = re.match(r"^https?://([^/]+)", url)
+    """Hostname of a git remote URL, for every form the API accepts.
+
+    https://, http://, ssh:// and the scp-like git@host:path, with any
+    user@ and :port stripped. Mirrors hunter-rs's url_host.
+
+    Returning no host for an unparseable URL matters: this used to
+    return the literal "gitlab.com", which meant every ssh:// URL --
+    a form the API accepts -- was read as GitLab, so a GitHub repo
+    added over ssh ran every PR operation through
+    `glab --hostname github.com`.
+    """
+    m = re.match(r"^(?:https?|ssh)://([^/]+)", url)
     if m:
-        return m.group(1)
-    m = re.match(r"^git@([^:]+):", url)
-    if m:
-        return m.group(1)
-    return "gitlab.com"
+        authority = m.group(1)
+    else:
+        m = re.match(r"^([^/:]+):", url)
+        if not m:
+            return ""
+        authority = m.group(1)
+    host = authority.rpartition("@")[2] or authority
+    return host.partition(":")[0]
 
 
 def detect_forge(url: str) -> str:
-    """Best-effort forge type from a remote URL."""
-    host = _extract_host(url).lower()
-    if "github" in host:
+    """Which forge serves `url`, from its host alone.
+
+    The asymmetry is the point: GitHub is only ever reachable at domains
+    GitHub operates -- github.com and Enterprise Cloud's <org>.ghe.com --
+    plus Enterprise Server installs, which by convention carry a
+    "github" label (github.corp.com). GitLab has no such bound: any
+    hostname can be a self-hosted GitLab, and code.corp.com or
+    git.corp.com usually is one. GitHub gets the closed list; GitLab
+    gets the remainder.
+
+    Matching is per label rather than by substring, so a host merely
+    containing the letters (notgithub.com) is not GitHub. That is a
+    sanity bound, not an anti-spoofing measure: the URL comes from the
+    operator adding their own repo, and github.com.evil.example would
+    still read as GitHub.
+
+    This is only the fallback. An operator running something else, or a
+    GitHub Enterprise Server at a host that hides it, passes `forge`
+    explicitly on POST /api/repos and never reaches this function.
+    """
+    host = _extract_host(url)
+    if is_github_host(host):
         return "github"
-    if "gitlab" in host:
-        return "gitlab"
-    return "github"
+    return "gitlab"
 
 
 def forge_for(repo: Row) -> Forge:
