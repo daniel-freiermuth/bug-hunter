@@ -99,6 +99,12 @@
         toast(`${repo.name} ${enabled ? "enabled" : "paused"}`, true);
         store.refresh();
       } else {
+        // post() resolves on 4xx/5xx, so the toast is the only other trace
+        // this write ever leaves: without the status a refused toggle and a
+        // crashed daemon look identical from the console.
+        console.error(
+          `toggle repo ${repo.name} (id ${repo.id}) rejected with HTTP ${r.status}`,
+        );
         toast(`Failed to toggle ${repo.name}`, false);
       }
     } catch (err) {
@@ -115,6 +121,9 @@
         toast(`Removed ${repo.name}`, true);
         store.refresh();
       } else {
+        console.error(
+          `remove repo ${repo.name} (id ${repo.id}) rejected with HTTP ${r.status}`,
+        );
         toast(`Failed to remove ${repo.name}`, false);
       }
     } catch (err) {
@@ -138,6 +147,9 @@
     try {
       const r = await post("/api/repos", body);
       if (!r.ok) {
+        console.error(
+          `add repo ${newUrl.trim()} rejected with HTTP ${r.status}`,
+        );
         toast("Failed to add repo", false);
         return false;
       }
@@ -201,6 +213,9 @@
           ...(category ? { category } : {}),
         });
         if (!r.ok) {
+          console.error(
+            `add note to repo ${repoId} rejected with HTTP ${r.status}`,
+          );
           toast("Failed to add note", false);
           return;
         }

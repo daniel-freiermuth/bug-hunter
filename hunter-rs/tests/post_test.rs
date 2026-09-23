@@ -852,6 +852,82 @@ async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
     );
 }
 
+/// The same must hold when it is the *notes* that cannot be removed.
+///
+/// Reclamation removes two things, and the sibling test above only ever
+/// reaches the first: the clone directory fails, so the notes removal is
+/// never attempted and neither is the branch that has to propagate its
+/// failure. Make notes best-effort — `let _ = remove_file(..)`, which is
+/// tempting since they are secondary to the clone — and the row is
+/// dropped while the operator's private context is still on disk, with
+/// nothing left that will ever retry it. That is the one outcome
+/// two-phase deletion exists to prevent, and nothing else fails.
+///
+/// The obstruction is a directory at the notes path: `unlink` refuses a
+/// directory outright, so this needs no permission games and holds under
+/// root, where the sibling test has to bow out.
+#[tokio::test]
+async fn notes_that_cannot_be_removed_keep_the_id_reserved_too() {
+    let state = test_state().await;
+
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "throwaway", "url": "https://example.com/throwaway.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let rid = body["repo"]["id"].as_i64().expect("new repo id");
+
+    let notes_path = Store::notes_path(&state.config.work_root, rid);
+    std::fs::create_dir_all(&notes_path).unwrap();
+    std::fs::write(notes_path.join("occupied"), "x").unwrap();
+    // The clone was never made, so its removal reports NotFound and is
+    // skipped -- this test only gets to say anything because the notes
+    // step runs after it.
+    let clone_dir = Store::repo_dir(&state.config.work_root.join("repos"), rid);
+    assert!(
+        !clone_dir.exists(),
+        "fixture: the clone must be absent, or it fails first"
+    );
+
+    let sink = LogSink::default();
+    let capture = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .finish(),
+    );
+    let (status, body) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
+    drop(capture);
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        state.store.deleted_repo_ids().await.unwrap(),
+        vec![rid],
+        "notes left on disk must keep the repo reapable, not release its id"
+    );
+    let logged = sink.text();
+    assert!(
+        logged.contains(&format!("repo {rid} deleted, but reclaiming ")),
+        "a failed reclamation must be logged: {logged}"
+    );
+
+    // And once the obstruction is gone the reaper finishes, which is what
+    // makes the retained row a retry rather than a wedge.
+    std::fs::remove_dir_all(&notes_path).unwrap();
+    let reaped = hunter::server::reap_deleted_repos(
+        &state.store,
+        &state.config.work_root,
+        &state.repo_notes,
+    )
+    .await;
+    assert_eq!(reaped, 1);
+    assert!(
+        state.store.deleted_repo_ids().await.unwrap().is_empty(),
+        "and only then release the id"
+    );
+}
+
 /// A repo URL that would execute when clicked is rejected at the write.
 ///
 /// `Repo.url` is rendered as an `<a href>`, so a stored `javascript:` URL

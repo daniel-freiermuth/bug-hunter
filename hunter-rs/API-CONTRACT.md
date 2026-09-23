@@ -135,7 +135,7 @@ Store: `list_all_findings` (store.py:397-441): `SELECT * FROM findings [WHERE st
 | `test_gap` | literal `"coverage"` |
 | `refactor` | `smell_type` value |
 | `modernization` | `modernization_class` value |
-| `standards` | `standard_section` value — Rust-only branch (`Finding::category()`, types.rs:136-145); the Python mapping has no `standards` case |
+| `standards` | `standard_section` value (`Finding::category()` types.rs:138-147; Python store.py:892-893) |
 | anything else | **key absent** |
 
 (Legacy `list_findings`, store.py:372-395: same SELECT minus the `type` cond and minus `category`.)

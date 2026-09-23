@@ -6,9 +6,13 @@
 //! `OmpScavengeBackend`.
 //!
 //! Decisions cross this boundary as data (`Outlook`); diagnostics cross as
-//! presentation (an HTML fragment the backend fully owns — the typed
-//! `WindowPanel` model behind it lives in the `omp_scavenge` impl and becomes
-//! the API payload when the Svelte UI lands, per future.md §8.1).
+//! presentation (an HTML fragment the backend fully owns). The typed
+//! `WindowPanel` model behind that fragment stays private to the
+//! `omp_scavenge` impl: the set of window dimensions a backend reports is
+//! its own vocabulary, so typing it here would put one impl's shape into the
+//! shared contract. The resulting coupling to the UI's CSS class names is
+//! paid for by specifying the markup byte-exactly instead
+//! (BACKEND-CONTRACT.md §2.3).
 
 use async_trait::async_trait;
 

@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS repos (
 
 CREATE TABLE IF NOT EXISTS findings (
   id            INTEGER PRIMARY KEY,
-  type          TEXT NOT NULL,             -- bug | dep_update | test_gap | refactor
+  type          TEXT NOT NULL,             -- bug | dep_update | test_gap | refactor | modernization | standards
   repo_id       INTEGER NOT NULL REFERENCES repos(id),
   fingerprint   TEXT NOT NULL,
   file          TEXT,
