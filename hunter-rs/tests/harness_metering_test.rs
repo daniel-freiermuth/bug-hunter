@@ -184,15 +184,25 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
     let calls = fx.bins.calls_to("omp");
     let argv = calls.first().expect("omp was invoked");
     assert_eq!(calls.len(), 1);
-    assert_eq!(argv[..3], ["omp", "-p", PROMPT]);
-    assert!(
-        argv.contains(&"--model=test-model".to_owned()),
+    // OMP's print mode takes a variadic message: every option must come
+    // before `-p <prompt>`, or the CLI reads it as more prompt text.
+    let print_arg = argv
+        .iter()
+        .position(|arg| arg == "-p")
+        .expect("OMP print flag");
+    assert_eq!(
+        argv.get(print_arg + 1),
+        Some(&PROMPT.to_owned()),
         "got {argv:?}"
     );
-    let sdir = argv
+    assert!(
+        argv[..print_arg].contains(&"--model=test-model".to_owned()),
+        "got {argv:?}"
+    );
+    let sdir = argv[..print_arg]
         .iter()
         .find_map(|a| a.strip_prefix("--session-dir="))
-        .expect("worker handed a session dir");
+        .expect("session directory must be passed as an option, before -p");
     assert!(
         std::path::Path::new(sdir).starts_with(
             hunter::backends::omp_scavenge::harness::sessions_root(&fx.cfg.work_root,)

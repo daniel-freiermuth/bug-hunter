@@ -269,16 +269,17 @@ pub fn run_worker(
         };
     }
 
-    // Build command: [omp_bin, "-p", prompt] + optional flags
+    // OMP's print mode has a variadic message argument. All options must
+    // precede `-p <prompt>` or the CLI treats them as additional prompt text.
     let mut cmd = Command::new(&cfg.omp_bin);
-    cmd.arg("-p").arg(prompt);
-    cmd.arg(format!("--session-dir={}", run_dir.display()));
     if let Some(m) = model {
         cmd.arg(format!("--model={m}"));
     }
     if let Some(smol) = &cfg.model_smol {
         cmd.arg(format!("--smol={smol}"));
     }
+    cmd.arg(format!("--session-dir={}", run_dir.display()));
+    cmd.arg("-p").arg(prompt);
 
     // Spawn in its own process group (for group-kill).
     #[cfg(unix)]
