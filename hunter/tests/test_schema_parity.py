@@ -26,6 +26,7 @@ cargo toolchain into it.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -41,9 +42,19 @@ MIGRATIONS = Path(__file__).resolve().parents[2] / "hunter-rs" / "migrations"
 # counterpart by design.
 IGNORED_TABLES = {"_sqlx_migrations"}
 
+# `sqlite_master.sql` is the CREATE statement as typed, comments and
+# all, and `repos`' comment explains why the keyword is there -- so a
+# plain substring test reports AUTOINCREMENT for a table that no longer
+# declares it. Strip comments first, then match the keyword itself.
+_SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def _declares_autoincrement(create_sql: str) -> bool:
+    return bool(re.search(r"\bAUTOINCREMENT\b", _SQL_COMMENT.sub(" ", create_sql), re.IGNORECASE))
+
 
 def _snapshot(db_path: Path) -> dict[str, Any]:
-    """Semantic schema: tables, columns and indexes.
+    """Semantic schema: tables, columns, indexes and rowid allocation.
 
     Deliberately not a text diff of the DDL. The two systems arrive at
     the same schema by different routes — Python from one `CREATE
@@ -52,18 +63,28 @@ def _snapshot(db_path: Path) -> dict[str, Any]:
     the set of columns with their types, nullability, defaults and
     primary keys, and the set of indexes with their uniqueness and
     covered columns.
+
+    `PRAGMA table_info` is blind to AUTOINCREMENT — it describes
+    `INTEGER PRIMARY KEY` and `INTEGER PRIMARY KEY AUTOINCREMENT`
+    identically — so that one keyword is read out of the stored DDL
+    instead. It is not cosmetic: without it SQLite reissues the highest
+    freed rowid, and a `repos.id` reused while the previous repo's
+    `repos/repo-<id>` clone is still on disk points the new repo at the
+    old one's files. Both daemons share `work_root`, so only one of them
+    having it is the same as neither having it.
     """
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         out: dict[str, Any] = {}
-        tables = [
-            r[0]
+        table_sql = {
+            r[0]: r[1] or ""
             for r in db.execute(
-                "SELECT name FROM sqlite_master "
+                "SELECT name, sql FROM sqlite_master "
                 "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
             )
             if r[0] not in IGNORED_TABLES
-        ]
+        }
+        tables = list(table_sql)
         for table in tables:
             cols = {
                 r[1]: (r[2].upper(), bool(r[3]), r[4], bool(r[5]))
@@ -78,7 +99,11 @@ def _snapshot(db_path: Path) -> dict[str, Any]:
                 # name for the same guarantee. Key on the guarantee.
                 key = name if not name.startswith("sqlite_autoindex") else f"<unique:{covered}>"
                 indexes[key] = (unique, covered)
-            out[table] = {"columns": cols, "indexes": indexes}
+            out[table] = {
+                "columns": cols,
+                "indexes": indexes,
+                "autoincrement": _declares_autoincrement(table_sql[table]),
+            }
         return out
     finally:
         db.close()
@@ -126,6 +151,12 @@ def _assert_same(expected: dict[str, Any], actual: dict[str, Any], what: str) ->
             f"{what}: {table} indexes differ — "
             f"python {expected[table]['indexes']} vs rust {actual[table]['indexes']}"
         )
+        assert expected[table]["autoincrement"] == actual[table]["autoincrement"], (
+            f"{what}: {table} AUTOINCREMENT differs — "
+            f"python {expected[table]['autoincrement']} vs "
+            f"rust {actual[table]['autoincrement']}; the two daemons would "
+            "allocate rowids differently for the same table"
+        )
 
 
 def test_migrations_dir_exists() -> None:
@@ -170,6 +201,87 @@ def test_upgraded_databases_match(tmp_path: Path) -> None:
     _rust_schema(rs_db)  # Rust brings the same start forward
 
     _assert_same(_snapshot(py_db), _snapshot(rs_db), "upgraded install")
+
+
+def test_python_upgrade_rebuilds_repos_without_reusing_ids(tmp_path: Path) -> None:
+    """The rebuild behind that flag, asserted as behaviour.
+
+    Schema equality says the keyword is there; this says what it buys
+    and what the rebuild must not cost. `repos.id` is referenced by
+    `findings.repo_id` and `jobs.repo_id`, so copying the rows into a
+    new table has to carry the ids verbatim — a renumbering reparents
+    those rows silently, and nothing downstream would notice.
+    """
+    db_path = tmp_path / "pre_autoincrement.db"
+    _rust_schema(db_path, through=8)  # 001..008: repos.id is a bare rowid alias
+    db = sqlite3.connect(db_path)
+    try:
+        create_sql = db.execute("SELECT sql FROM sqlite_master WHERE name = 'repos'").fetchone()[0]
+        assert not _declares_autoincrement(create_sql), "seed must start without the keyword"
+        # Non-contiguous ids: a straight copy preserves them, a rebuild
+        # that renumbers would close the gap and look tidy doing it.
+        for rid, name in ((1, "alpha"), (4, "beta"), (9, "gamma")):
+            db.execute(
+                "INSERT INTO repos (id, name, url, path, forge, default_branch,"
+                " enabled, added_at) VALUES (?, ?, ?, ?, 'github', 'main', 1, 1)",
+                (rid, name, f"https://example.invalid/{name}", f"/w/repos/repo-{rid}"),
+            )
+        db.execute(
+            "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence,"
+            " summary, status, created_at, updated_at)"
+            " VALUES (7, 'bug', 9, 'fp', 'high', 0.9, 's', 'new', 1, 1)"
+        )
+        db.execute("INSERT INTO jobs (id, kind, repo_id, state) VALUES (3, 'hunt', 4, 'done')")
+        db.commit()
+        before = db.execute("SELECT id, name FROM repos ORDER BY id").fetchall()
+    finally:
+        db.close()
+
+    Store(Config(work_root=tmp_path, db_path=db_path))
+
+    db = sqlite3.connect(db_path)
+    try:
+        create_sql = db.execute("SELECT sql FROM sqlite_master WHERE name = 'repos'").fetchone()[0]
+        assert _declares_autoincrement(create_sql), "the upgrade must add AUTOINCREMENT"
+        assert db.execute("SELECT id, name FROM repos ORDER BY id").fetchall() == before
+        assert db.execute("PRAGMA foreign_key_check").fetchall() == [], (
+            "the table swap orphaned a findings or jobs row"
+        )
+        assert db.execute("SELECT repo_id FROM findings WHERE id = 7").fetchone()[0] == 9
+        assert db.execute("SELECT repo_id FROM jobs WHERE id = 3").fetchone()[0] == 4
+        assert db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'repos_deleted_at'"
+        ).fetchone(), "the DROP took migration 008's partial index with it"
+
+        # The point of the keyword: free the highest id and the next
+        # insert must climb past it, not step into the hole.
+        db.execute("DELETE FROM findings WHERE repo_id = 9")
+        db.execute("DELETE FROM repos WHERE id = 9")
+        db.commit()
+        reissued = db.execute(
+            "INSERT INTO repos (name, url, path, forge, default_branch, enabled, added_at)"
+            " VALUES ('delta', 'https://example.invalid/delta', '/w/repos/x', 'github',"
+            " 'main', 1, 1)"
+        ).lastrowid
+        db.commit()
+        assert reissued == 10, f"id {reissued} reuses a freed repo id"
+    finally:
+        db.close()
+
+    # The live database already has the keyword; opening it again must
+    # not rebuild anything.
+    Store(Config(work_root=tmp_path, db_path=db_path))
+    db = sqlite3.connect(db_path)
+    try:
+        assert (
+            db.execute(
+                "SELECT name FROM sqlite_master WHERE name LIKE '\\_repos%' ESCAPE '\\'"
+            ).fetchall()
+            == []
+        ), "a second open left a rebuild table behind"
+        assert db.execute("SELECT COUNT(*) FROM repos").fetchone()[0] == 3
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize("types", [("bug", "test_gap"), ("refactor", "dep_update")])
