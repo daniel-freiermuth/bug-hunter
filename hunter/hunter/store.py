@@ -840,9 +840,25 @@ class Store:
         assert cur.lastrowid is not None
         return cur.lastrowid, True
 
+    # Columns the daemon keeps for itself. These reads are `SELECT *`
+    # while the Rust port names its columns one by one, so a column added
+    # for internal use silently becomes part of one daemon's API
+    # responses and not the other's. Dropping them here keeps the two
+    # shapes identical without giving up `SELECT *`.
+    #
+    # found_by_job: which job produced a finding is already reported the
+    # other way round, as produced_finding_ids on /api/jobs.
+    _INTERNAL_FINDING_COLS = ("found_by_job",)
+
+    @classmethod
+    def _public_finding(cls, row: Row) -> Row:
+        for col in cls._INTERNAL_FINDING_COLS:
+            row.pop(col, None)
+        return row
+
     def get_finding(self, fid: int) -> Row | None:
         r = self.db.execute("SELECT * FROM findings WHERE id = ?", (fid,)).fetchone()
-        return dict(r) if r else None
+        return self._public_finding(dict(r)) if r else None
 
     def list_findings(
         self,
@@ -891,6 +907,7 @@ class Store:
                 r["category"] = r.get("modernization_class")
             elif r["type"] == "standards":
                 r["category"] = r.get("standard_section")
+            self._public_finding(r)
         return rows
 
     def set_status(
