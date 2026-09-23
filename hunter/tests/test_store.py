@@ -1199,3 +1199,48 @@ def test_standards_finding_round_trips_through_the_fallback(store: Store) -> Non
     assert listed[0]["category"] == section, (
         "standards findings must expose their section as category, like every other type"
     )
+
+
+class TestLedgerQueriesUseThePartialIndex:
+    """The budget sums must not scan the jobs table.
+
+    jobs_finished_at is declared WHERE finished_at IS NOT NULL AND
+    tokens_new IS NOT NULL, so a query that does not carry the second
+    predicate cannot use it -- SQLite has no way to prove the query only
+    touches indexed rows, and falls back to scanning every job. The
+    predicate does not change the sums, since SUM skips NULLs.
+
+    The plan is taken from the SQL the methods actually execute, not
+    from a copy pasted into the test: a copy stays green when the real
+    query loses the predicate, which is the only regression this is
+    here to catch.
+    """
+
+    @staticmethod
+    def _captured_plan(store: Store, call: str) -> list[str]:
+        # The trace callback reports each statement with its parameters
+        # already bound, so the plan below is of the statement the method
+        # really ran -- there is no copy of the SQL here to drift.
+        seen: list[str] = []
+        store.db.set_trace_callback(seen.append)
+        try:
+            if call == "since":
+                store.finished_since(0)
+            else:
+                store.finished_between(0, now_ms())
+        finally:
+            store.db.set_trace_callback(None)
+
+        sql = next(s for s in seen if "SUM(tokens_new)" in s)
+        rows = store.db.execute("EXPLAIN QUERY PLAN " + sql).fetchall()
+        return [r["detail"] for r in rows]
+
+    def test_finished_since_searches_the_index(self, store: Store) -> None:
+        plan = self._captured_plan(store, "since")
+        assert any("jobs_finished_at" in d for d in plan), plan
+        assert not any(d.startswith("SCAN jobs") for d in plan), plan
+
+    def test_finished_between_searches_the_index(self, store: Store) -> None:
+        plan = self._captured_plan(store, "between")
+        assert any("jobs_finished_at" in d for d in plan), plan
+        assert not any(d.startswith("SCAN jobs") for d in plan), plan

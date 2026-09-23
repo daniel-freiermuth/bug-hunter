@@ -1249,19 +1249,34 @@ class Store:
         return int(r["total"])
 
     def finished_since(self, ts_ms: int) -> int:
-        """SUM(tokens_new) of jobs that finished after ts_ms."""
+        """SUM(tokens_new) of jobs that finished after ts_ms.
+
+        `tokens_new IS NOT NULL` does not change the sum -- SUM skips
+        NULLs -- it is what makes the row eligible for the partial index
+        jobs_finished_at, which is declared WHERE finished_at IS NOT NULL
+        AND tokens_new IS NOT NULL. Without it SQLite cannot prove the
+        query only touches indexed rows and falls back to scanning every
+        job. Same predicate as the Rust port's copy of this query.
+        """
         r = self.db.execute(
             "SELECT COALESCE(SUM(tokens_new), 0) AS total FROM jobs"
-            " WHERE state != 'running' AND finished_at > ?",
+            " WHERE state != 'running' AND tokens_new IS NOT NULL"
+            " AND finished_at > ?",
             (ts_ms,),
         ).fetchone()
         return int(r["total"])
 
     def finished_between(self, start_ms: int, end_ms: int) -> int:
-        """SUM(tokens_new) of jobs that finished in (start_ms, end_ms]."""
+        """SUM(tokens_new) of jobs that finished in (start_ms, end_ms].
+
+        Carries `tokens_new IS NOT NULL` for the same reason as
+        finished_since: it is the partial index's predicate, not a filter
+        on the result.
+        """
         r = self.db.execute(
             "SELECT COALESCE(SUM(tokens_new), 0) AS total FROM jobs"
-            " WHERE state != 'running' AND finished_at > ? AND finished_at <= ?",
+            " WHERE state != 'running' AND tokens_new IS NOT NULL"
+            " AND finished_at > ? AND finished_at <= ?",
             (start_ms, end_ms),
         ).fetchone()
         return int(r["total"])
