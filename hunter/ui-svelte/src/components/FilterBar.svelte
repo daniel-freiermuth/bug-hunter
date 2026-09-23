@@ -85,15 +85,6 @@
       case "oldest":
         out.sort((a, b) => a.created_at - b.created_at);
         break;
-      case "repo":
-        out.sort((a, b) => {
-          const ra = repoNames.get(a.repo_id) ?? "unknown";
-          const rb = repoNames.get(b.repo_id) ?? "unknown";
-          const rc = ra.localeCompare(rb);
-          if (rc !== 0) return rc;
-          return (SEV_RANK[b.severity] ?? 0) - (SEV_RANK[a.severity] ?? 0);
-        });
-        break;
     }
 
     return out;
@@ -149,7 +140,6 @@
       <option value="newest">Newest</option>
       <option value="updated">Recently updated</option>
       <option value="oldest">Oldest</option>
-      <option value="repo">By repo</option>
     </select>
   </div>
 </div>
