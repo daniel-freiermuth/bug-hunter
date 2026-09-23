@@ -35,23 +35,37 @@ _LIST_REQUIRED_FIELDS = frozenset({"missing_tests"})
 
 
 def ingest_findings(
-    store: Store, repo_id: int, findings_path: Path, finding_type: str | None = "bug"
+    store: Store,
+    repo_id: int,
+    findings_path: Path,
+    finding_type: str | None = "bug",
+    job: int | None = None,
 ) -> dict[str, int]:
     """finding_type=None means every entry in the file declares its own
     "type" (used for FOLLOW-UPS.json, which can propose any kind of
     follow-up, not just one fixed type per file -- see
-    hunter.scheduler's ingestion call sites)."""
+    hunter.scheduler's ingestion call sites).
+
+    `job` is the job whose output is being ingested: it is recorded on
+    every finding this call creates, and on every event it logs, so the
+    findings a hunt turned up can be read back off the job itself rather
+    than inferred from event text and timestamps. None where no job
+    produced the file (the renovate dep scan runs no worker).
+    """
     result: dict[str, int] = {"inserted": 0, "duplicates": 0, "invalid": 0}
     try:
         entries = json.loads(Path(findings_path).read_text())
     except (OSError, json.JSONDecodeError) as e:
-        store.log_event("error", f"ingest: unreadable findings file {findings_path}: {e}")
+        store.log_event(
+            "error", f"ingest: unreadable findings file {findings_path}: {e}", job_id=job
+        )
         result["invalid"] += 1
         return result
     if not isinstance(entries, list):
         store.log_event(
             "error",
             f"ingest: findings root is not a list in {findings_path}",
+            job_id=job,
         )
         result["invalid"] += 1
         return result
@@ -67,6 +81,7 @@ def ingest_findings(
             store.log_event(
                 "error",
                 f"ingest: entry {i} has unknown/missing type {entry_type!r}: {json.dumps(f)[:300]}",
+                job_id=job,
             )
             continue
         problem = _validate(f, entry_type)
@@ -75,15 +90,25 @@ def ingest_findings(
             store.log_event(
                 "error",
                 f"ingest: entry {i} invalid ({problem}): {json.dumps(f)[:300]}",
+                job_id=job,
             )
             continue
         row: Row = dict(f)
         row["confidence"] = max(0.0, min(1.0, float(row.get("confidence", 0.0))))
-        fid, inserted = store.upsert_finding(repo_id, row, finding_type=entry_type)
+        fid, inserted = store.upsert_finding(
+            repo_id, row, finding_type=entry_type, found_by_job=job
+        )
         event_kind = "hunt" if entry_type == "bug" else entry_type
         if inserted:
             result["inserted"] += 1
-            store.log_event(event_kind, f"new {entry_type}: {row['fingerprint']}", finding_id=fid)
+            # The event marking a finding coming into existence is the one
+            # that most needs to say which job produced it.
+            store.log_event(
+                event_kind,
+                f"new {entry_type}: {row['fingerprint']}",
+                job_id=job,
+                finding_id=fid,
+            )
         else:
             result["duplicates"] += 1
     return result

@@ -1244,3 +1244,35 @@ class TestLedgerQueriesUseThePartialIndex:
         plan = self._captured_plan(store, "between")
         assert any("jobs_finished_at" in d for d in plan), plan
         assert not any(d.startswith("SCAN jobs") for d in plan), plan
+
+
+class TestFindingResponseShapeMatchesRust:
+    """Internal columns must not leak into findings responses.
+
+    The Python reads are `SELECT *` while the Rust port names its columns
+    one by one, so any column added for the daemon's own use appears on
+    one daemon's API responses and not the other's. The frontend is
+    served by whichever daemon is running, so the two shapes have to
+    agree.
+    """
+
+    def test_found_by_job_is_not_in_the_findings_shape(self, store: Store) -> None:
+        rid = store.add_repo(
+            "w", "https://github.com/a/w.git", store.cfg.work_root / "repos", "main", "github"
+        )
+        jid = store.create_job("hunt", rid, None, 1000, "running")
+        fid, inserted = store.upsert_finding(
+            rid, _make_finding(), finding_type="bug", found_by_job=jid
+        )
+        assert inserted
+
+        # The column is written -- this is not passing because nothing set it.
+        row = store.db.execute("SELECT found_by_job FROM findings WHERE id = ?", (fid,)).fetchone()
+        assert row["found_by_job"] == jid
+
+        assert "found_by_job" not in dict(store.get_finding(fid) or {})
+        assert all("found_by_job" not in f for f in store.list_findings())
+
+        # And the provenance is still reachable, the other way round.
+        entry = next(j for j in store.list_jobs(limit=10) if j["id"] == jid)
+        assert entry["produced_finding_ids"] == [fid]

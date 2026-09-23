@@ -76,6 +76,8 @@ export interface Job {
   usage_delta?: number | null;
   started_at: number | null;
   finished_at: number | null;
+  /** Findings this job brought into existence; empty for jobs given one. */
+  produced_finding_ids?: number[];
   // Only on current_job when finding exists
   finding_summary?: string | null;
   finding_fingerprint?: string | null;

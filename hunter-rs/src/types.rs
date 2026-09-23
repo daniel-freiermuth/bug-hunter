@@ -200,6 +200,25 @@ pub struct Job {
     pub finding_fingerprint: Option<String>,
 }
 
+/// A job as /api/jobs reports it: the row plus what it produced.
+///
+/// Separate from [`Job`] because "what this job created" is not a column
+/// on `jobs` — it is a reverse lookup over `findings.found_by_job`, and
+/// only the jobs list needs it. Keeping it out of `Job` leaves the three
+/// other job queries selecting exactly the columns they have.
+#[derive(Debug, Clone, Serialize)]
+pub struct JobListEntry {
+    #[serde(flatten)]
+    pub job: Job,
+    /// Findings this job brought into existence.
+    ///
+    /// Empty for every job that works on a finding it was handed
+    /// (`finding_id`); non-empty for the ingesting jobs, chiefly hunts,
+    /// which have no `finding_id` of their own. Always present, so a
+    /// client never distinguishes "produced nothing" from "not reported".
+    pub produced_finding_ids: Vec<i64>,
+}
+
 /// events row.
 #[derive(Debug, Clone, Serialize)]
 pub struct Event {

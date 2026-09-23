@@ -133,7 +133,7 @@ def _ingest_followups(
     followups_path = worktree / "FOLLOW-UPS.json"
     if not followups_path.exists():
         return
-    counts = ingest_findings(store, repo_id, followups_path, finding_type=None)
+    counts = ingest_findings(store, repo_id, followups_path, finding_type=None, job=job)
     if counts["inserted"]:
         store.log_event(
             kind,
@@ -322,7 +322,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         "full_rehunt": full_rehunt_triggered,
     }
     if out_path.exists():
-        counts = ingest_findings(store, rid, out_path)
+        counts = ingest_findings(store, rid, out_path, job=job)
         summary["ingest"] = counts
         store.log_event(
             "hunt",
@@ -638,7 +638,7 @@ def _run_analysis_job(
     }
 
     if out_path.exists():
-        counts = ingest_findings(store, rid, out_path, finding_type=kind)
+        counts = ingest_findings(store, rid, out_path, finding_type=kind, job=job)
         summary["ingest"] = counts
         store.log_event(
             kind,

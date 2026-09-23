@@ -1,9 +1,21 @@
 <script lang="ts">
   import { store } from "../lib/api.svelte";
+  import type { Job } from "../lib/types";
   import { ts, ktok, dur } from "../lib/format";
 
   let events = $derived(store.events);
   let jobs = $derived(store.jobs);
+
+  // A hunt can turn up a dozen findings; listing them all would push the
+  // rest of the row off the table. The remainder stays reachable as a
+  // tooltip rather than being silently dropped.
+  const MAX_PRODUCED_LINKS = 3;
+
+  // Absent rather than empty when talking to a daemon that predates the
+  // field, so this is the one place that decides what "no data" means.
+  function produced(job: Job): number[] {
+    return job.produced_finding_ids ?? [];
+  }
 
   // The daemon's event kinds (hunter-rs: `log_event(`). Ingest logs one kind
   // per finding type — `hunt` for bugs, the type's own name otherwise.
@@ -124,13 +136,23 @@
                   <td class="cell-kind">{job.kind}</td>
                   <td class="cell-small">{job.repo_name}</td>
                   <td class="cell-links">
-                    <!-- A hunt has no finding of its own: it is the job
-                         that produces them, so the column is empty rather
-                         than linking somewhere misleading. -->
+                    <!-- Two different relationships, deliberately shown in
+                         one column: the finding a job was given to work
+                         on, or the findings a hunt turned up. A job never
+                         has both. -->
                     {#if job.finding_id != null}
                       <a href="#findings:{job.finding_id}" class="finding-link">
                         F#{job.finding_id}
                       </a>
+                    {:else if produced(job).length > 0}
+                      {#each produced(job).slice(0, MAX_PRODUCED_LINKS) as fid (fid)}
+                        <a href="#findings:{fid}" class="finding-link">F#{fid}</a>
+                      {/each}
+                      {#if produced(job).length > MAX_PRODUCED_LINKS}
+                        <span class="dim" title={produced(job).join(", ")}>
+                          +{produced(job).length - MAX_PRODUCED_LINKS}
+                        </span>
+                      {/if}
                     {:else}
                       <span class="dim">–</span>
                     {/if}
