@@ -781,7 +781,7 @@ async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
     let logged = sink.text();
     assert!(
         logged.contains(&format!("repo {rid} deleted, but reclaiming "))
-            && logged.contains("its id stays reserved until the reaper retries"),
+            && logged.contains("its files stay until the reaper retries"),
         "a failed reclamation must say the id is still held: {logged}"
     );
 

@@ -56,11 +56,12 @@ pub struct AppState {
     /// The scheduler loop this server fronts.
     pub scheduler: SchedulerHandle,
     /// Held across "check the repo exists, then touch its notes file".
-    /// Deleting a repo removes the row and the file; appending a note
-    /// validates the row and then writes the file. Interleaved, the append
-    /// can recreate `repo-{id}/NOTES.md` after the delete removed it, and
-    /// SQLite reuses `INTEGER PRIMARY KEY` ids — so those notes surface
-    /// under whichever repo is created next.
+    /// Deleting a repo removes the directory and then the row; appending
+    /// a note validates the row and then writes the file. Interleaved,
+    /// the append recreates `repo-{id}/NOTES.md` after the reaper has
+    /// already passed that path, leaving a directory no row owns and
+    /// nothing will ever remove — and `sync_repo` refuses to clone into
+    /// a directory it finds sitting at a repo's path.
     pub repo_notes: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -116,8 +117,17 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// Reject POST requests that don't originate from localhost.
-/// Self-hosted service — no reason to accept remote mutations.
+/// Reject requests whose `Host` is not a loopback name.
+///
+/// The listener already binds 127.0.0.1, so this is not about reachability
+/// from the network — it is about DNS rebinding. A page the operator
+/// visits can point its own hostname at 127.0.0.1 and then talk to this
+/// port as same-origin, which defeats CORS; the one thing that still
+/// differs is the `Host` header, which carries the attacker's name.
+///
+/// So it applies to reads as well as writes. Findings carry file paths,
+/// code excerpts and repo notes from private repositories, and leaking
+/// those is the same class of loss as an unauthorised mutation.
 fn require_localhost(headers: &HeaderMap) -> Result<(), ApiError> {
     let host = headers
         .get(header::HOST)
@@ -128,8 +138,16 @@ fn require_localhost(headers: &HeaderMap) -> Result<(), ApiError> {
         Ok(())
     } else {
         Err(ApiError::BadRequest(
-            "POST only accepted from localhost".to_owned(),
+            "only accepted from localhost".to_owned(),
         ))
+    }
+}
+
+/// [`require_localhost`] for every route, reads included.
+async fn host_guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    match require_localhost(req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(e) => e.into_response(),
     }
 }
 
@@ -163,6 +181,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/unqueue", post(unqueue))
         .route("/api/override", post(override_))
         .fallback(static_files)
+        // Host check ahead of every handler and the static files, so a
+        // rebound hostname cannot read findings either (contract §0.1).
+        .layer(axum::middleware::from_fn(host_guard))
         // Cache-Control: no-store on EVERY response, static files included
         // (contract §1) — `overriding` so nothing downstream can win.
         .layer(SetResponseHeaderLayer::overriding(
@@ -493,8 +514,6 @@ async fn static_files(State(state): State<AppState>, uri: Uri) -> Response {
 /// (so "; charset=utf-8" passes), applied to every POST — including
 /// /api/cycle, which never reads a body. Missing header == "".
 fn post_gate(headers: &HeaderMap) -> Result<(), ApiError> {
-    // Localhost-only: self-hosted service, no remote mutations.
-    require_localhost(headers)?;
     let ctype = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -851,9 +870,6 @@ async fn update_repo(
 
 // -- POST /api/repos (contract §7) -----------------------------------------------
 
-/// re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.\-]*', name) without a regex
-/// dependency (server.py:616-618): ASCII alnum/underscore first, then
-/// alnum/underscore/dot/hyphen. No '/', so traversal is blocked here too.
 /// Reject a repo URL whose scheme could execute when rendered as a link.
 ///
 /// `Repo.url` is displayed as an `<a href>` in the UI, so a stored
@@ -866,7 +882,7 @@ async fn update_repo(
 /// Allow-listing `http`/`https` alone would break SSH clone URLs, which
 /// the forge layer accepts (`git@host:owner/repo.git`). Those carry no
 /// scheme at all — the colon belongs to the scp-like syntax — so the
-/// rule is: if there is a URL scheme, it must be http or https.
+/// rule is: if there is a URL scheme, it must be http, https or ssh.
 fn valid_repo_url(url: &str) -> bool {
     let Some(colon) = url.find(':') else {
         return true; // no scheme at all (scp-like or a bare path)
@@ -892,6 +908,9 @@ fn valid_repo_url(url: &str) -> bool {
         .any(|s| scheme.eq_ignore_ascii_case(s))
 }
 
+/// re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.\-]*', name) without a regex
+/// dependency (server.py:616-618): ASCII alnum/underscore first, then
+/// alnum/underscore/dot/hyphen. No '/', so traversal is blocked here too.
 fn valid_repo_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
@@ -1010,10 +1029,12 @@ async fn add_repo(
 
 /// Remove one flagged repo's directory, then drop its row.
 ///
-/// Ordering is the whole point: the row is what keeps SQLite from
-/// reissuing the id, so it may only be dropped once nothing of the repo
-/// is left on disk. Leaving it flagged is always safe — the repo is
-/// already invisible, and the next pass tries again.
+/// Ordering is the whole point: the row is what marks `repos/repo-<id>`
+/// as still owned, so it may only be dropped once nothing of the repo is
+/// left on disk. Drop it first and the directory becomes an orphan no
+/// row accounts for and no pass will ever revisit. Leaving it flagged is
+/// always safe — the repo is already invisible, and the next pass tries
+/// again.
 pub async fn reap_repo(store: &Store, repos_dir: &Path, rid: i64) -> std::io::Result<()> {
     let dir = Store::repo_dir(repos_dir, rid);
     // `tokio::fs`, not `std::fs`: removing a clone is explicitly not
@@ -1043,7 +1064,7 @@ pub async fn reap_deleted_repos(store: &Store, work_root: &Path) -> usize {
             Ok(()) => reaped += 1,
             Err(e) => tracing::warn!(
                 "repo {id} is flagged deleted but {} could not be removed ({e}); \
-                 its id stays reserved",
+                 its row stays until the reaper retries",
                 Store::repo_dir(&repos_dir, id).display()
             ),
         }
@@ -1093,12 +1114,12 @@ async fn delete_repo(
     // Phase two, attempted inline so the common case finishes before the
     // response: reclaim the directory and drop the row, which is what
     // actually frees the id. A failure here is not an error for the
-    // caller — the repo *is* deleted — it just leaves the id reserved
+    // caller — the repo *is* deleted — it just leaves the files on disk
     // until the reaper retries on the next cycle.
     if let Err(e) = reap_repo(&state.store, &repos_dir, rid).await {
         tracing::warn!(
             "repo {rid} deleted, but reclaiming {} failed ({e}); \
-             its id stays reserved until the reaper retries",
+             its files stay until the reaper retries",
             Store::repo_dir(&repos_dir, rid).display()
         );
     }

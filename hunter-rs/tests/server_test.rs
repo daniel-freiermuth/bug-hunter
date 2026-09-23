@@ -240,3 +240,59 @@ async fn unknown_filter_values_match_nothing_rather_than_everything() {
     let blank: Vec<Value> = serde_json::from_slice(&body).unwrap();
     assert_eq!(blank.len(), all.len(), "an empty filter is no filter");
 }
+
+/// The Host check covers reads, not only mutations.
+///
+/// The listener binds 127.0.0.1, so this is not about the network: a page
+/// the operator visits can resolve its own hostname to 127.0.0.1 and then
+/// speak to this port as same-origin, which CORS does not stop. The
+/// attacker's name is still in `Host`, and findings carry file paths, code
+/// excerpts and notes from private repositories.
+#[tokio::test]
+async fn a_foreign_host_header_cannot_read_findings() {
+    let state = test_state().await;
+
+    for uri in [
+        "/api/findings",
+        "/api/summary",
+        "/api/events",
+        "/api/repo/notes?id=1",
+        "/",
+    ] {
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::HOST, "rebound.attacker.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "GET {uri} must refuse a foreign Host"
+        );
+    }
+
+    // Loopback names still work, including the absent header the test
+    // helpers and curl-without-Host both produce.
+    for host in ["localhost", "localhost:8377", "127.0.0.1", "::1"] {
+        let response = router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/findings")
+                    .header(header::HOST, host)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "Host {host} must be served"
+        );
+    }
+}
