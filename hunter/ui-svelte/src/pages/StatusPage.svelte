@@ -239,7 +239,7 @@
   :global(.scv-fill.scv-bad) { background: #e54; }
   :global(.scv-fill.scv-stale) { background: #888; }
   :global(.scv-soft) { display: inline-block; height: 100%; background: repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(255,255,255,0.15) 3px, rgba(255,255,255,0.15) 6px); }
-  :global(.scv-ramp) { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff8; }
+  :global(.scv-ramp) { position: absolute; top: 0; bottom: 0; width: 2px; background: #e54; }
   :global(.scv-sub) { font-size: 0.75rem; color: var(--text-dim); margin-top: 2px; }
   :global(.scv-note) { font-size: 0.875rem; color: var(--text-dim); }
 
