@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import sqlite3
 import threading
 from pathlib import Path
@@ -34,6 +35,20 @@ from .types import (
 # (e.g. passing a dict or a list by mistake) while still fitting every
 # legitimate column value, without Any's "stop checking entirely."
 SqlParam = str | int | float | None
+
+_SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def _declares_autoincrement(create_sql: str) -> bool:
+    """Does this CREATE TABLE statement actually declare AUTOINCREMENT?
+
+    `sqlite_master.sql` is the statement as typed, comments included, and
+    schema.sql's `repos.id` carries a comment saying why the keyword is
+    there. A substring test would therefore report the keyword for a
+    table that merely documents it.
+    """
+    return bool(re.search(r"\bAUTOINCREMENT\b", _SQL_COMMENT.sub(" ", create_sql), re.IGNORECASE))
+
 
 _JOB_COLUMNS = {
     "state",
@@ -145,7 +160,7 @@ class Store:
     # shared by every Store instance) and guards that file's lifecycle.
     _NOTES_LOCK: ClassVar[threading.Lock] = threading.Lock()
 
-    def __init__(self, cfg: Config) -> None:  # noqa: PLR0915 (migration code)
+    def __init__(self, cfg: Config) -> None:  # noqa: PLR0912, PLR0915 (migration code)
         self.cfg = cfg
         cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(cfg.db_path)
@@ -308,6 +323,96 @@ class Store:
             " WHERE deleted_at IS NOT NULL"
         )
         self.db.commit()
+
+        # `repos.id` must be INTEGER PRIMARY KEY AUTOINCREMENT, mirroring
+        # hunter-rs migration 009: without it the id is a plain rowid
+        # alias and SQLite hands the highest freed number to the next
+        # INSERT, so a stale client id -- or a leftover repos/repo-<id>
+        # directory -- lands on whichever repo now answers to it. Both
+        # daemons share one database and one work_root, so an upgrade
+        # path that skips this restores the hazard for whichever of them
+        # created the row.
+        #
+        # schema.sql declares it, but `CREATE TABLE IF NOT EXISTS` is a
+        # no-op on a database that already has the table, and
+        # AUTOINCREMENT cannot be added by ALTER TABLE. Hence a rebuild,
+        # and hence the probe: on the live database migration 009 already
+        # ran, so the common path must do nothing at all.
+        repos_ddl = self.db.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repos'"
+        ).fetchone()
+        # Comments survive verbatim in sqlite_master.sql, and the column's
+        # comment in schema.sql says the word -- so strip them before
+        # looking for the keyword, or the probe answers "already done" for
+        # a table that only *explains* AUTOINCREMENT.
+        if repos_ddl is not None and not _declares_autoincrement(repos_ddl["sql"] or ""):
+            self.db.commit()  # PRAGMA foreign_keys cannot run inside a transaction
+            self.db.execute("PRAGMA foreign_keys = OFF")
+            try:
+                # Build-copy-drop-rename, NOT the findings rebuild's
+                # rename-first shape. That one is safe only because
+                # nothing references `findings`; `repos` is referenced by
+                # findings.repo_id and jobs.repo_id, and renaming it out
+                # of the way rewrites those REFERENCES clauses to point at
+                # the temporary name, which is then dropped. The referenced
+                # name is never renamed here -- the new table is renamed
+                # INTO it, and nothing references the name it had.
+                self.db.execute(
+                    "CREATE TABLE _repos_new ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  name TEXT NOT NULL UNIQUE,"
+                    "  url TEXT NOT NULL,"
+                    "  path TEXT NOT NULL,"
+                    "  forge TEXT NOT NULL DEFAULT 'github',"
+                    "  default_branch TEXT NOT NULL DEFAULT 'main',"
+                    "  last_hunt_sha TEXT,"
+                    "  last_hunt_at INTEGER,"
+                    "  enabled INTEGER NOT NULL DEFAULT 1,"
+                    "  added_at INTEGER NOT NULL,"
+                    "  last_full_hunt_at INTEGER,"
+                    "  last_test_gap_at INTEGER,"
+                    "  last_dep_update_at INTEGER,"
+                    "  last_refactor_at INTEGER,"
+                    "  last_modernization_at INTEGER,"
+                    "  last_standards_at INTEGER,"
+                    "  deleted_at INTEGER)"
+                )
+                repo_cols = (
+                    "id, name, url, path, forge, default_branch, last_hunt_sha,"
+                    " last_hunt_at, enabled, added_at, last_full_hunt_at,"
+                    " last_test_gap_at, last_dep_update_at, last_refactor_at,"
+                    " last_modernization_at, last_standards_at, deleted_at"
+                )
+                # Ids are copied, never reissued: findings.repo_id and
+                # jobs.repo_id hold those numbers, so a renumbering
+                # reparents their rows silently.
+                self.db.execute(
+                    f"INSERT INTO _repos_new ({repo_cols}) SELECT {repo_cols} FROM repos"
+                )
+                self.db.execute("DROP TABLE repos")
+                self.db.execute("ALTER TABLE _repos_new RENAME TO repos")
+                # The DROP took the index with it.
+                self.db.execute(
+                    "CREATE INDEX IF NOT EXISTS repos_deleted_at ON repos(deleted_at)"
+                    " WHERE deleted_at IS NOT NULL"
+                )
+                # The copy above sets sqlite_sequence when it inserts any
+                # row, because an explicit id on an AUTOINCREMENT table
+                # raises the counter. An empty table inserts nothing and
+                # would leave no sequence row at all, so the next id would
+                # be 1 -- one a deleted repo may well have used. Seed the
+                # floor explicitly; identical to migration 009's.
+                self.db.execute(
+                    "INSERT INTO sqlite_sequence (name, seq)"
+                    " SELECT 'repos', (SELECT COALESCE(MAX(id), 0) FROM repos)"
+                    " WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'repos')"
+                )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                raise
+            finally:
+                self.db.execute("PRAGMA foreign_keys = ON")
 
         # Migrate UNIQUE(fingerprint) → UNIQUE(type, fingerprint).
         # Probe: if the autoindex covers only fingerprint (1 column),
@@ -596,13 +701,30 @@ class Store:
 
     # -- repo notes ----------------------------------------------------
     def repo_notes_path(self, repo_id: int) -> Path:
-        """Return path to repo's NOTES.md file (ID-based for stability)."""
+        """Path to a repo's notes: <work_root>/notes/repo-<id>.md.
+
+        Outside the clone, and deliberately so. Notes used to be written
+        to repos/repo-<id>/NOTES.md, inside the working tree of a real
+        checkout, with two consequences.
+
+        The file showed up as untracked in the clone, so any worker doing
+        a broad `git add` would commit the operator's private notes into
+        a pull request.
+
+        And writing a note created repos/repo-<id>/ as a side effect.
+        sync_repo treats an existing path as an already-cloned repo and
+        checks its origin; a directory holding only notes has none, so it
+        refused to work there -- permanently, since nothing removes it.
+        Adding a note to a repo before its first cycle was enough to make
+        that repo uncloneable for good.
+
+        Keyed by id, which survives renames.
+        """
         repo = self.get_repo(repo_id)
         if not repo:
             msg = f"repo {repo_id} not found"
             raise ValueError(msg)
-        # Use repo_id for path stability (survives renames)
-        return repo_dir(self.cfg.work_root / "repos", repo_id) / "NOTES.md"
+        return self.cfg.work_root / "notes" / f"repo-{repo_id}.md"
 
     _MAX_NOTES_CHARS = 4000  # prompt-injection safety + token budget
 
