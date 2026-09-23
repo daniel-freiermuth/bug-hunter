@@ -45,6 +45,14 @@ CREATE TABLE IF NOT EXISTS findings (
   created_at    INTEGER NOT NULL,
   updated_at    INTEGER NOT NULL,
 
+  -- The job that produced this finding. No foreign key to jobs(id):
+  -- jobs are pruned on a retention policy that knows nothing about
+  -- findings, and a finding must outlive the job that found it rather
+  -- than block its cleanup. NULL for rows ingested before provenance
+  -- was recorded -- the job that found them was never stored, so it is
+  -- not recoverable and the UI shows nothing rather than guessing.
+  found_by_job  INTEGER,
+
   -- Bug-specific fields (nullable for other types)
   bug_class     TEXT,                      -- boundary|error-path|race|contract-drift|leak|logic
   evidence_plan TEXT,

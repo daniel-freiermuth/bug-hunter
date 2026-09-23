@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use hunter::domain::{FindingType, ForgeName, Severity};
+use hunter::domain::{FindingJobKind, FindingType, ForgeName, JobState, RepoJobKind, Severity};
 use hunter::store::{FindingFilter, Store};
 
 mod support;
@@ -143,4 +143,177 @@ async fn a_non_bug_entry_cannot_smuggle_in_a_bug_class() {
         all[0].bug_class, None,
         "a refactor finding has no bug class"
     );
+}
+
+/// Two bug entries, ingested as `job`. Returns the store and the ids.
+async fn hunt_producing_two(dir: &TempDir, store: &Store, repo_id: i64, job: i64) -> i64 {
+    let entries = serde_json::json!([
+        {
+            "fingerprint": "widget:src/a.rs:f:1", "type": "bug", "file": "src/a.rs",
+            "bug_class": "boundary", "severity": "high", "confidence": 0.9, "summary": "first"
+        },
+        {
+            "fingerprint": "widget:src/b.rs:g:2", "type": "bug", "file": "src/b.rs",
+            "bug_class": "boundary", "severity": "low", "confidence": 0.8, "summary": "second"
+        }
+    ]);
+    let path = dir.join("findings.json");
+    std::fs::write(&path, serde_json::to_string(&entries).unwrap()).unwrap();
+    hunter::ingest::ingest_findings(
+        store,
+        repo_id,
+        Path::new(&path),
+        Some(FindingType::Bug),
+        Some(job),
+        None,
+    )
+    .await
+    .inserted
+}
+
+async fn provenance_fixture() -> (TempDir, Store, i64) {
+    let dir = TempDir::new("ingest-provenance");
+    let store = Store::connect(&dir.join("hunter.db"))
+        .await
+        .expect("bootstrap");
+    let repo_id = store
+        .add_repo(
+            "widget",
+            "git@github.com:acme/widget.git",
+            std::path::Path::new("/tmp/wr/repos"),
+            "main",
+            ForgeName::Github,
+        )
+        .await
+        .unwrap();
+    (dir, store, repo_id)
+}
+
+async fn produced_by(store: &Store, job: i64) -> Vec<i64> {
+    let mut ids = store
+        .list_jobs(50)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.job.id == job)
+        .expect("job is listed")
+        .produced_finding_ids;
+    ids.sort_unstable();
+    ids
+}
+
+/// A hunt's findings must be reachable from the job that produced them.
+///
+/// Nothing recorded this before: ingest had the job id and passed it to
+/// every event except the one marking the finding's creation, so the
+/// only trace of "this hunt found that bug" was a `+N new` counter in a
+/// log message.
+#[tokio::test]
+async fn findings_are_attributed_to_the_hunt_that_produced_them() {
+    let (dir, store, repo_id) = provenance_fixture().await;
+    let job = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            repo_id,
+            None,
+            1000,
+            JobState::Running,
+        )
+        .await
+        .unwrap();
+
+    let inserted = hunt_producing_two(&dir, &store, repo_id, job).await;
+    assert_eq!(inserted, 2, "fixture: both entries are new");
+    assert_eq!(
+        produced_by(&store, job).await.len(),
+        2,
+        "both findings must point back at the hunt that produced them"
+    );
+}
+
+/// A rediscovery belongs to the job that first turned it up.
+///
+/// Hunts re-run over the same code constantly, so without this the
+/// attribution would drift to whichever hunt last saw the finding, and
+/// "which hunt found this?" would answer "the most recent one" forever.
+#[tokio::test]
+async fn a_rediscovery_does_not_steal_attribution() {
+    let (dir, store, repo_id) = provenance_fixture().await;
+    let first = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            repo_id,
+            None,
+            1000,
+            JobState::Running,
+        )
+        .await
+        .unwrap();
+    assert_eq!(hunt_producing_two(&dir, &store, repo_id, first).await, 2);
+    let original = produced_by(&store, first).await;
+
+    let second = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            repo_id,
+            None,
+            1000,
+            JobState::Running,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hunt_producing_two(&dir, &store, repo_id, second).await,
+        0,
+        "fixture: the same two entries are duplicates now"
+    );
+
+    assert_eq!(
+        produced_by(&store, first).await,
+        original,
+        "the original finder keeps its findings"
+    );
+    assert!(
+        produced_by(&store, second).await.is_empty(),
+        "a hunt that only rediscovered known findings produced nothing"
+    );
+}
+
+/// A job handed a finding produces none: `finding_id` and
+/// `produced_finding_ids` are opposite directions and never both set.
+#[tokio::test]
+async fn a_job_given_a_finding_produces_nothing() {
+    let (dir, store, repo_id) = provenance_fixture().await;
+    let hunt = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            repo_id,
+            None,
+            1000,
+            JobState::Running,
+        )
+        .await
+        .unwrap();
+    hunt_producing_two(&dir, &store, repo_id, hunt).await;
+    let found = produced_by(&store, hunt).await;
+
+    let fix = store
+        .create_job(
+            FindingJobKind::Fix.into(),
+            repo_id,
+            Some(found[0]),
+            1000,
+            JobState::Running,
+        )
+        .await
+        .unwrap();
+    let entry = store
+        .list_jobs(50)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.job.id == fix)
+        .unwrap();
+    assert!(entry.produced_finding_ids.is_empty());
+    assert_eq!(entry.job.finding_id, Some(found[0]));
 }

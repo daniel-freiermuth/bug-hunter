@@ -19,7 +19,8 @@ use crate::domain::{
     BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState, RepoJobKind, Severity,
 };
 use crate::types::{
-    Event, Finding, Job, PrState, Repo, SchedulerState, StatsByFinding, StatsByKind, StatsTotals,
+    Event, Finding, Job, JobListEntry, PrState, Repo, SchedulerState, StatsByFinding, StatsByKind,
+    StatsTotals,
 };
 use crate::util::now_ms;
 
@@ -928,17 +929,24 @@ impl Store {
     // -- jobs ----------------------------------------------------------------
 
     /// jobs JOIN repos, ORDER BY j.id DESC LIMIT ?. finding_* keys stay None.
-    pub async fn list_jobs(&self, limit: i64) -> sqlx::Result<Vec<Job>> {
-        sqlx::query_as!(
-            Job,
+    /// Recent jobs, each carrying the findings it produced.
+    ///
+    /// `produced_finding_ids` comes from one correlated subquery rather
+    /// than a query per job: this feeds a 50-row table that polls, so an
+    /// N+1 here would be 50 extra round trips every few seconds.
+    /// `group_concat` returns NULL for a job that produced nothing,
+    /// which is the common case (every fix, recheck and engage job), so
+    /// the empty vector is the normal result and not an error.
+    pub async fn list_jobs(&self, limit: i64) -> sqlx::Result<Vec<JobListEntry>> {
+        let rows = sqlx::query!(
             r#"
             SELECT j.id AS "id!", j.kind AS "kind!: JobKind", j.repo_id AS "repo_id!",
                    j.finding_id, j.state AS "state!: JobState", j.pid, j.session_file,
                    j.cap_tokens, j.tokens_new, j.calls, j.exit_code,
                    j.killed_reason, j.notes, j.model, j.usage_delta,
                    j.started_at, j.finished_at, r.name AS "repo_name!",
-                   NULL AS "finding_summary?: String",
-                   NULL AS "finding_fingerprint?: String"
+                   (SELECT group_concat(f.id) FROM findings f WHERE f.found_by_job = j.id)
+                       AS "produced?: String"
             FROM jobs j
             JOIN repos r ON r.id = j.repo_id
             ORDER BY j.id DESC
@@ -947,7 +955,40 @@ impl Store {
             limit
         )
         .fetch_all(&self.pool)
-        .await
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| JobListEntry {
+                produced_finding_ids: r
+                    .produced
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter_map(|s| s.parse().ok())
+                    .collect(),
+                job: Job {
+                    id: r.id,
+                    kind: r.kind,
+                    repo_id: r.repo_id,
+                    finding_id: r.finding_id,
+                    state: r.state,
+                    pid: r.pid,
+                    session_file: r.session_file,
+                    cap_tokens: r.cap_tokens,
+                    tokens_new: r.tokens_new,
+                    calls: r.calls,
+                    exit_code: r.exit_code,
+                    killed_reason: r.killed_reason,
+                    notes: r.notes,
+                    model: r.model,
+                    usage_delta: r.usage_delta,
+                    started_at: r.started_at,
+                    finished_at: r.finished_at,
+                    repo_name: r.repo_name,
+                    finding_summary: None,
+                    finding_fingerprint: None,
+                },
+            })
+            .collect())
     }
 
     /// Complete history for one finding, ORDER BY j.id DESC, no limit.
@@ -1358,11 +1399,17 @@ impl Store {
     /// would have the second fail the UNIQUE constraint rather than be
     /// ignored. Only the single scheduler loop ingests, so no second caller
     /// exists to open that window.
+    /// Insert a finding, or report the existing one with this fingerprint.
+    ///
+    /// `found_by_job` is stored only on a genuine insert: a duplicate
+    /// belongs to the job that first turned it up, not the latest one to
+    /// rediscover it.
     pub async fn upsert_finding(
         &self,
         repo_id: i64,
         row: &FindingInsert,
         finding_type: &str,
+        found_by_job: Option<i64>,
     ) -> sqlx::Result<(i64, bool)> {
         // Check if already exists
         let fingerprint = &row.fingerprint;
@@ -1408,14 +1455,14 @@ impl Store {
              ecosystem, package, current_version, latest_version, update_type, security_advisory, \
              missing_tests, test_file, smell_type, suggested_refactor, \
              modernization_class, current_approach, proposed_approach, standard_section, \
-             status, created_at, updated_at) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27, ?28, ?29, ?30)",
+             status, created_at, updated_at, found_by_job) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27, ?28, ?29, ?30, ?31)",
             finding_type, repo_id, fingerprint, file, symbol, line, bug_class,
             severity, confidence, summary, detail, evidence_plan, introduced_by,
             ecosystem, package, current_version, latest_version, update_type, security_advisory,
             missing_tests_ref, test_file, smell_type, suggested_refactor,
             modernization_class, current_approach, proposed_approach, standard_section,
-            new_status, now, now
+            new_status, now, now, found_by_job
         )
         .execute(&self.pool)
         .await?;

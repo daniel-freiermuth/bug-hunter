@@ -109,16 +109,16 @@ async fn record_job_done_state() {
     // Verify written fields
     let jobs = store.list_jobs(10).await.unwrap();
     let j = &jobs[0];
-    assert_eq!(j.state, hunter::domain::JobState::Done);
-    assert_eq!(j.tokens_new, Some(42_000));
-    assert_eq!(j.calls, Some(15));
-    assert_eq!(j.exit_code, Some(0));
-    assert!(j.killed_reason.is_none());
-    assert_eq!(j.session_file.as_deref(), Some("/tmp/sess.jsonl"));
-    assert_eq!(j.model.as_deref(), Some("claude-4"));
-    assert!(j.finished_at.is_some());
+    assert_eq!(j.job.state, hunter::domain::JobState::Done);
+    assert_eq!(j.job.tokens_new, Some(42_000));
+    assert_eq!(j.job.calls, Some(15));
+    assert_eq!(j.job.exit_code, Some(0));
+    assert!(j.job.killed_reason.is_none());
+    assert_eq!(j.job.session_file.as_deref(), Some("/tmp/sess.jsonl"));
+    assert_eq!(j.job.model.as_deref(), Some("claude-4"));
+    assert!(j.job.finished_at.is_some());
     // notes should be None for "done" state
-    assert!(j.notes.is_none());
+    assert!(j.job.notes.is_none());
 
     cleanup(&path);
 }
@@ -155,11 +155,11 @@ async fn record_job_failed_state() {
 
     let jobs = store.list_jobs(10).await.unwrap();
     let j = &jobs[0];
-    assert_eq!(j.state, hunter::domain::JobState::Failed);
-    assert_eq!(j.exit_code, Some(1));
+    assert_eq!(j.job.state, hunter::domain::JobState::Failed);
+    assert_eq!(j.job.exit_code, Some(1));
     // notes should contain stdout_tail (up to 500 chars)
-    assert!(j.notes.is_some());
-    assert!(j.notes.as_ref().unwrap().contains("panic at line 42"));
+    assert!(j.job.notes.is_some());
+    assert!(j.job.notes.as_ref().unwrap().contains("panic at line 42"));
 
     cleanup(&path);
 }
@@ -196,9 +196,9 @@ async fn record_job_killed_state() {
 
     let jobs = store.list_jobs(10).await.unwrap();
     let j = &jobs[0];
-    assert_eq!(j.state, hunter::domain::JobState::Killed);
-    assert_eq!(j.killed_reason.as_deref(), Some("cap"));
-    assert!(j.notes.is_some()); // killed => notes from stdout_tail
+    assert_eq!(j.job.state, hunter::domain::JobState::Killed);
+    assert_eq!(j.job.killed_reason.as_deref(), Some("cap"));
+    assert!(j.job.notes.is_some()); // killed => notes from stdout_tail
 
     cleanup(&path);
 }
@@ -227,10 +227,10 @@ async fn create_and_update_job_round_trip() {
     // Verify initial state
     let jobs = store.list_jobs(10).await.unwrap();
     assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].state, hunter::domain::JobState::Running);
-    assert_eq!(jobs[0].kind, FindingJobKind::Fix.into());
-    assert_eq!(jobs[0].repo_id, 1);
-    assert_eq!(jobs[0].cap_tokens, Some(150_000));
+    assert_eq!(jobs[0].job.state, hunter::domain::JobState::Running);
+    assert_eq!(jobs[0].job.kind, FindingJobKind::Fix.into());
+    assert_eq!(jobs[0].job.repo_id, 1);
+    assert_eq!(jobs[0].job.cap_tokens, Some(150_000));
 
     // Update with completion
     store
@@ -252,13 +252,13 @@ async fn create_and_update_job_round_trip() {
 
     let jobs = store.list_jobs(10).await.unwrap();
     let j = &jobs[0];
-    assert_eq!(j.state, hunter::domain::JobState::Done);
-    assert_eq!(j.tokens_new, Some(80_000));
-    assert_eq!(j.calls, Some(25));
-    assert_eq!(j.exit_code, Some(0));
-    assert_eq!(j.notes.as_deref(), Some("completed"));
-    assert_eq!(j.model.as_deref(), Some("claude-4"));
-    assert_eq!(j.finished_at, Some(2000));
+    assert_eq!(j.job.state, hunter::domain::JobState::Done);
+    assert_eq!(j.job.tokens_new, Some(80_000));
+    assert_eq!(j.job.calls, Some(25));
+    assert_eq!(j.job.exit_code, Some(0));
+    assert_eq!(j.job.notes.as_deref(), Some("completed"));
+    assert_eq!(j.job.model.as_deref(), Some("claude-4"));
+    assert_eq!(j.job.finished_at, Some(2000));
 
     cleanup(&path);
 }
@@ -297,11 +297,11 @@ async fn reconcile_orphaned_jobs() {
     assert_eq!(orphaned_jobs.len(), 1);
     assert_eq!(orphaned_jobs[0].id, job_id);
     let jobs = store.list_jobs(10).await.unwrap();
-    let j = jobs.iter().find(|j| j.id == job_id).unwrap();
-    assert_eq!(j.state, hunter::domain::JobState::Killed);
-    assert_eq!(j.killed_reason.as_deref(), Some("orphaned"));
-    assert!(j.notes.as_deref().unwrap().contains("reconciled"));
-    assert!(j.finished_at.is_some());
+    let j = jobs.iter().find(|j| j.job.id == job_id).unwrap();
+    assert_eq!(j.job.state, hunter::domain::JobState::Killed);
+    assert_eq!(j.job.killed_reason.as_deref(), Some("orphaned"));
+    assert!(j.job.notes.as_deref().unwrap().contains("reconciled"));
+    assert!(j.job.finished_at.is_some());
 
     cleanup(&path);
 }
@@ -457,12 +457,12 @@ async fn upsert_finding_and_queries() {
         bug_class: Some("logic".into()),
         ..Default::default()
     };
-    let (id, inserted) = store.upsert_finding(1, &row, "bug").await.unwrap();
+    let (id, inserted) = store.upsert_finding(1, &row, "bug", None).await.unwrap();
     assert!(inserted);
     assert!(id > 0);
 
     // Duplicate -> not inserted
-    let (id2, inserted2) = store.upsert_finding(1, &row, "bug").await.unwrap();
+    let (id2, inserted2) = store.upsert_finding(1, &row, "bug", None).await.unwrap();
     assert!(!inserted2);
     assert_eq!(id, id2);
 
