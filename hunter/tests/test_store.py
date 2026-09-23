@@ -113,6 +113,33 @@ class TestRepos:
         store.soft_delete_repo(999)  # no rows affected, does not raise
         assert store.deleted_repo_ids() == []
 
+    def test_create_job_refuses_a_soft_deleted_repo(self, store: Store) -> None:
+        """The scheduler picks a live repo, the operator deletes it
+        mid-cycle, and the runner reaches the job insert afterwards. The
+        foreign key is no defence -- the flagged row is still physically
+        there -- so a job written here would pin the repo half-deleted
+        forever: forget_deleted_repo is a plain DELETE and the FK refuses
+        it while any job references the row.
+        """
+        live = store.add_repo("live", "https://l", "/l")
+        doomed = store.add_repo("doomed", "https://d", "/d")
+        picked = store.get_repo(doomed)  # the scheduler's view, taken while live
+        assert picked is not None
+        store.soft_delete_repo(doomed)
+
+        with pytest.raises(ValueError, match=f"repo {doomed} is deleted"):
+            store.create_job("hunt", picked["id"], state="running")
+        assert store.list_jobs() == []
+        # Keyed on deleted_at, not on absence: a live repo still gets its job.
+        assert store.create_job("hunt", live, state="running") > 0
+
+        # And the deletion can still finish, because no job row is holding
+        # the id: the reaper's DELETE goes through instead of hitting the FK.
+        assert store.deleted_repo_ids() == [doomed]
+        store.forget_deleted_repo(doomed)
+        assert store.deleted_repo_ids() == []
+        assert store.get_repo(doomed) is None
+
     def test_legacy_name_based_paths_are_rewritten_to_ids(self, tmp_path: Path) -> None:
         """Rows written before clone dirs were keyed by id must converge.
 

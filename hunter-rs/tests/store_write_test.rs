@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use hunter::backend::SpendLedger;
-use hunter::domain::ForgeName;
+use hunter::domain::{ForgeName, JobState, RepoJobKind};
 use hunter::store::{RepoUpdate, Store, StoreWriteError};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -207,6 +207,83 @@ async fn delete_repo_refusal_message_is_byte_exact_and_clean_delete_works() {
     );
     store.forget_deleted_repo(2).await.unwrap();
     assert!(store.deleted_repo_ids().await.unwrap().is_empty());
+
+    pool.close().await;
+    cleanup(&path);
+}
+
+// -- 3b. create_job vs a soft-deleted repo --------------------------------
+
+/// The scheduler picks a live repo, an operator deletes it mid-cycle, and
+/// the runner reaches the job insert afterwards. The foreign key is no
+/// defence here — the flagged row is still physically there — so the
+/// insert has to check `deleted_at` itself, or the job it writes pins the
+/// repo in the half-deleted state forever: `forget_deleted_repo` is a
+/// plain DELETE and the FK refuses it while any job references the row.
+#[tokio::test]
+async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
+    let (path, pool) = fresh_db().await;
+    sqlx::raw_sql(
+        r"
+        INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at)
+        VALUES (1, 'alpha', 'u1', '/tmp/a', 'github', 'main', 1, 1000),
+               (2, 'beta',  'u2', '/tmp/b', 'github', 'main', 1, 1000);
+        ",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+
+    // The scheduler's view of repo 2, taken while it was still live.
+    let picked = store.get_repo_by_id(2).await.unwrap().unwrap();
+    store.soft_delete_repo(2).await.unwrap();
+
+    let err = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            picked.id,
+            None,
+            100_000,
+            JobState::Running,
+        )
+        .await
+        .unwrap_err();
+    match err {
+        StoreWriteError::Refused(msg) => {
+            assert_eq!(msg, "repo 2 is deleted -- cannot start a hunt job");
+        }
+        StoreWriteError::Db(e) => panic!("expected Refused, got Db({e:?})"),
+    }
+    assert!(
+        store.list_jobs(10).await.unwrap().is_empty(),
+        "a refused insert must write no job row"
+    );
+
+    // The guard is keyed on deleted_at, not on the repo being absent: a
+    // live repo still gets its job.
+    let job = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            1,
+            None,
+            100_000,
+            JobState::Running,
+        )
+        .await
+        .unwrap();
+    assert!(job > 0);
+
+    // And the deletion can still finish: no job row is holding repo 2's
+    // id, so the reaper's DELETE goes through instead of hitting the FK.
+    assert_eq!(store.deleted_repo_ids().await.unwrap(), vec![2]);
+    store.forget_deleted_repo(2).await.unwrap();
+    assert!(store.deleted_repo_ids().await.unwrap().is_empty());
+    let still_there = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM repos WHERE id = 2")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(still_there, 0, "the reaped row must be gone for good");
 
     pool.close().await;
     cleanup(&path);

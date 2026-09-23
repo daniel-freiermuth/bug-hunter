@@ -9,7 +9,7 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::domain::{FindingJobKind, FindingStatus, FindingType, JobKind, JobState, RepoJobKind};
-use crate::store::{FindingFilter, Store, SyncPrData};
+use crate::store::{FindingFilter, Store, StoreWriteError, SyncPrData};
 use crate::types::{Finding, Repo};
 use crate::util::now_ms;
 
@@ -401,6 +401,31 @@ fn job_state(rr: &RunResult) -> JobState {
         JobState::Done
     } else {
         JobState::Failed
+    }
+}
+
+/// Turn a refused `create_job` into a skipped cycle.
+///
+/// The repo was live when this run was picked and soft-deleted before the
+/// job row went in. Losing that race is ordinary operator traffic, not a
+/// fault: reporting it as an error would log "cycle crashed" and hand the
+/// operator a stack trace for having deleted a repo. A genuine DB failure
+/// still propagates.
+fn job_refused(
+    kind: JobKind,
+    repo: Option<&str>,
+    finding_id: Option<i64>,
+    err: StoreWriteError,
+) -> anyhow::Result<CycleSummary> {
+    match err {
+        StoreWriteError::Refused(msg) => Ok(CycleSummary {
+            kind: Some(kind),
+            repo: repo.map(ToOwned::to_owned),
+            finding_id,
+            skipped: Some(msg),
+            ..Default::default()
+        }),
+        StoreWriteError::Db(e) => Err(e.into()),
     }
 }
 
@@ -806,9 +831,13 @@ pub async fn run_hunt(
         BudgetDecision::Denied(d) => return Ok(*d),
     };
 
-    let job = store
+    let job = match store
         .create_job(RepoJobKind::Hunt.into(), rid, None, cap, JobState::Running)
-        .await?;
+        .await
+    {
+        Ok(j) => j,
+        Err(e) => return job_refused(RepoJobKind::Hunt.into(), Some(rname), None, e),
+    };
     let out_path = cfg
         .work_root
         .join("out")
@@ -1046,7 +1075,7 @@ pub async fn run_recheck(
         BudgetDecision::Denied(d) => return Ok(*d),
     };
 
-    let job = store
+    let job = match store
         .create_job(
             FindingJobKind::Recheck.into(),
             repo.id,
@@ -1054,7 +1083,18 @@ pub async fn run_recheck(
             cap,
             JobState::Running,
         )
-        .await?;
+        .await
+    {
+        Ok(j) => j,
+        Err(e) => {
+            return job_refused(
+                FindingJobKind::Recheck.into(),
+                Some(&repo.name),
+                Some(fid),
+                e,
+            );
+        }
+    };
     let out_path = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
     // Remove stale output from a previous crashed attempt — a leftover verdict
@@ -1312,9 +1352,13 @@ async fn run_analysis_job(
         BudgetDecision::Approved(c) => c,
         BudgetDecision::Denied(d) => return Ok(*d),
     };
-    let job = store
+    let job = match store
         .create_job(kind.into(), rid, None, cap, JobState::Running)
-        .await?;
+        .await
+    {
+        Ok(j) => j,
+        Err(e) => return job_refused(kind.into(), Some(rname), None, e),
+    };
     let out_path = cfg
         .work_root
         .join("out")
@@ -1748,7 +1792,7 @@ pub async fn run_fix(
         }
     };
 
-    let job = store
+    let job = match store
         .create_job(
             FindingJobKind::Fix.into(),
             repo.id,
@@ -1756,7 +1800,14 @@ pub async fn run_fix(
             cap,
             JobState::Running,
         )
-        .await?;
+        .await
+    {
+        Ok(j) => j,
+        Err(e) => {
+            let _ = drop_worktree(true).await;
+            return job_refused(FindingJobKind::Fix.into(), Some(&repo.name), Some(fid), e);
+        }
+    };
 
     // set_in_progress: fixing -> fallback queued
     let _ = store.set_in_progress(fid, FindingStatus::Fixing).await;
@@ -2658,7 +2709,7 @@ pub async fn run_engage(
         }
     };
 
-    let job = store
+    let job = match store
         .create_job(
             FindingJobKind::Engage.into(),
             repo.id,
@@ -2666,7 +2717,27 @@ pub async fn run_engage(
             cap,
             JobState::Running,
         )
-        .await?;
+        .await
+    {
+        Ok(j) => j,
+        Err(e) => {
+            let rps = rpath.to_string_lossy().to_string();
+            let wts = worktree.to_string_lossy().to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                run_cmd_sync(
+                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                    30,
+                );
+            })
+            .await;
+            return job_refused(
+                FindingJobKind::Engage.into(),
+                Some(&repo.name),
+                Some(fid),
+                e,
+            );
+        }
+    };
 
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
     let prompt = playbooks::build_engage_prompt(
@@ -3121,7 +3192,7 @@ pub async fn run_harvest(
         }
     };
 
-    let job = store
+    let job = match store
         .create_job(
             FindingJobKind::Harvest.into(),
             repo.id,
@@ -3129,7 +3200,27 @@ pub async fn run_harvest(
             cap,
             JobState::Running,
         )
-        .await?;
+        .await
+    {
+        Ok(j) => j,
+        Err(e) => {
+            let rps = rpath.to_string_lossy().to_string();
+            let wts = worktree.to_string_lossy().to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                run_cmd_sync(
+                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                    30,
+                );
+            })
+            .await;
+            return job_refused(
+                FindingJobKind::Harvest.into(),
+                Some(&repo.name),
+                Some(fid),
+                e,
+            );
+        }
+    };
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
     let prompt = playbooks::build_harvest_prompt(
         &cfg.root,

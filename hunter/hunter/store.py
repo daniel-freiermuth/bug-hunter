@@ -989,12 +989,27 @@ class Store:
         (prompt building, git operations, worktree setup) opened a real
         window where _cycle_lock was already held (the UI's "cycle
         running" indicator) but current_job() found nothing yet, showing
-        stale last-cycle text instead."""
+        stale last-cycle text instead.
+
+        Refuses (ValueError) when the repo has been soft-deleted. The
+        EXISTS check rides along with the INSERT rather than preceding it
+        because the scheduler read its repo row long before reaching here:
+        a delete landing in between passes any check-then-insert, and the
+        foreign key does not catch it either -- a flagged row is still
+        physically present. The job that slips through is worse than a
+        lost cycle: forget_deleted_repo is a plain DELETE, so one
+        referencing job wedges the repo half-deleted forever -- invisible
+        to every read path, unreapable, still accruing work."""
         cur = self.db.execute(
             "INSERT INTO jobs (kind, repo_id, finding_id, cap_tokens, state, started_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (kind, repo_id, finding_id, cap_tokens, state, now_ms()),
+            " SELECT ?,?,?,?,?,?"
+            " WHERE EXISTS (SELECT 1 FROM repos WHERE id = ? AND deleted_at IS NULL)",
+            (kind, repo_id, finding_id, cap_tokens, state, now_ms(), repo_id),
         )
+        if not cur.rowcount:
+            self.db.rollback()
+            msg = f"repo {repo_id} is deleted -- cannot start a {kind} job"
+            raise ValueError(msg)
         self.db.commit()
         assert cur.lastrowid is not None
         return cur.lastrowid

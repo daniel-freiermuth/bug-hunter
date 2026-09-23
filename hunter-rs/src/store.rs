@@ -1080,6 +1080,16 @@ impl Store {
 
     /// INSERT INTO jobs, returns new id. state starts as "running" (the
     /// scheduler immediately overwrites to the caller's desired state).
+    ///
+    /// Refuses when the repo has been soft-deleted. The `WHERE EXISTS` is
+    /// part of the insert rather than a preceding SELECT because the
+    /// scheduler reads its repo row long before it gets here: a delete
+    /// landing in between would pass any check-then-insert, and the
+    /// foreign key cannot catch it either — a flagged row is still
+    /// physically present. The job that slips through is worse than a lost
+    /// cycle: `forget_deleted_repo` is a plain DELETE, so a single
+    /// referencing job wedges the repo permanently half-deleted —
+    /// invisible to every read path, unreapable, still accruing work.
     pub async fn create_job(
         &self,
         kind: JobKind,
@@ -1087,11 +1097,12 @@ impl Store {
         finding_id: Option<i64>,
         cap_tokens: i64,
         state: JobState,
-    ) -> sqlx::Result<i64> {
+    ) -> Result<i64, StoreWriteError> {
         let now = now_ms();
         let result = sqlx::query!(
             "INSERT INTO jobs (kind, repo_id, finding_id, cap_tokens, state, started_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6 \
+             WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
             kind,
             repo_id,
             finding_id,
@@ -1101,6 +1112,11 @@ impl Store {
         )
         .execute(&self.pool)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreWriteError::Refused(format!(
+                "repo {repo_id} is deleted -- cannot start a {kind} job"
+            )));
+        }
         Ok(result.last_insert_rowid())
     }
 
