@@ -289,14 +289,40 @@ fn github_owner_repo(url: &str) -> Option<(String, String)> {
     Some((owner, repo.to_owned()))
 }
 
+/// Strip `<scheme>://` from `url`, comparing the scheme without regard
+/// to case.
+///
+/// Schemes are case-insensitive per RFC 3986, and `valid_repo_url`
+/// admits `HTTPS://…` because it lowercases before checking its
+/// allow-list. Comparing case-sensitively here left the scheme inside
+/// the authority, so parsing fell through to the scp-like branch and
+/// read `HTTPS` as the host: no `github` label, so the repo was filed
+/// as GitLab and every later PR operation ran `glab` against GitHub.
+///
+/// Only the scheme is folded. The path half carries the owner/repo
+/// slug, which is case-sensitive.
+fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
+    let (head, rest) = url.split_at_checked(scheme.len())?;
+    if head.eq_ignore_ascii_case(scheme) {
+        rest.strip_prefix("://")
+    } else {
+        None
+    }
+}
+
+/// Strip whichever of the schemes the write path accepts `url` carries.
+fn strip_any_scheme(url: &str) -> Option<&str> {
+    ["https", "http", "ssh"]
+        .iter()
+        .find_map(|s| strip_scheme(url, s))
+}
+
 /// Split a remote URL into (host, path), for every form the write path
 /// accepts: `https://`, `http://`, `ssh://` and scp-like `git@host:path`.
 /// Any `user@` and `:port` are stripped from the host.
 fn url_host_path(url: &str) -> Option<(&str, &str)> {
     let host = url_host(url)?;
-    let after_scheme = ["https://", "http://", "ssh://"]
-        .iter()
-        .find_map(|p| url.strip_prefix(p));
+    let after_scheme = strip_any_scheme(url);
     let path = match after_scheme {
         // Past the authority, which is everything up to the first slash.
         Some(rest) => rest.split_once('/').map(|(_, p)| p)?,
@@ -503,7 +529,7 @@ impl Forge for GitHubForge {
         // Enterprise hosts too: a self-hosted GitHub's clone URL is
         // `git@<its host>:owner/repo.git`, and rewriting it to
         // github.com would push an internal repo at the public forge.
-        if https_url.starts_with("https://")
+        if strip_scheme(https_url, "https").is_some()
             && let Some((host, path)) = url_host_path(https_url)
             && is_github_host(host)
         {
@@ -522,7 +548,7 @@ impl Forge for GitHubForge {
     fn parse_pr_url(&self, url: &str) -> Option<(String, i64)> {
         // https://<github host>/owner/repo/pull/123
         let (host, path) = url_host_path(url)?;
-        if !url.starts_with("https://") || !is_github_host(host) {
+        if strip_scheme(url, "https").is_none() || !is_github_host(host) {
             return None;
         }
         let (slug, num_part) = path.rsplit_once("/pull/")?;
@@ -649,7 +675,7 @@ impl Forge for GitHubForge {
 impl Forge for GitLabForge {
     fn ssh_url(&self, https_url: &str) -> String {
         if let Some((host, path)) = gitlab_host_path(https_url)
-            && https_url.starts_with("https://")
+            && strip_scheme(https_url, "https").is_some()
         {
             return format!("git@{host}:{path}.git");
         }
@@ -668,8 +694,7 @@ impl Forge for GitLabForge {
 
     fn parse_pr_url(&self, url: &str) -> Option<(String, i64)> {
         // https://gitlab.com/group/subgroup/repo/-/merge_requests/42
-        let after_host = url
-            .strip_prefix("https://")
+        let after_host = strip_scheme(url, "https")
             .and_then(|s| s.split_once('/'))?
             .1;
         let (slug, num_part) = after_host.rsplit_once("/-/merge_requests/")?;
@@ -828,9 +853,7 @@ pub fn forge_for(forge: ForgeName) -> Box<dyn Forge> {
 /// substring test against the whole URL, which called a GitHub repo
 /// named `gitlab-ci-templates` a GitLab repo.
 pub fn url_host(url: &str) -> Option<&str> {
-    let after_scheme = ["https://", "http://", "ssh://"]
-        .iter()
-        .find_map(|p| url.strip_prefix(p));
+    let after_scheme = strip_any_scheme(url);
     let authority = match after_scheme {
         // scheme://[user@]host[:port]/path
         Some(rest) => rest.split('/').next()?,
