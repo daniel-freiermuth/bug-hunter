@@ -254,6 +254,13 @@ class Store:
                 "repos",
                 "ALTER TABLE repos ADD COLUMN last_standards_at INTEGER",
             ),
+            # Provenance: which job first turned this finding up. Not a
+            # foreign key -- see schema.sql for why.
+            (
+                "found_by_job",
+                "findings",
+                "ALTER TABLE findings ADD COLUMN found_by_job INTEGER",
+            ),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
@@ -338,6 +345,7 @@ class Store:
                     "  smell_type TEXT, suggested_refactor TEXT,"
                     "  modernization_class TEXT, current_approach TEXT, proposed_approach TEXT,"
                     "  standard_section TEXT,"
+                    "  found_by_job INTEGER,"
                     "  UNIQUE(type, fingerprint))"
                 )
                 # Build column list dynamically: old tables may not have every
@@ -383,6 +391,7 @@ class Store:
                     "current_approach",
                     "proposed_approach",
                     "standard_section",
+                    "found_by_job",
                 ]
                 # Defaults for NOT NULL columns that might be absent in the old table.
                 _defaults = {
@@ -420,6 +429,19 @@ class Store:
                 raise
             finally:
                 self.db.execute("PRAGMA foreign_keys = ON")
+
+        # After the rebuild, which drops the table and with it every index
+        # it carried, and after the column migrations rather than in
+        # schema.sql, which runs before them: on an existing database
+        # `findings.found_by_job` does not exist yet at that point.
+        # Partial because the column is NULL for every finding ingested
+        # before provenance was recorded, and those rows are exactly the
+        # ones no job will ever be looked up by.
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS findings_found_by_job ON findings(found_by_job)"
+            " WHERE found_by_job IS NOT NULL"
+        )
+        self.db.commit()
 
     # -- repos ---------------------------------------------------------
     def add_repo(
@@ -627,7 +649,19 @@ class Store:
                 f.write(f"- [{ts}] {note}\n\n")
 
     # -- findings ------------------------------------------------------
-    def upsert_finding(self, repo_id: int, f: Row, finding_type: str = "bug") -> tuple[int, bool]:
+    def upsert_finding(
+        self,
+        repo_id: int,
+        f: Row,
+        finding_type: str = "bug",
+        found_by_job: int | None = None,
+    ) -> tuple[int, bool]:
+        """Insert a finding, or report the existing one with this fingerprint.
+
+        `found_by_job` is written only on a genuine insert: a duplicate
+        belongs to the job that first turned it up, not to the latest one
+        to rediscover it.
+        """
         cur = self.db.execute(
             "SELECT id FROM findings WHERE type = ? AND fingerprint = ?",
             (finding_type, f["fingerprint"]),
@@ -645,8 +679,8 @@ class Store:
             " ecosystem, package, current_version, latest_version, update_type, security_advisory,"
             " missing_tests, test_file, smell_type, suggested_refactor,"
             " modernization_class, current_approach, proposed_approach, standard_section,"
-            " status, created_at, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?)",
+            " status, created_at, updated_at, found_by_job)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'new', ?, ?, ?)",
             (
                 finding_type,
                 repo_id,
@@ -677,15 +711,32 @@ class Store:
                 f.get("standard_section"),
                 t,
                 t,
+                found_by_job,
             ),
         )
         self.db.commit()
         assert cur.lastrowid is not None
         return cur.lastrowid, True
 
+    # Columns the daemon keeps for itself. These reads are `SELECT *`
+    # while the Rust port names its columns one by one, so a column added
+    # for internal use silently becomes part of one daemon's API
+    # responses and not the other's. Dropping them here keeps the two
+    # shapes identical without giving up `SELECT *`.
+    #
+    # found_by_job: which job produced a finding is already reported the
+    # other way round, as produced_finding_ids on /api/jobs.
+    _INTERNAL_FINDING_COLS = ("found_by_job",)
+
+    @classmethod
+    def _public_finding(cls, row: Row) -> Row:
+        for col in cls._INTERNAL_FINDING_COLS:
+            row.pop(col, None)
+        return row
+
     def get_finding(self, fid: int) -> Row | None:
         r = self.db.execute("SELECT * FROM findings WHERE id = ?", (fid,)).fetchone()
-        return dict(r) if r else None
+        return self._public_finding(dict(r)) if r else None
 
     def list_findings(
         self,
@@ -734,6 +785,7 @@ class Store:
                 r["category"] = r.get("modernization_class")
             elif r["type"] == "standards":
                 r["category"] = r.get("standard_section")
+            self._public_finding(r)
         return rows
 
     def set_status(
@@ -1024,14 +1076,32 @@ class Store:
         self.db.commit()
 
     def list_jobs(self, limit: int = 50) -> list[Row]:
-        return _rows(
+        """Recent jobs, each carrying the findings it brought into existence.
+
+        The produced ids come from one correlated subquery rather than a
+        query per job: this feeds a 50-row table that polls, so an N+1
+        here would be 50 extra round trips every few seconds.
+        `group_concat` returns NULL for a job that produced nothing,
+        which is the common case (every fix, recheck and engage job), so
+        the empty list is the normal result and not an error. Always
+        present, so a client never has to distinguish "produced nothing"
+        from "not reported".
+        """
+        rows = _rows(
             self.db.execute(
-                "SELECT j.*, r.name AS repo_name FROM jobs j"
+                "SELECT j.*, r.name AS repo_name,"
+                " (SELECT group_concat(f.id) FROM findings f WHERE f.found_by_job = j.id)"
+                " AS produced"
+                " FROM jobs j"
                 " JOIN repos r ON r.id = j.repo_id"
                 " ORDER BY j.id DESC LIMIT ?",
                 (limit,),
             )
         )
+        for r in rows:
+            produced = r.pop("produced")
+            r["produced_finding_ids"] = [int(x) for x in produced.split(",")] if produced else []
+        return rows
 
     def jobs_by_finding(self, fid: int) -> list[Row]:
         """Every job ever run against this finding, newest first -- unlike

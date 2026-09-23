@@ -274,7 +274,7 @@ pub async fn ingest_findings(
             standard_section: opt_str("standard_section"),
         };
         match store
-            .upsert_finding(repo_id, &insert, &entry_type_str)
+            .upsert_finding(repo_id, &insert, &entry_type_str, job)
             .await
         {
             Ok((fid, true)) => {
@@ -285,11 +285,14 @@ pub async fn ingest_findings(
                     &entry_type_str
                 };
                 let fp = &insert.fingerprint;
+                // `job`, not None: this is the event that records the
+                // finding coming into existence, so it is the one that
+                // most needs to say which job produced it.
                 let _ = store
                     .log_event(
                         event_kind,
                         &format!("new {entry_type}: {fp}"),
-                        None,
+                        job,
                         Some(fid),
                     )
                     .await;

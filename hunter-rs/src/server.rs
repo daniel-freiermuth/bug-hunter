@@ -30,8 +30,8 @@ use crate::config::Config;
 use crate::domain::{FindingStatus, FindingType, ForgeName, Severity};
 use crate::store::{FindingFilter, RepoUpdate, Store, StoreWriteError};
 use crate::types::{
-    ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, Job, Repo, RepoBrief,
-    Stats, Summary,
+    ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, JobListEntry, Repo,
+    RepoBrief, Stats, Summary,
 };
 
 /// Handle to this process's scheduler loop.
@@ -460,7 +460,7 @@ async fn finding_detail(
 
 // -- /api/jobs, /api/repos, /api/events, /api/stats (contract §§6,7,9,10) ----
 
-async fn jobs(State(state): State<AppState>) -> Result<Json<Vec<Job>>, ApiError> {
+async fn jobs(State(state): State<AppState>) -> Result<Json<Vec<JobListEntry>>, ApiError> {
     Ok(Json(state.store.list_jobs(50).await?))
 }
 

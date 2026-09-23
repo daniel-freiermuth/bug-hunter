@@ -118,6 +118,7 @@ async fn fixture(label: &str) -> Fixture {
                 ..Default::default()
             },
             "bug",
+            None,
         )
         .await
         .unwrap();
