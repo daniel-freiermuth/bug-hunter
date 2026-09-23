@@ -75,6 +75,13 @@
       case "newest":
         out.sort((a, b) => b.created_at - a.created_at);
         break;
+      case "updated":
+        // updated_at, not created_at: a finding moves when it is
+        // triaged, fixed, or its PR changes state, so this surfaces what
+        // the daemon and you have just been working on rather than what
+        // happened to be found last.
+        out.sort((a, b) => b.updated_at - a.updated_at);
+        break;
       case "oldest":
         out.sort((a, b) => a.created_at - b.created_at);
         break;
@@ -140,6 +147,7 @@
     >
       <option value="severity">Severity × Confidence</option>
       <option value="newest">Newest</option>
+      <option value="updated">Recently updated</option>
       <option value="oldest">Oldest</option>
       <option value="repo">By repo</option>
     </select>
