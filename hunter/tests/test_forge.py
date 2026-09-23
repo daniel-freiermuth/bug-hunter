@@ -239,8 +239,15 @@ class TestExtractHost:
     def test_self_hosted_ssh(self) -> None:
         assert _extract_host("git@git.corp.com:team/proj.git") == "git.corp.com"
 
-    def test_fallback(self) -> None:
-        assert _extract_host("bogus") == "gitlab.com"
+    def test_unparseable_has_no_host(self) -> None:
+        # Not the literal "gitlab.com" it used to return: that read
+        # every ssh:// URL as GitLab, including GitHub ones.
+        assert _extract_host("bogus") == ""
+
+    def test_ssh_scheme_and_port(self) -> None:
+        assert _extract_host("ssh://git@github.com/acme/w.git") == "github.com"
+        assert _extract_host("ssh://git@gitlab.example.com:2222/g/r.git") == "gitlab.example.com"
+        assert _extract_host("http://github.com/a/b.git") == "github.com"
 
 
 class TestDetectForge:
@@ -256,12 +263,24 @@ class TestDetectForge:
     def test_gitlab_self_hosted(self) -> None:
         assert detect_forge("https://gitlab.corp.net/a/b") == "gitlab"
 
-    def test_unknown_defaults_github(self) -> None:
-        assert detect_forge("https://bitbucket.org/a/b") == "github"
+    def test_unknown_host_defaults_gitlab(self) -> None:
+        # GitHub cannot be self-hosted off a domain GitHub operates
+        # without saying so; anything else can be a self-hosted GitLab.
+        assert detect_forge("https://bitbucket.org/a/b") == "gitlab"
+        assert detect_forge("https://git.internal/a/b") == "gitlab"
 
     def test_empty_defaults_gitlab(self) -> None:
-        # empty → _extract_host fallback "gitlab.com" → "gitlab"
+        # No host takes the same remainder as any unrecognised host.
         assert detect_forge("") == "gitlab"
+
+    def test_ssh_urls_detect_by_host(self) -> None:
+        assert detect_forge("ssh://git@github.com/acme/widget.git") == "github"
+        assert detect_forge("ssh://git@gitlab.example.com:2222/g/r.git") == "gitlab"
+
+    def test_forge_comes_from_the_host_not_the_path(self) -> None:
+        # A GitHub repo whose NAME contains "gitlab".
+        assert detect_forge("https://github.com/acme/gitlab-ci-templates.git") == "github"
+        assert detect_forge("https://GitLab.example.com/g/r.git") == "gitlab"
 
 
 class TestForgeFor:
@@ -290,3 +309,42 @@ class TestForgeFor:
     def test_empty_dict(self) -> None:
         f = forge_for({})
         assert isinstance(f, GitHubForge)
+
+
+class TestGitHubEnterpriseHosts:
+    """A host detect_forge calls GitHub must work with the GitHub ops.
+
+    When only github.com parsed, an Enterprise repo was accepted at
+    POST /api/repos, hunted and fixed, and then every PR action for it
+    failed because its slug would not parse.
+    """
+
+    def test_owner_repo_carries_the_host(self) -> None:
+        gh = GitHubForge()
+        for url in (
+            "https://github.corp.com/acme/widget.git",
+            "ssh://git@github.corp.com:22/acme/widget.git",
+            "git@github.corp.com:acme/widget.git",
+        ):
+            assert gh.owner_repo(url) == "github.corp.com/acme/widget", url
+        assert gh.owner_repo("https://mycompany.ghe.com/a/w") == "mycompany.ghe.com/a/w"
+        # github.com keeps the bare slug every stored PR already uses.
+        assert gh.owner_repo("https://github.com/acme/widget.git") == "acme/widget"
+
+    def test_non_github_hosts_stay_rejected(self) -> None:
+        gh = GitHubForge()
+        assert gh.owner_repo("https://gitlab.com/acme/widget") is None
+        assert gh.owner_repo("https://code.corp.com/acme/widget") is None
+        assert gh.parse_pr_url("https://gitlab.com/a/b/pull/7") is None
+        # Handed back untouched rather than rewritten to github.com.
+        assert gh.ssh_url("https://code.corp.com/a/b") == "https://code.corp.com/a/b"
+
+    def test_pr_url_and_ssh_url_use_the_real_host(self) -> None:
+        gh = GitHubForge()
+        assert gh.parse_pr_url("https://github.corp.com/a/w/pull/7") == (
+            "github.corp.com/a/w",
+            7,
+        )
+        assert gh.parse_pr_url("https://github.com/a/w/pull/7") == ("a/w", 7)
+        assert gh.ssh_url("https://github.corp.com/a/w") == "git@github.corp.com:a/w.git"
+        assert gh.ssh_url("https://github.com/a/w") == "git@github.com:a/w.git"
