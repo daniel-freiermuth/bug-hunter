@@ -20,6 +20,7 @@ clicking around the UI.
 
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -576,3 +577,64 @@ class TestRepoUrlScheme:
     )
     def test_rejects_other_schemes(self, url: str) -> None:
         assert server.valid_repo_url(url) is False
+
+
+def _git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "init.defaultBranch=main",
+            *args,
+        ],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+    )
+
+
+class TestMigrateRepoNotes:
+    """Parity with hunter-rs tests/notes_layout_test.rs.
+
+    Clones are real git checkouts: the migration moves NOTES.md only when
+    git positively reports it untracked, so a plain directory cannot stand
+    in for one.
+    """
+
+    def _clone(self, work_root: Path, repo_id: int) -> Path:
+        d = work_root / "repos" / f"repo-{repo_id}"
+        d.mkdir(parents=True)
+        _git(d, "init", "-q")
+        return d
+
+    def test_untracked_legacy_notes_move_out(self, tmp_path: Path) -> None:
+        d = self._clone(tmp_path, 12)
+        (d / "NOTES.md").write_text("# Notes: widget\n\n- old entry\n")
+        assert server.migrate_repo_notes(tmp_path) == 1
+        assert not (d / "NOTES.md").exists()
+        assert "old entry" in (tmp_path / "notes" / "repo-12.md").read_text()
+
+    def test_a_tracked_notes_file_is_left_in_the_project(self, tmp_path: Path) -> None:
+        d = self._clone(tmp_path, 4)
+        (d / "NOTES.md").write_text("# Project design notes\n")
+        _git(d, "add", "NOTES.md")
+        _git(d, "commit", "-q", "-m", "docs")
+        assert server.migrate_repo_notes(tmp_path) == 0
+        assert (d / "NOTES.md").read_text() == "# Project design notes\n"
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=d, capture_output=True, text=True, check=True
+        )
+        assert status.stdout == "", "the clone must stay clean"
+        assert not (tmp_path / "notes" / "repo-4.md").exists()
+
+    def test_a_notes_file_git_cannot_classify_is_left_alone(self, tmp_path: Path) -> None:
+        d = tmp_path / "repos" / "repo-6"
+        d.mkdir(parents=True)
+        (d / "NOTES.md").write_text("unknown\n")
+        assert server.migrate_repo_notes(tmp_path) == 0
+        assert (d / "NOTES.md").is_file()
+        assert not (tmp_path / "notes" / "repo-6.md").exists()

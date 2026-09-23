@@ -38,6 +38,42 @@ impl std::ops::Deref for TestState {
     }
 }
 
+/// Refuse to run when this process can write through a read-only
+/// directory.
+///
+/// Three tests below block reclamation by taking write permission off
+/// `repos/`. Root ignores that bit, so under root the removal succeeds,
+/// the row is reaped, and every one of them goes green having exercised
+/// the opposite of what it claims to test — the silent kind of pass,
+/// where the assertions still run and still hold.
+///
+/// Checked by trying it rather than by comparing the euid to 0: the euid
+/// is a proxy, and `CAP_DAC_OVERRIDE` or a filesystem mounted without
+/// permission enforcement defeats the tests the same way while leaving
+/// it non-zero. It also keeps this to `std`.
+///
+/// Runs in its own directory and restores it before asserting, so a
+/// caller's `repos/` is untouched whether this passes or panics — which
+/// is also why it must be called BEFORE the caller's own chmod.
+fn require_enforced_permissions() {
+    let probe = support::TempDir::new("perm-probe");
+    let dir = probe.path();
+    let mut perms = std::fs::metadata(dir).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(dir, perms).unwrap();
+    let wrote = std::fs::write(dir.join("probe"), "x").is_ok();
+    let mut perms = std::fs::metadata(dir).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(dir, perms).unwrap();
+    assert!(
+        !wrote,
+        "this process writes through a read-only directory (running as \
+         root?), and this test blocks reclamation with one — it would \
+         pass while proving the opposite"
+    );
+}
+
 /// Copy dev.db into `dir`, seed repos/findings through a writable pool,
 /// then reopen WRITABLE (POSTs write). Seed layout:
 /// - repo 1 "demo" with findings 1 (new, fp-1), 2 (queued, fp-2),
@@ -691,13 +727,14 @@ async fn cycle_while_running_is_409_busy() {
 /// Deleting a repo must remove its notes file.
 ///
 /// The original reason was id reuse: SQLite handed a freed rowid to the
-/// next INSERT, so a `repo-{id}/NOTES.md` left behind was inherited by
-/// the next repo to take that id. Migration 009 made `repos.id`
-/// AUTOINCREMENT and closed that premise — see
-/// `a_reclaimed_id_is_never_reissued`.
+/// next INSERT, so a notes file left behind was inherited by the next
+/// repo to take that id. Migration 009 made `repos.id` AUTOINCREMENT
+/// and closed that premise — see `a_reclaimed_id_is_never_reissued`.
 ///
-/// The removal still has to happen. `reap_repo` only drops the row once
-/// `repo-{id}` is gone, so notes that survive keep a deleted repo's
+/// The removal still has to happen, and since notes moved out of the
+/// clone to `notes/repo-{id}.md` it has to be explicit: removing
+/// `repo-{id}` no longer takes them with it. `reap_repo` only drops the
+/// row once both are gone, so notes that survive keep a deleted repo's
 /// private context on disk and its row alive indefinitely.
 #[tokio::test]
 async fn deleting_a_repo_removes_its_notes() {
@@ -720,12 +757,8 @@ async fn deleting_a_repo_removes_its_notes() {
     )
     .await;
     assert_eq!(status, StatusCode::CREATED);
-    let notes_path = state
-        .config
-        .work_root
-        .join("repos")
-        .join(format!("repo-{rid}"))
-        .join("NOTES.md");
+    // Via the production path builder: notes have moved once already.
+    let notes_path = Store::notes_path(&state.config.work_root, rid);
     assert!(notes_path.exists(), "fixture: notes file was written");
 
     let (status, body) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
@@ -753,6 +786,7 @@ async fn deleting_a_repo_removes_its_notes() {
 /// operator through the log, and that is where they are asserted.
 #[tokio::test]
 async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
+    require_enforced_permissions();
     let state = test_state().await;
 
     let (status, body) = post(
@@ -813,9 +847,90 @@ async fn a_repo_whose_files_survive_keeps_its_id_reserved_until_reaped() {
     );
 
     // The reaper finishes the job once the obstruction is gone.
-    let reaped = hunter::server::reap_deleted_repos(&state.store, &state.config.work_root).await;
+    let reaped = hunter::server::reap_deleted_repos(
+        &state.store,
+        &state.config.work_root,
+        &state.repo_notes,
+    )
+    .await;
     assert_eq!(reaped, 1);
     assert!(!repo_dir.exists(), "the reaper must remove the directory");
+    assert!(
+        state.store.deleted_repo_ids().await.unwrap().is_empty(),
+        "and only then release the id"
+    );
+}
+
+/// The same must hold when it is the *notes* that cannot be removed.
+///
+/// Reclamation removes two things, and the sibling test above only ever
+/// reaches the first: the clone directory fails, so the notes removal is
+/// never attempted and neither is the branch that has to propagate its
+/// failure. Make notes best-effort — `let _ = remove_file(..)`, which is
+/// tempting since they are secondary to the clone — and the row is
+/// dropped while the operator's private context is still on disk, with
+/// nothing left that will ever retry it. That is the one outcome
+/// two-phase deletion exists to prevent, and nothing else fails.
+///
+/// The obstruction is a directory at the notes path: `unlink` refuses a
+/// directory outright, so this needs no permission games and holds under
+/// root, where the sibling test has to bow out.
+#[tokio::test]
+async fn notes_that_cannot_be_removed_keep_the_id_reserved_too() {
+    let state = test_state().await;
+
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "throwaway", "url": "https://example.com/throwaway.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let rid = body["repo"]["id"].as_i64().expect("new repo id");
+
+    let notes_path = Store::notes_path(&state.config.work_root, rid);
+    std::fs::create_dir_all(&notes_path).unwrap();
+    std::fs::write(notes_path.join("occupied"), "x").unwrap();
+    // The clone was never made, so its removal reports NotFound and is
+    // skipped -- this test only gets to say anything because the notes
+    // step runs after it.
+    let clone_dir = Store::repo_dir(&state.config.work_root.join("repos"), rid);
+    assert!(
+        !clone_dir.exists(),
+        "fixture: the clone must be absent, or it fails first"
+    );
+
+    let sink = LogSink::default();
+    let capture = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(sink.clone())
+            .finish(),
+    );
+    let (status, body) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
+    drop(capture);
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(
+        state.store.deleted_repo_ids().await.unwrap(),
+        vec![rid],
+        "notes left on disk must keep the repo reapable, not release its id"
+    );
+    let logged = sink.text();
+    assert!(
+        logged.contains(&format!("repo {rid} deleted, but reclaiming ")),
+        "a failed reclamation must be logged: {logged}"
+    );
+
+    // And once the obstruction is gone the reaper finishes, which is what
+    // makes the retained row a retry rather than a wedge.
+    std::fs::remove_dir_all(&notes_path).unwrap();
+    let reaped = hunter::server::reap_deleted_repos(
+        &state.store,
+        &state.config.work_root,
+        &state.repo_notes,
+    )
+    .await;
+    assert_eq!(reaped, 1);
     assert!(
         state.store.deleted_repo_ids().await.unwrap().is_empty(),
         "and only then release the id"
@@ -933,6 +1048,7 @@ async fn deleting_a_repo_removes_its_directory() {
 /// What pending reclamation governs is only the name and the clone path.
 #[tokio::test]
 async fn deleting_frees_the_name_at_once_and_never_reissues_the_id() {
+    require_enforced_permissions();
     let state = test_state().await;
     let repos_dir = state.config.work_root.join("repos");
 
@@ -1036,6 +1152,7 @@ async fn deleting_a_repo_logs_exactly_one_event() {
 /// for an id that never existed.
 #[tokio::test]
 async fn a_retried_delete_is_a_success_while_reclamation_is_pending() {
+    require_enforced_permissions();
     let state = test_state().await;
     let (status, body) = post(
         &state,
@@ -1068,7 +1185,8 @@ async fn a_retried_delete_is_a_success_while_reclamation_is_pending() {
     assert_eq!(retry, StatusCode::OK, "a retry must not 404: {retry_body}");
 
     // Once reclaimed, the id is ordinary again and answers 404.
-    hunter::server::reap_deleted_repos(&state.store, &state.config.work_root).await;
+    hunter::server::reap_deleted_repos(&state.store, &state.config.work_root, &state.repo_notes)
+        .await;
     let (after, _) = post(&state, "/api/repo/delete", json!({ "id": rid })).await;
     assert_eq!(after, StatusCode::NOT_FOUND);
 
@@ -1107,7 +1225,8 @@ async fn a_reclaimed_id_is_never_reissued() {
     // the state in which a rowid alias would be reissued.
     let (status, _) = post(&state, "/api/repo/delete", json!({ "id": first })).await;
     assert_eq!(status, StatusCode::OK);
-    hunter::server::reap_deleted_repos(&state.store, &state.config.work_root).await;
+    hunter::server::reap_deleted_repos(&state.store, &state.config.work_root, &state.repo_notes)
+        .await;
     assert!(state.store.deleted_repo_ids().await.unwrap().is_empty());
 
     let (status, body) = post(
@@ -1123,5 +1242,212 @@ async fn a_reclaimed_id_is_never_reissued() {
         second > first,
         "id {first} was reissued as {second}; a client still holding {first} \
          would now be addressing a different repository"
+    );
+}
+
+/// Changing a repo's URL must not strand its clone.
+///
+/// `sync_repo` refuses to work in a directory whose origin is not the
+/// repo's URL, which is how it recognises somebody else's checkout at
+/// the path. Leaving the clone on the old origin turned that check into
+/// a permanent block: every job for the repo failed until the directory
+/// was removed by hand.
+#[tokio::test]
+async fn changing_the_url_repoints_the_existing_clone() {
+    let state = test_state().await;
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "movable", "url": "https://example.com/old.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let rid = body["repo"]["id"].as_i64().expect("new repo id");
+
+    // A real clone carrying the old origin.
+    let dir = state
+        .config
+        .work_root
+        .join("repos")
+        .join(format!("repo-{rid}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_string_lossy().to_string();
+    for argv in [
+        vec!["git", "-C", &d, "init", "-q"],
+        vec![
+            "git",
+            "-C",
+            &d,
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/old.git",
+        ],
+    ] {
+        let (rc, out) = hunter::util::run_cmd(&argv, 30);
+        assert_eq!(rc, 0, "fixture: {argv:?} failed: {out}");
+    }
+
+    let (status, body) = post(
+        &state,
+        "/api/repo",
+        json!({ "id": rid, "url": "https://example.com/new.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (rc, out) = hunter::util::run_cmd(&["git", "-C", &d, "remote", "get-url", "origin"], 30);
+    assert_eq!(rc, 0);
+    assert_eq!(
+        out.trim(),
+        "https://example.com/new.git",
+        "the clone must follow the repo to its new url"
+    );
+}
+
+/// A clone belonging to something else is left alone to trip the check.
+#[tokio::test]
+async fn changing_the_url_leaves_an_unrelated_clone_untouched() {
+    let state = test_state().await;
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "occupied", "url": "https://example.com/old.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let rid = body["repo"]["id"].as_i64().expect("new repo id");
+
+    let dir = state
+        .config
+        .work_root
+        .join("repos")
+        .join(format!("repo-{rid}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_string_lossy().to_string();
+    for argv in [
+        vec!["git", "-C", &d, "init", "-q"],
+        vec![
+            "git",
+            "-C",
+            &d,
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/someone-else.git",
+        ],
+    ] {
+        let (rc, out) = hunter::util::run_cmd(&argv, 30);
+        assert_eq!(rc, 0, "fixture: {argv:?} failed: {out}");
+    }
+
+    let (status, _) = post(
+        &state,
+        "/api/repo",
+        json!({ "id": rid, "url": "https://example.com/new.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, out) = hunter::util::run_cmd(&["git", "-C", &d, "remote", "get-url", "origin"], 30);
+    assert_eq!(
+        out.trim(),
+        "https://example.com/someone-else.git",
+        "an unrelated checkout must not be rewritten -- that refusal is the point"
+    );
+}
+
+/// The clone that gets repointed is the one the scheduler actually uses.
+///
+/// Migration 007 left any path that did not end in the repo's name
+/// exactly as it was — an operator-edited one — and every scheduler
+/// runner syncs `repo.path`. A repoint that derived the directory from
+/// the id would rewrite nothing for such a row while `sync_repo` kept
+/// finding the old origin, which is the permanent refusal this is meant
+/// to avoid.
+#[tokio::test]
+async fn the_repoint_follows_an_operator_edited_path() {
+    let state = test_state().await;
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "moved", "url": "https://example.com/old.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let rid = body["repo"]["id"].as_i64().expect("new repo id");
+
+    // A clone somewhere the id does not name, recorded on the row.
+    let custom = state.config.work_root.join("elsewhere").join("checkout");
+    std::fs::create_dir_all(&custom).unwrap();
+    let cs = custom.to_string_lossy().to_string();
+    for argv in [
+        vec!["git", "-C", &cs, "init", "-q"],
+        vec![
+            "git",
+            "-C",
+            &cs,
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/old.git",
+        ],
+    ] {
+        let (rc, out) = hunter::util::run_cmd(&argv, 30);
+        assert_eq!(rc, 0, "fixture: {argv:?} failed: {out}");
+    }
+    // Straight to the column: no production code path sets a custom
+    // path, which is the point -- these rows predate the id layout.
+    let pool = sqlx::SqlitePool::connect(&format!(
+        "sqlite://{}",
+        state.config.db_path.to_string_lossy()
+    ))
+    .await
+    .unwrap();
+    sqlx::query("UPDATE repos SET path = ?1 WHERE id = ?2")
+        .bind(&cs)
+        .bind(rid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let (status, body) = post(
+        &state,
+        "/api/repo",
+        json!({ "id": rid, "url": "https://example.com/new.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (_, out) = hunter::util::run_cmd(&["git", "-C", &cs, "remote", "get-url", "origin"], 30);
+    assert_eq!(
+        out.trim(),
+        "https://example.com/new.git",
+        "the clone named by repo.path is the one the scheduler syncs"
+    );
+}
+
+/// The scratch directory does not outlive the test that made it.
+///
+/// Each state carries a copy of `dev.db` plus whatever the POSTs wrote
+/// under `work_root`; left behind, a full run of this suite deposits one
+/// directory per test in the system temp dir, which on this machine is a
+/// tmpfs shared with every build. It filled twice in one day, and a
+/// truncated file mid-checkout is how that failure presents — nowhere
+/// near the tests that caused it.
+#[tokio::test]
+async fn the_scratch_dir_is_removed_with_the_state() {
+    let root = {
+        let state = test_state().await;
+        // Writes so the directory is not merely the db copy.
+        let (status, _) = post(&state, "/api/repo/notes", json!({ "id": 1, "note": "x" })).await;
+        assert_eq!(status, StatusCode::CREATED);
+        state.config.root.clone()
+    };
+    assert!(
+        !root.exists(),
+        "{} outlived its test and leaks into the temp dir",
+        root.display()
     );
 }
