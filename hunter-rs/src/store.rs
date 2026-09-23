@@ -1540,7 +1540,18 @@ impl Store {
     /// columns; two conditional queries handle `attention_since` and
     /// clearing addressed state — three compile-time checked queries
     /// instead of one dynamic one.
+    ///
+    /// All three share one transaction because the conditional UPDATEs are
+    /// decided from the state the UPSERT writes: `attention_since` is only
+    /// stamped on the sync where the attention reason *changes*, so if the
+    /// UPSERT committed the new `attention_fingerprint` and the UPDATE then
+    /// failed, every later sync would see an unchanged reason and never
+    /// stamp it — leaving `list_attention` ordering and the displayed
+    /// attention age permanently wrong.  `clear_addressed` has the same
+    /// shape.  A plain (deferred) `begin` suffices: the first statement is
+    /// a write, so the lock is taken before anything is read back.
     pub async fn sync_pr_open(&self, finding_id: i64, d: &SyncPrData) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query!(
             "INSERT INTO pr_state (finding_id, pr_number, state, mergeable, checks, \
              head_ref, head_sha, last_activity_at, last_engaged_activity_at, \
@@ -1571,7 +1582,7 @@ impl Store {
             d.attention_fingerprint,
             d.synced_at
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         // Conditional: set attention_since when the reason changed.
         if let Some(since) = d.attention_since {
@@ -1580,7 +1591,7 @@ impl Store {
                 since,
                 finding_id
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
         // Conditional: clear addressed state when the static snapshot changed.
@@ -1590,9 +1601,10 @@ impl Store {
                  addressed_head_sha = NULL WHERE finding_id = ?1",
                 finding_id
             )
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 

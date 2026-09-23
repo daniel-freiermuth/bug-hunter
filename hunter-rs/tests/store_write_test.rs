@@ -733,3 +733,126 @@ async fn connect_creates_and_migrates_a_brand_new_database() {
     pool.close().await;
     cleanup(&path);
 }
+
+// -- 10. sync_pr_open atomicity -------------------------------------------
+
+fn sync_pr_data(
+    fingerprint: &str,
+    reason: &str,
+    since: i64,
+    clear_addressed: bool,
+) -> hunter::store::SyncPrData {
+    hunter::store::SyncPrData {
+        pr_number: 7,
+        state: "OPEN".into(),
+        mergeable: "MERGEABLE".into(),
+        checks: Some("2 pass".into()),
+        head_ref: "fix/one".into(),
+        head_sha: "deadbee".into(),
+        last_activity_at: since,
+        last_engaged_activity_at: 0,
+        needs_attention: Some(reason.into()),
+        attention_fingerprint: Some(fingerprint.into()),
+        synced_at: since,
+        attention_since: Some(Some(since)),
+        clear_addressed,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
+struct PrStateRow {
+    needs_attention: Option<String>,
+    attention_fingerprint: Option<String>,
+    attention_since: Option<i64>,
+    addressed_fingerprint: Option<String>,
+    synced_at: Option<i64>,
+}
+
+async fn pr_state_row(pool: &SqlitePool) -> PrStateRow {
+    sqlx::query_as::<_, PrStateRow>(
+        "SELECT needs_attention, attention_fingerprint, attention_since, \
+         addressed_fingerprint, synced_at FROM pr_state WHERE finding_id = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// `sync_pr_open` decides its two conditional UPDATEs from the state its
+/// UPSERT writes, so a failure between them is not a lost update but a
+/// permanently wrong one: the next sync compares against the already
+/// committed `attention_fingerprint`, sees no change, and never stamps
+/// `attention_since` again.
+///
+/// Provoking the real trigger (`SQLITE_BUSY` past the 5 s busy timeout) is
+/// not something a test can schedule, so the failure is injected where it
+/// would land: a trigger that ABORTs the `attention_since` UPDATE. ABORT
+/// unwinds only that statement, leaving the caller's transaction (if any)
+/// to decide the fate of the UPSERT — which is exactly the question.
+#[tokio::test]
+async fn sync_pr_open_rolls_back_the_upsert_when_a_later_statement_fails() {
+    let (path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+
+    store
+        .sync_pr_open(
+            1,
+            &sync_pr_data("fp-old", "review_changes_requested", 1000, false),
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE pr_state SET addressed_fingerprint = 'af-old' WHERE finding_id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = pr_state_row(&pool).await;
+
+    sqlx::query(
+        "CREATE TRIGGER no_attention_since BEFORE UPDATE OF attention_since ON pr_state \
+         BEGIN SELECT RAISE(ABORT, 'injected attention_since failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = store
+        .sync_pr_open(1, &sync_pr_data("fp-new", "merge_conflict", 5000, true))
+        .await
+        .expect_err("the injected failure must surface to the caller");
+    assert!(
+        err.to_string().contains("injected attention_since failure"),
+        "failed on the injected trigger, not something else: {err}"
+    );
+
+    // The whole sync is gone, not just the statement that failed.
+    assert_eq!(
+        pr_state_row(&pool).await,
+        before,
+        "the UPSERT must not survive a failure in a statement that depends on it"
+    );
+
+    // With the injected failure removed the same sync applies all three
+    // writes, so the assertion above measures atomicity, not inertness.
+    sqlx::query("DROP TRIGGER no_attention_since")
+        .execute(&pool)
+        .await
+        .unwrap();
+    store
+        .sync_pr_open(1, &sync_pr_data("fp-new", "merge_conflict", 5000, true))
+        .await
+        .unwrap();
+    assert_eq!(
+        pr_state_row(&pool).await,
+        PrStateRow {
+            needs_attention: Some("merge_conflict".into()),
+            attention_fingerprint: Some("fp-new".into()),
+            attention_since: Some(5000),
+            addressed_fingerprint: None,
+            synced_at: Some(5000),
+        }
+    );
+
+    pool.close().await;
+    cleanup(&path);
+}
