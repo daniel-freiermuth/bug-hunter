@@ -4,7 +4,9 @@
 import type {
   Summary, Finding, Job, Event, Stats, FindingDetail,
 } from "./types";
-import { isFindingDetail, isRecordList, isStats, isSummary } from "./validate";
+import {
+  isEventList, isFindingDetail, isFindingList, isJobList, isStats, isSummary,
+} from "./validate";
 
 const POLL_MS = 5000;
 
@@ -101,13 +103,16 @@ class HunterStore {
       //
       // Checking the category alone was not enough to keep that promise:
       // `{}` is an object, so it passed as a Summary and the status panel
-      // then dereferenced its missing `activity_status`.
+      // then dereferenced its missing `activity_status`. Nor is
+      // record-ness enough for the lists: every one of them is rendered
+      // by a keyed `{#each}`, which throws on a missing or repeated key
+      // inside the component, where this `error` no longer reaches.
       if (
         !isSummary(s.body)
         || !isStats(st.body)
-        || !isRecordList(f.body)
-        || !isRecordList(j.body)
-        || !isRecordList(e.body)
+        || !isFindingList(f.body)
+        || !isJobList(j.body)
+        || !isEventList(e.body)
       ) {
         this.error = "API error (malformed response body)";
         return;
