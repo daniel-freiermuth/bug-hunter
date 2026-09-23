@@ -109,6 +109,7 @@
                 <th class="th-ts">ID</th>
                 <th class="th-kind">Kind</th>
                 <th>Repo</th>
+                <th class="th-kind">Finding</th>
                 <th class="th-kind">State</th>
                 <th class="right">Tokens</th>
                 <th class="right">Calls</th>
@@ -122,6 +123,18 @@
                   <td class="cell-ts">#{job.id}</td>
                   <td class="cell-kind">{job.kind}</td>
                   <td class="cell-small">{job.repo_name}</td>
+                  <td class="cell-links">
+                    <!-- A hunt has no finding of its own: it is the job
+                         that produces them, so the column is empty rather
+                         than linking somewhere misleading. -->
+                    {#if job.finding_id != null}
+                      <a href="#findings:{job.finding_id}" class="finding-link">
+                        F#{job.finding_id}
+                      </a>
+                    {:else}
+                      <span class="dim">–</span>
+                    {/if}
+                  </td>
                   <td>
                     <span class="badge {stateClass(job.state)}">
                       {job.state}
