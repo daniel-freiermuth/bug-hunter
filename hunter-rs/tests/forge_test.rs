@@ -510,3 +510,26 @@ fn uppercase_scheme_rewrites_to_ssh() {
 fn a_scheme_word_without_a_separator_is_not_a_scheme() {
     assert_eq!(url_host("HTTPSgithub.com/Acme/Widget"), None);
 }
+
+/// The scp form has no slash before the colon.
+///
+/// `github.com/x:y` is not `host:path` — and reading it as host
+/// `github.com/x` split the two daemons: POST /api/repos with that URL
+/// stored forge=github here and forge=gitlab on the Python daemon,
+/// which rejects the form. `valid_repo_url` accepts it (the pre-colon
+/// text contains a slash, so it is not a legal scheme either), so the
+/// disagreement was reachable from the API.
+#[test]
+fn a_slash_before_the_colon_is_not_the_scp_form() {
+    for url in ["github.com/x:y", "code.corp.com/a:b"] {
+        assert_eq!(url_host(url), None, "url_host({url})");
+        assert_eq!(
+            detect_forge(url),
+            ForgeName::Gitlab,
+            "an unparseable URL takes the GitLab remainder, as on the other daemon"
+        );
+    }
+    // The real scp form still parses.
+    assert_eq!(url_host("git@github.com:acme/w.git"), Some("github.com"));
+    assert_eq!(detect_forge("git@github.com:acme/w.git"), ForgeName::Github);
+}
