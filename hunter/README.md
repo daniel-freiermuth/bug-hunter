@@ -121,16 +121,55 @@ what actually runs):
 3. **Harvest** the oldest merged PR still pending follow-up review.
 4. **Recheck** the oldest finding stuck in `rechecking`.
 5. **Fix** the oldest queued finding.
-6. Otherwise, **hunt/test_gap/dep_update/refactor** — whichever is most
+6. **Resume** the newest suspended attempt that can still be continued.
+   A worker killed for running out of window headroom (and only that:
+   never a wallclock overrun, which is the runaway signature) keeps its
+   session and comes back as `suspended` rather than `killed`, and the
+   next cycle hands omp that exact session instead of starting cold.
+   Ranked here because a suspension has already been paid for — it
+   outranks *starting* new background work, never a human waiting on a
+   PR. Restarting costs a flat ~37k-token session floor and then redoes
+   the work; continuing costs re-caching the context the worker was
+   already carrying.
+7. Otherwise, **hunt/test_gap/dep_update/refactor** — whichever is most
    overdue for the least-recently-scanned enabled repo (a never-cloned repo
    always hunts first). **Modernization** joins this rotation too, but only
    once `modernization.intervalDays` (config, default 30) has passed since it last ran for that
    repo — a periodic strategic check, not a tight-loop scan competing for
    every cycle.
 
+Each of 1-5 picks a (finding, kind). When that finding has a suspended
+attempt of that same kind that can still be continued, the tier continues
+it, at the tier's own position, instead of starting the work fresh.
+
 A repeatedly-failing item (same failure reason, consecutive attempts) gives
 up after a bounded streak rather than looping forever — this applies
-uniformly to fix retries, recheck retries, and harvest retries.
+uniformly to fix retries, recheck retries, and harvest retries. A resume
+chain has the same kind of ceiling, on either of two counts: once it has
+made four attempts, or once — after at least one resume — everything it
+spent *besides its single largest attempt* is past three times what that
+kind of job typically costs. Whichever fires, the suspension is marked
+`failed` (reason `give-up`) instead of being continued again. A chain
+that has never been resumed is never retired: one attempt's spend is by
+definition at least its own cap, and the largest attempt is discounted
+because one enormous attempt says the job is big, not that the chain is
+stuck.
+
+Two more things end a suspension, because after either one it can never
+usefully be continued, and a suspension nobody ends stays `suspended`
+forever:
+
+- **Superseded.** Starting the same work fresh — same finding and kind
+  for engage/harvest/recheck/fix, same repo and kind for hunt and the
+  analysis scans — marks the suspended attempt `killed` (reason
+  `superseded`) in the same transaction that creates the fresh job,
+  whichever path started it.
+- **Working directory gone.** The transcript describes files in the
+  clone (hunt, recheck, analysis scans) or the per-finding worktree
+  (fix, engage, harvest). If that directory no longer exists the
+  suspension is marked `killed` (reason `workdir-gone`) when selection
+  reaches it, and selection moves on to the next candidate the same
+  cycle.
 
 ### Budget policy
 
@@ -152,9 +191,12 @@ linear ramps, never letting spend get ahead of either:
   either ramp. It is an estimate from history, not the job's granted cap:
   a cold-cache first call arrives as one atomic, uninterruptible LLM call
   that has been observed spending 2-4x what was reserved for it. The
-  history is the 20 most recent *completed* jobs of that kind, not all of
-  it — a window ages out both rows written under accounting bugs that
-  have since been fixed and repos that have since changed size.
+  history is the 20 most recent *completed chains* of that kind, not all
+  of it — a window ages out both rows written under accounting bugs that
+  have since been fixed and repos that have since changed size. A chain
+  counts once, at what the whole chain cost: a resumed attempt only
+  meters what it added, so the row that finishes the work records the
+  tail of it and its suspended predecessors record the rest.
 - A granted job's token cap is the ramp's remaining headroom, verbatim —
   there is no separate configured per-kind cap. Workers are metered
   **externally**: the harness tails the worker's live session JSONL and
@@ -267,8 +309,11 @@ for the schema — most columns carry comments explaining *why*, not just *what*
   missing\_tests, refactor smell\_type, modernization\_class), and retry
   streak tracking (fix/recheck) for the give-up mechanism.
 - **`jobs`** — one row per worker invocation: kind, cap/actual tokens,
-  exit/kill reason, timing. The audit trail for "what did hunter actually
-  spend, and on what."
+  exit/kill reason, timing, and `resumed_from` (the suspended attempt this
+  one continues). States are `queued | running | done | failed | killed |
+  suspended | denied`; `suspended` is a pause with a session file to
+  continue, everything else killed is terminal. The audit trail for "what
+  did hunter actually spend, and on what."
 - **`pr_state`** — one row per finding with an open/merged PR: forge state,
   attention fingerprint + suppression marker (state-based, see § PR
   follow-up loop), harvest tracking.

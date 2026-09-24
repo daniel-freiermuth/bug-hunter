@@ -1997,6 +1997,7 @@ async fn run_reports_how_far_the_long_window_moved_during_the_job() {
             Some(1_000_000),
             30,
             hunter::backend::JobClass::Hunt,
+            None,
         )
         .await
         .unwrap();

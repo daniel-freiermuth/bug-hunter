@@ -155,7 +155,9 @@ pub trait Backend: Send + Sync {
     async fn status_html(&self) -> anyhow::Result<String>;
     /// Execute a worker job. `cap_tokens` is the token bound the ramp
     /// granted, `None` for a job that has none; `job_class` drives model
-    /// selection.
+    /// selection. `resume_from` is the session file of an earlier attempt
+    /// to continue instead of starting cold — `None` is a cold run, which
+    /// is what every job was before resume existed.
     async fn run(
         &self,
         cwd: &std::path::Path,
@@ -163,6 +165,7 @@ pub trait Backend: Send + Sync {
         cap_tokens: Option<i64>,
         max_wall_s: i64,
         job_class: JobClass,
+        resume_from: Option<&std::path::Path>,
     ) -> anyhow::Result<crate::types::RunResult>;
 }
 
@@ -197,6 +200,7 @@ impl Backend for NullBackend {
         _cap_tokens: Option<i64>,
         _max_wall_s: i64,
         _job_class: JobClass,
+        _resume_from: Option<&std::path::Path>,
     ) -> anyhow::Result<crate::types::RunResult> {
         anyhow::bail!("NullBackend cannot run workers")
     }

@@ -72,6 +72,7 @@ async fn record_job_done_state() {
             Some(100_000),
             hunter::domain::JobState::Running,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -85,7 +86,7 @@ async fn record_job_done_state() {
         stdout_tail: "all good".to_owned(),
         usage_delta: Some(0.05),
     };
-    let state = hunter::scheduler::record_job(&store, job_id, &rr, Some("claude-4"))
+    let state = hunter::scheduler::record_job(&store, job_id, &rr, Some("claude-4"), None)
         .await
         .unwrap();
     assert_eq!(state, hunter::domain::JobState::Done);
@@ -118,6 +119,7 @@ async fn record_job_failed_state() {
             Some(100_000),
             hunter::domain::JobState::Running,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -131,7 +133,7 @@ async fn record_job_failed_state() {
         stdout_tail: "error: something broke\npanic at line 42".to_owned(),
         usage_delta: None,
     };
-    let state = hunter::scheduler::record_job(&store, job_id, &rr, None)
+    let state = hunter::scheduler::record_job(&store, job_id, &rr, None, None)
         .await
         .unwrap();
     assert_eq!(state, hunter::domain::JobState::Failed);
@@ -145,8 +147,12 @@ async fn record_job_failed_state() {
     assert!(j.job.notes.as_ref().unwrap().contains("panic at line 42"));
 }
 
+/// A cap kill that left NO transcript is still `killed`. The session
+/// file is what makes a suspension resumable — there is one exact path
+/// to hand omp, or there is nothing to continue — so a cap kill without
+/// one must not be parked as suspended work that can never be picked up.
 #[tokio::test]
-async fn record_job_killed_state() {
+async fn record_job_cap_kill_without_a_session_stays_killed() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
@@ -157,6 +163,7 @@ async fn record_job_killed_state() {
             None,
             Some(50_000),
             hunter::domain::JobState::Running,
+            None,
             None,
         )
         .await
@@ -171,7 +178,7 @@ async fn record_job_killed_state() {
         stdout_tail: "exceeded cap".to_owned(),
         usage_delta: Some(0.1),
     };
-    let state = hunter::scheduler::record_job(&store, job_id, &rr, Some("claude-4"))
+    let state = hunter::scheduler::record_job(&store, job_id, &rr, Some("claude-4"), None)
         .await
         .unwrap();
     assert_eq!(state, hunter::domain::JobState::Killed);
@@ -181,6 +188,96 @@ async fn record_job_killed_state() {
     assert_eq!(j.job.state, hunter::domain::JobState::Killed);
     assert_eq!(j.job.killed_reason.as_deref(), Some("cap"));
     assert!(j.job.notes.is_some()); // killed => notes from stdout_tail
+}
+
+/// A cap kill that DID leave a transcript is a pause, not a failure.
+///
+/// The work stopped because the window ran out of headroom, and the
+/// reasoning that got it that far is still on disk. Recording it as
+/// `killed` is what let one repo run ten consecutive hunts over an
+/// identical diff range for 1.48M tokens: a killed job advances no
+/// watermark, so the same work was re-selected from scratch every cycle.
+#[tokio::test]
+async fn record_job_cap_kill_with_a_session_suspends() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    let store = rw_store(&path).await;
+    let job_id = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            1,
+            None,
+            Some(50_000),
+            hunter::domain::JobState::Running,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rr = RunResult {
+        exit_code: None,
+        killed_reason: Some("cap".to_owned()),
+        tokens_new: 50_000,
+        calls: 20,
+        session_file: Some("/tmp/sess.jsonl".to_owned()),
+        duration_s: 300.0,
+        stdout_tail: "exceeded cap".to_owned(),
+        usage_delta: Some(0.1),
+    };
+    let state = hunter::scheduler::record_job(&store, job_id, &rr, Some("claude-4"), None)
+        .await
+        .unwrap();
+    assert_eq!(state, hunter::domain::JobState::Suspended);
+
+    let jobs = store.list_jobs(10).await.unwrap();
+    assert_eq!(jobs[0].job.state, hunter::domain::JobState::Suspended);
+    assert_eq!(
+        store.list_resumable_jobs().await.unwrap().len(),
+        1,
+        "a suspension with a transcript must be offered back to the scheduler"
+    );
+}
+
+/// A wallclock kill is never a suspension, transcript or not.
+///
+/// An unbounded overrun is the runaway signature: the job was not short
+/// of budget, it was not converging. Resuming it would buy the same
+/// non-convergence another full wall-clock window.
+#[tokio::test]
+async fn record_job_wallclock_kill_stays_killed_even_with_a_session() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    let store = rw_store(&path).await;
+    let job_id = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            1,
+            None,
+            Some(50_000),
+            hunter::domain::JobState::Running,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rr = RunResult {
+        exit_code: None,
+        killed_reason: Some("wallclock".to_owned()),
+        tokens_new: 50_000,
+        calls: 20,
+        session_file: Some("/tmp/sess.jsonl".to_owned()),
+        duration_s: 1800.0,
+        stdout_tail: "ran out of wall clock".to_owned(),
+        usage_delta: Some(0.1),
+    };
+    let state = hunter::scheduler::record_job(&store, job_id, &rr, Some("claude-4"), None)
+        .await
+        .unwrap();
+    assert_eq!(state, hunter::domain::JobState::Killed);
+    assert!(
+        store.list_resumable_jobs().await.unwrap().is_empty(),
+        "a runaway must never be offered for resumption"
+    );
 }
 
 // -- 2. create_job + update_job round-trip -----------------------------------
@@ -199,6 +296,7 @@ async fn create_and_update_job_round_trip() {
             None,
             Some(150_000),
             hunter::domain::JobState::Running,
+            None,
             None,
         )
         .await
@@ -259,6 +357,7 @@ async fn reconcile_orphaned_jobs() {
             Some(3),
             Some(100_000),
             hunter::domain::JobState::Running,
+            None,
             None,
         )
         .await

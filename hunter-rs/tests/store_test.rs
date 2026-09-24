@@ -431,3 +431,80 @@ async fn kind_token_history_reads_only_the_most_recent_completed_jobs() {
         "exactly the 20 newest completed hunts, ascending for the percentile index"
     );
 }
+
+/// One hunt attempt that stopped at the cap, and the attempt that
+/// continued it to `done`.
+async fn seed_resumed_hunt_chain(pool: &SqlitePool, suspended: i64, done: i64) {
+    let first = sqlx::query(
+        "INSERT INTO jobs (kind, repo_id, state, tokens_new, killed_reason, started_at, \
+         finished_at) VALUES ('hunt', 1, 'suspended', ?1, 'cap', 1000, 2000)",
+    )
+    .bind(suspended)
+    .execute(pool)
+    .await
+    .unwrap()
+    .last_insert_rowid();
+    sqlx::query(
+        "INSERT INTO jobs (kind, repo_id, state, tokens_new, resumed_from, started_at, \
+         finished_at) VALUES ('hunt', 1, 'done', ?1, ?2, 3000, 4000)",
+    )
+    .bind(done)
+    .bind(first)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A chain that had to be continued counts once, at what the whole chain
+/// cost — not at what its last attempt added.
+///
+/// A resumed attempt meters only its own delta: the harness subtracts the
+/// transcript's pre-spawn baseline, so the row that reaches `done` records
+/// the tail of the work and the attempts that paid for the rest stay
+/// `suspended`, which this query never reads. Live numbers, from engage
+/// 4375: 38,193 recorded against a chain that cost 142,256, the other
+/// 104,063 on its suspended predecessor 4374. Left uncorrected the
+/// estimate is dragged down by exactly the jobs that were too big to
+/// finish in one go — the ones a cold reservation, a resume's own
+/// reservation and the give-up ceiling all have to be sized for.
+#[tokio::test]
+async fn kind_token_history_counts_a_resumed_chain_at_its_full_cost() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_bare_repo(&pool).await;
+    seed_hunt_jobs(&pool, "done", &[7_000, 50_000]).await;
+    seed_resumed_hunt_chain(&pool, 104_063, 38_193).await;
+    let store = open_store(pool, &path).await;
+
+    let history = store.kind_token_history("hunt").await.unwrap();
+
+    assert_eq!(
+        history,
+        vec![7_000, 50_000, 142_256],
+        "the chain contributes 104_063 + 38_193 once, not 38_193"
+    );
+}
+
+/// A job that was never resumed is its own whole chain, so it still
+/// contributes exactly its own `tokens_new` — and a suspension that no
+/// completed job continues contributes nothing at all.
+///
+/// The chain walk must not reach sideways: it follows `resumed_from` from
+/// a `done` row and nowhere else, so an unrelated suspended attempt is
+/// neither a sample of its own (its `tokens_new` is the bound that stopped
+/// it) nor part of anyone else's total.
+#[tokio::test]
+async fn kind_token_history_counts_an_unresumed_job_at_its_own_cost() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_bare_repo(&pool).await;
+    seed_hunt_jobs(&pool, "done", &[10_000, 20_000, 30_000]).await;
+    seed_hunt_jobs(&pool, "suspended", &[200_000]).await;
+    let store = open_store(pool, &path).await;
+
+    let history = store.kind_token_history("hunt").await.unwrap();
+
+    assert_eq!(
+        history,
+        vec![10_000, 20_000, 30_000],
+        "each completed job alone, with the orphan suspension nowhere in it"
+    );
+}

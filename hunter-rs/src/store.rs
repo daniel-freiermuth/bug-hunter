@@ -11,9 +11,11 @@
 //!   together owns its transaction internally -- `add_repo` (the insert and
 //!   the id-derived clone path), `soft_delete_repo` (the findings/jobs
 //!   refusal checks and the flag, under `BEGIN IMMEDIATE` so the checks
-//!   cannot go stale before the write), and `sync_pr_open` (the PR upsert
-//!   and the dependent `attention_since` update). Those transactions close
-//!   real races; do not unwind them to make a method look like the others.
+//!   cannot go stale before the write), `sync_pr_open` (the PR upsert and
+//!   the dependent `attention_since` update), and `create_job` (the insert
+//!   and the retirement of the suspension it supersedes, with that
+//!   retirement's event). Those transactions close real races; do not
+//!   unwind them to make a method look like the others.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -39,6 +41,31 @@ pub enum StoreWriteError {
     Refused(String),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
+}
+
+/// How far [`Store::resume_chain_stats`] will walk a resume chain.
+///
+/// Purely a termination guarantee for a graph that should not need one:
+/// far beyond any chain a give-up ceiling would let form, so it never
+/// truncates a real answer, and small enough that a cyclic row from a
+/// hand-repaired database costs a bounded query instead of a hung one.
+const RESUME_CHAIN_MAX_DEPTH: i64 = 64;
+
+/// What a resume chain has cost, across every attempt in it.
+///
+/// The three numbers are read in one walk because they answer one
+/// question — has this work run out of road? — and a ceiling that read
+/// them separately could see three different chains if a successor row
+/// landed between the queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeChainStats {
+    /// Every token the chain has spent.
+    pub total: i64,
+    /// How many attempts the chain contains, this one included.
+    pub attempts: i64,
+    /// The costliest single attempt in it. 0 when nothing in the chain
+    /// has a metered cost yet.
+    pub max_single: i64,
 }
 
 /// Allowed /api/repo update fields, post-coercion (WRITES contract §6).
@@ -162,6 +189,52 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+}
+
+/// INSERT one event row on `ex` — the pool, or an open transaction when
+/// the event must land with the change it records.
+async fn insert_event<'e, E: sqlx::SqliteExecutor<'e>>(
+    ex: E,
+    kind: &str,
+    message: &str,
+    job_id: Option<i64>,
+    finding_id: Option<i64>,
+) -> sqlx::Result<()> {
+    let at = now_ms();
+    sqlx::query!(
+        "INSERT INTO events (at, kind, message, job_id, finding_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        at,
+        kind,
+        message,
+        job_id,
+        finding_id
+    )
+    .execute(ex)
+    .await?;
+    Ok(())
+}
+
+/// Move one job to a terminal `state` on `ex`; see
+/// [`Store::retire_suspended_job`] for why `killed_reason` is optional.
+async fn retire_job<'e, E: sqlx::SqliteExecutor<'e>>(
+    ex: E,
+    job_id: i64,
+    state: JobState,
+    killed_reason: Option<&str>,
+    notes: &str,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        "UPDATE jobs SET state = ?1, killed_reason = COALESCE(?2, killed_reason), \
+         notes = ?3 WHERE id = ?4",
+        state,
+        killed_reason,
+        notes,
+        job_id
+    )
+    .execute(ex)
+    .await?;
+    Ok(())
 }
 
 impl Store {
@@ -665,19 +738,7 @@ impl Store {
         job_id: Option<i64>,
         finding_id: Option<i64>,
     ) -> sqlx::Result<()> {
-        let at = now_ms();
-        sqlx::query!(
-            "INSERT INTO events (at, kind, message, job_id, finding_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            at,
-            kind,
-            message,
-            job_id,
-            finding_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        insert_event(&self.pool, kind, message, job_id, finding_id).await
     }
 
     /// Append to [`Store::notes_path`] (creating dir +
@@ -1104,6 +1165,187 @@ impl Store {
         .await
     }
 
+    /// Suspended jobs that could actually be picked up again, newest first.
+    ///
+    /// Newest first because a suspended transcript loses value as its
+    /// repo moves on: the freshest one was reasoning about a tree closest
+    /// to today's HEAD, so continuing it redoes the least. That also
+    /// matches every other job read here, so the scheduler's candidate
+    /// list runs in the same direction as the UI's job feed. The
+    /// starvation this ordering permits is the intended outcome, not a
+    /// defect — a suspension nothing has come back to for many cycles is
+    /// stale work, and the scheduler's give-up ceiling ends it.
+    ///
+    /// Three filters make "could be picked up again" true rather than
+    /// merely claimed:
+    /// - the repo must still be live, since a soft-deleted repo's clone
+    ///   is being reaped and `create_job` would refuse the successor;
+    /// - `session_file` must be present, because resume means handing
+    ///   omp that exact session path. A suspended job with no path has
+    ///   nothing to continue and would silently become a fresh run —
+    ///   the implicit-resume behaviour that once re-cached an unrelated
+    ///   290-call transcript for 508,709 tokens on a single call;
+    /// - nothing may already continue it. A successor row IS the record
+    ///   that this suspension has been picked up, which is why no
+    ///   `resumed` state exists: the link carries the fact, and a state
+    ///   flag beside it would be a second copy of the same truth, free
+    ///   to disagree. Without this clause one transcript would be
+    ///   resumed once per cycle forever, every attempt re-caching the
+    ///   same context — the loop this feature exists to end, rebuilt
+    ///   one level up.
+    pub async fn list_resumable_jobs(&self) -> sqlx::Result<Vec<Job>> {
+        let suspended = JobState::Suspended;
+        sqlx::query_as!(
+            Job,
+            r#"
+            SELECT j.id AS "id!", j.kind AS "kind!: JobKind", j.repo_id AS "repo_id!",
+                   j.finding_id, j.state AS "state!: JobState", j.pid, j.session_file,
+                   j.cap_tokens, j.tokens_new, j.calls, j.exit_code,
+                   j.killed_reason, j.notes, j.model, j.usage_delta,
+                   j.started_at, j.finished_at, r.name AS "repo_name!",
+                   NULL AS "finding_summary?: String",
+                   NULL AS "finding_fingerprint?: String"
+            FROM jobs j
+            JOIN repos r ON r.id = j.repo_id
+            WHERE j.state = ?1
+              AND r.deleted_at IS NULL
+              AND j.session_file IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
+            ORDER BY j.id DESC
+            "#,
+            suspended
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// What the chain containing `job_id` has cost, how many attempts
+    /// it took, and what its most expensive attempt cost.
+    ///
+    /// A resumed attempt is its own row, so `tokens_new` alone answers
+    /// "what did this attempt cost" and never "what has this work
+    /// cost". The second question is the one a give-up ceiling has to
+    /// ask, so it is answered by walking the link.
+    ///
+    /// `attempts` and `max_single` ride along because the ceiling
+    /// cannot be applied without them: a chain of one has not been
+    /// continued even once, and one enormous attempt is evidence about
+    /// the job's size rather than about the chain being stuck.
+    ///
+    /// Walks BOTH ways — to predecessors via `resumed_from` and to
+    /// successors via the rows that name this one — because `job_id`
+    /// can be any link, not just the newest.
+    ///
+    /// The depth cap is the termination guarantee. `UNION` de-duplicates
+    /// against rows already produced, but cannot stop a cycle once
+    /// `depth` is carried: each revisit arrives with a larger depth and
+    /// is therefore a genuinely new row, so the recursion would run
+    /// forever. The write path cannot produce a cycle — `resumed_from`
+    /// is set once at INSERT to an id that already exists, so ids
+    /// strictly decrease along the link — but this read must not hang on
+    /// a database that did not come from that write path (a hand repair,
+    /// a partial restore). [`RESUME_CHAIN_MAX_DEPTH`] sits far above any
+    /// chain length worth resuming, so the cap costs a healthy chain
+    /// nothing.
+    ///
+    /// Carrying `depth` is what forces the aggregate to go through `id
+    /// IN (SELECT ...)` rather than a join: a node reachable by several
+    /// paths appears once per depth, and joining on it would count that
+    /// job's tokens once per appearance.
+    pub async fn resume_chain_stats(&self, job_id: i64) -> sqlx::Result<ResumeChainStats> {
+        sqlx::query_as!(
+            ResumeChainStats,
+            r#"
+            WITH RECURSIVE chain(id, resumed_from, depth) AS (
+                SELECT id, resumed_from, 0 FROM jobs WHERE id = ?1
+                UNION
+                SELECT j.id, j.resumed_from, c.depth + 1
+                FROM jobs j, chain c
+                WHERE c.depth < ?2
+                  AND (j.id = c.resumed_from OR j.resumed_from = c.id)
+            )
+            SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64",
+                   COUNT(*) AS "attempts!: i64",
+                   COALESCE(MAX(tokens_new), 0) AS "max_single!: i64"
+            FROM jobs WHERE id IN (SELECT id FROM chain)
+            "#,
+            job_id,
+            RESUME_CHAIN_MAX_DEPTH
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// The first attempt in `job_id`'s chain — the one that ran from a
+    /// real playbook prompt.
+    ///
+    /// A resumed worker is continuing a transcript, and that transcript
+    /// names an output file: the hunt playbook bakes
+    /// `<work_root>/out/job<N>.findings.json` into the prompt, the
+    /// analysis playbooks bake `job<N>.<plural>.json`. `N` is the id of
+    /// the job whose prompt was written, so every later attempt in the
+    /// chain writes to the FIRST attempt's path. An executor that
+    /// ingested its own id's path would find nothing, advance no
+    /// watermark, and re-select the same work next cycle — the loop
+    /// resume exists to end, rebuilt one level up.
+    ///
+    /// One hop back is not enough: a resume of a resume still writes the
+    /// original's path. So this walks `resumed_from` to the top.
+    ///
+    /// `MIN(id)` is exact rather than a heuristic: `resumed_from` is
+    /// written once at INSERT naming a row that already exists, so ids
+    /// strictly decrease along the link and the ancestor walk's smallest
+    /// id is its root. Depth-capped for the same reason
+    /// [`Self::resume_chain_stats`] is — a hand-repaired database can
+    /// carry a cycle the write path cannot produce. Falls back to
+    /// `job_id` when the row is gone (retention prunes oldest-first, and
+    /// `ON DELETE SET NULL` means a pruned root leaves the successor
+    /// looking like a root, which is the honest answer).
+    pub async fn resume_origin_job(&self, job_id: i64) -> sqlx::Result<i64> {
+        sqlx::query_scalar!(
+            r#"
+            WITH RECURSIVE ancestry(id, resumed_from, depth) AS (
+                SELECT id, resumed_from, 0 FROM jobs WHERE id = ?1
+                UNION
+                SELECT j.id, j.resumed_from, a.depth + 1
+                FROM jobs j, ancestry a
+                WHERE a.depth < ?2
+                  AND j.id = a.resumed_from
+            )
+            SELECT COALESCE(MIN(id), ?1) AS "origin!: i64" FROM ancestry
+            "#,
+            job_id,
+            RESUME_CHAIN_MAX_DEPTH
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Take a suspended attempt out of the resumable pool for good.
+    ///
+    /// The ways a suspension ends without being continued: the
+    /// scheduler's give-up ceiling retires it `failed` / `give-up`; a
+    /// suspension whose working directory is gone is retired `killed` /
+    /// `workdir-gone`; fresh work at the same key retires it `killed` /
+    /// `superseded` ([`Self::create_job`]); and a resume that found the
+    /// transcript gone retires it `killed`. All are terminal states, so
+    /// [`Self::list_resumable_jobs`] stops offering the row.
+    ///
+    /// `killed_reason` is `Option` so the last case can leave the
+    /// original reason alone: that attempt really was killed for `cap`,
+    /// and overwriting that with the successor's problem would lose the
+    /// only record of why the work stopped. `notes` carries the new fact
+    /// instead.
+    pub async fn retire_suspended_job(
+        &self,
+        job_id: i64,
+        state: JobState,
+        killed_reason: Option<&str>,
+        notes: &str,
+    ) -> sqlx::Result<()> {
+        retire_job(&self.pool, job_id, state, killed_reason, notes).await
+    }
+
     // -- events / scheduler ----------------------------------------------------
 
     /// ORDER BY id DESC LIMIT ?.
@@ -1176,6 +1418,22 @@ impl Store {
     /// granted the job, not the job's cap. The inflight reservation is
     /// read back from that column, so a job that omits it is invisible
     /// to the budget for as long as it runs.
+    ///
+    /// `resumed_from` names the suspended attempt this job continues, or
+    /// `None` for work starting fresh. It is written here and never
+    /// updated, so a row can only ever point at an id that already
+    /// existed — which is what keeps the chain acyclic.
+    ///
+    /// Fresh work supersedes a suspension of the same work: a suspended
+    /// job with no successor, of this kind and for this finding (finding
+    /// kinds) or this repo (hunt and the analysis kinds), is retired
+    /// `killed` / `superseded` in the same transaction. Whatever path
+    /// started the work over, the fresh attempt now owns it — and for a
+    /// finding kind its worktree handling reclaims the directory the old
+    /// transcript refers to — so the suspension can never be resumed.
+    /// Left `suspended`, it would stay in the table forever. Doing it
+    /// here rather than in selection is what covers every path that
+    /// creates a job.
     pub async fn create_job(
         &self,
         kind: JobKind,
@@ -1184,12 +1442,17 @@ impl Store {
         cap_tokens: Option<i64>,
         state: JobState,
         estimated_tokens: Option<i64>,
+        resumed_from: Option<i64>,
     ) -> Result<i64, StoreWriteError> {
         let now = now_ms();
+        // IMMEDIATE so the supersession below reads the suspensions under
+        // the same write lock that inserts their replacement.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query!(
             "INSERT INTO jobs \
-             (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 \
+             (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
+              resumed_from) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
              WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
             kind,
             repo_id,
@@ -1197,16 +1460,54 @@ impl Store {
             cap_tokens,
             state,
             now,
-            estimated_tokens
+            estimated_tokens,
+            resumed_from
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(StoreWriteError::Refused(format!(
                 "repo {repo_id} is deleted -- cannot start a {kind} job"
             )));
         }
-        Ok(result.last_insert_rowid())
+        let id = result.last_insert_rowid();
+
+        if resumed_from.is_none() {
+            let suspended = JobState::Suspended;
+            let by_finding = kind.is_finding();
+            let superseded = sqlx::query!(
+                r#"
+                SELECT j.id AS "id!", r.name AS "repo_name!"
+                FROM jobs j
+                JOIN repos r ON r.id = j.repo_id
+                WHERE j.state = ?1
+                  AND j.kind = ?2
+                  AND j.id != ?3
+                  AND CASE WHEN ?4 THEN j.finding_id = ?5 ELSE j.repo_id = ?6 END
+                  AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
+                ORDER BY j.id
+                "#,
+                suspended,
+                kind,
+                id,
+                by_finding,
+                finding_id,
+                repo_id
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            for old in superseded {
+                let msg = format!(
+                    "resume {kind} {}: job {} superseded by fresh job {id}",
+                    old.repo_name, old.id
+                );
+                retire_job(&mut *tx, old.id, JobState::Killed, Some("superseded"), &msg).await?;
+                insert_event(&mut *tx, "resume", &msg, Some(old.id), finding_id).await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(id)
     }
 
     /// Record a completed job (all outcome fields set at once).
@@ -1324,9 +1625,9 @@ impl Store {
         Ok(row.is_some())
     }
 
-    /// Targeted query for `anticipated_tokens`: this kind's `tokens_new`
-    /// values, sorted ascending, from the most recent jobs that actually
-    /// COMPLETED.
+    /// Targeted query for `anticipated_tokens`: what this kind's most
+    /// recently COMPLETED work cost, one sample per completed chain,
+    /// sorted ascending.
     ///
     /// A killed job's `tokens_new` is not a measurement of what the work
     /// costs — it is whatever bound killed it, so killed rows cluster at the
@@ -1334,6 +1635,30 @@ impl Store {
     /// failures. Live data: 64 of 259 hunt jobs were killed, and counting
     /// them put the cold p90 at 204,173, within 2% of the 200,000 cap that
     /// did the killing, against 73,724 for the 189 that finished.
+    ///
+    /// The sample is the CHAIN's total, not the `done` row's own
+    /// `tokens_new`. Since resume exists, a continued attempt only meters
+    /// what that attempt added — the harness subtracts the transcript's
+    /// pre-spawn baseline — so the row that finally reaches `done` records
+    /// the tail of the work, and the attempts that paid for the rest stay
+    /// `suspended` and never enter this history at all. Live: engage 4375
+    /// finished having recorded 38,193 for a chain that cost 142,256, its
+    /// suspended predecessor 4374 holding the other 104,063. Reading the
+    /// row alone biases the estimate down exactly where the work was
+    /// hardest, and this estimate is what funds the next cold start, sizes
+    /// a resume's reservation and sets the give-up ceiling.
+    ///
+    /// Filtering to `resumed_from IS NULL` — counting only chain roots —
+    /// looks like the same fix and is the opposite of it: a resumed
+    /// chain's root is the attempt that was suspended, so it is never
+    /// `done`, and the filter would drop every chain that had to be
+    /// continued. The expensive work would leave the history entirely.
+    ///
+    /// Walking ancestors only is enough, and exact: resume is offered for
+    /// `suspended` attempts alone, so a `done` row is the last link of its
+    /// chain and no two `done` rows share one. That makes "the 20 most
+    /// recent `done` rows" already "the 20 most recent completed chains".
+    /// Depth-capped like [`Self::resume_chain_stats`], for the same reason.
     ///
     /// `RECENT_COMPLETED_WINDOW` is the other half, and it bounds how far
     /// back the estimate can be dragged. An estimator that reads all
@@ -1347,7 +1672,7 @@ impl Store {
     /// on its own, which no filter written against one known defect does.
     ///
     /// Most recent by `id` DESC, then sorted ascending, because the two
-    /// orderings answer different questions: the first picks WHICH jobs
+    /// orderings answer different questions: the first picks WHICH chains
     /// count, the second is what makes a percentile index meaningful.
     ///
     /// Below `MIN_COMPLETED_SAMPLES` the unfiltered history comes back
@@ -1360,14 +1685,30 @@ impl Store {
         const MIN_COMPLETED_SAMPLES: usize = 3;
         const RECENT_COMPLETED_WINDOW: i64 = 20;
         let done = sqlx::query_scalar!(
-            r#"SELECT tokens_new AS "tokens_new!: i64" FROM (
-                   SELECT id, tokens_new FROM jobs
-                   WHERE kind = ?1 AND state = 'done' AND tokens_new IS NOT NULL
-                   ORDER BY id DESC LIMIT ?2
-               )
-               ORDER BY tokens_new ASC"#,
+            r#"
+            WITH RECURSIVE recent(head) AS (
+                SELECT id FROM jobs
+                WHERE kind = ?1 AND state = 'done' AND tokens_new IS NOT NULL
+                ORDER BY id DESC LIMIT ?2
+            ),
+            chain(head, id, resumed_from, depth) AS (
+                SELECT r.head, j.id, j.resumed_from, 0
+                  FROM recent r JOIN jobs j ON j.id = r.head
+                UNION
+                SELECT c.head, j.id, j.resumed_from, c.depth + 1
+                  FROM jobs j, chain c
+                 WHERE c.depth < ?3 AND j.id = c.resumed_from
+            )
+            SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64" FROM (
+                SELECT DISTINCT c.head AS head, c.id AS id, j.tokens_new AS tokens_new
+                  FROM chain c JOIN jobs j ON j.id = c.id
+            )
+            GROUP BY head
+            ORDER BY 1 ASC
+            "#,
             kind,
-            RECENT_COMPLETED_WINDOW
+            RECENT_COMPLETED_WINDOW,
+            RESUME_CHAIN_MAX_DEPTH
         )
         .fetch_all(&self.pool)
         .await?;
