@@ -42,29 +42,32 @@ zero token cost and only spends against a budget it never overshoots.
 
 ## Quick start
 
-Requires Python 3.13+, `omp` on `PATH` (the headless worker CLI this
-project is built around), `git`, and the `gh` CLI (or `glab` for GitLab
-repos) authenticated for whatever repos you register.
+Requires a Rust toolchain and Node/npm (the daemon binary and the UI
+bundle), `omp` on `PATH` (the headless worker CLI this project is built
+around), `git`, and the `gh` CLI (or `glab` for GitLab repos)
+authenticated for whatever repos you register. Python 3.13+ is needed only
+for the rollback daemon in this package.
 
 ```sh
-cd hunter
-pip install -e .                 # installs pydantic, the only runtime dep
-python3 -m hunter daemon         # run forever: UI (:8377) + scheduler loop
+cd hunter-rs
+just build                                # UI bundle (ui-svelte/ -> hunter/ui/) + release binary
+./target/release/hunter --root ../hunter  # run forever: UI (:8377) + scheduler loop
 ```
 
 Then open `http://localhost:8377`, go to **Repos**, and add a repository
 (name, git URL, default branch). Everything else — registration, triage
 verdicts, notes, pausing repos, manual cycle/recheck triggers — happens in
-the UI; the CLI is intentionally reduced to two commands:
+the UI; the binary itself takes only `--root` and `--port`
+(hunter-rs/src/main.rs:14-15).
+
+The Python rollback daemon in this package keeps its own two commands, and
+serves the same generated `ui/` bundle:
 
 ```sh
-python3 -m hunter daemon         # UI + scheduler loop (production)
+cd hunter && pip install -e .    # installs pydantic, the only runtime dep
+python3 -m hunter daemon         # UI + scheduler loop
 python3 -m hunter serve          # UI only, no scheduler (local inspection)
 ```
-
-Both need the UI bundle built first (`just build-ui`, or just run `just
-daemon` / `just serve`, which build it for you — see
-[Development](#development)).
 
 ## How it works
 
@@ -204,8 +207,9 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 
 ## API
 
-Hand-rolled JSON routes (`ThreadingHTTPServer`, no framework) — the UI's
-only client, but usable directly:
+JSON routes — the UI's only client, but usable directly. Both servers
+expose the same set: axum in the Rust daemon (hunter-rs/src/server.rs:167-182),
+hand-rolled on `ThreadingHTTPServer` in the Python rollback.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -246,9 +250,10 @@ hunter/
 └── util.py         shared subprocess wrapper
 
 playbooks/          worker prompt templates (one per job kind, see table above)
-ui/                 generated Vite bundle (ignored; build before serving)
+ui/                 generated Vite bundle (ignored; built by `just build` in hunter-rs/)
 ui-svelte/          tracked Svelte source
-schema.sql           SQLite schema (source of truth; store.py migrates existing DBs)
+schema.sql           this package's schema; store.py migrates existing DBs. The live
+                     database is migrated by hunter-rs/migrations, and the two converge
 config.json          runtime config (§ Configuration)
 tests/               pytest suite, one file per module/behavior
 ```
@@ -315,13 +320,11 @@ column docs — most have inline comments explaining *why*, not just *what*):
 ## Development
 
 ```sh
-just check       # fmt-check + lint + typecheck (Python + UI) + test — run before committing
-just fix          # fmt + lint-fix + build-ui + check, in one shot
-just test         # pytest tests/
+just test           # pytest tests/
 just test-one NAME  # pytest tests/NAME.py -v
-just build-ui     # bundle ui/src/app.ts -> ui/app.js (esbuild)
-just daemon       # build-ui, then run the daemon locally
-just serve        # build-ui, then run UI-only
+just fmt-check      # ruff format --check
+just lint           # ruff check
+just typecheck      # mypy --strict
 ```
 
 Or directly:
@@ -330,13 +333,23 @@ Or directly:
 uv run pytest tests/ -q
 uv run mypy --strict hunter/
 uv run ruff check hunter/ tests/
-npx tsc --project ui/tsconfig.json   # UI typecheck (noEmit — esbuild does the real bundling)
 ```
 
-Conventions: `mypy --strict` on all Python; strict TypeScript with a
-zod-validated network boundary on the frontend and a pydantic-validated
-boundary on the backend for `/api/summary`, so a shape drift between them
-fails loudly instead of silently rendering garbage. Tests are colocated
+The frontend is not built from here any more: it lives in `ui-svelte/` and
+Vite writes the bundle into the generated `ui/` (`ui-svelte/vite.config.ts:15`),
+which `just build` in `hunter-rs/` does alongside the release binary. This
+package's `build-ui` and `typecheck-ui` recipes still point at
+`ui/src/app.ts` and `ui/tsconfig.json`, both deleted in that move, so they
+fail — and with them `just check`, `just fix`, `just daemon` and `just
+serve`, which depend on them. Use the commands above until the recipes are
+repaired.
+
+Conventions: `mypy --strict` on all Python; strict TypeScript on the
+frontend with hand-rolled structural validation at the network boundary
+(`ui-svelte/src/lib/validate.ts`, which checks exactly what the components
+dereference unconditionally) and a pydantic-validated boundary on the
+backend for `/api/summary`, so a shape drift between them fails loudly
+instead of silently rendering garbage. Tests are colocated
 one file per behavior/module under `tests/`, favoring real fixtures (actual
 git repos in `tmp_path`, an in-memory-equivalent SQLite `Store`) over deep
 mocking.
@@ -344,19 +357,24 @@ mocking.
 ## Running as a service
 
 The systemd user unit is checked in at `hunter.service`. Its `ExecStart`
-runs `python3 -m hunter daemon` directly (not through `just daemon`), so
-build the UI bundle once before enabling it — `just build-ui` regenerates
-`ui/app.js` any time `ui/src/app.ts` changes, but the service itself never
-rebuilds it on its own:
+runs the Rust binary directly — `<project-root>/hunter-rs/target/release/hunter
+--root <project-root>/hunter`, with `WorkingDirectory=<project-root>/hunter-rs`
+(hunter.service:6-7) — so `<project-root>` is the repository root, not this
+directory. The daemon never builds the UI: it reads `hunter/ui/` from disk
+at request time, so a binary built without the bundle serves a working API
+behind a 404 page. `just build` builds both halves.
 
 ```sh
-just build-ui
-sed -i "s|<project-root>|$(pwd)|" hunter.service   # fill in the real path
-cp hunter.service ~/.config/systemd/user/
+cd hunter-rs && just build && cd ..                        # release binary + ui/ bundle
+sed -i "s|<project-root>|$(pwd)|" hunter/hunter.service    # repo root, not hunter/
+cp hunter/hunter.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now hunter.service
 loginctl enable-linger $USER   # keep it running after you log out
 ```
+
+After a rebuild, `systemctl --user restart hunter.service`; `just build`
+deliberately does not reach into the service manager itself.
 
 It idles at zero token cost between cycles and wakes on a smart-sleep
 policy: right after a job with more queued work → drain immediately;
@@ -365,3 +383,24 @@ to the window reset; genuinely idle → 15 minutes. PR-comment polling is
 decoupled from the token-budget backoff loop, so a long budget-driven sleep
 never delays noticing new PR feedback. Every wake re-checks the budget gate
 before spending anything.
+
+### Rollback: running the Python daemon instead
+
+Kept working on purpose (see the note at the top of this file), so these
+steps stay here — but they are the rollback path, not the normal one. Both
+daemons share `data/hunter.db` and the same generated `ui/` bundle, and the
+Python store migrates whatever database it opens to the same shape
+(`tests/test_schema_parity.py` asserts the two agree), so switching is a
+unit edit plus a restart:
+
+```sh
+systemctl --user stop hunter.service
+cd hunter && pip install -e . && cd ..     # pydantic, the only runtime dep
+# then in ~/.config/systemd/user/hunter.service:
+#   WorkingDirectory=<project-root>/hunter
+#   ExecStart=/usr/bin/python3 -m hunter daemon
+systemctl --user daemon-reload
+systemctl --user start hunter.service
+```
+
+Switching back is the same edit in reverse, against the checked-in unit.
