@@ -71,6 +71,7 @@ async fn record_job_done_state() {
             None,
             100_000,
             hunter::domain::JobState::Running,
+            None,
         )
         .await
         .unwrap();
@@ -116,6 +117,7 @@ async fn record_job_failed_state() {
             None,
             100_000,
             hunter::domain::JobState::Running,
+            None,
         )
         .await
         .unwrap();
@@ -155,6 +157,7 @@ async fn record_job_killed_state() {
             None,
             50_000,
             hunter::domain::JobState::Running,
+            None,
         )
         .await
         .unwrap();
@@ -196,6 +199,7 @@ async fn create_and_update_job_round_trip() {
             None,
             150_000,
             hunter::domain::JobState::Running,
+            None,
         )
         .await
         .unwrap();
@@ -255,6 +259,7 @@ async fn reconcile_orphaned_jobs() {
             Some(3),
             100_000,
             hunter::domain::JobState::Running,
+            None,
         )
         .await
         .unwrap();

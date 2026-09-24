@@ -276,6 +276,17 @@ class Store:
                 "findings",
                 "ALTER TABLE findings ADD COLUMN found_by_job INTEGER",
             ),
+            # What the budget ramp actually reserved for this job. The
+            # inflight reservation used to be SUM(cap_tokens) over
+            # running jobs, which only worked while every job carried a
+            # finite cap; the estimate is the number that was reserved,
+            # so it stays meaningful whatever the cap becomes. Rows
+            # written before this keep NULL and fall back to their cap.
+            (
+                "estimated_tokens",
+                "jobs",
+                "ALTER TABLE jobs ADD COLUMN estimated_tokens INTEGER",
+            ),
         ]:
             try:
                 self.db.execute(f"SELECT {col} FROM {tbl} LIMIT 1")
@@ -1152,6 +1163,7 @@ class Store:
         finding_id: int | None = None,
         cap_tokens: int | None = None,
         state: str = "queued",
+        estimated_tokens: int | None = None,
     ) -> int:
         """'queued' is a transient default a caller immediately overwrites
         (via update_job) with the real outcome -- nothing ever reads a job
@@ -1173,12 +1185,27 @@ class Store:
         physically present. The job that slips through is worse than a
         lost cycle: forget_deleted_repo is a plain DELETE, so one
         referencing job wedges the repo half-deleted forever -- invisible
-        to every read path, unreapable, still accruing work."""
+        to every read path, unreapable, still accruing work.
+
+        `estimated_tokens` is what the budget ramp reserved for this job
+        before granting it -- not its cap. The inflight reservation is
+        read back from this column, so a job that omits it is invisible
+        to the budget while it runs."""
         cur = self.db.execute(
-            "INSERT INTO jobs (kind, repo_id, finding_id, cap_tokens, state, started_at)"
-            " SELECT ?,?,?,?,?,?"
+            "INSERT INTO jobs"
+            " (kind, repo_id, finding_id, cap_tokens, estimated_tokens, state, started_at)"
+            " SELECT ?,?,?,?,?,?,?"
             " WHERE EXISTS (SELECT 1 FROM repos WHERE id = ? AND deleted_at IS NULL)",
-            (kind, repo_id, finding_id, cap_tokens, state, now_ms(), repo_id),
+            (
+                kind,
+                repo_id,
+                finding_id,
+                cap_tokens,
+                estimated_tokens,
+                state,
+                now_ms(),
+                repo_id,
+            ),
         )
         if not cur.rowcount:
             self.db.rollback()
@@ -1196,6 +1223,22 @@ class Store:
         sets = ", ".join(f"{k} = ?" for k in fields)
         self.db.execute(f"UPDATE jobs SET {sets} WHERE id = ?", (*fields.values(), job_id))
         self.db.commit()
+
+    # Same reason as _INTERNAL_FINDING_COLS: these job reads are
+    # `SELECT j.*` while the Rust port names its columns one by one, so
+    # a column the daemon keeps for itself would appear on one daemon's
+    # API responses and not the other's.
+    #
+    # estimated_tokens: the budget's own bookkeeping, meaningful only
+    # while the job is running and already reported to clients as the
+    # ramp's reservation, not as a property of the job.
+    _INTERNAL_JOB_COLS = ("estimated_tokens",)
+
+    @classmethod
+    def _public_job(cls, row: Row) -> Row:
+        for col in cls._INTERNAL_JOB_COLS:
+            row.pop(col, None)
+        return row
 
     def list_jobs(self, limit: int = 50) -> list[Row]:
         """Recent jobs, each carrying the findings it brought into existence.
@@ -1221,7 +1264,7 @@ class Store:
             )
         )
         for r in rows:
-            produced = r.pop("produced")
+            produced = self._public_job(r).pop("produced")
             r["produced_finding_ids"] = [int(x) for x in produced.split(",")] if produced else []
         return rows
 
@@ -1231,14 +1274,17 @@ class Store:
         one finding (a finding fixed weeks ago can have jobs long since
         pushed off that global feed). Powers the /api/finding detail
         view's "all measurements" panel."""
-        return _rows(
-            self.db.execute(
-                "SELECT j.*, r.name AS repo_name FROM jobs j"
-                " JOIN repos r ON r.id = j.repo_id"
-                " WHERE j.finding_id = ? ORDER BY j.id DESC",
-                (fid,),
+        return [
+            self._public_job(r)
+            for r in _rows(
+                self.db.execute(
+                    "SELECT j.*, r.name AS repo_name FROM jobs j"
+                    " JOIN repos r ON r.id = j.repo_id"
+                    " WHERE j.finding_id = ? ORDER BY j.id DESC",
+                    (fid,),
+                )
             )
-        )
+        ]
 
     def current_job(self) -> JobDict | None:
         """The job currently in flight, if any -- at most one, given
@@ -1250,7 +1296,7 @@ class Store:
         ).fetchone()
         if r is None:
             return None
-        row = dict(r)
+        row = self._public_job(dict(r))
         if row.get("finding_id"):
             f = self.get_finding(row["finding_id"])
             if f is not None:
@@ -1434,9 +1480,22 @@ class Store:
         return max_tok if max_tok > 0 else None
 
     def running_estimate(self) -> int:
-        """SUM(cap_tokens) of jobs currently in state='running'."""
+        """Tokens already reserved by jobs currently in state='running'.
+
+        Per job this is its `estimated_tokens` -- what the ramp actually
+        reserved when it granted the job -- and not its `cap_tokens`.
+        The cap is a kill threshold, not a reservation, and a job may
+        carry no finite cap at all; summing caps would then reserve
+        nothing for a job that is very much spending.
+
+        Rows written before `estimated_tokens` existed have NULL there,
+        so they fall back to their cap, which is what the sum meant for
+        them at the time. The trailing 0 keeps a row with neither from
+        poisoning the whole sum with NULL.
+        """
         r = self.db.execute(
-            "SELECT COALESCE(SUM(cap_tokens), 0) AS total FROM jobs WHERE state = 'running'"
+            "SELECT COALESCE(SUM(COALESCE(estimated_tokens, cap_tokens, 0)), 0) AS total"
+            " FROM jobs WHERE state = 'running'"
         ).fetchone()
         return int(r["total"])
 

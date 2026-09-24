@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   pid           INTEGER,
   session_file  TEXT,                      -- worker's JSONL ledger path
   cap_tokens    INTEGER,
+  estimated_tokens INTEGER,                -- anticipated cost reserved against the ramp
   tokens_new    INTEGER,                   -- input+output+cacheWrite, from ledger
   calls         INTEGER,
   exit_code     INTEGER,

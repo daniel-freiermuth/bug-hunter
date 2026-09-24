@@ -53,9 +53,10 @@ Purpose (backend.py:89-96): compute spend the provider's probe hasn't seen; log 
 
 Exact Store SQL (`now_ms() = int(time.time()*1000)`, types.py:90-91):
 
-**`running_estimate() -> int`** (proto backend.py:98-100; impl store.py:923-928)
+**`running_estimate() -> int`** (proto backend.py:98-100; impl store.py:923-928). Per job this is `estimated_tokens` — what the ramp reserved when it granted the job — not `cap_tokens`, which is only a kill threshold and may not be finite. Rows written before `estimated_tokens` existed fall back to their cap.
 ```sql
-SELECT COALESCE(SUM(cap_tokens), 0) AS total FROM jobs WHERE state = 'running'
+SELECT COALESCE(SUM(COALESCE(estimated_tokens, cap_tokens, 0)), 0) AS total
+  FROM jobs WHERE state = 'running'
 ```
 
 **`finished_since(ts_ms) -> int`** (backend.py:102-104; store.py:930-937). Strictly-after. `denied` rows have NULL `tokens_new` → SUM skips them; `queued` rows have NULL `finished_at` → excluded by the comparison.
@@ -135,8 +136,8 @@ def status(self) -> str                                      # :194-206
 
 **Rust addition:** `killed_reason` also takes `"unmetered"`, when the worker's session ledger never appears within the discovery grace period. Python carried on with `tokens_new = 0`, which silently disarms the token cap and books the job as free; the port kills the worker and records the run as killed instead.
 
-### 1.9 What feeds `anticipated_tokens` (scheduler.py:39-77 — stays in core)
-Warm iff this exact `(repo_id, kind)` finished a non-denied job within `cfg.cache_ttl_s`: `SELECT 1 FROM jobs WHERE repo_id = ? AND kind = ? AND finished_at > ? AND state != 'denied' LIMIT 1` (:58-65, cutoff `now_ms() − cache_ttl_s*1000`). History = all `tokens_new` for the kind, ascending (:66-73). Empty → 0; else `history[min(int(len * (0.5 if warm else 0.9)), len−1)]` — warm p50, cold p90 (:74-77).
+### 1.9 What feeds `anticipated_tokens` (scheduler.py:45-111 — stays in core)
+Warm iff this exact `(repo_id, kind)` finished a non-denied job within `cfg.cache_ttl_s`: `SELECT 1 FROM jobs WHERE repo_id = ? AND kind = ? AND finished_at > ? AND state != 'denied' LIMIT 1` (cutoff `now_ms() − cache_ttl_s*1000`). History = `tokens_new` for the kind from `state = 'done'` rows only, ascending — a killed job's `tokens_new` records the bound that killed it, not the cost of the work, so killed rows cluster at the cap and the percentile measures the estimator's own failures. Below 3 completed rows the query falls back to the unfiltered history, because an empty history estimates 0 and an `anticipated` of 0 makes the gate reserve nothing. Empty → 0; else `history[min(int(len * (0.5 if warm else 0.9)), len−1)]` — warm p50, cold p90.
 
 ---
 

@@ -103,7 +103,8 @@ class SpendLedger(Protocol):
     """
 
     def running_estimate(self) -> int:
-        """SUM(cap_tokens) of jobs currently in state='running'."""
+        """Tokens reserved by jobs currently in state='running' --
+        their estimated_tokens, falling back to cap_tokens."""
         ...
 
     def finished_since(self, ts_ms: int) -> int:

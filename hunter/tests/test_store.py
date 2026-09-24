@@ -1201,6 +1201,37 @@ def test_standards_finding_round_trips_through_the_fallback(store: Store) -> Non
     )
 
 
+class TestRunningEstimate:
+    """The inflight reservation -- what a running job has been promised
+    but not yet spent."""
+
+    def test_a_running_job_is_counted_by_its_estimate_not_its_cap(self, store: Store) -> None:
+        """The reservation is what the ramp set aside for the job, not
+        the kill threshold it was granted. The two are independent
+        numbers -- the cap stops bounding spend at all once headroom is
+        the only bound -- so summing caps under-reserves for a job that
+        is very much running.
+        """
+        rid = store.add_repo("r", "https://r", "/r")
+        store.create_job("hunt", rid, cap_tokens=20_000, state="running", estimated_tokens=204_000)
+
+        assert store.running_estimate() == 204_000
+
+    def test_a_row_without_an_estimate_still_contributes_its_cap(self, store: Store) -> None:
+        """Jobs written before estimated_tokens existed have no estimate
+        to recover, so they keep contributing their cap -- what the
+        reservation meant for them at the time. A daemon restarted
+        mid-job across the migration would otherwise reserve nothing for
+        the job it left running.
+        """
+        rid = store.add_repo("r", "https://r", "/r")
+        # No estimate recorded: exactly the shape of a pre-migration row.
+        store.create_job("hunt", rid, cap_tokens=50_000, state="running")
+        store.create_job("fix", rid, cap_tokens=20_000, state="running", estimated_tokens=204_000)
+
+        assert store.running_estimate() == 254_000
+
+
 class TestLedgerQueriesUseThePartialIndex:
     """The budget sums must not scan the jobs table.
 
@@ -1246,8 +1277,8 @@ class TestLedgerQueriesUseThePartialIndex:
         assert not any(d.startswith("SCAN jobs") for d in plan), plan
 
 
-class TestFindingResponseShapeMatchesRust:
-    """Internal columns must not leak into findings responses.
+class TestResponseShapesMatchRust:
+    """Internal columns must not leak into API responses.
 
     The Python reads are `SELECT *` while the Rust port names its columns
     one by one, so any column added for the daemon's own use appears on
@@ -1276,3 +1307,20 @@ class TestFindingResponseShapeMatchesRust:
         # And the provenance is still reachable, the other way round.
         entry = next(j for j in store.list_jobs(limit=10) if j["id"] == jid)
         assert entry["produced_finding_ids"] == [fid]
+
+    def test_estimated_tokens_is_not_in_the_jobs_shape(self, store: Store) -> None:
+        rid = store.add_repo(
+            "w", "https://github.com/a/w.git", store.cfg.work_root / "repos", "main", "github"
+        )
+        fid, _ = store.upsert_finding(rid, _make_finding())
+        jid = store.create_job(
+            "fix", rid, finding_id=fid, cap_tokens=1000, state="running", estimated_tokens=204_000
+        )
+
+        # The column is written -- this is not passing because nothing set it.
+        row = store.db.execute("SELECT estimated_tokens FROM jobs WHERE id = ?", (jid,)).fetchone()
+        assert row["estimated_tokens"] == 204_000
+
+        assert all("estimated_tokens" not in j for j in store.list_jobs())
+        assert all("estimated_tokens" not in j for j in store.jobs_by_finding(fid))
+        assert "estimated_tokens" not in (store.current_job() or {})

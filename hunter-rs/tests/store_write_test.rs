@@ -227,6 +227,7 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
             None,
             100_000,
             JobState::Running,
+            None,
         )
         .await
         .unwrap_err();
@@ -250,6 +251,7 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
             None,
             100_000,
             JobState::Running,
+            None,
         )
         .await
         .unwrap();
@@ -368,8 +370,11 @@ async fn insert_job(
 
 // -- 5. running_estimate ----------------------------------------------------
 
+/// Every job here predates `estimated_tokens`, so the sum is entirely
+/// the `cap_tokens` fallback — what this asserts is the `state` filter
+/// and that a row with neither number does not poison the sum.
 #[tokio::test]
-async fn running_estimate_sums_cap_tokens_of_running_jobs_only() {
+async fn running_estimate_counts_running_jobs_only() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     insert_job(&pool, "running", Some(100_000), None, None).await;
@@ -379,6 +384,47 @@ async fn running_estimate_sums_cap_tokens_of_running_jobs_only() {
     let store = rw_store(&path).await;
 
     assert_eq!(store.running_estimate().await.unwrap(), 150_000);
+}
+
+async fn insert_running_job(pool: &SqlitePool, cap_tokens: Option<i64>, estimate: Option<i64>) {
+    sqlx::query(
+        "INSERT INTO jobs (kind, repo_id, state, cap_tokens, estimated_tokens, started_at) \
+         VALUES ('hunt', 1, 'running', ?1, ?2, 1)",
+    )
+    .bind(cap_tokens)
+    .bind(estimate)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The inflight reservation is what the ramp set aside for the job, not
+/// the kill threshold it was granted. The two are independent numbers —
+/// the cap will stop bounding spend at all once headroom is the only
+/// bound — so a sum over caps under-reserves for a job that is running.
+#[tokio::test]
+async fn running_estimate_counts_a_running_job_by_its_estimate_not_its_cap() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    insert_running_job(&pool, Some(20_000), Some(204_000)).await;
+    let store = rw_store(&path).await;
+
+    assert_eq!(store.running_estimate().await.unwrap(), 204_000);
+}
+
+/// Rows written before the column existed have no estimate to recover,
+/// so they keep contributing their cap — which is what the reservation
+/// meant for them when they were written. A daemon restarted mid-job
+/// across the migration would otherwise reserve nothing for it.
+#[tokio::test]
+async fn running_estimate_falls_back_to_cap_for_rows_without_an_estimate() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    insert_running_job(&pool, Some(50_000), None).await; // pre-migration row
+    insert_running_job(&pool, Some(20_000), Some(204_000)).await;
+    let store = rw_store(&path).await;
+
+    assert_eq!(store.running_estimate().await.unwrap(), 254_000);
 }
 
 // -- 6. finished_since ------------------------------------------------------
