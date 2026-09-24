@@ -30,28 +30,8 @@ fn err(dir: &TempDir, json: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Worker limits: zero is the tightest cap, not "disabled"
+// Worker limits: zero is the tightest limit, not "disabled"
 // ---------------------------------------------------------------------------
-
-#[test]
-fn test_hunt_cap_new_tokens_zero_rejected() {
-    let dir = TempDir::new("cfg-hunt-cap-zero");
-    let msg = err(&dir, r#"{"hunt": {"capNewTokens": 0}}"#);
-    assert!(
-        msg.contains("hunt.capNewTokens") && msg.contains("got 0"),
-        "message must name field and value: {msg}"
-    );
-}
-
-#[test]
-fn test_hunt_cap_new_tokens_negative_rejected() {
-    let dir = TempDir::new("cfg-hunt-cap-neg");
-    let msg = err(&dir, r#"{"hunt": {"capNewTokens": -1}}"#);
-    assert!(
-        msg.contains("hunt.capNewTokens") && msg.contains("got -1"),
-        "message must name field and value: {msg}"
-    );
-}
 
 #[test]
 fn test_hunt_max_wall_s_zero_rejected() {
@@ -61,20 +41,43 @@ fn test_hunt_max_wall_s_zero_rejected() {
 }
 
 #[test]
-fn test_fix_cap_new_tokens_negative_rejected() {
-    let dir = TempDir::new("cfg-fix-cap-neg");
-    let msg = err(&dir, r#"{"fix": {"capNewTokens": -5000}}"#);
-    assert!(
-        msg.contains("fix.capNewTokens") && msg.contains("got -5000"),
-        "{msg}"
-    );
-}
-
-#[test]
 fn test_fix_max_wall_s_zero_rejected() {
     let dir = TempDir::new("cfg-fix-wall-zero");
     let msg = err(&dir, r#"{"fix": {"maxWallS": 0}}"#);
     assert!(msg.contains("fix.maxWallS"), "{msg}");
+}
+
+// ---------------------------------------------------------------------------
+// Retired keys
+// ---------------------------------------------------------------------------
+
+/// `hunt.capNewTokens` and `fix.capNewTokens` are gone: a job's token
+/// bound is now the budget ramp's headroom and nothing else. Deployed
+/// config.json files still carry the keys, so loading one must keep
+/// working and simply ignore them — an operator does not get a daemon
+/// that refuses to start because a stale key is still in the file.
+#[test]
+fn retired_cap_keys_are_ignored_not_rejected() {
+    let dir = TempDir::new("cfg-retired-caps");
+    let cfg = load(
+        &dir,
+        r#"{"hunt": {"capNewTokens": 200000, "maxWallS": 600},
+             "fix": {"capNewTokens": 150000, "maxWallS": 900}}"#,
+    )
+    .expect("a config that still names the retired cap keys must load");
+    assert_eq!(cfg.hunt_max_wall_s, 600);
+    assert_eq!(cfg.fix_max_wall_s, 900);
+
+    // Not merely tolerated — not read at all. Both values were fatal
+    // while the keys were live (zero is the tightest cap, not "no cap"),
+    // so accepting them is what separates an ignored key from a
+    // validated one.
+    let dir = TempDir::new("cfg-retired-caps-fatal");
+    load(
+        &dir,
+        r#"{"hunt": {"capNewTokens": 0}, "fix": {"capNewTokens": -1}}"#,
+    )
+    .expect("a value that used to be rejected must now be inert");
 }
 
 // ---------------------------------------------------------------------------
@@ -98,12 +101,12 @@ fn test_stale_after_s_zero_accepted() {
     let cfg = load(
         &dir,
         r#"{"budget": {"staleAfterS": 0},
-             "hunt": {"capNewTokens": 1, "maxWallS": 1},
-             "fix": {"capNewTokens": 1, "maxWallS": 1}}"#,
+             "hunt": {"maxWallS": 1},
+             "fix": {"maxWallS": 1}}"#,
     )
     .expect("staleAfterS 0 is a valid threshold");
     assert_eq!(cfg.stale_after_s, 0.0);
-    assert_eq!(cfg.hunt_cap_tokens, 1);
+    assert_eq!(cfg.hunt_max_wall_s, 1);
     assert_eq!(cfg.fix_max_wall_s, 1);
 }
 
@@ -111,9 +114,7 @@ fn test_stale_after_s_zero_accepted() {
 fn test_defaults_load_without_config_file() {
     let dir = TempDir::new("cfg-defaults");
     let cfg = Config::load(dir.path()).expect("missing config.json = all defaults");
-    assert_eq!(cfg.hunt_cap_tokens, 200_000);
     assert_eq!(cfg.hunt_max_wall_s, 1800);
-    assert_eq!(cfg.fix_cap_tokens, 150_000);
     assert_eq!(cfg.fix_max_wall_s, 2700);
     assert_eq!(cfg.stale_after_s, 300.0);
     assert_eq!(cfg.root, Path::new(dir.path()));

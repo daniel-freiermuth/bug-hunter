@@ -739,7 +739,7 @@ impl Backend for OmpScavengeBackend {
         &self,
         cwd: &std::path::Path,
         prompt: &str,
-        cap_tokens: i64,
+        cap_tokens: Option<i64>,
         max_wall_s: i64,
         job_class: JobClass,
     ) -> anyhow::Result<crate::types::RunResult> {

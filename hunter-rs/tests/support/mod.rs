@@ -305,15 +305,28 @@ type RunFn = Box<dyn Fn(&Path) -> RunResult + Send + Sync>;
 /// A `Backend` whose `run()` is a closure over the worktree it is handed.
 ///
 /// Use it to stage exactly what a worker would leave behind. `decide()`
-/// always grants, so a test never has to satisfy the budget gate.
+/// always grants, so a test never has to satisfy the budget gate. The
+/// headroom it grants is `None` — no token bound — unless
+/// [`ScriptedBackend::granting`] says otherwise.
 pub struct ScriptedBackend {
     run: RunFn,
+    cap_tokens: Option<i64>,
 }
 
 impl ScriptedBackend {
     /// Run the given closure against the worktree.
     pub fn new(run: impl Fn(&Path) -> RunResult + Send + Sync + 'static) -> Self {
-        Self { run: Box::new(run) }
+        Self {
+            run: Box::new(run),
+            cap_tokens: None,
+        }
+    }
+
+    /// Grant `cap_tokens` as the backend's headroom for every verdict.
+    #[must_use]
+    pub fn granting(mut self, cap_tokens: Option<i64>) -> Self {
+        self.cap_tokens = cap_tokens;
+        self
     }
 
     /// A worker that writes `contents` to `name` in the worktree and exits 0.
@@ -348,7 +361,7 @@ pub fn done() -> RunResult {
 impl Backend for ScriptedBackend {
     async fn decide(&self, _anticipated_tokens: i64) -> anyhow::Result<Outlook> {
         let granted = Verdict::Granted {
-            cap_tokens: None,
+            cap_tokens: self.cap_tokens,
             reason: "test: always granted".to_owned(),
         };
         Ok(Outlook {
@@ -369,7 +382,7 @@ impl Backend for ScriptedBackend {
         &self,
         cwd: &Path,
         _prompt: &str,
-        _cap_tokens: i64,
+        _cap_tokens: Option<i64>,
         _max_wall_s: i64,
         _job_class: JobClass,
     ) -> anyhow::Result<RunResult> {
