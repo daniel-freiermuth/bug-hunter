@@ -1,0 +1,30 @@
+-- The attempt this job continues, so a paused job is not a lost one.
+--
+-- A job killed for running out of window headroom advanced no watermark,
+-- so the next cycle re-selected the same work and started it from
+-- nothing. One repo ran ten consecutive hunts over the identical diff
+-- range for 1.48M tokens, eight of them producing nothing at all.
+--
+-- Restarting costs a flat ~37,000-token session floor (measured: call #1
+-- cacheWrite is ~37k even in a 4,255-call session) plus redoing every
+-- token already paid for. Resuming costs only re-caching the transcript,
+-- which is smaller than the work that produced it -- so resuming wins
+-- essentially always.
+--
+-- The resumed attempt is a NEW row linked back here rather than a
+-- mutation of this one: each attempt keeps its own measured cost, which
+-- is what the token estimator reads, and the cost of the whole chain is
+-- the sum along the link.
+--
+-- Nullable because almost every job is not a resume. Acyclic by
+-- construction -- the column is only ever written at INSERT, naming a
+-- row that already exists, so a successor's id always exceeds its
+-- predecessor's.
+--
+-- ON DELETE SET NULL because job history is pruned by retention (see the
+-- findings.found_by_job comment in schema.sql) and retention deletes the
+-- OLDEST rows first -- exactly the ones a live chain points back at. The
+-- default NO ACTION would make the link veto its own predecessor's
+-- cleanup. Losing the predecessor's row is losing the chain, so dropping
+-- the link with it is the honest outcome.
+ALTER TABLE jobs ADD COLUMN resumed_from INTEGER REFERENCES jobs(id) ON DELETE SET NULL;

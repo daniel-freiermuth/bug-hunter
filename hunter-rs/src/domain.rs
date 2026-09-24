@@ -93,6 +93,12 @@ pub enum JobState {
     Done,
     Failed,
     Killed,
+    /// Out of window headroom, not out of order: the worker was stopped
+    /// at the token bound with its transcript intact, so the work can be
+    /// continued in a new job rather than started over. A wallclock kill
+    /// or an error is NOT this -- an unbounded overrun is the runaway
+    /// signature, and resuming it would just repeat it.
+    Suspended,
     Denied,
 }
 
@@ -104,6 +110,7 @@ impl JobState {
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Killed => "killed",
+            Self::Suspended => "suspended",
             Self::Denied => "denied",
         }
     }
