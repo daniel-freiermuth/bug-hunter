@@ -61,6 +61,44 @@ fn fmt_tokens(n: f64) -> String {
     }
 }
 
+/// Token count as a fraction of a window's capacity. A capacity that is
+/// not positive carries no meaningful fraction.
+fn as_fraction(tokens: i64, capacity: f64) -> f64 {
+    if capacity > 0.0 {
+        tokens as f64 / capacity
+    } else {
+        0.0
+    }
+}
+
+/// The inflight reservation for one `decide` call, as a fraction of each
+/// window's capacity. Field names match the Python dataclass.
+///
+/// Two reservations, because the gate and the cap ask different questions
+/// of the same number. `gate_*` counts `anticipated` in: the gate asks "if
+/// this job also runs, does the window cross its ramp?", and the job's own
+/// cost belongs in that answer. `budget_*` leaves it out, because the
+/// headroom a grant computes IS the job's budget — charging `anticipated`
+/// against the reservation and then handing the job what remains counts
+/// that cost twice, giving it `headroom - anticipated` tokens to do work
+/// worth `anticipated`. A job that clears the gate by a hair would then be
+/// capped far below its own session floor and killed by the watchdog
+/// having produced nothing, while the tokens it did spend still count
+/// against the window. Taking every cap from `budget_*` makes
+/// `cap >= anticipated` hold whenever the gate grants.
+#[derive(Clone, Copy)]
+struct Reservation {
+    /// Gate view: running + finished-since-probe + `anticipated`.
+    gate_5h: f64,
+    gate_7d: f64,
+    /// Cap view: the same, without `anticipated`.
+    budget_5h: f64,
+    budget_7d: f64,
+    /// Capacities the fractions were taken against.
+    cap_5h: f64,
+    cap_7d: f64,
+}
+
 impl OmpScavengeBackend {
     /// Fraction → token cap (`facade.OmpScavengeBackend._frac_to_tokens`).
     ///
@@ -80,13 +118,13 @@ impl OmpScavengeBackend {
 
     /// Inflight reservation as fraction per window
     /// (`facade.OmpScavengeBackend._unaccounted_fraction` / `_reservation`).
-    /// Returns (`res_5h`, `res_7d`, `cap_5h`, `cap_7d`).
+    /// See [`Reservation`] for why there are two of them.
     #[allow(clippy::similar_names)]
     async fn unaccounted_fraction(
         &self,
         windows: &BTreeMap<String, WindowState>,
         anticipated: i64,
-    ) -> anyhow::Result<(f64, f64, f64, f64)> {
+    ) -> anyhow::Result<Reservation> {
         let running = self.ledger.running_estimate().await?;
 
         let fallback = windows.values().map(|w| w.recorded_at).min().unwrap_or(0);
@@ -114,29 +152,26 @@ impl OmpScavengeBackend {
             .filter(|&v| v > 0.0)
             .unwrap_or(cap_5h / RATIO_5H_7D);
 
-        let res_5h = if cap_5h > 0.0 {
-            unaccounted_5h as f64 / cap_5h
-        } else {
-            0.0
-        };
-        let res_7d = if cap_7d > 0.0 {
-            unaccounted_7d as f64 / cap_7d
-        } else {
-            0.0
-        };
-        Ok((res_5h, res_7d, cap_5h, cap_7d))
+        let gate_5h = as_fraction(unaccounted_5h, cap_5h);
+        let gate_7d = as_fraction(unaccounted_7d, cap_7d);
+        let budget_5h = as_fraction(unaccounted_5h - anticipated, cap_5h);
+        let budget_7d = as_fraction(unaccounted_7d - anticipated, cap_7d);
+        Ok(Reservation {
+            gate_5h,
+            gate_7d,
+            budget_5h,
+            budget_7d,
+            cap_5h,
+            cap_7d,
+        })
     }
 
-    #[allow(clippy::similar_names)]
     /// Single verdict: 7d ramps first, then 5h (`facade.OmpScavengeBackend._decide_inner`).
     fn decide_inner(
         windows: &BTreeMap<String, WindowState>,
-        res_5h: f64,
-        res_7d: f64,
+        resv: Reservation,
         prio: bool,
         now_ms: i64,
-        cap_5h: f64,
-        cap_7d: f64,
     ) -> Verdict {
         if windows.is_empty() {
             return Verdict::Denied {
@@ -164,7 +199,7 @@ impl OmpScavengeBackend {
             }
 
             let elapsed_frac = ramp_7d(w.resets_at, now_ms);
-            let eff = effective_used(w, res_7d);
+            let eff = effective_used(w, resv.gate_7d);
 
             if eff >= elapsed_frac {
                 let is_exhausted = w.status.as_deref() == Some("exhausted");
@@ -173,14 +208,17 @@ impl OmpScavengeBackend {
                 } else {
                     retry_at_7d(w.resets_at, eff)
                 };
-                let u = eff - res_7d;
+                let u = eff - resv.gate_7d;
                 let reason = format!(
-                    "{lid}: used {u:.2} + unaccounted {res_7d:.2} = {eff:.2} >= ramp {elapsed_frac:.2}"
+                    "{lid}: used {u:.2} + unaccounted {res:.2} = {eff:.2} >= ramp {elapsed_frac:.2}",
+                    res = resv.gate_7d
                 );
 
                 if prio && !is_exhausted {
-                    let headroom_frac = (1.0 - eff).max(0.0);
-                    let cap = Self::frac_to_tokens(headroom_frac, "7d", cap_5h, cap_7d);
+                    // Headroom for THIS job, so the reservation it is
+                    // measured against must not already contain it.
+                    let headroom_frac = (1.0 - effective_used(w, resv.budget_7d)).max(0.0);
+                    let cap = Self::frac_to_tokens(headroom_frac, "7d", resv.cap_5h, resv.cap_7d);
                     if cap <= 0 {
                         return Verdict::Denied {
                             reason,
@@ -204,7 +242,7 @@ impl OmpScavengeBackend {
             && (w5.status.as_deref() == Some("exhausted") || w5.used_fraction.is_some())
             && let Some(allowed) = ramp_5h(w5.resets_at, now_ms)
         {
-            let eff = effective_used(w5, res_5h);
+            let eff = effective_used(w5, resv.gate_5h);
             if eff >= allowed {
                 let is_exhausted = w5.status.as_deref() == Some("exhausted");
                 let retry = if is_exhausted {
@@ -212,14 +250,17 @@ impl OmpScavengeBackend {
                 } else {
                     retry_at_5h(w5.resets_at, eff)
                 };
-                let u = eff - res_5h;
+                let u = eff - resv.gate_5h;
                 let reason = format!(
-                    "5h: used {u:.2} + unaccounted {res_5h:.2} = {eff:.2} >= ramp {allowed:.2}"
+                    "5h: used {u:.2} + unaccounted {res:.2} = {eff:.2} >= ramp {allowed:.2}",
+                    res = resv.gate_5h
                 );
 
                 if prio && !is_exhausted {
-                    let headroom_frac = (1.0 - eff).max(0.0);
-                    let cap = Self::frac_to_tokens(headroom_frac, "5h", cap_5h, cap_7d);
+                    // Headroom for THIS job, so the reservation it is
+                    // measured against must not already contain it.
+                    let headroom_frac = (1.0 - effective_used(w5, resv.budget_5h)).max(0.0);
+                    let cap = Self::frac_to_tokens(headroom_frac, "5h", resv.cap_5h, resv.cap_7d);
                     if cap <= 0 {
                         return Verdict::Denied {
                             reason,
@@ -241,8 +282,7 @@ impl OmpScavengeBackend {
 
         // All passed — compute headroom (fresh now_ms: second clock read).
         let headroom_now = crate::util::now_ms();
-        let headroom =
-            Self::compute_headroom(windows, res_5h, res_7d, prio, headroom_now, cap_5h, cap_7d);
+        let headroom = Self::compute_headroom(windows, resv, prio, headroom_now);
         Verdict::Granted {
             cap_tokens: headroom,
             reason: "ok".to_owned(),
@@ -250,15 +290,15 @@ impl OmpScavengeBackend {
     }
 
     /// Min headroom in tokens across windows (`facade.OmpScavengeBackend._compute_headroom`).
-    #[allow(clippy::similar_names)]
+    ///
+    /// Measured against `budget_*` (see [`Reservation`]): this headroom is
+    /// what the anticipated job is allowed to spend, not what is left once
+    /// it has spent.
     fn compute_headroom(
         windows: &BTreeMap<String, WindowState>,
-        res_5h: f64,
-        res_7d: f64,
+        resv: Reservation,
         prio: bool,
         now_ms: i64,
-        cap_5h: f64,
-        cap_7d: f64,
     ) -> Option<i64> {
         let mut caps: Vec<i64> = Vec::new();
 
@@ -272,15 +312,15 @@ impl OmpScavengeBackend {
                 } else {
                     ramp_7d(w.resets_at, now_ms)
                 };
-                let frac = (ceiling - effective_used(w, res_7d)).max(0.0);
-                let tok = Self::frac_to_tokens(frac, "7d", cap_5h, cap_7d);
+                let frac = (ceiling - effective_used(w, resv.budget_7d)).max(0.0);
+                let tok = Self::frac_to_tokens(frac, "7d", resv.cap_5h, resv.cap_7d);
                 caps.push(tok);
             } else if lid.contains(":5h")
                 && let Some(allowed) = ramp_5h(w.resets_at, now_ms)
             {
                 let ceiling = if prio { 1.0 } else { allowed };
-                let frac = (ceiling - effective_used(w, res_5h)).max(0.0);
-                let tok = Self::frac_to_tokens(frac, "5h", cap_5h, cap_7d);
+                let frac = (ceiling - effective_used(w, resv.budget_5h)).max(0.0);
+                let tok = Self::frac_to_tokens(frac, "5h", resv.cap_5h, resv.cap_7d);
                 caps.push(tok);
             }
         }
@@ -358,17 +398,16 @@ impl OmpScavengeBackend {
 impl OmpScavengeBackend {
     /// Testing seam: runs decide logic on pre-built windows (skips
     /// `read_windows`).  Not part of the Backend trait.
-    #[allow(clippy::similar_names)]
     pub async fn decide_with_windows(
         &self,
         windows: &BTreeMap<String, WindowState>,
         anticipated_tokens: i64,
     ) -> anyhow::Result<Outlook> {
         let now = crate::util::now_ms();
-        let (res_5h, res_7d, cap_5h, cap_7d) = self
+        let resv = self
             .unaccounted_fraction(windows, anticipated_tokens)
             .await?;
-        let normal = Self::decide_inner(windows, res_5h, res_7d, false, now, cap_5h, cap_7d);
+        let normal = Self::decide_inner(windows, resv, false, now);
 
         let prioritized = match &normal {
             Verdict::Granted {
@@ -378,8 +417,7 @@ impl OmpScavengeBackend {
                 // Normal granted → prioritized = normal, with possible
                 // prio-headroom upgrade (fresh now_ms).
                 let prio_now = crate::util::now_ms();
-                let prio_headroom =
-                    Self::compute_headroom(windows, res_5h, res_7d, true, prio_now, cap_5h, cap_7d);
+                let prio_headroom = Self::compute_headroom(windows, resv, true, prio_now);
                 match (prio_headroom, normal_cap) {
                     (Some(ph), None) => Verdict::Granted {
                         cap_tokens: Some(ph),
@@ -394,7 +432,7 @@ impl OmpScavengeBackend {
             }
             Verdict::Denied { .. } => {
                 // Normal denied → compute prioritized with prio=true.
-                Self::decide_inner(windows, res_5h, res_7d, true, now, cap_5h, cap_7d)
+                Self::decide_inner(windows, resv, true, now)
             }
         };
 
@@ -669,7 +707,6 @@ impl Backend for OmpScavengeBackend {
         Ok(rc == 0)
     }
 
-    #[allow(clippy::similar_names)]
     async fn status_html(&self) -> anyhow::Result<String> {
         let now_ms = crate::util::now_ms();
         let db = self.agent_db.clone();
@@ -681,8 +718,7 @@ impl Backend for OmpScavengeBackend {
         }
 
         // anticipated=0: bars show observable state, not gate's hypothetical.
-        let (unaccounted_5h, unaccounted_7d, _cap_5h, _cap_7d) =
-            self.unaccounted_fraction(&windows, 0).await?;
+        let resv = self.unaccounted_fraction(&windows, 0).await?;
 
         let mut capacities = BTreeMap::new();
         for lid in windows.keys() {
@@ -692,8 +728,8 @@ impl Backend for OmpScavengeBackend {
         Ok(render_status(&StatusInputs {
             now_ms,
             windows,
-            unaccounted_5h,
-            unaccounted_7d,
+            unaccounted_5h: resv.gate_5h,
+            unaccounted_7d: resv.gate_7d,
             capacities,
             stale_after_s: self.cfg.stale_after_s,
         }))
