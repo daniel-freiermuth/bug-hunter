@@ -1321,7 +1321,8 @@ impl Store {
     }
 
     /// Targeted query for `anticipated_tokens`: this kind's `tokens_new`
-    /// values, sorted ascending, from jobs that actually COMPLETED.
+    /// values, sorted ascending, from the most recent jobs that actually
+    /// COMPLETED.
     ///
     /// A killed job's `tokens_new` is not a measurement of what the work
     /// costs — it is whatever bound killed it, so killed rows cluster at the
@@ -1329,6 +1330,21 @@ impl Store {
     /// failures. Live data: 64 of 259 hunt jobs were killed, and counting
     /// them put the cold p90 at 204,173, within 2% of the 200,000 cap that
     /// did the killing, against 73,724 for the 189 that finished.
+    ///
+    /// `RECENT_COMPLETED_WINDOW` is the other half, and it bounds how far
+    /// back the estimate can be dragged. An estimator that reads all
+    /// history forever is hostage to every accounting bug the ledger has
+    /// ever had, and to repos that have since changed size: 130 of the 189
+    /// completed hunts here are recorded under 3,000 tokens, all of them
+    /// from before the metering repair, when a worker's first call alone
+    /// writes a ~37,000-token prompt cache. Those rows cannot be corrected
+    /// and will never leave the table, so the p50 they produced was 1,876
+    /// against 43,901 over the recent window. A window ages a bad era out
+    /// on its own, which no filter written against one known defect does.
+    ///
+    /// Most recent by `id` DESC, then sorted ascending, because the two
+    /// orderings answer different questions: the first picks WHICH jobs
+    /// count, the second is what makes a percentile index meaningful.
     ///
     /// Below `MIN_COMPLETED_SAMPLES` the unfiltered history comes back
     /// instead, because the alternative is worse than a biased estimate:
@@ -1338,11 +1354,16 @@ impl Store {
     /// anything other than an endpoint.
     pub async fn kind_token_history(&self, kind: &str) -> sqlx::Result<Vec<i64>> {
         const MIN_COMPLETED_SAMPLES: usize = 3;
+        const RECENT_COMPLETED_WINDOW: i64 = 20;
         let done = sqlx::query_scalar!(
-            r#"SELECT tokens_new AS "tokens_new!: i64" FROM jobs
-               WHERE kind = ?1 AND state = 'done' AND tokens_new IS NOT NULL
+            r#"SELECT tokens_new AS "tokens_new!: i64" FROM (
+                   SELECT id, tokens_new FROM jobs
+                   WHERE kind = ?1 AND state = 'done' AND tokens_new IS NOT NULL
+                   ORDER BY id DESC LIMIT ?2
+               )
                ORDER BY tokens_new ASC"#,
-            kind
+            kind,
+            RECENT_COMPLETED_WINDOW
         )
         .fetch_all(&self.pool)
         .await?;
