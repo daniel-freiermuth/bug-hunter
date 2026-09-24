@@ -156,7 +156,9 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
     # Ensure clone + fast-forward to origin's default branch.
     if not rpath.exists():
         rpath.parent.mkdir(parents=True, exist_ok=True)
-        rc, out = run_cmd(["git", "clone", repo["url"], str(rpath)], timeout=600)
+        # `--` before the operands: even a URL that slipped past
+        # validation cannot be read as an option here.
+        rc, out = run_cmd(["git", "clone", "--", repo["url"], str(rpath)], timeout=600)
         if rc != 0:
             store.log_event("error", f"hunt {rname}: clone failed: {out[-300:]}")
             return {"error": f"clone failed: {out[-300:]}"}
@@ -385,7 +387,9 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     # Ensure clone + fast-forward to latest default branch.
     if not rpath.exists():
         rpath.parent.mkdir(parents=True, exist_ok=True)
-        rc, out = run_cmd(["git", "clone", repo["url"], str(rpath)], timeout=600)
+        # `--` before the operands: even a URL that slipped past
+        # validation cannot be read as an option here.
+        rc, out = run_cmd(["git", "clone", "--", repo["url"], str(rpath)], timeout=600)
         if rc != 0:
             store.log_event(
                 "error",

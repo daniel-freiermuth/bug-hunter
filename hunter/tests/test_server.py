@@ -579,6 +579,30 @@ class TestRepoUrlScheme:
         assert server.valid_repo_url(url) is False
 
 
+class TestRepoUrlArgumentInjection:
+    """A URL git would read as an option never reaches the database.
+
+    `git clone --upload-pack=<cmd> <dir>` runs <cmd>, and the clone is
+    built from whatever URL the row holds. The clone passes `--` as
+    well; this is the half that keeps the value out of the row.
+    """
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            "--upload-pack=touch /tmp/pwned",
+            "-u../../etc/passwd",
+            "--config=core.sshCommand=id",
+        ],
+    )
+    def test_option_like_urls_are_rejected(self, bad: str) -> None:
+        assert not server.valid_repo_url(bad)
+
+    def test_a_hyphen_elsewhere_is_ordinary(self) -> None:
+        assert server.valid_repo_url("https://github.com/acme/my-repo.git")
+        assert server.valid_repo_url("git@github.com:acme/my-repo.git")
+
+
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(
         [
