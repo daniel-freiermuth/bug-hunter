@@ -292,7 +292,9 @@ pub async fn pick_next(
 /// Historical cost estimate for one (repo, kind): warm (finished a
 /// non-denied job of this kind on this repo within `cache_ttl_s`) -> p50 of
 /// the kind's `tokens_new` history, cold -> p90; empty history -> 0
-/// (`scheduler.anticipated_tokens`, exact index formula in BACKEND-CONTRACT.md §1.9).
+/// (`scheduler.anticipated_tokens`, exact index formula in
+/// BACKEND-CONTRACT.md §1.9; the history itself is
+/// `Store::kind_token_history`).
 pub async fn anticipated_tokens(
     store: &Store,
     cfg: &Config,
@@ -600,9 +602,15 @@ async fn sync_repo(
     Ok(())
 }
 
-/// Budget gate: check with backend, return (cap, granted) or Err with denied dict.
+/// Budget gate: check with backend, return the grant or a denied summary.
 enum BudgetDecision {
-    Approved(i64),
+    /// The cap to enforce, and the anticipated cost the ramp reserved to
+    /// grant it — the job row records the latter so the inflight
+    /// reservation can read it back while the job runs.
+    Approved {
+        cap: i64,
+        anticipated: i64,
+    },
     Denied(Box<CycleSummary>),
 }
 
@@ -646,7 +654,7 @@ async fn budget_gate(
                 Some(bc) => cfg_cap.min(*bc),
                 None => cfg_cap,
             };
-            Ok(BudgetDecision::Approved(cap))
+            Ok(BudgetDecision::Approved { cap, anticipated })
         }
     }
 }
@@ -818,7 +826,7 @@ pub async fn run_hunt(
         }
     };
 
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
@@ -831,12 +839,19 @@ pub async fn run_hunt(
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => return Ok(*d),
     };
 
     let job = match store
-        .create_job(RepoJobKind::Hunt.into(), rid, None, cap, JobState::Running)
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            rid,
+            None,
+            cap,
+            JobState::Running,
+            Some(anticipated),
+        )
         .await
     {
         Ok(j) => j,
@@ -1062,7 +1077,7 @@ pub async fn run_recheck(
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
@@ -1075,7 +1090,7 @@ pub async fn run_recheck(
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => return Ok(*d),
     };
 
@@ -1086,6 +1101,7 @@ pub async fn run_recheck(
             Some(fid),
             cap,
             JobState::Running,
+            Some(anticipated),
         )
         .await
     {
@@ -1340,7 +1356,7 @@ async fn run_analysis_job(
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
@@ -1353,11 +1369,18 @@ async fn run_analysis_job(
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => return Ok(*d),
     };
     let job = match store
-        .create_job(kind.into(), rid, None, cap, JobState::Running)
+        .create_job(
+            kind.into(),
+            rid,
+            None,
+            cap,
+            JobState::Running,
+            Some(anticipated),
+        )
         .await
     {
         Ok(j) => j,
@@ -1776,7 +1799,7 @@ pub async fn run_fix(
     };
 
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
@@ -1789,7 +1812,7 @@ pub async fn run_fix(
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => {
             let _ = drop_worktree(true).await;
             return Ok(*d);
@@ -1803,6 +1826,7 @@ pub async fn run_fix(
             Some(fid),
             cap,
             JobState::Running,
+            Some(anticipated),
         )
         .await
     {
@@ -2660,7 +2684,7 @@ pub async fn run_engage(
     .await;
 
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
@@ -2673,7 +2697,7 @@ pub async fn run_engage(
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => {
             let rps = rpath.to_string_lossy().to_string();
             let wts = worktree.to_string_lossy().to_string();
@@ -2720,6 +2744,7 @@ pub async fn run_engage(
             Some(fid),
             cap,
             JobState::Running,
+            Some(anticipated),
         )
         .await
     {
@@ -3143,7 +3168,7 @@ pub async fn run_harvest(
     }
 
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
@@ -3156,7 +3181,7 @@ pub async fn run_harvest(
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => {
             let rps = rpath.to_string_lossy().to_string();
             let wts = worktree.to_string_lossy().to_string();
@@ -3203,6 +3228,7 @@ pub async fn run_harvest(
             Some(fid),
             cap,
             JobState::Running,
+            Some(anticipated),
         )
         .await
     {

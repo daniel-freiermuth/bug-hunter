@@ -219,6 +219,7 @@ async fn findings_are_attributed_to_the_hunt_that_produced_them() {
             None,
             1000,
             JobState::Running,
+            None,
         )
         .await
         .unwrap();
@@ -247,6 +248,7 @@ async fn a_rediscovery_does_not_steal_attribution() {
             None,
             1000,
             JobState::Running,
+            None,
         )
         .await
         .unwrap();
@@ -260,6 +262,7 @@ async fn a_rediscovery_does_not_steal_attribution() {
             None,
             1000,
             JobState::Running,
+            None,
         )
         .await
         .unwrap();
@@ -292,6 +295,7 @@ async fn a_job_given_a_finding_produces_nothing() {
             None,
             1000,
             JobState::Running,
+            None,
         )
         .await
         .unwrap();
@@ -305,6 +309,7 @@ async fn a_job_given_a_finding_produces_nothing() {
             Some(found[0]),
             1000,
             JobState::Running,
+            None,
         )
         .await
         .unwrap();

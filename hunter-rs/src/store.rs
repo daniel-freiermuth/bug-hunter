@@ -1167,6 +1167,11 @@ impl Store {
     /// cycle: `forget_deleted_repo` is a plain DELETE, so a single
     /// referencing job wedges the repo permanently half-deleted —
     /// invisible to every read path, unreapable, still accruing work.
+    ///
+    /// `estimated_tokens` is what the budget ramp reserved before it
+    /// granted the job, not the job's cap. The inflight reservation is
+    /// read back from that column, so a job that omits it is invisible
+    /// to the budget for as long as it runs.
     pub async fn create_job(
         &self,
         kind: JobKind,
@@ -1174,18 +1179,21 @@ impl Store {
         finding_id: Option<i64>,
         cap_tokens: i64,
         state: JobState,
+        estimated_tokens: Option<i64>,
     ) -> Result<i64, StoreWriteError> {
         let now = now_ms();
         let result = sqlx::query!(
-            "INSERT INTO jobs (kind, repo_id, finding_id, cap_tokens, state, started_at) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6 \
+            "INSERT INTO jobs \
+             (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 \
              WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
             kind,
             repo_id,
             finding_id,
             cap_tokens,
             state,
-            now
+            now,
+            estimated_tokens
         )
         .execute(&self.pool)
         .await?;
@@ -1312,9 +1320,35 @@ impl Store {
         Ok(row.is_some())
     }
 
-    /// Targeted query for `anticipated_tokens`: all `tokens_new` values for
-    /// a given kind, sorted ascending (includes denied rows — Python parity).
+    /// Targeted query for `anticipated_tokens`: this kind's `tokens_new`
+    /// values, sorted ascending, from jobs that actually COMPLETED.
+    ///
+    /// A killed job's `tokens_new` is not a measurement of what the work
+    /// costs — it is whatever bound killed it, so killed rows cluster at the
+    /// cap and the percentile ends up describing the estimator's own
+    /// failures. Live data: 64 of 259 hunt jobs were killed, and counting
+    /// them put the cold p90 at 204,173, within 2% of the 200,000 cap that
+    /// did the killing, against 73,724 for the 189 that finished.
+    ///
+    /// Below `MIN_COMPLETED_SAMPLES` the unfiltered history comes back
+    /// instead, because the alternative is worse than a biased estimate:
+    /// with no completed history the estimate is 0, and an anticipated of 0
+    /// makes the budget gate reserve nothing and wave through work it cannot
+    /// fund. 3 is the smallest count for which a percentile index picks
+    /// anything other than an endpoint.
     pub async fn kind_token_history(&self, kind: &str) -> sqlx::Result<Vec<i64>> {
+        const MIN_COMPLETED_SAMPLES: usize = 3;
+        let done = sqlx::query_scalar!(
+            r#"SELECT tokens_new AS "tokens_new!: i64" FROM jobs
+               WHERE kind = ?1 AND state = 'done' AND tokens_new IS NOT NULL
+               ORDER BY tokens_new ASC"#,
+            kind
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        if done.len() >= MIN_COMPLETED_SAMPLES {
+            return Ok(done);
+        }
         let rows = sqlx::query_scalar!(
             r#"SELECT tokens_new AS "tokens_new!: i64" FROM jobs
                WHERE kind = ?1 AND tokens_new IS NOT NULL
@@ -1992,7 +2026,18 @@ impl Store {
 impl crate::backend::SpendLedger for Store {
     async fn running_estimate(&self) -> sqlx::Result<i64> {
         sqlx::query_scalar!(
-            r#"SELECT COALESCE(SUM(cap_tokens), 0) AS "total!: i64"
+            // Per job this is its `estimated_tokens` — what the ramp
+            // reserved when it granted the job — and not its
+            // `cap_tokens`. The cap is a kill threshold, not a
+            // reservation, and a job may carry no finite cap at all;
+            // summing caps would then reserve nothing for a job that is
+            // very much spending.
+            //
+            // Rows written before `estimated_tokens` existed have NULL
+            // there and fall back to their cap, which is what the sum
+            // meant for them at the time. The trailing 0 keeps a row
+            // with neither from turning the whole sum NULL.
+            r#"SELECT COALESCE(SUM(COALESCE(estimated_tokens, cap_tokens, 0)), 0) AS "total!: i64"
                FROM jobs WHERE state = 'running'"#
         )
         .fetch_one(&self.pool)
