@@ -738,6 +738,12 @@ def valid_repo_url(url: str) -> bool:
     *(ALPHA / DIGIT / "+" / "-" / "."), so `git@host:owner/repo.git`
     keeps its colon as part of a path.
     """
+    # A leading `-` makes git read the value as an option rather than a
+    # URL: `git clone --upload-pack=<cmd> <dir>` runs <cmd>. The clone is
+    # built from the stored URL, so accepting one here is what turns a
+    # repo row into an argument.
+    if url.startswith("-"):
+        return False
     head, sep, _ = url.partition(":")
     if not sep:
         return True
