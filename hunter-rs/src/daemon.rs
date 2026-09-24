@@ -16,6 +16,11 @@ use crate::server::{AppState, router};
 use crate::store::Store;
 
 const USAGE_PROBE_TICK_S: u64 = 60;
+/// How long to let in-flight HTTP responses finish once the scheduler has
+/// stopped. Bounded so a wedged client cannot keep the daemon alive past
+/// the unit's `TimeoutStopSec`, which would turn a graceful stop into a
+/// SIGKILL.
+const UI_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 const PR_SYNC_INTERVAL_S: f64 = 300.0; // 5 min, matching Python
 
 /// Exclusive lockfile on <`work_root>/hunter.lock` (server.py:58-81).
@@ -259,25 +264,24 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         std::future::pending::<()>().await;
     });
 
-    // UI server task. It waits on the same latched source as the
-    // scheduler, not its own signal future: with a private `ctrl_c()` the
-    // two halves answered the same signal differently — SIGINT stopped
-    // the HTTP server immediately while the scheduler kept going for the
-    // rest of the cycle (up to the fix cap), leaving a live process
-    // serving nothing, and SIGTERM stopped the server not at all until
-    // the abort below. Sharing it means the UI keeps serving until the
-    // cycle ends and then everything stops together.
-    let mut ui_shutdown = shutdown_rx.clone();
+    // UI server task, stopped by its own handle rather than by the
+    // signal. A private `ctrl_c()` made the two halves answer the same
+    // signal differently — SIGINT stopped the HTTP server at once while
+    // the scheduler ran on for the rest of the cycle (up to the fix cap,
+    // 45 minutes), leaving a live process serving nothing. Waiting on
+    // the shared shutdown latch instead does not fix that: the latch is
+    // set when the signal arrives, so the UI still stops immediately and
+    // the process spends the rest of the cycle refusing HTTP.
+    //
+    // The operator wants the opposite — a stopping daemon that still
+    // answers "what is it doing?" until it has actually stopped. So this
+    // is notified after the scheduler loop exits, and nothing else
+    // resolves it.
+    let ui_stop = Arc::new(Notify::new());
+    let ui_stop_rx = ui_stop.clone();
     let ui_handle = tokio::spawn(async move {
         let _ = axum::serve(listener, router(state))
-            .with_graceful_shutdown(async move {
-                // Already latched (signal during startup) or newly set.
-                while !*ui_shutdown.borrow() {
-                    if ui_shutdown.changed().await.is_err() {
-                        break;
-                    }
-                }
-            })
+            .with_graceful_shutdown(async move { ui_stop_rx.notified().await })
             .await;
     });
 
@@ -359,7 +363,10 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
 
     signal_handle.abort();
     prober_handle.abort();
-    ui_handle.abort();
+    // Only now: the cycle is over, so the UI has nothing left to report.
+    // Notified rather than aborted, so in-flight responses finish.
+    ui_stop.notify_waiters();
+    let _ = tokio::time::timeout(UI_DRAIN, ui_handle).await;
     tracing::info!("daemon stopped");
     Ok(())
 }
