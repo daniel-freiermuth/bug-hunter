@@ -1,9 +1,9 @@
 # Hunter read-only API contract (Python -> Rust port, round 1)
 
 Extracted from the Python source at commit state of 2026-09-13. Every claim cites `file:line`.
-Sources: `hunter/hunter/server.py` (handler), `hunter/hunter/store.py` (SQL), `hunter/hunter/types.py` (types/config), `hunter/schema.sql` (DDL), `hunter/ui/src/app.ts` (consumer).
+Sources: `hunter/hunter/server.py` (handler), `hunter/hunter/store.py` (SQL), `hunter/hunter/types.py` (types/config), `hunter/schema.sql` (DDL), `hunter/ui-svelte/src/` (consumer — the vanilla `hunter/ui/src/app.ts` this document was first written against no longer exists; `hunter/ui/` is now the gitignored Vite bundle built from `ui-svelte`, `.gitignore:15`).
 
-Parity bar: the vanilla-TS UI (`hunter/ui/src/app.ts`) must work unchanged. `/api/summary` is zod-validated client-side (app.ts:166-178), so its shape is a **hard** runtime contract; the other endpoints are consumed via plain TS interfaces (soft contract, but every listed key is rendered).
+Parity bar: the Svelte UI (`hunter/ui-svelte/src/`) must work unchanged. Nothing client-side validates against a schema: `lib/validate.ts` is a structural guard that checks only what a component dereferences without a `?.`, so some missing keys blank the whole dashboard and others degrade to a dash with no signal. Which is which is section 13, and that split is the contract — not the interfaces in `lib/types.ts`, which `api<T>()` casts to without looking at the bytes (`lib/api.svelte.ts:32-41`).
 
 ---
 
@@ -30,7 +30,7 @@ Parity bar: the vanilla-TS UI (`hunter/ui/src/app.ts`) must work unchanged. `/ap
 
 ## 2. Static file serving
 
-Handled first in `do_GET` (server.py:195-210). UI files live in `UI_DIR = PROJECT_ROOT / "ui"` where `PROJECT_ROOT` is the directory containing the `hunter/` package tree, i.e. the repo's `hunter/` dir (types.py:17-20). On-disk contents: `ui/index.html` (checked in), `ui/app.js` + `ui/app.js.map` (tsc output from `ui/src/app.ts`, gitignored). `index.html` references only `app.js` (ui/index.html:446).
+Handled first in `do_GET` (server.py:195-210). UI files live in `UI_DIR = PROJECT_ROOT / "ui"` where `PROJECT_ROOT` is the directory containing the `hunter/` package tree, i.e. the repo's `hunter/` dir (types.py:17-20). On-disk contents are the Vite build output of `hunter/ui-svelte/`, and the whole directory is gitignored (`.gitignore:15`): `ui/index.html`, `ui/assets/index-<hash>.js`, `ui/assets/index-<hash>.css`. `index.html` references exactly those two hashed assets and carries its favicon as an inline `data:` URI (`hunter/ui/index.html:5,8-9`), so a build also drops unreferenced `icons.svg`/`favicon.svg` into `ui/` that nothing ever requests — which is the only reason the absence of `.svg` from the content-type map below has never surfaced as a 404.
 
 | Path | Behavior |
 |---|---|
@@ -63,7 +63,7 @@ Handler: server.py:211-212 -> `_summary()` (server.py:251-326) -> `_validate_sum
 
 | key | type | source |
 |---|---|---|
-| `backend_status_html` | string | `self.backend.status()` — **this is the key that carries the backend-status HTML fragment**; the UI assigns it via `innerHTML` (server.py:256,306; app.ts:167). Opaque string; Rust port must expose the same key name. |
+| `backend_status_html` | string | `self.backend.status()` — **this is the key that carries the backend-status HTML fragment**; the UI injects it with `{@html}` (server.py:256,306; `pages/StatusPage.svelte:60`) and then rewrites any `<time data-ms>` element inside it into the browser's local time, which the server cannot know (`StatusPage.svelte:37-48`; the Rust facade emits that markup unescaped for exactly this, `backends/omp_scavenge/facade.rs:538-541,605`). Otherwise opaque; Rust port must expose the same key name. |
 | `counts` | object: status -> int | `dict.fromkeys(FINDING_STATUSES, 0)` then `Counter` of `status` over `list_all_findings()` (server.py:257-259). **All 9 status keys always present** (zero-filled): `new, rechecking, queued, fixing, pr_open, merged, rejected, wontfix, note` (types.py:23-33,66). |
 | `type_counts` | object: type -> int | `Counter` of `type` over the same rows (server.py:261,308). Only observed types present; may be `{}`. |
 | `repos` | array of Repo | `store.list_repos()`: `SELECT * FROM repos WHERE deleted_at IS NULL ORDER BY name`, rows through `_repo_row` (store.py:460-464, 101-113), then pydantic-narrowed to `RepoDict` (types.py:143-158): `id:int, name:str, url:str, path:str, forge:str, default_branch:str, last_hunt_sha:str\|null, last_hunt_at:int\|null, enabled:int (0/1, NOT bool), added_at:int`. The narrowing drops the 6 `last_*_at` migration columns here; `deleted_at` is already gone before it (§7). |
@@ -106,7 +106,7 @@ Discriminated union on `kind`, priority order:
 6. `{"kind":"idle"}` — scheduler_state present, none of the above
 7. `{"kind":"warming_up"}` — nothing at all (no cycle has ever run)
 
-Variants carry ONLY the listed fields (no `job: null` on non-running variants). The UI parses this with `z.discriminatedUnion` (app.ts:156-164) and an exhaustive switch — new/renamed variants are a breaking change.
+Variants carry ONLY the listed fields (no `job: null` on non-running variants). `StatusPage` switches on `activity_status.kind` with one branch per variant and no fallback (`pages/StatusPage.svelte:83-151`), so a renamed variant silently renders an empty activity card; a variant that keeps its name but loses its payload field is louder — `validate.ts` rejects the whole summary, and with it the other four polled responses (section 13.2). Either way, new/renamed variants are a breaking change.
 
 ---
 
@@ -237,7 +237,7 @@ SELECT COUNT(*) AS jobs,
  SUM(CASE WHEN state='denied' THEN 1 ELSE 0 END) AS denied
 FROM jobs
 ```
-Keys: `jobs:int, total_tokens:int|null, total_calls:int|null, total_usage_delta:float|null, done:int|null, denied:int|null`. With zero job rows: `jobs = 0` and every SUM is null (SQL semantics) — the UI declares `done`/`denied` as `number` (app.ts:216-221) but only formats them, so null survives; replicate SQL behavior exactly. (`rows[0] if rows else {}` — the else branch is unreachable for an aggregate.)
+Keys: `jobs:int, total_tokens:int|null, total_calls:int|null, total_usage_delta:float|null, done:int|null, denied:int|null`. With zero job rows: `jobs = 0` and every SUM is null (SQL semantics) — the UI declares `done`/`denied` as nullable (`lib/types.ts:159-160`) and formats them with `?? '–'` (`pages/StatsPage.svelte:38,43`), so null survives and renders as a dash; replicate SQL behavior exactly. (`rows[0] if rows else {}` — the else branch is unreachable for an aggregate.)
 
 ### by_kind — `stats_by_kind()` (store.py:1028-1044), array
 ```sql
@@ -348,38 +348,65 @@ Actual config.json in this repo: `workRoot=data`, `dbPath=data/hunter.db`, `serv
 
 ---
 
-## 13. UI consumer cross-check (hunter/ui/src/app.ts)
+## 13. UI consumer cross-check (`hunter/ui-svelte/src`)
 
-### Every fetch the UI makes
+Cite the symbol names below, not the line numbers: the numbers are a hint for finding them and nothing more. The first version of this section pinned every claim to a line in `hunter/ui/src/app.ts`, and when that file was replaced by the Svelte app the citations kept looking authoritative while pointing at nothing.
 
-| call site | request | validation |
+### 13.1 Every request the UI makes
+
+| caller | request | what the response has to survive |
 |---|---|---|
-| app.ts:1344 | `GET /api/summary` (5s poll) | **zod `SummarySchema.parse` — hard contract** (app.ts:166-178) |
-| app.ts:1345 | `GET /api/findings` (no query params — filtering is client-side) | TS interface only |
-| app.ts:1346 | `GET /api/jobs` | TS interface only |
-| app.ts:1347 | `GET /api/events` | TS interface only |
-| app.ts:1348 | `GET /api/stats` | TS interface only |
-| app.ts:888 | `GET /api/finding?id=<id>` (lazy, on card expand) | TS interface only |
-| app.ts:821 | `GET /api/repo/notes?id=<id>` (lazy) | reads `notes`, `error` |
-| app.ts:640,654,673,694,710,722,734,746,774,796,858 | POST endpoints (out of scope, section 14) | reads `error`, plus 409 status for /api/cycle |
+| `HunterStore.refresh` (`lib/api.svelte.ts:94-143`), on a 5 s timer (`#poll`/`startPolling`, `:145-160`) and again after every successful write | `GET /api/summary`, `/api/findings`, `/api/jobs`, `/api/events`, `/api/stats` — issued together in one `Promise.all` | **All-or-nothing.** Any non-200 among the five -> `error = "API error (non-200 response)"` and **no** state written; any body failing `lib/validate.ts` -> `error = "API error (malformed response body)"`, again nothing written; any transport failure, including the per-GET read deadline, -> `error` is the stringified exception, and still nothing written. One bad endpoint freezes the other four at their last good values behind App.svelte's staleness banner (`App.svelte:137-141`). |
+| the same `refresh` | `GET /api/findings` carries **no query params** | Every filter, threshold and sort is client-side (`components/FilterBar.svelte:22-26,54-88`), so §4's query-param table has no UI consumer at all. |
+| `HunterStore.fetchFindingDetail` (`api.svelte.ts:177-200`), lazily when a card is expanded (`FindingCard` renders `FindingDetail`, `components/FindingCard.svelte:280`; loader `components/FindingDetail.svelte:19-46`) | `GET /api/finding?id=<id>` | Kept only when `status === 200` **and** `isFindingDetail` passes; otherwise the cache entry is dropped and the panel shows "Failed to load finding detail". Refetched whenever a poll landed new data, since the cache is keyed to `store.revision`. |
+| `HunterStore.fetchRepoNotes` (`api.svelte.ts:202-213`), lazily from `ReposPage.toggleNotes` on panel expand (`pages/ReposPage.svelte:170-197`) | `GET /api/repo/notes?id=<id>` | Throws unless `r.ok` **and** `typeof body.notes === "string"`; the caller collapses the panel and toasts. It does **not** read `error`. |
+| `post()` (`api.svelte.ts:44-50`) from the page/component handlers | the 9 POST routes | Section 14 and `API-CONTRACT-WRITES.md`. |
 
-### Keys the UI actually reads — the port MUST NOT drop any of these
+### 13.2 What is enforced at runtime — dropping any of this blanks the dashboard
 
-**`/api/summary` (zod = request fails visibly if any is missing/wrong-typed):** `backend_status_html` (string; innerHTML'd), `counts` (record str->num), `type_counts`, `repos[]` (all 10 RepoDict keys required per RepoSchema app.ts:105-116), `last_cycle` (nullable Event), `cycle_running` (bool), `current_job` (nullable; requires JobSchema keys: `id, kind, repo_id, repo_name, finding_id, state, tokens_new, calls, exit_code, killed_reason, started_at, finished_at`; `finding_summary`/`finding_fingerprint` optional; `pid`/`session_file`/`cap_tokens`/`notes`/`model`/`usage_delta` are NOT required by zod — but keep them for /api/jobs parity), `next_candidate` (nullable; requires `kind, id, label, is_finding, budget_state, budget_reason, budget_retry_at`; `is_prioritized` optional-with-default), `scheduler_state` (nullable; requires `state, detail, next_wake_at, updated_at`), `activity_status` (discriminated union; unknown `kind` = parse failure).
+`lib/validate.ts` is the only client-side check, and it is deliberately *not* a schema mirror: it checks what a component dereferences with no `?.`, plus every `{#each}` key, because Svelte 5 throws `each_key_duplicate` inside the component — past the store, where setting `error` could still have shown the operator a dashboard. Because the five polled responses are validated as a unit (§13.1), a violation anywhere in this list takes all of them down.
 
-**`/api/findings` (interface app.ts:18-56):** `type, id, repo_id, fingerprint, file, symbol, line, category, severity, confidence, summary, detail, evidence_plan, introduced_by, status, verdict_reason, pr_url, created_at, updated_at, timeline (Event[]), budget_override, needs_attention`, plus optional type-specific: `bug_class, ecosystem, package, current_version, latest_version, update_type, security_advisory, missing_tests, smell_type, suggested_refactor, modernization_class, current_approach, proposed_approach, standard_section` (`standard_section` only in the Svelte consumer, ui-svelte/src/lib/types.ts:52).
+- `/api/summary` — `isSummary` (`validate.ts:83-96`): `activity_status` an object with a string `kind`; the field that `kind` implies — `job` object for `running`, `candidate` object for `paused` and `ready`, string `detail` for `error`, nothing for the kinds whose branches render no payload (`hasActivityFields`, `:68-80`); string `backend_status_html`; `counts` and `type_counts` objects (contents unchecked); `repos` an array of objects each carrying a **distinct numeric `id`**.
+- `/api/stats` — `isStats` (`:99-108`): `totals` an object; `by_kind` rows with a distinct **string** `kind`; `by_finding` rows with a distinct **numeric** `finding_id`.
+- `/api/findings` — `isFindingList` (`:144-146`): rows with distinct numeric `id`, and each row's `timeline`, when present and non-null, rows with distinct numeric `id`.
+- `/api/jobs` — `isJobList` (`:149-151`): rows with distinct numeric `id`, and `produced_finding_ids`, when present and non-null, an array with no repeated entry.
+- `/api/events` — `isEventList` (`:154-156`): rows with distinct numeric `id`.
+- `/api/finding` — `isFindingDetail` (`:130-136`): `jobs` rows with distinct numeric `id`; `pr_state` either absent/null or an object.
 
-**`/api/jobs` (JobSchema-derived type, app.ts:58-71):** `id, kind, repo_id, repo_name, finding_id, state, tokens_new, calls, exit_code, killed_reason, started_at, finished_at`.
+Nothing else is checked. `api<T>()` casts the parsed JSON to `T` without inspecting it (`api.svelte.ts:32-41`), so `lib/types.ts` states what the server is believed to send, never what the client verified.
 
-**`/api/events` (app.ts:73-82):** `id, at, kind, message, job_id, finding_id`.
+### 13.3 Keys actually rendered — dropping one degrades silently
 
-**`/api/finding` (app.ts:102-105):** `jobs` (Job[]), `pr_state` (nullable; keys read app.ts:86-96: `pr_number, state, mergeable, checks, head_ref, last_activity_at, last_engaged_activity_at, needs_attention, synced_at`).
+Absent here is a dash, an empty cell or a missing badge, with `error` still null and the staleness banner still hidden. That is the failure mode to weigh when deciding whether a key is droppable.
 
-**`/api/stats` (app.ts:188-223):** `totals.{jobs,total_tokens,total_calls,total_usage_delta,done,denied}`; `by_kind[].{kind,jobs,done,failed,killed,denied,total_tokens,total_calls,avg_tokens,total_usage_delta,models}`; `by_finding[].{finding_id,fingerprint,status,severity,jobs,total_tokens,total_calls,total_usage_delta}`.
+**`/api/summary`.** `backend_status_html` (`{@html}`, `pages/StatusPage.svelte:60`, plus the `<time data-ms>` rewrite at `:37-48`); `cycle_running` (button label and `disabled`, `:67-71`); `last_cycle.{at,kind,message}` (`:73-77`); `scheduler_state.{next_wake_at,detail}` (`:118-123,133-137,144-148,154-156`); `activity_status` payloads — `running` reads `job.{id,kind,repo_name,finding_id,finding_summary,finding_fingerprint,started_at,finished_at,tokens_new}` (`:84-92`), `error` reads `detail` (`:102`), `paused`/`ready` read `candidate.{kind,id,label,is_finding,budget_state,budget_reason,budget_retry_at}` (`:105-137`, label via `candidateLabel`, `:31-33`); `repos[].{id,name}` build the repo-name maps on three pages (`pages/InboxPage.svelte:11`, `pages/AllFindingsPage.svelte:11`, `pages/KanbanPage.svelte:8`), and `repos[].{forge,enabled,url,default_branch,last_hunt_at}` are rendered per card by `ReposPage` (`:344-366`) while `{url,added_at}` together form the identity that invalidates a repo's cached notes (`repoIdentity`, `ReposPage:67-68`).
 
-**`/api/repo/notes`:** `notes` (string), `error` (on non-200).
+**`/api/findings`.** `FindingCard` renders `id, type, severity, confidence, category, budget_override, needs_attention, pr_url, status, summary, fingerprint, file, line, timeline[].{id,at,kind,message}, detail, evidence_plan, verdict_reason` (`FindingCard.svelte:115-282`). `FilterBar` additionally reads `repo_id, type, category, severity, status, confidence` as filter dimensions and `created_at`/`updated_at` as sort keys (`FilterBar.svelte:22-26,54-87`); `KanbanPage` columns key off `status` plus `needs_attention` (`KanbanPage.svelte:11-16,31-32`).
 
-**Error handling:** the UI reads `body.error` from failed responses across the board — keep the `{"error": string}` envelope and the specific statuses (400/404/409/415/500).
+**`/api/jobs`.** `LogPage` renders `id, started_at, finished_at, kind, repo_name, finding_id, produced_finding_ids, state, tokens_new, calls, model` (`LogPage.svelte:139-182`; `produced_finding_ids` is read through `produced()`, `:21-23`, which treats absent as `[]`).
+
+**`/api/events`.** `LogPage` renders all six keys: `id, at, kind, message, finding_id, job_id` (`LogPage.svelte:89-108`).
+
+**`/api/finding`.** `FindingDetail` renders `jobs[].{id,kind,state,tokens_new,started_at,finished_at,model}` (`:71-89`) and, when `pr_state` is non-null, `pr_state.{state,mergeable,checks,head_ref,pr_number,needs_attention,synced_at}` (`:104-127`).
+
+**`/api/stats`.** `StatsPage` renders `totals.{jobs,total_tokens,total_calls,done,denied,total_usage_delta}` (`:23-49`), `by_kind[].{kind,jobs,done,failed,killed,denied,total_tokens,avg_tokens,total_usage_delta,models}` (`:75-87`) and `by_finding[].{finding_id,fingerprint,status,severity,jobs,total_tokens,total_calls,total_usage_delta}` (`:114-134`).
+
+**`/api/repo/notes`.** `notes` only, rendered in a `<pre>` (`ReposPage.svelte:407-412`).
+
+### 13.4 Shipped for parity, with no consumer to catch a regression
+
+Serialized by the port and read by nobody in the Svelte UI. A wrong *value* in any of these is invisible; only the structural ones in the first group are load-bearing at all.
+
+- Present-but-unrendered, still required by §13.2: `/api/summary`'s `counts` and `type_counts` must remain objects — no page displays either, so the counters are enforced as containers and ignored as data.
+- Never read: top-level `next_candidate` (the status panel reads `activity_status.candidate` instead, which is the same payload by a different route), `candidate.is_prioritized`, `scheduler_state.{state,updated_at}`, `repos[].{path,last_hunt_sha}`.
+- `/api/jobs` and `current_job`: `pid, session_file, cap_tokens, exit_code, killed_reason, notes, usage_delta`.
+- `/api/finding`: `pr_state.{finding_id,last_activity_at,last_engaged_activity_at,attention_since}` and every pr_state column past those (`hunter-rs/src/types.rs:230-249`).
+- `/api/stats`: `by_kind[].total_calls` — declared (`lib/types.ts:163-175`) and given no column in the table.
+- `/api/findings`: `symbol, bug_class, introduced_by, test_file` and the type-specific columns `ecosystem, package, current_version, latest_version, update_type, security_advisory, missing_tests, smell_type, suggested_refactor, modernization_class, current_approach, proposed_approach, standard_section`. The card shows the server-computed `category` (§4) in their place, and `category` *is* derived from them, so they are load-bearing on the server and inert on the wire.
+
+### 13.5 The error envelope has no UI reader
+
+No Svelte code reads `body.error`. Every caller branches on `r.ok` or `r.status` alone and reports failure in its own words — `console.error` plus a toast (`ReposPage.svelte:104-112`), or the store's own wording behind App.svelte's banner (the two literals at `api.svelte.ts:106,129` and the stringified exception at `:141`; `App.svelte:137-141`). The one place a status *code* carries meaning is `/api/cycle`, where 409 and 202 become different button text (`StatusPage.svelte:13-17`). Keep the `{"error": <msg>}` envelope and the 400/404/409/415/500 taxonomy — they are what a human debugging with curl sees, and the WRITES contract pins several of them — but expect no UI regression to fire if a message string changes.
 
 ---
 
