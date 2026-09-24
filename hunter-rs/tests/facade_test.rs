@@ -1352,3 +1352,123 @@ async fn the_7d_cap_prefers_the_7d_estimate_over_the_5h_ratio() {
          gives a different number, which is the bug this pins"
     );
 }
+
+// ============================================================
+// Cap vs gate: the anticipated job is counted once, not twice
+// ============================================================
+
+/// A grant must be big enough to pay for the job it grants.
+///
+/// The gate and the cap used to share one reservation, the one that
+/// includes the anticipated spend. For the gate that is right — it asks
+/// whether the window survives this job. For the cap it charges the job
+/// for itself: the grant is then the headroom left over AFTER the job has
+/// run, so a job that clears the gate by a hair is handed nearly nothing.
+/// In production that shipped caps of a few thousand tokens against a
+/// session floor around 32k, and the watchdog killed those workers seconds
+/// in, having done no work.
+///
+/// Numbers here: 5h capacity 1M, used .69, ramp .90, anticipated 200k
+/// (res .20) — the gate grants with .89 against .90, a margin of .01.
+/// Headroom for the job is (.90 − .69) × 1M = 210k. Counting the job's
+/// own 200k against it leaves (.90 − .89) × 1M = 10k.
+#[tokio::test]
+async fn test_granted_cap_covers_the_anticipated_job() {
+    const ANTICIPATED: i64 = 200_000;
+    let now = now_ms();
+    let mut w = BTreeMap::new();
+    // Elapsed 4.55h of 5h → ramp = (4.55 − 0.5) / 4.5 = 0.90.
+    w.insert(
+        "anthropic:5h".to_owned(),
+        ws(
+            "anthropic:5h",
+            0.69,
+            "ok",
+            now + (0.45 * HOUR_MS as f64) as i64,
+            60.0,
+        ),
+    );
+    // Roomy 7d so the 5h window is the binding one.
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 0.10, "ok", now + WEEK_MS / 2, 60.0),
+    );
+
+    let mut ledger = FakeLedger::new(0, 0);
+    ledger
+        .capacity
+        .insert("anthropic:5h".to_owned(), 1_000_000.0);
+
+    let b = make_backend(ledger);
+    let o = b.decide_with_windows(&w, ANTICIPATED).await.unwrap();
+
+    assert!(
+        is_granted(&o.normal),
+        "expected Granted, got {:?}",
+        o.normal
+    );
+    let cap = cap_tokens(&o.normal).expect("a granted cap");
+    assert!(
+        cap >= ANTICIPATED,
+        "granted a {ANTICIPATED}-token job a cap of only {cap}: the cap \
+         counted the anticipated spend against itself, so the watchdog \
+         kills the worker long before it can do the work it was granted"
+    );
+    assert!(
+        (cap - 210_000).abs() <= 100,
+        "cap {cap} should be the 5h headroom, (ramp .90 − used .69) × 1M"
+    );
+}
+
+/// Same double-count, the other place it lives: the prio override arm
+/// inside a pacing denial, which caps at `1.0 − effective_used`.
+///
+/// 5h capacity 1M, used .55, ramp .50, anticipated 200k (res .20) → the
+/// gate denies on .75 ≥ .50 and prio waives the ramp. The job's headroom
+/// to the hard limit is (1.0 − .55) × 1M = 450k; charging it for its own
+/// 200k leaves (1.0 − .75) × 1M = 250k.
+#[tokio::test]
+async fn test_prio_override_cap_excludes_the_anticipated_job() {
+    const ANTICIPATED: i64 = 200_000;
+    let now = now_ms();
+    let mut w = BTreeMap::new();
+    // Elapsed 2.75h of 5h → ramp = (2.75 − 0.5) / 4.5 = 0.50.
+    w.insert(
+        "anthropic:5h".to_owned(),
+        ws(
+            "anthropic:5h",
+            0.55,
+            "ok",
+            now + (2.25 * HOUR_MS as f64) as i64,
+            60.0,
+        ),
+    );
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 0.01, "ok", now + WEEK_MS / 2, 60.0),
+    );
+
+    let mut ledger = FakeLedger::new(0, 0);
+    ledger
+        .capacity
+        .insert("anthropic:5h".to_owned(), 1_000_000.0);
+
+    let b = make_backend(ledger);
+    let o = b.decide_with_windows(&w, ANTICIPATED).await.unwrap();
+
+    assert!(
+        is_denied(&o.normal),
+        "normal should be denied by the 5h ramp"
+    );
+    assert!(
+        reason(&o.prioritized).contains("prio override"),
+        "expected a prio override, got {:?}",
+        o.prioritized
+    );
+    let cap = cap_tokens(&o.prioritized).expect("a prio override cap");
+    assert!(
+        (cap - 450_000).abs() <= 2,
+        "prio cap {cap} should be (1.0 − used .55) × 1M = 450000; counting \
+         the anticipated 200k against the job gives 250000 instead"
+    );
+}

@@ -185,34 +185,36 @@ Pure math (already parameterized on now_ms — keep pure in Rust):
 
 Constants: `_TOK_PER_FRAC_5H = 200_000 / 0.10 = 2_000_000.0` (:37; comment :34-36 — 200 k ≈ 10% of a 5h window; 7d is 168h/5h = 33.6× larger); `_5H_7D_RATIO = capacity._5H_MS / capacity._WEEK_MS = 5/168 ≈ 0.0297619` (:38); `_esc(s) = html.escape(str(s))` (:41-43 — escapes `& < > " '`); `_CALIBRATION_DURATIONS_MS = {"5h": _5H_MS, "7d": _WEEK_MS}` (:50-53, moved from store — Anthropic-window knowledge). `@dataclass OmpScavengeBackend { cfg: Config, ledger: SpendLedger }` (:56-65). Logger `hunter.backend` (:32).
 
-**`_unaccounted_fraction(windows, anticipated) -> (res_5h, res_7d)`** (:68-98). Inflight reservation as a fraction, PER WINDOW, each against its own probe time:
+**`_unaccounted_fraction(windows, anticipated)`** (:68-98). Inflight reservation as a fraction, PER WINDOW, each against its own probe time. A decide() needs TWO of them per window — `gate_X`, which counts `anticipated` in, and `budget_X`, which does not; both live on the `_Reservation` dataclass (Rust: `struct Reservation`) built at :144-151. See item 5 for why.
 1. `running = ledger.running_estimate()` (:79).
 2. `fallback = min(w.recorded_at for w in windows.values(), default=0)`; `probe_at_5h = windows["anthropic:5h"].recorded_at` if present else fallback; likewise 7d (:81-85). (Regression fix: per-window probe_at, never a shared min — see test 47 below.)
 3. `base = running + anticipated` (:88); `unaccounted_5h = base + ledger.finished_since(probe_at_5h)` (:89); `unaccounted_7d = base + ledger.finished_since(probe_at_7d)` (:90).
-4. `cap_5h = ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H` (:93); `cap_7d = ledger.estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)` (:94). Note `or`: None and 0 both fall back.
-5. `reservation_X = unaccounted_X / cap_X if cap_X else 0.0` (:96-97).
+4. `cap_5h, cap_7d = _capacities()` (:123; body :128-136) — `estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H`; `estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)`. Note `or`: None and 0 both fall back. Single derivation point, shared with `_frac_to_tokens` (Rust: derived once and carried on `Reservation`).
+5. Gate reservation `gate_X = unaccounted_X / cap_X if cap_X else 0.0` (:96-97). Cap reservation `budget_X = gate_X − (anticipated / cap_X if cap_X else 0.0)` — equivalently, the same fraction recomputed from `unaccounted_X − anticipated`.
 
-**`_decide_inner(windows, res_5h, res_7d, *, prio) -> Verdict`** (:100-176). One verdict: 7d ramps first, then 5h. `prio=True`: pacing denials become grants (ramp waived to the 1.0 hard limit) but exhaustion denials stand (:105-109).
+   **Gate vs cap — the invariant.** The gate reserves `anticipated`; the cap MUST NOT, so a granted `cap_tokens` is always `>= anticipated`. Why: the headroom a grant computes IS the anticipated job's budget, so reserving its cost first and then handing it what remains counts that cost twice and gives it `headroom − anticipated` tokens to do work worth `anticipated`. A job that clears the gate by a hair is then capped far below its own session floor and killed by the watchdog having produced nothing, while the tokens it did spend still count against the window. The gate's question — "if this job also runs, does the window cross its ramp?" — genuinely needs the job's own cost in the answer, so the gate keeps `gate_X` with its conditions and reason strings unchanged; every cap computation uses `budget_X`: the all-passed headroom AND both `prio and not is_exhausted` override arms.
+
+**`_decide_inner(windows, res, *, prio) -> Verdict`** (:100-176), `res` being the `_Reservation` above. One verdict: 7d ramps first, then 5h. `prio=True`: pacing denials become grants (ramp waived to the 1.0 hard limit) but exhaustion denials stand (:105-109).
 1. `now_ms = time.time() * 1000` (:107).
 2. `if not windows: return Denied("no window data -- deny until fresh")` (:109-110) — ASCII double hyphen, `retry_at=None`.
 3. **7d pass** (:113-141) — iterate `windows.items()` in dict order (insertion order = SQL GROUP BY order, ascending limit_id in practice; **Rust: use BTreeMap** — among multiple over-ramp `:7d` lids the first wins the reason string):
    - consider only lids containing `":7d"`; skip if `w.status != "exhausted" and w.used_fraction is None` (:114-115);
    - skip expired cycles `if w.resets_at and w.resets_at <= now_ms` (:116-117; belt-and-braces vs read_windows — covers per-model-class rows read_windows kept because their resets_at was future at read time);
-   - `elapsed_frac = ramp_7d(w.resets_at, now_ms)`; `effective_used = _effective_used(w, res_7d)` (:118-119);
+   - `elapsed_frac = ramp_7d(w.resets_at, now_ms)`; `effective_used = _effective_used(w, res.gate_7d)` (:118-119);
    - if `effective_used >= elapsed_frac` (:120): `is_exhausted = (w.status == "exhausted")`; `retry = w.resets_at if is_exhausted else retry_at_7d(w.resets_at, effective_used)` (:121-126); reason (:127-131) EXACTLY:
-     `f"{lid}: used {effective_used - reservation_7d:.2f} + unaccounted {reservation_7d:.2f} = {effective_used:.2f} >= ramp {elapsed_frac:.2f}"`
-     If `prio and not is_exhausted` (:132-138): `headroom_frac = max(0.0, 1.0 − effective_used)`; `cap = _frac_to_tokens(headroom_frac, "7d")`; `cap <= 0 → Denied(reason, retry_at=retry)`; else `Granted(cap_tokens=cap, reason=f"prio override ({reason})")`. Else `Denied(reason, retry_at=retry)` (:139).
-4. **5h pass** (:143-168): `w5 = windows.get("anthropic:5h")`; gate only if `w5 is not None and (w5.status == "exhausted" or w5.used_fraction is not None)` (:144-145); `allowed = ramp_5h(w5.resets_at, now_ms)`; `allowed is None` → opener, skip (:146-147); `effective_used = _effective_used(w5, res_5h)`; deny iff `effective_used >= allowed` (:148-149); `retry = w5.resets_at if exhausted else retry_at_5h(w5.resets_at, effective_used)` (:150-155); reason (:156-160) EXACTLY (label literal `5h`, not the lid):
-   `f"5h: used {effective_used - reservation_5h:.2f} + unaccounted {reservation_5h:.2f} = {effective_used:.2f} >= ramp {allowed:.2f}"`
-   Same prio-waiver structure with dim "5h" (:161-167).
-5. **All passed** (:170-176): `headroom = _compute_headroom(windows, res_5h, res_7d, prio=prio)`; `return Granted(cap_tokens=headroom, reason="ok")` — headroom may be None (unbounded) when no window had a usable used_fraction.
+     `f"{lid}: used {effective_used - res.gate_7d:.2f} + unaccounted {res.gate_7d:.2f} = {effective_used:.2f} >= ramp {elapsed_frac:.2f}"`
+     If `prio and not is_exhausted` (:132-138): `headroom_frac = max(0.0, 1.0 − _effective_used(w, res.budget_7d))` — the CAP reservation, NOT the `effective_used` the gate just denied on, which already contains `anticipated`; `cap = _frac_to_tokens(headroom_frac, "7d")`; `cap <= 0 → Denied(reason, retry_at=retry)`; else `Granted(cap_tokens=cap, reason=f"prio override ({reason})")`. Else `Denied(reason, retry_at=retry)` (:139).
+4. **5h pass** (:143-168): `w5 = windows.get("anthropic:5h")`; gate only if `w5 is not None and (w5.status == "exhausted" or w5.used_fraction is not None)` (:144-145); `allowed = ramp_5h(w5.resets_at, now_ms)`; `allowed is None` → opener, skip (:146-147); `effective_used = _effective_used(w5, res.gate_5h)`; deny iff `effective_used >= allowed` (:148-149); `retry = w5.resets_at if exhausted else retry_at_5h(w5.resets_at, effective_used)` (:150-155); reason (:156-160) EXACTLY (label literal `5h`, not the lid):
+   `f"5h: used {effective_used - res.gate_5h:.2f} + unaccounted {res.gate_5h:.2f} = {effective_used:.2f} >= ramp {allowed:.2f}"`
+   Same prio-waiver structure with dim "5h" (:161-167), its headroom likewise from `res.budget_5h`.
+5. **All passed** (:170-176): `headroom = _compute_headroom(windows, res, prio=prio)`; `return Granted(cap_tokens=headroom, reason="ok")` — headroom may be None (unbounded) when no window had a usable used_fraction.
 
-**`_compute_headroom(windows, res_5h, res_7d, *, prio) -> int | None`** (:178-212). Min headroom in tokens across windows. Fresh `now_ms = time.time()*1000` (:186 — second clock read inside one decide()). Per window: skip `used_fraction is None` (:189-190). `:7d` lids: `ceiling = 1.0 if prio else ramp_7d(w.resets_at, now_ms)`; `frac = max(0.0, ceiling − _effective_used(w, res_7d))`; `tok = _frac_to_tokens(frac, "7d")` (:191-196). `:5h` lids: `allowed = ramp_5h(…)`; only if not None: `ceiling = 1.0 if prio else allowed`; same with res_5h, dim "5h" (:197-204). `return min(caps) if caps else None` (:212).
+**`_compute_headroom(windows, res, *, prio) -> int | None`** (:178-212). Min headroom in tokens across windows, taken against `res.budget_X` — the reservation that EXCLUDES the anticipated job (see `_unaccounted_fraction` item 5). Fresh `now_ms = time.time()*1000` (:186 — second clock read inside one decide()). Per window: skip `used_fraction is None` (:189-190). `:7d` lids: `ceiling = 1.0 if prio else ramp_7d(w.resets_at, now_ms)`; `frac = max(0.0, ceiling − _effective_used(w, res.budget_7d))`; `tok = _frac_to_tokens(frac, "7d")` (:191-196). `:5h` lids: `allowed = ramp_5h(…)`; only if not None: `ceiling = 1.0 if prio else allowed`; same with `res.budget_5h`, dim "5h" (:197-204). `return min(caps) if caps else None` (:212).
 
-**`_frac_to_tokens(frac, dim) -> int`** (:214-220): `cap_5h = ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H`; `cap_7d = ledger.estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)`; `dim == "5h" or ":5h" in dim` → `int(frac * cap_5h)`; else → `int(frac * cap_7d)`. Both caps are derived exactly as in `_unaccounted_fraction` (:94-99): the 7d estimate is consulted, and the 5h-times-ratio value is only the fallback when there is not yet enough history to estimate one. (An earlier revision of this document claimed the 7d estimate was *not* consulted here and told the port to reproduce that asymmetry verbatim. It was a mis-transcription: facade.py:224 has always read the estimate. The Rust port matches the source, not that sentence.)
+**`_frac_to_tokens(frac, dim) -> int`** (:271-276): `cap_5h, cap_7d = _capacities()`; `dim == "5h" or ":5h" in dim` → `int(frac * cap_5h)`; else → `int(frac * cap_7d)`. Both caps come from the one derivation `_unaccounted_fraction` uses: the 7d estimate is consulted, and the 5h-times-ratio value is only the fallback when there is not yet enough history to estimate one. (An earlier revision of this document claimed the 7d estimate was *not* consulted here and told the port to reproduce that asymmetry verbatim. It was a mis-transcription: the 7d estimate has always been read. The Rust port matches the source, not that sentence.)
 
 **`decide(*, anticipated_tokens) -> Outlook`** (:222-242):
-1. `windows = capacity.read_windows()` (:224); `res_5h, res_7d = _unaccounted_fraction(windows, anticipated_tokens)` (:225).
+1. `windows = capacity.read_windows()` (:224); build the `_Reservation` from `_unaccounted_fraction(windows, anticipated_tokens)` and the window capacities (:144-151) → `gate_5h/gate_7d` for the gate, `budget_5h/budget_7d` for every cap.
 2. `normal = _decide_inner(prio=False)` (:227).
 3. Monotonicity by construction (:228-238): if normal is Granted → `prioritized = normal`; then `prio_headroom = _compute_headroom(prio=True)` (:232); replace with `Granted(cap_tokens=prio_headroom, reason="ok")` iff `prio_headroom is not None and (normal.cap_tokens is None or prio_headroom > normal.cap_tokens)` (:233-236). (Edge: normal cap None ⇒ prio headroom is None too — the per-window skip conditions are identical — so prioritized stays == normal; invariant can't break.) If normal is Denied → `prioritized = _decide_inner(prio=True)` (:237-238).
 4. `Outlook(normal=normal, prioritized=prioritized)` (:240).
@@ -223,7 +225,7 @@ Verdict quick reference (tests substring-match `"5h"`, `"7d"`, `"ramp"`, `"no wi
 | no windows | Denied | `no window data -- deny until fresh` | retry None |
 | :7d over ramp (pacing) | Denied | `{lid}: used {u:.2f} + unaccounted {r:.2f} = {eff:.2f} >= ramp {ramp:.2f}` | `retry_at_7d(resets, eff)` |
 | :7d exhausted | Denied | same format (eff = 1.0 + r) | `resets_at` |
-| :7d pacing + prio, 1−eff yields cap>0 | Granted | `prio override ({7d reason})` | cap = `_frac_to_tokens(1−eff, "7d")` |
+| :7d pacing + prio, cap>0 | Granted | `prio override ({7d reason})` | cap = `_frac_to_tokens(1 − _effective_used(w, budget_7d), "7d")` |
 | 5h over ramp (pacing) | Denied | `5h: used {u:.2f} + unaccounted {r:.2f} = {eff:.2f} >= ramp {ramp:.2f}` | `retry_at_5h(resets, eff)` |
 | 5h exhausted | Denied | same | `resets_at` |
 | 5h pacing + prio, cap>0 | Granted | `prio override ({5h reason})` | cap dim "5h" |
@@ -395,7 +397,7 @@ Also relevant, NOT backend-behavior tests: scheduler tests each define a local F
 
 | method | store writes | other effects |
 |---|---|---|
-| `decide()` | **none** (reads: running_estimate ×1, finished_since ×2, estimate_capacity ×2 in _unaccounted_fraction + ×1 per _frac_to_tokens call) | reads agent.db via read_windows |
+| `decide()` | **none** (reads: running_estimate ×1, finished_since ×2, estimate_capacity ×2 per `_capacities()` call — one in `_unaccounted_fraction`, one building the `_Reservation`, one per `_frac_to_tokens`) | reads agent.db via read_windows |
 | `keep_fresh()` | `window_log` INSERT per window (always) + conditional `calibration_samples` INSERT — both via `_observe` (facade.py:287,306-346) | spawns `omp usage invalidate` then `omp usage` (facade.py:296-303); reads agent.db |
 | `status()` | **none** (reads ledger like decide + estimate_capacity per lid) | reads agent.db |
 | `run()` | none itself — scheduler's `_record_job` persists the RunResult (scheduler.py:88-116) | spawns omp worker; two read_windows snapshots; sets rr.usage_delta |
@@ -404,7 +406,7 @@ No scheduler wake from the backend: `_wake` (server.py:90) is set by server POST
 
 Clock call sites (`time.time()`):
 - capacity.read_windows :94 (expiry/rollover/age_s)
-- facade._decide_inner :107 and facade._compute_headroom :186 (two reads inside one decide — a frozen Clock removes intra-call skew)
+- facade._decide_inner :165 and facade._compute_headroom :248 (two reads inside one decide — a frozen Clock removes intra-call skew)
 - facade._observe :313; facade.status :354 + `time.strftime/localtime` :412 (**local timezone**, 12-h clock)
 - store `now_ms()` for observed_at in log_window_observation :960 / record_calibration_sample :993 and the `resets_at < now` bound in estimate_capacity :896 (types.py:90-91)
 - harness :111-147 (Rust: harness.rs — spawn time :255-260 via `epoch_to_iso`, wallclock cap :359)
