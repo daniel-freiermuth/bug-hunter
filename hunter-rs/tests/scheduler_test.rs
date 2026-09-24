@@ -2,12 +2,13 @@
 //! Scheduler selection tests: `anticipated_tokens` (warm/cold percentile
 //! choice) and `pick_next` (priority order + eligibility), plus one
 //! router-level summary integration over `NullBackend`. Fixture pattern
-//! matches the store tests: copy dev.db to a unique temp path, seed via a
-//! writable pool, reopen read-only through `Store::connect_read_only`.
+//! matches the store tests: copy dev.db into a `support::TempDir`, seed via
+//! a writable pool, reopen read-only through `Store::connect_read_only`.
+
+mod support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -19,44 +20,26 @@ use hunter::store::Store;
 use hunter::util::now_ms;
 use serde_json::Value;
 use sqlx::SqlitePool;
-use sqlx::sqlite::SqliteConnectOptions;
+use support::TempDir;
 use tower::util::ServiceExt;
 
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn unique_temp_path(stem: &str, ext: &str) -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("{stem}-{}-{nanos}-{n}{ext}", std::process::id()))
-}
-
-/// Copy dev.db (schema-complete, zero rows) to a unique temp path and open
-/// a WRITABLE pool on the copy for fixture inserts.
-async fn fresh_db() -> (PathBuf, SqlitePool) {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("dev.db");
-    let path = unique_temp_path("hunter-sched-test", ".db");
-    std::fs::copy(&src, &path).unwrap();
-    let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path))
-        .await
-        .unwrap();
-    (path, pool)
+/// Copy dev.db (schema-complete, zero rows) into a scratch directory and
+/// open a WRITABLE pool on the copy for fixture inserts.
+///
+/// The guard comes FIRST in the tuple so every caller binds it first:
+/// locals drop in reverse declaration order, so the directory outlives the
+/// pool and the `Store` opened on `path`. Removing the files by hand at the
+/// end of the test body leaked the whole set on any failing assertion.
+async fn fresh_db() -> (TempDir, PathBuf, SqlitePool) {
+    let dir = TempDir::new("sched");
+    let (path, pool) = support::fresh_pool(&dir, "hunter").await;
+    (dir, path, pool)
 }
 
 /// Close the writer and reopen the same file read-only through Store.
 async fn open_store(pool: SqlitePool, path: &Path) -> Store {
     pool.close().await;
     Store::connect_read_only(path).await.unwrap()
-}
-
-fn cleanup(path: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut p = path.as_os_str().to_owned();
-        p.push(suffix);
-        std::fs::remove_file(PathBuf::from(p)).ok();
-    }
 }
 
 fn test_config(cache_ttl_s: f64) -> Config {
@@ -143,7 +126,7 @@ async fn seed_history(pool: &SqlitePool) {
 
 #[tokio::test]
 async fn anticipated_tokens_empty_history_is_zero() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
@@ -151,12 +134,11 @@ async fn anticipated_tokens_empty_history_is_zero() {
         .await
         .unwrap();
     assert_eq!(got, 0);
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn anticipated_tokens_cold_p90() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     seed_history(&pool).await;
     let store = open_store(pool, &path).await;
@@ -166,12 +148,11 @@ async fn anticipated_tokens_cold_p90() {
         .await
         .unwrap();
     assert_eq!(got, 1000);
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn anticipated_tokens_warm_p50() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     seed_history(&pool).await;
     // Recent non-denied hunt on the SAME repo. tokens_new NULL keeps the
@@ -190,12 +171,11 @@ async fn anticipated_tokens_warm_p50() {
         .await
         .unwrap();
     assert_eq!(got, 600);
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn anticipated_tokens_warm_requires_same_repo_and_non_denied() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     seed_repo(&pool, 2, "beta", 1, "/nonexistent/beta").await;
     seed_history(&pool).await;
@@ -224,7 +204,6 @@ async fn anticipated_tokens_warm_requires_same_repo_and_non_denied() {
         .await
         .unwrap();
     assert_eq!(got, 1000); // still cold -> p90
-    cleanup(&path);
 }
 
 #[tokio::test]
@@ -232,7 +211,7 @@ async fn anticipated_tokens_warm_cold_boundary_via_cache_ttl() {
     // Same fixture, same finished_at (1 minute ago) — only the TTL moves:
     // TTL 3600 s puts the job inside the window (warm -> p50), TTL 1 s
     // puts it outside (cold -> p90).
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     seed_history(&pool).await;
     sqlx::query(
@@ -256,33 +235,30 @@ async fn anticipated_tokens_warm_cold_boundary_via_cache_ttl() {
         .await
         .unwrap();
     assert_eq!(got, 1000, "outside TTL -> cold -> p90");
-    cleanup(&path);
 }
 
 // -- pick_next ----------------------------------------------------------------
 
 #[tokio::test]
 async fn pick_next_empty_db_is_none() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
     assert!(pick_next(&store, &cfg, None).await.unwrap().is_none());
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn pick_next_disabled_repo_never_selected() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 0, "/nonexistent/alpha").await;
     let store = open_store(pool, &path).await;
     let cfg = test_config(3600.0);
     assert!(pick_next(&store, &cfg, None).await.unwrap().is_none());
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn pick_next_queued_finding_beats_huntable_repo() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     // Never-cloned enabled repo: would be a "hunt" candidate on its own.
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     seed_finding(&pool, 5, 1, "queued", "queued bug").await;
@@ -295,12 +271,11 @@ async fn pick_next_queued_finding_beats_huntable_repo() {
     assert!(matches!(c, hunter::scheduler::Candidate::Finding { .. }));
     assert_eq!(c.budget_override(), None);
     assert_eq!(c.label(), Some("queued bug"));
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn pick_next_attention_beats_queued_fix_and_orders_by_attention_since() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     seed_finding(&pool, 5, 1, "queued", "queued bug").await;
     // Two attention-flagged pr_open findings; #7 has been waiting longer
@@ -326,12 +301,11 @@ async fn pick_next_attention_beats_queued_fix_and_orders_by_attention_since() {
     assert_eq!(c.job_kind(), FindingJobKind::Engage.into());
     assert_eq!(c.target_id(), 7, "oldest-outstanding attention first");
     assert!(matches!(c, hunter::scheduler::Candidate::Finding { .. }));
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn pick_next_budget_override_jumps_the_queue() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     // Attention row would normally win over a queued fix ...
     seed_finding(&pool, 7, 1, "pr_open", "flagged pr").await;
@@ -355,22 +329,19 @@ async fn pick_next_budget_override_jumps_the_queue() {
     assert_eq!(c.job_kind(), FindingJobKind::Fix.into());
     assert_eq!(c.target_id(), 5);
     assert_eq!(c.budget_override(), Some("once"));
-    cleanup(&path);
 }
 
 // -- summary integration (oneshot router, NullBackend) -------------------------
 
 #[tokio::test]
 async fn summary_paused_on_denied_candidate() {
-    let (path, pool) = fresh_db().await;
+    let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     seed_finding(&pool, 5, 1, "queued", "queued bug").await;
     let store = open_store(pool, &path).await;
 
-    let ui_dir = unique_temp_path("hunter-sched-ui", "");
-    std::fs::create_dir_all(&ui_dir).unwrap();
     let mut config = test_config(3600.0);
-    config.ui_dir = ui_dir;
+    config.ui_dir = dir.subdir("ui");
     let state = AppState {
         store: Arc::new(store),
         config: Arc::new(config),
@@ -417,5 +388,4 @@ async fn summary_paused_on_denied_candidate() {
         v["backend_status_html"],
         r#"<div class="scv-note">No window data available</div>"#
     );
-    cleanup(&path);
 }

@@ -2,46 +2,29 @@
 //! Round-3 scheduler executor + store method tests. Each test seeds its own
 //! fresh copy of dev.db (schema-complete, zero rows) through a plain sqlx pool.
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use hunter::domain::{FindingJobKind, FindingType, RepoJobKind};
 use hunter::store::Store;
 use hunter::types::RunResult;
 use sqlx::SqlitePool;
-use sqlx::sqlite::SqliteConnectOptions;
+use support::{TempDir, fresh_pool};
 
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn unique_temp_path(stem: &str, ext: &str) -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("{stem}-{}-{nanos}-{n}{ext}", std::process::id()))
-}
-
-async fn fresh_db() -> (PathBuf, SqlitePool) {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("dev.db");
-    let path = unique_temp_path("hunter-sched-exec-test", ".db");
-    std::fs::copy(&src, &path).unwrap();
-    let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path))
-        .await
-        .unwrap();
-    (path, pool)
+/// The guard comes FIRST in the tuple so every caller binds it first:
+/// locals drop in reverse declaration order, so the directory outlives
+/// the pool and any `Store` opened on `path` and SQLite's handles are
+/// closed before the files go. Returning only the path would leak the
+/// whole directory the moment an assertion panicked.
+async fn fresh_db() -> (TempDir, PathBuf, SqlitePool) {
+    let dir = TempDir::new("sched-exec");
+    let (path, pool) = fresh_pool(&dir, "hunter").await;
+    (dir, path, pool)
 }
 
 async fn rw_store(path: &Path) -> Store {
     Store::connect(path).await.unwrap()
-}
-
-fn cleanup(path: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut p = path.as_os_str().to_owned();
-        p.push(suffix);
-        std::fs::remove_file(PathBuf::from(p)).ok();
-    }
 }
 
 async fn seed_repo(pool: &SqlitePool) {
@@ -78,7 +61,7 @@ async fn seed_findings(pool: &SqlitePool) {
 
 #[tokio::test]
 async fn record_job_done_state() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
     let job_id = store
@@ -119,13 +102,11 @@ async fn record_job_done_state() {
     assert!(j.job.finished_at.is_some());
     // notes should be None for "done" state
     assert!(j.job.notes.is_none());
-
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn record_job_failed_state() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
     let job_id = store
@@ -160,13 +141,11 @@ async fn record_job_failed_state() {
     // notes should contain stdout_tail (up to 500 chars)
     assert!(j.job.notes.is_some());
     assert!(j.job.notes.as_ref().unwrap().contains("panic at line 42"));
-
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn record_job_killed_state() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
     let job_id = store
@@ -199,15 +178,13 @@ async fn record_job_killed_state() {
     assert_eq!(j.job.state, hunter::domain::JobState::Killed);
     assert_eq!(j.job.killed_reason.as_deref(), Some("cap"));
     assert!(j.job.notes.is_some()); // killed => notes from stdout_tail
-
-    cleanup(&path);
 }
 
 // -- 2. create_job + update_job round-trip -----------------------------------
 
 #[tokio::test]
 async fn create_and_update_job_round_trip() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
 
@@ -259,15 +236,13 @@ async fn create_and_update_job_round_trip() {
     assert_eq!(j.job.notes.as_deref(), Some("completed"));
     assert_eq!(j.job.model.as_deref(), Some("claude-4"));
     assert_eq!(j.job.finished_at, Some(2000));
-
-    cleanup(&path);
 }
 
 // -- 3. reconcile_orphaned_jobs ----------------------------------------------
 
 #[tokio::test]
 async fn reconcile_orphaned_jobs() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
@@ -302,20 +277,18 @@ async fn reconcile_orphaned_jobs() {
     assert_eq!(j.job.killed_reason.as_deref(), Some("orphaned"));
     assert!(j.job.notes.as_deref().unwrap().contains("reconciled"));
     assert!(j.job.finished_at.is_some());
-
-    cleanup(&path);
 }
 
 // -- 4. ingest_findings: valid inserted, duplicates skipped, invalid counted -
 
 #[tokio::test]
 async fn ingest_findings_valid_dup_invalid() {
-    let (path, pool) = fresh_db().await;
+    let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
 
     // Write a temporary findings JSON
-    let tmp = unique_temp_path("findings", ".json");
+    let tmp = dir.join("findings.json");
     let content = serde_json::json!([
         {
             "fingerprint": "fp-ingest-1",
@@ -354,18 +327,15 @@ async fn ingest_findings_valid_dup_invalid() {
         hunter::ingest::ingest_findings(&store, 1, &tmp, Some(FindingType::Bug), None, None).await;
     assert_eq!(result2.inserted, 0);
     assert_eq!(result2.duplicates, 2);
-
-    std::fs::remove_file(&tmp).ok();
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn ingest_findings_test_gap_type() {
-    let (path, pool) = fresh_db().await;
+    let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
 
-    let tmp = unique_temp_path("test-gaps", ".json");
+    let tmp = dir.join("test-gaps.json");
     let content = serde_json::json!([
         {
             "fingerprint": "tg-1",
@@ -391,16 +361,13 @@ async fn ingest_findings_test_gap_type() {
             .await;
     assert_eq!(result.inserted, 1);
     assert_eq!(result.invalid, 1); // missing_tests not a list
-
-    std::fs::remove_file(&tmp).ok();
-    cleanup(&path);
 }
 
 // -- 5. finalize_in_progress ------------------------------------------------
 
 #[tokio::test]
 async fn finalize_in_progress_resets_when_unchanged() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
@@ -436,15 +403,13 @@ async fn finalize_in_progress_resets_when_unchanged() {
         .unwrap();
     let f2 = store.get_finding(2).await.unwrap().unwrap();
     assert_eq!(f2.status, hunter::domain::FindingStatus::PrOpen); // untouched
-
-    cleanup(&path);
 }
 
 // -- 6. upsert_finding + suppressions + known_active -------------------------
 
 #[tokio::test]
 async fn upsert_finding_and_queries() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
 
@@ -481,15 +446,13 @@ async fn upsert_finding_and_queries() {
     assert_eq!(active2.len(), 0);
     let suppressed2 = store.suppressions(1, "bug").await.unwrap();
     assert_eq!(suppressed2.len(), 1);
-
-    cleanup(&path);
 }
 
 // -- 7. record/clear attempt tracking ----------------------------------------
 
 #[tokio::test]
 async fn fix_attempt_streak_tracking() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
@@ -518,6 +481,4 @@ async fn fix_attempt_streak_tracking() {
     let f = store.get_finding(1).await.unwrap().unwrap();
     assert_eq!(f.fix_attempts, 0);
     assert!(f.last_fix_failure.is_none());
-
-    cleanup(&path);
 }

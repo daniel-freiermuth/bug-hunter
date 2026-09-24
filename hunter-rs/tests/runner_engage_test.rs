@@ -35,9 +35,6 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// `pr_state.state` read straight from the database — the runner's
-    /// own Store API exposes no reader for it, and the point of the test
-    /// is what was persisted.
     /// `pr_state.addressed_fingerprint` — set when an engage cycle has
     /// taken its shot at the current attention reason.
     async fn addressed_fp(&self) -> Option<String> {
@@ -55,6 +52,9 @@ impl Fixture {
         row.and_then(|r| r.0)
     }
 
+    /// `pr_state.state` read straight from the database — the runner's
+    /// own Store API exposes no reader for it, and the point of the test
+    /// is what was persisted.
     async fn pr_state(&self) -> Option<String> {
         let pool = sqlx::SqlitePool::connect_with(
             sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
