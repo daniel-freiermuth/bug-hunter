@@ -1175,20 +1175,57 @@ pub fn migrate_repo_notes(work_root: &Path) -> usize {
             continue;
         }
         let new = Store::notes_path(work_root, rid);
-        if new.exists() {
-            continue;
-        }
         if let Some(parent) = new.parent()
             && std::fs::create_dir_all(parent).is_err()
         {
             continue;
         }
-        // Copy-then-remove rather than rename: the two paths can sit on
-        // different filesystems once `repos/` is a mount of its own,
-        // where rename fails with EXDEV.
-        if std::fs::copy(&old, &new).is_ok() && std::fs::remove_file(&old).is_ok() {
+        // Already migrated: the live notes are the ones at the new path,
+        // so the old file is not content to keep -- but it must still
+        // leave the checkout, because that is the whole point. Parked
+        // beside the current notes rather than deleted, since it is the
+        // operator's writing and this pass is not the place to decide it
+        // is worthless.
+        if new.exists() {
+            let parked = new.with_extension("legacy.md");
+            if std::fs::rename(&old, &parked).is_ok() {
+                tracing::info!(
+                    "repo {rid} already had notes at the new path; parked the copy \
+                     left in its clone at {}",
+                    parked.display()
+                );
+            }
+            continue;
+        }
+        // Copy to a temporary beside the destination and rename it into
+        // place, so `new` only ever appears complete. A copy written
+        // straight to `new` and interrupted leaves a truncated file that
+        // every later pass skips, and `repo_notes` would serve the
+        // truncation forever.
+        //
+        // Copy rather than rename the original: `repos/` can be a mount
+        // of its own, where a cross-device rename fails with EXDEV. The
+        // temporary is beside `new`, so that rename is always same-device.
+        let staged = new.with_extension("md.part");
+        if std::fs::copy(&old, &staged).is_err() {
+            let _ = std::fs::remove_file(&staged);
+            continue;
+        }
+        if std::fs::rename(&staged, &new).is_err() {
+            let _ = std::fs::remove_file(&staged);
+            continue;
+        }
+        if std::fs::remove_file(&old).is_ok() {
             moved += 1;
             tracing::info!("moved repo {rid} notes out of its clone directory");
+        } else {
+            // The content is safe at the new path; what is left is the
+            // copy in the checkout, which is the hazard.
+            tracing::warn!(
+                "repo {rid} notes were copied out of its clone but {} could not be \
+                 removed; it is still in the working tree",
+                old.display()
+            );
         }
     }
     moved

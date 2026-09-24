@@ -110,4 +110,17 @@ fn migration_keeps_the_current_notes() {
         notes.contains("current note") && !notes.contains("stale copy"),
         "a note already at the new path is the live one: {notes}"
     );
+    // And the copy still leaves the checkout. Skipping the entry left it
+    // in the working tree for good, which is the hazard the move exists
+    // to remove -- a worker's broad `git add` can still commit it.
+    assert!(
+        !clone_dir.join("NOTES.md").exists(),
+        "the legacy file must not stay in the clone"
+    );
+    assert!(
+        std::fs::read_to_string(work_root.join("notes").join("repo-5.legacy.md"))
+            .unwrap()
+            .contains("stale copy"),
+        "the operator's older writing is parked, not deleted"
+    );
 }
