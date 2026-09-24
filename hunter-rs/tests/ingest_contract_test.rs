@@ -217,7 +217,7 @@ async fn findings_are_attributed_to_the_hunt_that_produced_them() {
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
-            1000,
+            Some(1000),
             JobState::Running,
             None,
         )
@@ -246,7 +246,7 @@ async fn a_rediscovery_does_not_steal_attribution() {
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
-            1000,
+            Some(1000),
             JobState::Running,
             None,
         )
@@ -260,7 +260,7 @@ async fn a_rediscovery_does_not_steal_attribution() {
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
-            1000,
+            Some(1000),
             JobState::Running,
             None,
         )
@@ -293,7 +293,7 @@ async fn a_job_given_a_finding_produces_nothing() {
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
-            1000,
+            Some(1000),
             JobState::Running,
             None,
         )
@@ -307,7 +307,7 @@ async fn a_job_given_a_finding_produces_nothing() {
             FindingJobKind::Fix.into(),
             repo_id,
             Some(found[0]),
-            1000,
+            Some(1000),
             JobState::Running,
             None,
         )

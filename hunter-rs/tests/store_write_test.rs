@@ -225,7 +225,7 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
             RepoJobKind::Hunt.into(),
             picked.id,
             None,
-            100_000,
+            Some(100_000),
             JobState::Running,
             None,
         )
@@ -249,7 +249,7 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
             RepoJobKind::Hunt.into(),
             1,
             None,
-            100_000,
+            Some(100_000),
             JobState::Running,
             None,
         )

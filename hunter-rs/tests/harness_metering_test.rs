@@ -91,7 +91,7 @@ impl Fixture {
         }
     }
 
-    fn run(&self, cap_tokens: i64, max_wall_s: i64) -> RunResult {
+    fn run(&self, cap_tokens: Option<i64>, max_wall_s: i64) -> RunResult {
         harness::run_worker(&self.cfg, &self.cwd, PROMPT, cap_tokens, max_wall_s, None)
     }
 }
@@ -163,7 +163,14 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
         ),
     );
 
-    let res = harness::run_worker(&fx.cfg, &fx.cwd, PROMPT, 1_000_000, 30, Some("test-model"));
+    let res = harness::run_worker(
+        &fx.cfg,
+        &fx.cwd,
+        PROMPT,
+        Some(1_000_000),
+        30,
+        Some("test-model"),
+    );
 
     assert_eq!(res.killed_reason, None, "a metered run carries no flag");
     assert_eq!(res.exit_code, Some(0));
@@ -211,7 +218,7 @@ fn worker_without_a_ledger_is_flagged_unmetered_despite_exit_zero() {
     let fx = Fixture::new("unmetered");
     fx.bins.script("omp", "printf 'nothing metered\\n'\nexit 0");
 
-    let res = fx.run(1_000_000, 30);
+    let res = fx.run(Some(1_000_000), 30);
 
     assert_eq!(
         res.killed_reason.as_deref(),
@@ -241,8 +248,8 @@ fn consecutive_runs_in_one_cwd_never_share_a_session_dir() {
         &format!("{ledger}exit 0", ledger = ledger_sh(&[(1000, 200, 50)])),
     );
 
-    let first = fx.run(1_000_000, 30);
-    let second = fx.run(1_000_000, 30);
+    let first = fx.run(Some(1_000_000), 30);
+    let second = fx.run(Some(1_000_000), 30);
 
     assert_eq!(first.tokens_new, 1250);
     assert_eq!(
@@ -271,7 +278,7 @@ fn an_existing_kill_reason_survives_the_unmetered_check() {
     let fx = Fixture::new("wallclock-wins");
     fx.bins.script("omp", "sleep 10");
 
-    let res = fx.run(1_000_000, 1);
+    let res = fx.run(Some(1_000_000), 1);
 
     assert_eq!(
         res.killed_reason.as_deref(),
@@ -302,7 +309,7 @@ fn cap_kill_fires_while_the_worker_is_still_running() {
         ),
     );
 
-    let res = fx.run(1_000, 30);
+    let res = fx.run(Some(1_000), 30);
 
     assert_eq!(res.killed_reason.as_deref(), Some("cap"));
     assert_eq!(res.tokens_new, 500_000, "metered before the kill");
@@ -310,6 +317,47 @@ fn cap_kill_fires_while_the_worker_is_still_running() {
     assert!(
         res.duration_s < 5.0,
         "killed on crossing the cap, not after the worker's own sleep: {}s",
+        res.duration_s
+    );
+}
+
+/// No cap means no token bound — not a very large one.
+///
+/// The budget ramp decides how much headroom a job gets, and it can
+/// legitimately decide there is no ceiling to impose. There used to be a
+/// config constant underneath it (`hunt.capNewTokens` / `fix.capNewTokens`)
+/// that the scheduler substituted whenever the ramp granted no ceiling, so
+/// "unbounded" silently meant "bounded at whatever someone typed into
+/// config.json" — a number that had drifted below what the jobs it
+/// governed cost, and killed them on its own.
+///
+/// The same ledger as the cap test above, an order of magnitude past any
+/// threshold it could plausibly be compared with. What stops this worker
+/// is `max_wall_s`, which is the point: dropping the token bound does not
+/// leave a runaway worker with nothing to stop it.
+#[test]
+fn no_cap_means_no_token_bound_only_the_wall_clock() {
+    let fx = Fixture::new("cap-none");
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{ledger}sleep 10",
+            ledger = ledger_sh(&[(400_000, 50_000, 50_000)])
+        ),
+    );
+
+    let res = fx.run(None, 1);
+
+    assert_eq!(
+        res.killed_reason.as_deref(),
+        Some("wallclock"),
+        "500 000 tokens under no token bound is not a cap kill"
+    );
+    assert_eq!(res.tokens_new, 500_000, "still metered, just not bounded");
+    assert!(
+        res.duration_s < 5.0,
+        "the wall limit still stops it, well before the worker's own \
+         sleep: {}s",
         res.duration_s
     );
 }
@@ -324,7 +372,7 @@ fn missing_omp_binary_is_a_failure_not_a_free_run() {
     // with omp installed spawns an actual worker from this test.
     fx.bins.isolate();
 
-    let res = fx.run(1_000_000, 30);
+    let res = fx.run(Some(1_000_000), 30);
 
     assert_eq!(res.exit_code, Some(127));
     assert_ne!(res.exit_code, Some(0), "never a clean success");
@@ -361,7 +409,7 @@ fn oversized_output_on_both_pipes_does_not_deadlock() {
         ),
     );
 
-    let res = fx.run(1_000_000, 5);
+    let res = fx.run(Some(1_000_000), 5);
 
     assert_eq!(
         res.killed_reason, None,
@@ -395,7 +443,7 @@ fn invalid_utf8_output_is_kept_lossily() {
         "printf 'START-'\nprintf '\\377\\376\\375\\300'\nprintf -- '-END\\n'\nexit 0",
     );
 
-    let res = fx.run(1_000_000, 30);
+    let res = fx.run(Some(1_000_000), 30);
 
     assert_eq!(res.exit_code, Some(0));
     assert!(
@@ -433,7 +481,7 @@ fn output_cut_mid_multibyte_char_is_not_a_panic() {
         ),
     );
 
-    let res = fx.run(1_000_000, 30);
+    let res = fx.run(Some(1_000_000), 30);
 
     assert_eq!(res.exit_code, Some(0));
     assert!(res.stdout_tail.ends_with("END\n"));
@@ -471,7 +519,7 @@ fn hanging_worker_without_a_ledger_is_killed_as_unmetered() {
 
     let started = std::time::Instant::now();
     // max_wall_s is far larger, so a pass cannot be the wall-clock branch.
-    let res = fx.run(1_000_000, 300);
+    let res = fx.run(Some(1_000_000), 300);
 
     assert_eq!(
         res.killed_reason.as_deref(),
@@ -507,7 +555,7 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
     );
 
     let t0 = std::time::Instant::now();
-    let res = harness::run_worker(&fx.cfg, &fx.cwd, PROMPT, 1_000_000, 30, None);
+    let res = harness::run_worker(&fx.cfg, &fx.cwd, PROMPT, Some(1_000_000), 30, None);
     let elapsed = t0.elapsed();
 
     assert!(
