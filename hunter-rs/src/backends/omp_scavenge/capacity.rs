@@ -103,11 +103,22 @@ async fn read_windows_async(
     let mut result = BTreeMap::new();
 
     for row in rows {
-        let limit_id: String = row.get("limit_id");
-        let used_fraction: Option<f64> = row.get("used_fraction");
-        let status: Option<String> = row.get("status");
-        let resets_at: Option<i64> = row.get("resets_at");
-        let recorded_at: i64 = row.get("recorded_at");
+        // agent.db belongs to omp, so its schema and values are foreign
+        // input: `Row::get` would panic on a NULL or a wrongly-typed cell
+        // and unwind the caller's `spawn_blocking`, turning one bad cell
+        // into a JoinError on every `/api/summary` poll and every worker
+        // pre-snapshot. A decode failure abandons the WHOLE snapshot
+        // rather than the offending row, because a partial map is unsafe
+        // in a way an empty one is not: `decide_inner` only refuses when
+        // the map is empty, so dropping just an undecodable anthropic:5h
+        // row would let spending be granted against a window nobody can
+        // see, while the empty map is the designed "capacity unknown"
+        // state (deny until fresh, probe, "no window data" in the UI).
+        let limit_id: String = row.try_get("limit_id")?;
+        let used_fraction: Option<f64> = row.try_get("used_fraction")?;
+        let status: Option<String> = row.try_get("status")?;
+        let resets_at: Option<i64> = row.try_get("resets_at")?;
+        let recorded_at: i64 = row.try_get("recorded_at")?;
 
         match resets_at {
             // Truthy resets_at (> 0) that has expired (<= now_ms).

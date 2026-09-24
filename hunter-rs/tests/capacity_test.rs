@@ -578,3 +578,65 @@ async fn test_read_windows_empty_sources_log_nothing() {
         "legitimately-empty case must be silent: {logs}"
     );
 }
+
+/// Append a row whose `recorded_at` holds TEXT. Raw SQL rather than a
+/// bind, because sqlx types the parameter: SQLite's INTEGER affinity
+/// leaves a non-numeric string as TEXT, which is what makes the cell
+/// undecodable as `i64`.
+async fn insert_undecodable_row(path: &std::path::Path) {
+    use sqlx::sqlite::SqliteConnectOptions;
+
+    let pool = sqlx::SqlitePool::connect_with(SqliteConnectOptions::new().filename(path))
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO usage_history \
+         (recorded_at, provider, account_key, limit_id, label, \
+          used_fraction, status, resets_at) \
+         VALUES ('not-a-timestamp', 'anthropic', 'acct', 'anthropic:5h', \
+                 '5h', 0.42, 'ok', NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+}
+
+/// omp owns `agent.db`, so every cell in it is foreign input. A value
+/// that will not decode as the requested Rust type must reach the logged
+/// fallback, not abort the read: the read runs inside `spawn_blocking`,
+/// so a panic surfaces to callers as a `JoinError` through `.await?` and
+/// takes down `/api/summary` on every poll plus every worker's
+/// pre-snapshot, while the error log for exactly this case never runs.
+///
+/// The good row is present on purpose: one undecodable cell discards the
+/// whole snapshot. A map that merely lost its `anthropic:5h` row still
+/// looks authoritative to `decide_inner`, which refuses only when the
+/// map is empty, so it would grant spending against a window that can no
+/// longer be read. Empty is the designed "capacity unknown" state.
+#[tokio::test]
+async fn test_read_windows_undecodable_row_degrades() {
+    let now = now_ms();
+    let dir = TempDir::new("cap-baddecode");
+    let db_path = make_agent_db(
+        &dir,
+        &[("anthropic:7d", Some(0.2), "ok", Some(now + WEEK_MS), now)],
+    )
+    .await;
+    insert_undecodable_row(&db_path).await;
+
+    let db = db_path.clone();
+    let (windows, logs) =
+        tokio::task::spawn_blocking(move || capture_logs(|| read_windows(&db, now)))
+            .await
+            .expect("an undecodable row must not unwind the blocking task");
+
+    assert!(
+        windows.is_empty(),
+        "a partially-undecodable agent.db must degrade to capacity-unknown, got: {windows:?}"
+    );
+    assert!(
+        logs.contains("reading omp usage windows failed"),
+        "the decode failure must be logged, got: {logs}"
+    );
+}
