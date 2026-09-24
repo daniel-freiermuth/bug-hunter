@@ -915,7 +915,8 @@ async fn repoint_clone_origin(rid: i64, dir: &Path, old_url: &str, new_url: &str
     }
     if out.trim() != old_url {
         tracing::warn!(
-            "repo {rid} url changed but {dir_s} has origin {} -- left as is;              remove the directory to re-clone",
+            "repo {rid} url changed but {dir_s} has origin {} -- left as is; \
+             remove the directory to re-clone",
             out.trim()
         );
         return;
@@ -1187,12 +1188,28 @@ pub fn migrate_repo_notes(work_root: &Path) -> usize {
         // operator's writing and this pass is not the place to decide it
         // is worthless.
         if new.exists() {
+            // Copy-stage-rename, not a bare rename: `repos/` can be a
+            // mount of its own, where renaming out of it fails with
+            // EXDEV and would leave the legacy file sitting in the
+            // checkout -- the one outcome this whole pass exists to
+            // prevent.
             let parked = new.with_extension("legacy.md");
-            if std::fs::rename(&old, &parked).is_ok() {
+            let staged = new.with_extension("legacy.md.part");
+            if std::fs::copy(&old, &staged).is_ok()
+                && std::fs::rename(&staged, &parked).is_ok()
+                && std::fs::remove_file(&old).is_ok()
+            {
                 tracing::info!(
                     "repo {rid} already had notes at the new path; parked the copy \
                      left in its clone at {}",
                     parked.display()
+                );
+            } else {
+                let _ = std::fs::remove_file(&staged);
+                tracing::warn!(
+                    "repo {rid} has notes at the new path and a copy still in its \
+                     clone at {} that could not be moved aside",
+                    old.display()
                 );
             }
             continue;
