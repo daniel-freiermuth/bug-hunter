@@ -317,3 +317,83 @@ async fn ledger_window_sums_use_the_finished_at_index() {
         );
     }
 }
+
+// -- kind_token_history -------------------------------------------------------
+
+/// One enabled repo and nothing else: the shared `seed` fixture carries
+/// finished hunt/fix jobs of its own, which would sit in the middle of the
+/// history these tests are counting.
+async fn seed_bare_repo(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+         VALUES (1, 'alpha', 'https://example.com/a.git', '/tmp/a', 'github', 'main', 1, 1000)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A run of hunt jobs that all ended in `state`, one per `tokens` entry.
+async fn seed_hunt_jobs(pool: &SqlitePool, state: &str, tokens: &[i64]) {
+    for &t in tokens {
+        sqlx::query(
+            "INSERT INTO jobs (kind, repo_id, state, tokens_new, started_at, finished_at) \
+             VALUES ('hunt', 1, ?1, ?2, 1000, 2000)",
+        )
+        .bind(state)
+        .bind(t)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+/// A killed job's `tokens_new` is not a measurement of what the work costs
+/// — it is whatever bound killed it. Killed rows therefore pile up at the
+/// cap, and feeding them to the percentile makes the estimator measure its
+/// own failures instead of the job.
+#[tokio::test]
+async fn kind_token_history_excludes_killed_jobs() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_bare_repo(&pool).await;
+    seed_hunt_jobs(&pool, "done", &[1_000, 2_000, 3_000, 4_000, 5_000]).await;
+    seed_hunt_jobs(&pool, "killed", &[200_000; 5]).await;
+    let store = open_store(pool, &path).await;
+
+    let history = store.kind_token_history("hunt").await.unwrap();
+    assert_eq!(history, vec![1_000, 2_000, 3_000, 4_000, 5_000]);
+}
+
+/// Two completed samples are not a distribution, and filtering to none at
+/// all would estimate 0 — which makes the budget gate reserve nothing and
+/// wave through work it cannot fund. Below the floor the unfiltered history
+/// is the better of the two bad options, so the killed rows come back.
+#[tokio::test]
+async fn kind_token_history_falls_back_below_three_completed() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_bare_repo(&pool).await;
+    seed_hunt_jobs(&pool, "done", &[1_000, 2_000]).await;
+    seed_hunt_jobs(&pool, "killed", &[200_000; 4]).await;
+    let store = open_store(pool, &path).await;
+
+    let history = store.kind_token_history("hunt").await.unwrap();
+    assert_eq!(
+        history,
+        vec![1_000, 2_000, 200_000, 200_000, 200_000, 200_000]
+    );
+}
+
+/// The boundary itself: three completed samples is the smallest count for
+/// which a percentile index picks anything other than an endpoint, so it is
+/// the first count that filters.
+#[tokio::test]
+async fn kind_token_history_filters_at_exactly_three_completed() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_bare_repo(&pool).await;
+    seed_hunt_jobs(&pool, "done", &[1_000, 2_000, 3_000]).await;
+    seed_hunt_jobs(&pool, "killed", &[200_000; 4]).await;
+    let store = open_store(pool, &path).await;
+
+    let history = store.kind_token_history("hunt").await.unwrap();
+    assert_eq!(history, vec![1_000, 2_000, 3_000]);
+}
