@@ -185,34 +185,36 @@ Pure math (already parameterized on now_ms — keep pure in Rust):
 
 Constants: `_TOK_PER_FRAC_5H = 200_000 / 0.10 = 2_000_000.0` (:42; comment :39-41 — 200 k ≈ 10% of a 5h window; 7d is 168h/5h = 33.6× larger); `_5H_7D_RATIO = capacity.FIVE_HOUR_MS / capacity.WEEK_MS = 5/168 ≈ 0.0297619` (:43); `_esc(s) = html.escape(str(s))` (:46-48 — escapes `& < > " '`); `_CALIBRATION_DURATIONS_MS = {"5h": capacity.FIVE_HOUR_MS, "7d": capacity.WEEK_MS}` (:55-58, moved from store — Anthropic-window knowledge). `@dataclass OmpScavengeBackend { cfg: Config, ledger: SpendLedger }` (:86-94). Logger `hunter.backend` (:37).
 
-**`_unaccounted_fraction(windows, anticipated) -> (res_5h, res_7d)`** (:68-98). Inflight reservation as a fraction, PER WINDOW, each against its own probe time:
+**`_unaccounted_fraction(windows, anticipated)`** (:98-126). Inflight reservation as a fraction, PER WINDOW, each against its own probe time. A decide() needs TWO of them per window — `gate_X`, which counts `anticipated` in, and `budget_X`, which does not; both live on the `_Reservation` dataclass (Rust: `struct Reservation`) built at :144-151. See item 5 for why.
 1. `running = ledger.running_estimate()` (:111).
 2. `fallback = min(w.recorded_at for w in windows.values(), default=0)`; `probe_at_5h = windows["anthropic:5h"].recorded_at` if present else fallback; likewise 7d (:113-117). (Regression fix: per-window probe_at, never a shared min — see test 47 below.)
 3. `base = running + anticipated` (:119); `unaccounted_5h = base + ledger.finished_since(probe_at_5h)` (:120); `unaccounted_7d = base + ledger.finished_since(probe_at_7d)` (:121).
-4. `cap_5h = ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H` (:93); `cap_7d = ledger.estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)` (:94). Note `or`: None and 0 both fall back.
-5. `reservation_X = unaccounted_X / cap_X if cap_X else 0.0` (:96-97).
+4. `cap_5h, cap_7d = _capacities()` (:123; body :128-136) — `estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H`; `estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)`. Note `or`: None and 0 both fall back. Single derivation point, shared with `_frac_to_tokens` (Rust: derived once and carried on `Reservation`).
+5. Gate reservation `gate_X = unaccounted_X / cap_X if cap_X else 0.0` (:124-125). Cap reservation `budget_X = gate_X − (anticipated / cap_X if cap_X else 0.0)` — equivalently, the same fraction recomputed from `unaccounted_X − anticipated`.
 
-**`_decide_inner(windows, res_5h, res_7d, *, prio) -> Verdict`** (:100-176). One verdict: 7d ramps first, then 5h. `prio=True`: pacing denials become grants (ramp waived to the 1.0 hard limit) but exhaustion denials stand (:105-109).
+   **Gate vs cap — the invariant.** The gate reserves `anticipated`; the cap MUST NOT, so a granted `cap_tokens` is always `>= anticipated`. Why: the headroom a grant computes IS the anticipated job's budget, so reserving its cost first and then handing it what remains counts that cost twice and gives it `headroom − anticipated` tokens to do work worth `anticipated`. A job that clears the gate by a hair is then capped far below its own session floor and killed by the watchdog having produced nothing, while the tokens it did spend still count against the window. The gate's question — "if this job also runs, does the window cross its ramp?" — genuinely needs the job's own cost in the answer, so the gate keeps `gate_X` with its conditions and reason strings unchanged; every cap computation uses `budget_X`: the all-passed headroom AND both `prio and not is_exhausted` override arms.
+
+**`_decide_inner(windows, res, *, prio) -> Verdict`** (:153-230), `res` being the `_Reservation` above. One verdict: 7d ramps first, then 5h. `prio=True`: pacing denials become grants (ramp waived to the 1.0 hard limit) but exhaustion denials stand (:162-163).
 1. `now_ms = time.time() * 1000` (:165).
 2. `if not windows: return Denied("no window data -- deny until fresh")` (:167-168) — ASCII double hyphen, `retry_at=None`.
 3. **7d pass** (:170-199) — iterate `windows.items()` in dict order (insertion order = SQL GROUP BY order, ascending limit_id in practice; **Rust: use BTreeMap** — among multiple over-ramp `:7d` lids the first wins the reason string):
    - consider only lids containing `":7d"`; skip if `w.status != "exhausted" and w.used_fraction is None` (:172-173);
    - skip expired cycles `if w.resets_at and w.resets_at <= now_ms` (:174-175; belt-and-braces vs read_windows — covers per-model-class rows read_windows kept because their resets_at was future at read time);
-   - `elapsed_frac = ramp_7d(w.resets_at, now_ms)`; `effective_used = _effective_used(w, res_7d)` (:118-119);
+   - `elapsed_frac = ramp_7d(w.resets_at, now_ms)`; `effective_used = capacity.effective_used(w, res.gate_7d)` (:176-177);
    - if `effective_used >= elapsed_frac` (:178): `is_exhausted = (w.status == "exhausted")`; `retry = w.resets_at if is_exhausted else retry_at_7d(w.resets_at, effective_used)` (:179-184); reason (:185-189) EXACTLY:
-     `f"{lid}: used {effective_used - reservation_7d:.2f} + unaccounted {reservation_7d:.2f} = {effective_used:.2f} >= ramp {elapsed_frac:.2f}"`
-     If `prio and not is_exhausted` (:132-138): `headroom_frac = max(0.0, 1.0 − effective_used)`; `cap = _frac_to_tokens(headroom_frac, "7d")`; `cap <= 0 → Denied(reason, retry_at=retry)`; else `Granted(cap_tokens=cap, reason=f"prio override ({reason})")`. Else `Denied(reason, retry_at=retry)` (:139).
-4. **5h pass** (:143-168): `w5 = windows.get("anthropic:5h")`; gate only if `w5 is not None and (w5.status == "exhausted" or w5.used_fraction is not None)` (:144-145); `allowed = ramp_5h(w5.resets_at, now_ms)`; `allowed is None` → opener, skip (:146-147); `effective_used = _effective_used(w5, res_5h)`; deny iff `effective_used >= allowed` (:148-149); `retry = w5.resets_at if exhausted else retry_at_5h(w5.resets_at, effective_used)` (:150-155); reason (:156-160) EXACTLY (label literal `5h`, not the lid):
-   `f"5h: used {effective_used - reservation_5h:.2f} + unaccounted {reservation_5h:.2f} = {effective_used:.2f} >= ramp {allowed:.2f}"`
-   Same prio-waiver structure with dim "5h" (:161-167).
-5. **All passed** (:170-176): `headroom = _compute_headroom(windows, res_5h, res_7d, prio=prio)`; `return Granted(cap_tokens=headroom, reason="ok")` — headroom may be None (unbounded) when no window had a usable used_fraction.
+     `f"{lid}: used {effective_used - res.gate_7d:.2f} + unaccounted {res.gate_7d:.2f} = {effective_used:.2f} >= ramp {elapsed_frac:.2f}"`
+     If `prio and not is_exhausted` (:190-198): `headroom_frac = max(0.0, 1.0 − capacity.effective_used(w, res.budget_7d))` — the CAP reservation, NOT the `effective_used` the gate just denied on, which already contains `anticipated`; `cap = _frac_to_tokens(headroom_frac, "7d")`; `cap <= 0 → Denied(reason, retry_at=retry)`; else `Granted(cap_tokens=cap, reason=f"prio override ({reason})")`. Else `Denied(reason, retry_at=retry)` (:199).
+4. **5h pass** (:201-225): `w5 = windows.get("anthropic:5h")`; gate only if `w5 is not None and (w5.status == "exhausted" or w5.used_fraction is not None)` (:202-203); `allowed = ramp_5h(w5.resets_at, now_ms)`; `allowed is None` → opener, skip (:204-205); `effective_used = capacity.effective_used(w5, res.gate_5h)`; deny iff `effective_used >= allowed` (:206-207); `retry = w5.resets_at if exhausted else retry_at_5h(w5.resets_at, effective_used)` (:208-213); reason (:214-218) EXACTLY (label literal `5h`, not the lid):
+   `f"5h: used {effective_used - res.gate_5h:.2f} + unaccounted {res.gate_5h:.2f} = {effective_used:.2f} >= ramp {allowed:.2f}"`
+   Same prio-waiver structure with dim "5h" (:219-224), its headroom likewise from `res.budget_5h`.
+5. **All passed** (:227-230): `headroom = _compute_headroom(windows, res, prio=prio)`; `return Granted(cap_tokens=headroom, reason="ok")` — headroom may be None (unbounded) when no window had a usable used_fraction.
 
-**`_compute_headroom(windows, res_5h, res_7d, *, prio) -> int | None`** (:178-212). Min headroom in tokens across windows. Fresh `now_ms = time.time()*1000` (:186 — second clock read inside one decide()). Per window: skip `used_fraction is None` (:189-190). `:7d` lids: `ceiling = 1.0 if prio else ramp_7d(w.resets_at, now_ms)`; `frac = max(0.0, ceiling − _effective_used(w, res_7d))`; `tok = _frac_to_tokens(frac, "7d")` (:191-196). `:5h` lids: `allowed = ramp_5h(…)`; only if not None: `ceiling = 1.0 if prio else allowed`; same with res_5h, dim "5h" (:197-204). `return min(caps) if caps else None` (:212).
+**`_compute_headroom(windows, res, *, prio) -> int | None`** (:232-269). Min headroom in tokens across windows, taken against `res.budget_X` — the reservation that EXCLUDES the anticipated job (see `_unaccounted_fraction` item 5). Fresh `now_ms = time.time()*1000` (:248 — second clock read inside one decide()). Per window: skip `used_fraction is None` (:252-253). `:7d` lids: `ceiling = 1.0 if prio else ramp_7d(w.resets_at, now_ms)`; `frac = max(0.0, ceiling − capacity.effective_used(w, res.budget_7d))`; `tok = _frac_to_tokens(frac, "7d")` (:254-259). `:5h` lids: `allowed = ramp_5h(…)`; only if not None: `ceiling = 1.0 if prio else allowed`; same with `res.budget_5h`, dim "5h" (:260-267). `return min(caps) if caps else None` (:269).
 
-**`_frac_to_tokens(frac, dim) -> int`** (:214-220): `cap_5h = ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H`; `cap_7d = ledger.estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)`; `dim == "5h" or ":5h" in dim` → `int(frac * cap_5h)`; else → `int(frac * cap_7d)`. Both caps are derived exactly as in `_unaccounted_fraction` (:94-99): the 7d estimate is consulted, and the 5h-times-ratio value is only the fallback when there is not yet enough history to estimate one. (An earlier revision of this document claimed the 7d estimate was *not* consulted here and told the port to reproduce that asymmetry verbatim. It was a mis-transcription: facade.py:224 has always read the estimate. The Rust port matches the source, not that sentence.)
+**`_frac_to_tokens(frac, dim) -> int`** (:271-276): `cap_5h, cap_7d = _capacities()`; `dim == "5h" or ":5h" in dim` → `int(frac * cap_5h)`; else → `int(frac * cap_7d)`. Both caps come from the one derivation `_unaccounted_fraction` uses: the 7d estimate is consulted, and the 5h-times-ratio value is only the fallback when there is not yet enough history to estimate one. (An earlier revision of this document claimed the 7d estimate was *not* consulted here and told the port to reproduce that asymmetry verbatim. It was a mis-transcription: the 7d estimate has always been read. The Rust port matches the source, not that sentence.)
 
 **`decide(*, anticipated_tokens) -> Outlook`** (:278-296):
-1. `windows = capacity.read_windows()` (:224); `res_5h, res_7d = _unaccounted_fraction(windows, anticipated_tokens)` (:225).
+1. `windows = capacity.read_windows()` (:280); build the `_Reservation` from `_unaccounted_fraction(windows, anticipated_tokens)` and the window capacities (:144-151) → `gate_5h/gate_7d` for the gate, `budget_5h/budget_7d` for every cap.
 2. `normal = _decide_inner(prio=False)` (:283).
 3. Monotonicity by construction (:284-294): if normal is Granted → `prioritized = normal`; then `prio_headroom = _compute_headroom(prio=True)` (:288); replace with `Granted(cap_tokens=prio_headroom, reason="ok")` iff `prio_headroom is not None and (normal.cap_tokens is None or prio_headroom > normal.cap_tokens)` (:289-292). (Edge: normal cap None ⇒ prio headroom is None too — the per-window skip conditions are identical — so prioritized stays == normal; invariant can't break.) If normal is Denied → `prioritized = _decide_inner(prio=True)` (:293-294).
 4. `Outlook(normal=normal, prioritized=prioritized)` (:296).
@@ -223,7 +225,7 @@ Verdict quick reference (tests substring-match `"5h"`, `"7d"`, `"ramp"`, `"no wi
 | no windows | Denied | `no window data -- deny until fresh` | retry None |
 | :7d over ramp (pacing) | Denied | `{lid}: used {u:.2f} + unaccounted {r:.2f} = {eff:.2f} >= ramp {ramp:.2f}` | `retry_at_7d(resets, eff)` |
 | :7d exhausted | Denied | same format (eff = 1.0 + r) | `resets_at` |
-| :7d pacing + prio, 1−eff yields cap>0 | Granted | `prio override ({7d reason})` | cap = `_frac_to_tokens(1−eff, "7d")` |
+| :7d pacing + prio, cap>0 | Granted | `prio override ({7d reason})` | cap = `_frac_to_tokens(1 − capacity.effective_used(w, budget_7d), "7d")` |
 | 5h over ramp (pacing) | Denied | `5h: used {u:.2f} + unaccounted {r:.2f} = {eff:.2f} >= ramp {ramp:.2f}` | `retry_at_5h(resets, eff)` |
 | 5h exhausted | Denied | same | `resets_at` |
 | 5h pacing + prio, cap>0 | Granted | `prio override ({5h reason})` | cap dim "5h" |
@@ -312,82 +314,86 @@ UI dependency map (class names are load-bearing): every rule lives in `StatusPag
 
 ---
 
-## 4. TEST SPEC — 71 tests; every one ports (constants inline)
+## 4. TEST SPEC — 75 tests; every one ports (constants inline)
 
-**Shared harness, tests/test_budget.py:22-94**: `_NOW_MS` = real `time.time()*1000` at import; `_WEEK_MS/_5H_MS/_1H_MS`; `_cfg(**o)` = Config(work_root=/tmp, db_path=/tmp/test.db, hunt_cap_tokens=200_000, fix_cap_tokens=150_000, **stale_after_s=1800** ← note: test default ≠ prod default 300); `_ws(lid, used_fraction=0.10, status="ok", resets_at=_NOW_MS+_WEEK_MS//2, age_s=60.0)` with `recorded_at=_NOW_MS−age_s*1000`; `_healthy_windows(w5_used=0.05, w5_elapsed_h=4.5)` = {anthropic:5h(used=w5_used, resets=_NOW_MS+(5−elapsed_h)h), anthropic:7d(0.10), anthropic:7d:model-class(0.10)}; `_FakeLedger(running=0, finished=0)`: running_estimate→running, finished_since→finished (**ignores ts**), finished_between→0, estimate_capacity→None (⇒ 2M/67.2M fallback caps: res_5h=finished/2e6, res_7d=finished/(2e6/0.0297619)≈finished/67.2e6), observation methods no-op; `_backend(...)` monkeypatches `capacity.read_windows`.
+**Shared harness, tests/test_budget.py:28-118**: `_NOW_MS` = real `time.time()*1000` at import; `_WEEK_MS/_5H_MS/_1H_MS`; `_cfg(**o)` = Config(work_root=/tmp, db_path=/tmp/test.db, hunt_cap_tokens=200_000, fix_cap_tokens=150_000, **stale_after_s=1800** ← note: test default ≠ prod default 300); `_ws(lid, used_fraction=0.10, status="ok", resets_at=_NOW_MS+_WEEK_MS//2, age_s=60.0)` with `recorded_at=_NOW_MS−age_s*1000`; `_healthy_windows(w5_used=0.05, w5_elapsed_h=4.5)` = {anthropic:5h(used=w5_used, resets=_NOW_MS+(5−elapsed_h)h), anthropic:7d(0.10), anthropic:7d:model-class(0.10)}; `_FakeLedger(running=0, finished=0, finished_map=None)`: running_estimate→running, finished_since→finished (**ignores ts** unless a finished_map is passed; no test passes one), finished_between→0, estimate_capacity→None (⇒ 2M/67.2M fallback caps: res_5h=finished/2e6, res_7d=finished/(2e6/0.0297619)≈finished/67.2e6), observation methods no-op; `_backend(...)` monkeypatches `capacity.read_windows`.
 
-### tests/test_budget.py (42)
-1. `test_empty_windows_deny` :102 — G: windows={} / W: decide(0) / T: normal Denied, reason contains "no window data".
-2. `test_stale_5h_low_usage_allows_via_ramp_not_bypass` :109 — 5h used .10 age 3600 s resets now+1h (elapsed 4h ⇒ ramp (4−0.5)/4.5≈0.778), 7d .10 → Granted (staleness never special-cased; live ramp passed the reading).
-3. `test_stale_5h_high_usage_still_denies` :124 — same but used .90 ≥ .778 → Denied, "5h" in reason.
-4. `test_stale_5h_own_finished_jobs_count_toward_effective_used` :139 — 5h used .10 age 30 s resets now+1h; ledger finished=1_600_000 ⇒ res_5h=.80 ⇒ eff .90 ≥ .778 → Denied "5h".
-5. `test_stale_5h_denied_by_7d_ramp` :155 — 5h defaults, 7d used .30 resets now+.95w (ramp .05) → Denied, "7d" in reason (7d pass runs before 5h).
-6. `test_5h_and_7d_unaccounted_reservations_are_independent` :168 — (a) healthy 5h(used 0, 4.5h), 7d .02 resets now+.9w (ramp .10), finished=20M ⇒ res_7d≈.298 → Denied "7d"; (b) 5h used 0 elapsed 3.0h (ramp .556), finished=5M ⇒ res_5h=2.5 → Denied "5h".
-7. `test_7d_used_above_ramp_deny` :197 — 7d .30 resets now+.9w → Denied; "ramp" in reason; **retry_at ≈ _NOW_MS + 0.20·_WEEK_MS ± 2000** (retry_at_7d inverse).
-8. `test_7d_used_below_ramp_allow` :210 — 7d .30 resets now+.5w (ramp .5) → Granted.
-9. `test_5h_first_30min_deny` :226 — 5h used .05, elapsed .25h (ramp 0) → Denied, "5h" and "ramp" in reason.
-10. `test_5h_at_exactly_30min_deny` :235 — elapsed .5h ramp 0, used .01 ≥ 0 → Denied.
-11. `test_5h_harvest_halfway_low_usage_allow` :242 — elapsed 2.75h (ramp .5), used .05 → Granted.
-12. `test_5h_harvest_halfway_high_usage_deny` :248 — used .60 ≥ .5 → Denied "5h"+"ramp"; **retry_at ≈ _NOW_MS + 0.45·3600·1000 ± 2000**.
-13. `test_5h_harvest_end_high_usage_allow` :257 — elapsed 4.95h (ramp≈.989), used .90 → Granted.
-14. `test_5h_exhausted_deny` :264 — 5h used 1.0 status exhausted resets now+w//2 → Denied; **retry_at == resets_at exactly**.
-15. `test_5h_exhausted_but_stale_still_denies` :276 — exhausted, age 3600 s, resets now+4 min → Denied; retry_at == resets_at (stale exhausted ≠ opener).
-16. `test_7d_denial_during_5h_headroom_uses_7d_retry_not_5h_timing` :294 — 5h used 0 resets now+4.75h (in headroom); 7d .30 resets now+.9w → Denied; reason startswith "anthropic:7d"; retry ≈ now+.20w ± 2 s.
-17. `test_no_5h_window_allow` :315 — only 7d(.10) → Granted, cap_tokens not None and > 0.
-18. `test_no_5h_window_but_7d_over_deny` :325 — only 7d(.30, resets now+.95w) → Denied "7d".
-19. `test_expired_model_class_window_ignored` :343 — healthy + `anthropic:7d:abandoned-model`(used .99, resets now−3w, age 26 d) → Granted (expired :7d row skipped by _decide_inner guard).
-20. `test_active_model_class_window_still_gates` :358 — `anthropic:7d:active-model`(.30, resets now+.95w) → Denied "7d".
-21. `test_healthy_allow` :375 — `_healthy_windows()` → Granted, cap > 0.
-22-26 use a REAL sqlite file: `_make_agent_db` :387-412 (usage_history DDL above; inserts provider='anthropic', account_key='acct', label=limit_id) + `monkeypatch budget_module.OMP_AGENT_DB` :425 etc.
-22. `test_read_windows_drops_expired_cycle_window` :414 — rows (anthropic:7d, .3, ok, now+w/2, now−60 s) and (anthropic:7d:fable, .56, ok, now−26 d, now−26 d) → keys == {"anthropic:7d"}.
-23. `test_read_windows_keeps_active_window` :434 — single live 7d row → present with used_fraction 0.3.
-24. `test_read_windows_rolls_forward_expired_5h_window` :449 — 5h .36 resets now−47 min (recorded resets−1h) → present; used 0.0; status "ok"; resets == old+_5H_MS; **recorded_at == old resets** (new cycle's actual start).
-25. `test_read_windows_rolls_forward_expired_7d_window` :485 — 7d .55 resets now−2h → used 0.0; resets old+_WEEK_MS; recorded_at old.
-26. `test_read_windows_rolls_forward_through_multiple_missed_cycles` :507 — 5h resets now−2.3·_5H_MS → resets>now, resets−now ≤ _5H_MS (current cycle, not the first missed one), used 0.0.
-27. `test_decide_denies_on_unaccounted_alone_through_a_fresh_rollover` :528 — 5h used 0.0 recorded_at=window_start, elapsed 3h (ramp .556); ledger finished=2_900_000 ⇒ res_5h=1.45 → Denied "5h".
-28-32. `TestRamp7d` :559 — `ramp_7d(None, now)==1.0` :560; expired(now−1000)→1.0 :563; resets now+w/2 → 0.5±1e-6 :566; resets now+w → 0.0±1e-6 :570; resets now+2w → ≤1.0 (bad-data clamp) :574.
-33-37. `TestRamp5h` :581 — None→None :582; expired→None :585; 15 min elapsed→0.0 :588; 2.75h elapsed→0.5±1e-6 :592; just-started (resets now+_5H_MS)→0.0 never negative :597.
-38-39. `TestRetryAt7d` :602 — None→None :603; **round-trip** `ramp_7d(resets, retry_at_7d(resets,u)) == u ± 1e-9` for u∈{0,.1,.5,.9}, resets=now+.4w :606.
-40-42. `TestRetryAt5h` :617 — None→None :618; round-trip for u∈{0,.25,.5,.9}, resets=now+3.2h :621; `retry_at_5h(resets, 0.0) == window_start + 30·60·1000` (resets=now+4h) :628.
+### tests/test_budget.py (46)
+1. `test_empty_windows_deny` :126 — G: windows={} / W: decide(0) / T: normal Denied, reason contains "no window data".
+2. `test_stale_5h_low_usage_allows_via_ramp_not_bypass` :133 — 5h used .10 age 3600 s resets now+1h (elapsed 4h ⇒ ramp (4−0.5)/4.5≈0.778), 7d .10 → Granted (staleness never special-cased; live ramp passed the reading).
+3. `test_stale_5h_high_usage_still_denies` :150 — same but used .90 ≥ .778 → Denied, "5h" in reason.
+4. `test_stale_5h_own_finished_jobs_count_toward_effective_used` :167 — 5h used .10 age 30 s resets now+1h; ledger finished=1_600_000 ⇒ res_5h=.80 ⇒ eff .90 ≥ .778 → Denied "5h".
+5. `test_stale_5h_denied_by_7d_ramp` :185 — 5h defaults, 7d used .30 resets now+.95w (ramp .05) → Denied, "7d" in reason (7d pass runs before 5h).
+6. `test_5h_and_7d_unaccounted_reservations_are_independent` :200 — (a) healthy 5h(used 0, 4.5h), 7d .02 resets now+.9w (ramp .10), finished=20M ⇒ res_7d≈.298 → Denied "7d"; (b) 5h used 0 elapsed 3.0h (ramp .556), finished=5M ⇒ res_5h=2.5 → Denied "5h".
+7. `test_7d_used_above_ramp_deny` :233 — 7d .30 resets now+.9w → Denied; "ramp" in reason; **retry_at ≈ _NOW_MS + 0.20·_WEEK_MS ± 2000** (retry_at_7d inverse).
+8. `test_7d_used_below_ramp_allow` :248 — 7d .30 resets now+.5w (ramp .5) → Granted.
+9. `test_5h_first_30min_deny` :266 — 5h used .05, elapsed .25h (ramp 0) → Denied, "5h" and "ramp" in reason.
+10. `test_5h_at_exactly_30min_deny` :275 — elapsed .5h ramp 0, used .01 ≥ 0 → Denied.
+11. `test_5h_harvest_halfway_low_usage_allow` :282 — elapsed 2.75h (ramp .5), used .05 → Granted.
+12. `test_5h_harvest_halfway_high_usage_deny` :289 — used .60 ≥ .5 → Denied "5h"+"ramp"; **retry_at ≈ _NOW_MS + 0.45·3600·1000 ± 2000**.
+13. `test_5h_harvest_end_high_usage_allow` :299 — elapsed 4.95h (ramp≈.989), used .90 → Granted.
+14. `test_5h_exhausted_deny` :306 — 5h used 1.0 status exhausted resets now+w//2 → Denied; **retry_at == resets_at exactly**.
+15. `test_5h_exhausted_but_stale_still_denies` :321 — exhausted, age 3600 s, resets now+4 min → Denied; retry_at == resets_at (stale exhausted ≠ opener).
+16. `test_7d_denial_during_5h_headroom_uses_7d_retry_not_5h_timing` :342 — 5h used 0 resets now+4.75h (in headroom); 7d .30 resets now+.9w → Denied; reason startswith "anthropic:7d"; retry ≈ now+.20w ± 2 s.
+17. `test_no_5h_window_allow` :363 — only 7d(.10) → Granted, cap_tokens not None and > 0.
+18. `test_no_5h_window_but_7d_over_deny` :374 — only 7d(.30, resets now+.95w) → Denied "7d".
+19. `test_expired_model_class_window_ignored` :392 — healthy + `anthropic:7d:abandoned-model`(used .99, resets now−3w, age 26 d) → Granted (expired :7d row skipped by _decide_inner guard).
+20. `test_active_model_class_window_still_gates` :407 — `anthropic:7d:active-model`(.30, resets now+.95w) → Denied "7d".
+21. `test_healthy_allow` :427 — `_healthy_windows()` → Granted, cap > 0.
+22. `test_granted_cap_covers_the_job_it_was_granted_for` :446 — 5h used .785 elapsed 4.5h (ramp .889), decide(200_000) → Granted; **cap_tokens ≥ 200_000** and ≈ 207_777 ± 2000 (headroom (.889−.785)×2M; counting the job against its own cap would leave ~7.8k). Rust: `facade_test::test_granted_cap_covers_the_anticipated_job`.
+23. `test_cap_is_the_same_headroom_whatever_the_job_anticipates` :468 — same windows; decide(0) and decide(200_000) both Granted with equal cap ± 2000 (headroom belongs to the window, not the applicant). Rust: `facade_test::test_cap_is_the_same_headroom_whatever_the_job_anticipates`.
+24. `test_5h_prio_override_cap_excludes_the_anticipated_job` :485 — 5h used .80 elapsed 4.5h, decide(200_000) → normal Denied; prioritized Granted, reason contains "prio override", cap ≈ 400_000 ± 2000 ((1.0−.80)×2M, not 200k). Rust: `facade_test::test_prio_override_cap_excludes_the_anticipated_job`.
+25. `test_7d_prio_override_cap_excludes_the_anticipated_job` :502 — 5h used .05 resets now+30 min, 7d used .60 (ramp .5), decide(200_000) → normal Denied with "7d"; prioritized Granted, cap ≈ 0.40 × 7d capacity ± 50_000. Rust: `facade_test::test_7d_prio_override_cap_excludes_the_anticipated_job`.
+26-30 use a REAL sqlite file: `_make_agent_db` :525-550 (usage_history DDL above; inserts provider='anthropic', account_key='acct', label=limit_id) + `monkeypatch budget_module.OMP_AGENT_DB` :566 etc.
+26. `test_read_windows_drops_expired_cycle_window` :553 — rows (anthropic:7d, .3, ok, now+w/2, now−60 s) and (anthropic:7d:fable, .56, ok, now−26 d, now−26 d) → keys == {"anthropic:7d"}.
+27. `test_read_windows_keeps_active_window` :573 — single live 7d row → present with used_fraction 0.3.
+28. `test_read_windows_rolls_forward_expired_5h_window` :588 — 5h .36 resets now−47 min (recorded resets−1h) → present; used 0.0; status "ok"; resets == old+_5H_MS; **recorded_at == old resets** (new cycle's actual start).
+29. `test_read_windows_rolls_forward_expired_7d_window` :624 — 7d .55 resets now−2h → used 0.0; resets old+_WEEK_MS; recorded_at old.
+30. `test_read_windows_rolls_forward_through_multiple_missed_cycles` :646 — 5h resets now−2.3·_5H_MS → resets>now, resets−now ≤ _5H_MS (current cycle, not the first missed one), used 0.0.
+31. `test_decide_denies_on_unaccounted_alone_through_a_fresh_rollover` :667 — 5h used 0.0 recorded_at=window_start, elapsed 3h (ramp .556); ledger finished=2_900_000 ⇒ res_5h=1.45 → Denied "5h".
+32-36. `TestRamp7d` :700 — `ramp_7d(None, now)==1.0` :701; expired(now−1000)→1.0 :704; resets now+w/2 → 0.5±1e-6 :707; resets now+w → 0.0±1e-6 :711; resets now+2w → ≤1.0 (bad-data clamp) :715.
+37-41. `TestRamp5h` :722 — None→None :723; expired→None :726; 15 min elapsed→0.0 :729; 2.75h elapsed→0.5±1e-6 :733; just-started (resets now+_5H_MS)→0.0 never negative :738.
+42-43. `TestRetryAt7d` :743 — None→None :744; **round-trip** `ramp_7d(resets, retry_at_7d(resets,u)) == u ± 1e-9` for u∈{0,.1,.5,.9}, resets=now+.4w :747.
+44-46. `TestRetryAt5h` :758 — None→None :759; round-trip for u∈{0,.25,.5,.9}, resets=now+3.2h :762; `retry_at_5h(resets, 0.0) == window_start + 30·60·1000` (resets=now+4h) :769.
 
-### tests/test_unaccounted_tokens.py (6) — real Store as ledger (fixtures :29-39); `_ws(lid, recorded_at)` used .1, resets recorded+1h :42-49; `_finished_job`/`_running_job` :52-58; `_backing_tokens` inverts fractions via `_TOK_PER_FRAC_5H`/`_5H_7D_RATIO` :61-70 (valid because fresh Store ⇒ estimate_capacity None ⇒ fallback caps)
-43. `test_no_jobs_returns_zero` :73 — both probes 1h old, no jobs → (0, 0).
-44. `test_running_job_counted_via_cap_tokens_in_both_fields` :83 — running job cap 150_000 → (150000, 150000).
-45. `test_anticipated_added_to_both_fields` :100 — anticipated=80_000 → (80000, 80000).
-46. `test_finished_job_scoped_to_each_windows_own_probe` :114 — 5h probe 1h ago, 7d probe 2h ago; 50_000 tok finished probe_5h+60 s → (50000, 50000).
-47. `test_stale_7d_probe_no_longer_drags_the_5h_baseline_back` :133 — 7d probe 3h ago; 5h rollover 1h ago; 999_999 tok finished rollover−60 s → **(0, 999999)**; then +42_000 finished rollover+60 s → (42000, 1041999). Pins per-window probe_at (no shared min()).
-48. `test_falls_back_to_min_when_window_missing` :178 — only 7d present (probe 1h ago); 10_000 tok after → (10000, 10000) (absent 5h falls back to min recorded_at of present windows).
+### tests/test_unaccounted_tokens.py (6) — real Store as ledger (fixtures :31-39); `_ws(lid, recorded_at)` used .1, resets recorded+1h :42-49; `_finished_job`/`_running_job` :52-58; `_backing_tokens` inverts fractions via `_TOK_PER_FRAC_5H`/`_5H_7D_RATIO` :61-70 (valid because fresh Store ⇒ estimate_capacity None ⇒ fallback caps)
+47. `test_no_jobs_returns_zero` :73 — both probes 1h old, no jobs → (0, 0).
+48. `test_running_job_counted_via_cap_tokens_in_both_fields` :83 — running job cap 150_000 → (150000, 150000).
+49. `test_anticipated_added_to_both_fields` :101 — anticipated=80_000 → (80000, 80000).
+50. `test_finished_job_scoped_to_each_windows_own_probe` :116 — 5h probe 1h ago, 7d probe 2h ago; 50_000 tok finished probe_5h+60 s → (50000, 50000).
+51. `test_stale_7d_probe_no_longer_drags_the_5h_baseline_back` :136 — 7d probe 3h ago; 5h rollover 1h ago; 999_999 tok finished rollover−60 s → **(0, 999999)**; then +42_000 finished rollover+60 s → (42000, 1041999). Pins per-window probe_at (no shared min()).
+52. `test_falls_back_to_min_when_window_missing` :182 — only 7d present (probe 1h ago); 10_000 tok after → (10000, 10000) (absent 5h falls back to min recorded_at of present windows).
 
-### tests/test_refresh_stale_probe.py (9) — patches `hunter.util.run_cmd` + `capacity.read_windows` (:65-82); `_INVALIDATE = ["omp","usage","invalidate","--provider","anthropic"]`, `_READ = ["omp","usage","--provider","anthropic"]` :32-33; `_ws(age_s)` = 5h used .1 :47-56; ledger = real Store (observe writes flow into tmp DB)
-49. `test_no_windows_at_all_forces_a_probe` :85 — {} → True; calls == [INVALIDATE, READ].
-50. `test_fresh_window_does_not_force_a_probe` :95 — age 60 vs threshold 1800 → False; no calls.
-51. `test_stale_window_forces_a_probe` :106 — age 2000 → True; both calls.
-52. `test_exactly_at_threshold_does_not_force` :117 — age 1800 == threshold → False (**strict >** forces).
-53. `test_respects_configured_stale_after_s` :131 — age 500: threshold 1800 → False; threshold 300 → True (config knob has real effect).
-54. `test_invalidates_before_reading_so_the_read_cannot_serve_a_stale_cache` :148 — calls[0]==INVALIDATE, calls[1]==READ.
-55. `test_uses_configured_omp_bin` :164 — omp_bin="/custom/path/omp" → argv[0] replaced in BOTH commands.
-56. `test_failed_probe_returns_false` :177 — rc=1 → False (windows stay stale; tolerated via unaccounted tracking).
-57. `test_failed_invalidate_does_not_block_the_read_attempt` :189 — invalidate rc 1, read rc 0 → True; both attempted.
+### tests/test_refresh_stale_probe.py (9) — patches `hunter.util.run_cmd` + `capacity.read_windows` (:64-81); `_INVALIDATE = ["omp","usage","invalidate","--provider","anthropic"]`, `_READ = ["omp","usage","--provider","anthropic"]` :31-32; `_ws(age_s)` = 5h used .1 :46-55; ledger = real Store (observe writes flow into tmp DB)
+53. `test_no_windows_at_all_forces_a_probe` :84 — {} → True; calls == [INVALIDATE, READ].
+54. `test_fresh_window_does_not_force_a_probe` :95 — age 60 vs threshold 1800 → False; no calls.
+55. `test_stale_window_forces_a_probe` :107 — age 2000 → True; both calls.
+56. `test_exactly_at_threshold_does_not_force` :119 — age 1800 == threshold → False (**strict >** forces).
+57. `test_respects_configured_stale_after_s` :134 — age 500: threshold 1800 → False; threshold 300 → True (config knob has real effect).
+58. `test_invalidates_before_reading_so_the_read_cannot_serve_a_stale_cache` :152 — calls[0]==INVALIDATE, calls[1]==READ.
+59. `test_uses_configured_omp_bin` :169 — omp_bin="/custom/path/omp" → argv[0] replaced in BOTH commands.
+60. `test_failed_probe_returns_false` :183 — rc=1 → False (windows stay stale; tolerated via unaccounted tracking).
+61. `test_failed_invalidate_does_not_block_the_read_attempt` :196 — invalidate rc 1, read rc 0 → True; both attempted.
 
 ### tests/test_store.py — ledger + observe (9)
-58. `TestWindowLog.test_log_window_observation` :354 — two observations (5h .3 ok resets 9_999_999 age 5.0; 7d .1 age 10.0) → 2 rows in id order; `source_age_s == 5` (int-truncated).
-59. `TestCalibration.test_first_probe_records_no_sample` :392 — single observe(.10) → 0 samples. (Helpers :373-390: `_RESETS_AT = 99_999_999_999`; `_probe(frac)` recorded_at=1, age 1.0; `_observe` builds a REAL OmpScavengeBackend over the Store and calls `backend._observe({"anthropic:5h": probe})`.)
-60. `test_fresh_probe_with_hunter_spend_records_a_sample` :397 — observe(.10); job done 500_000 tok; observe(.20) → exactly 1 sample {limit_id anthropic:5h, hunter_tokens 500000, used_fraction_delta ≈ 0.10, window_resets_at _RESETS_AT}.
-61. `test_unchanged_used_fraction_records_no_sample` :414 — .10 → spend → .10 again → 0 samples (delta must be strictly > 0).
-62. `test_no_hunter_spend_records_no_sample` :426 — .10 → .20 with no jobs → 0 samples (finished_between == 0).
-63. `test_different_window_instance_not_compared` :434 — .90 → spend → observe .05 with resets_at+6h → 0 samples (±5 s last_window_observation window misses the new cycle).
-64. `test_estimate_capacity_no_data_returns_none` :450.
-65. `test_estimate_capacity_returns_max_spend_per_cycle` :453 — window_log rows for two completed 5h cycles (resets now−5h, now−10h); jobs 500_000 and 2_000_000 finished inside each → estimate == 2_000_000.
-66. `test_estimate_capacity_scoped_by_limit_id` :478 — completed 7d cycle + 1_000_000 job → estimate("anthropic:5h") None; estimate("anthropic:7d") == 1_000_000.
+62. `TestWindowLog.test_log_window_observation` :613 — two observations (5h .3 ok resets 9_999_999 age 5.0; 7d .1 age 10.0) → 2 rows in id order; `source_age_s == 5` (int-truncated).
+63. `TestCalibration.test_first_probe_records_no_sample` :661 — single observe(.10) → 0 samples. (Helpers :641-659: `_RESETS_AT = 99_999_999_999`; `_probe(frac)` recorded_at=1, age 1.0; `_observe` builds a REAL OmpScavengeBackend over the Store and calls `backend._observe({"anthropic:5h": probe})`.)
+64. `test_fresh_probe_with_hunter_spend_records_a_sample` :666 — observe(.10); job done 500_000 tok; observe(.20) → exactly 1 sample {limit_id anthropic:5h, hunter_tokens 500000, used_fraction_delta ≈ 0.10, window_resets_at _RESETS_AT}.
+65. `test_unchanged_used_fraction_records_no_sample` :683 — .10 → spend → .10 again → 0 samples (delta must be strictly > 0).
+66. `test_no_hunter_spend_records_no_sample` :695 — .10 → .20 with no jobs → 0 samples (finished_between == 0).
+67. `test_different_window_instance_not_compared` :703 — .90 → spend → observe .05 with resets_at+6h → 0 samples (±5 s last_window_observation window misses the new cycle).
+68. `test_estimate_capacity_no_data_returns_none` :723.
+69. `test_estimate_capacity_returns_max_spend_per_cycle` :726 — window_log rows for two completed 5h cycles (resets now−5h, now−10h); jobs 500_000 and 2_000_000 finished inside each → estimate == 2_000_000.
+70. `test_estimate_capacity_scoped_by_limit_id` :752 — completed 7d cycle + 1_000_000 job → estimate("anthropic:5h") None; estimate("anthropic:7d") == 1_000_000.
 
 ### tests/test_server.py `TestUsageProberLoop` (5) — the loop lives server-side; the Rust equivalent is the daemon's prober task (daemon.rs:288-305), so these port against `run_daemon`, not `serve`
-67. `test_runs_immediately_without_waiting_a_full_tick` :328 — tick monkeypatched to 3600 → exactly 1 keep_fresh call shortly after start.
-68. `test_ticks_again_after_the_configured_interval` :352 — tick 0.02 → ≥ 3 calls.
-69. `test_stops_promptly_when_the_stop_event_is_set` :374 — stop event → thread exits ≤ 2 s.
-70. `test_a_failed_tick_does_not_crash_the_loop` :390 — keep_fresh raising RuntimeError → loop survives, ≥ 2 calls.
-71. `test_default_tick_is_within_the_1_to_5_minute_range` :416 — `60.0 <= USAGE_PROBE_TICK_S <= 300.0` (actual 60.0, server.py:111).
+71. `test_runs_immediately_without_waiting_a_full_tick` :364 — tick monkeypatched to 3600 → exactly 1 keep_fresh call shortly after start.
+72. `test_ticks_again_after_the_configured_interval` :388 — tick 0.02 → ≥ 3 calls.
+73. `test_stops_promptly_when_the_stop_event_is_set` :410 — stop event → thread exits ≤ 2 s.
+74. `test_a_failed_tick_does_not_crash_the_loop` :426 — keep_fresh raising RuntimeError → loop survives, ≥ 2 calls.
+75. `test_default_tick_is_within_the_1_to_5_minute_range` :450 — `60.0 <= USAGE_PROBE_TICK_S <= 300.0` (actual 60.0, server.py:115).
 
-Also relevant, NOT backend-behavior tests: scheduler tests each define a local FakeBackend (`keep_fresh→False`, `status→""`, canned decide) — test_followups.py:41, test_recheck_status.py:37, test_run_fix_invariant.py:44, test_run_hunt_rehunt.py:91, test_engage_history_guard.py:34, test_fix_retry_give_up.py:43, test_override_wake.py:32 — the mock pattern the Rust core tests took over as `ScriptedBackend` (tests/support/mod.rs:297-340). tests/test_types.py touches enums/statuses only (no backend config assertions).
+Also relevant, NOT backend-behavior tests: scheduler tests each define a local FakeBackend (`keep_fresh→False`, `status→""`, canned decide) — test_followups.py:29, test_recheck_status.py:25, test_run_fix_invariant.py:32, test_run_hunt_rehunt.py:79, test_engage_history_guard.py:22, test_fix_retry_give_up.py:31, test_override_wake.py:24 — the mock pattern the Rust core tests took over as `ScriptedBackend` (tests/support/mod.rs:305-378). tests/test_types.py touches enums/statuses only (no backend config assertions).
 
 ---
 
@@ -395,7 +401,7 @@ Also relevant, NOT backend-behavior tests: scheduler tests each define a local F
 
 | method | store writes | other effects |
 |---|---|---|
-| `decide()` | **none** (reads: running_estimate ×1, finished_since ×2, estimate_capacity ×2 in _unaccounted_fraction + ×1 per _frac_to_tokens call) | reads agent.db via read_windows |
+| `decide()` | **none** (reads: running_estimate ×1, finished_since ×2, estimate_capacity ×2 per `_capacities()` call — one in `_unaccounted_fraction`, one building the `_Reservation`, one per `_frac_to_tokens`) | reads agent.db via read_windows |
 | `keep_fresh()` | `window_log` INSERT per window (always) + conditional `calibration_samples` INSERT — both via `_observe` (facade.py:341,360-398) | spawns `omp usage invalidate` then `omp usage` (facade.py:350-357); reads agent.db |
 | `status()` | **none** (reads ledger like decide + estimate_capacity per lid) | reads agent.db |
 | `run()` | none itself — scheduler's `_record_job` persists the RunResult (scheduler.py:92-115) | spawns omp worker; two read_windows snapshots; sets rr.usage_delta |
@@ -404,7 +410,7 @@ No scheduler wake from the backend: `_wake` (server.py:95) is set by server POST
 
 Clock call sites (`time.time()`):
 - capacity.read_windows capacity.py:89 (expiry/rollover/age_s)
-- facade._decide_inner :107 and facade._compute_headroom :186 (two reads inside one decide — a frozen Clock removes intra-call skew)
+- facade._decide_inner facade.py:165 and facade._compute_headroom :248 (two reads inside one decide — a frozen Clock removes intra-call skew)
 - facade._observe facade.py:367; facade.status :408 + `time.strftime/localtime` :473-475 (**local timezone**, 12-h clock)
 - store `now_ms()` for observed_at in log_window_observation store.py:1488 / record_calibration_sample :1519 and the `resets_at < now` bound in estimate_capacity :1410 (types.py:90-91)
 - harness.run_worker harness.py:164,222,241 (Rust: harness.rs — spawn time :250-253 via `SystemTime::now()`, wallclock cap :385-389)

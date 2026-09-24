@@ -58,6 +58,31 @@ _CALIBRATION_DURATIONS_MS: dict[str, int] = {
 }
 
 
+@dataclass(frozen=True)
+class _Reservation:
+    """Inflight spend no probe reflects yet, as a fraction of each window.
+
+    Two views of the same reservation, differing only in whether the
+    about-to-run job's own anticipated cost is part of it:
+
+    ``gate_*`` includes it -- the gate asks "if this job runs, do we cross
+    the ramp?", so the job's own cost belongs in the answer.
+
+    ``budget_*`` excludes it, because the headroom a grant computes IS the
+    job's budget.  Charging its anticipated cost against the reservation
+    and then handing it what remains counts that cost twice: the job is
+    given (headroom - anticipated) tokens to do work worth `anticipated`.
+    A job that clears the gate by a hair then receives a cap far below its
+    own session floor and is killed by the watchdog having produced
+    nothing, while the tokens it did spend still count against the window.
+    """
+
+    gate_5h: float
+    gate_7d: float
+    budget_5h: float
+    budget_7d: float
+
+
 @dataclass
 class OmpScavengeBackend:
     """Backend implementation for omp harness + Anthropic scavenging policy.
@@ -77,7 +102,8 @@ class OmpScavengeBackend:
     ) -> tuple[float, float]:
         """Compute unaccounted inflight reservation as fraction, per window.
 
-        Returns (reservation_5h, reservation_7d).
+        Returns (reservation_5h, reservation_7d), each INCLUDING
+        `anticipated` -- the gate's view of the reservation.
         Each is independently computed against its own window's recorded_at.
         Uses empirical capacity estimates when available; falls back to the
         hardcoded default (2M for 5h) when calibration data is insufficient.
@@ -94,19 +120,40 @@ class OmpScavengeBackend:
         unaccounted_5h = base + self.ledger.finished_since(probe_at_5h)
         unaccounted_7d = base + self.ledger.finished_since(probe_at_7d)
 
-        # Use per-cycle empirical capacity for each window.
-        cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
-        cap_7d = self.ledger.estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)
-
+        cap_5h, cap_7d = self._capacities()
         reservation_5h = unaccounted_5h / cap_5h if cap_5h else 0.0
         reservation_7d = unaccounted_7d / cap_7d if cap_7d else 0.0
         return reservation_5h, reservation_7d
 
+    def _capacities(self) -> tuple[float, float]:
+        """Per-cycle empirical (5h, 7d) token capacity of a full window.
+
+        Falls back to the hardcoded 5h default, and to the 5h/7d duration
+        ratio for the week, when calibration data is insufficient.
+        """
+        cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
+        cap_7d = self.ledger.estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)
+        return cap_5h, cap_7d
+
+    def _reservation(
+        self,
+        windows: dict[str, capacity.WindowState],
+        anticipated: int,
+    ) -> _Reservation:
+        """Both views of the reservation: gating, and budgeting (see _Reservation)."""
+        gate_5h, gate_7d = self._unaccounted_fraction(windows, anticipated)
+        cap_5h, cap_7d = self._capacities()
+        return _Reservation(
+            gate_5h=gate_5h,
+            gate_7d=gate_7d,
+            budget_5h=gate_5h - (anticipated / cap_5h if cap_5h else 0.0),
+            budget_7d=gate_7d - (anticipated / cap_7d if cap_7d else 0.0),
+        )
+
     def _decide_inner(  # noqa: PLR0911
         self,
         windows: dict[str, capacity.WindowState],
-        reservation_5h: float,
-        reservation_7d: float,
+        res: _Reservation,
         *,
         prio: bool,
     ) -> Granted | Denied:
@@ -127,7 +174,7 @@ class OmpScavengeBackend:
             if w.resets_at and w.resets_at <= now_ms:
                 continue  # expired cycle -- skip (see capacity.read_windows)
             elapsed_frac = capacity.ramp_7d(w.resets_at, now_ms)
-            effective_used = capacity.effective_used(w, reservation_7d)
+            effective_used = capacity.effective_used(w, res.gate_7d)
             if effective_used >= elapsed_frac:
                 is_exhausted = w.status == "exhausted"
                 retry = (
@@ -136,13 +183,15 @@ class OmpScavengeBackend:
                     else capacity.retry_at_7d(w.resets_at, effective_used)
                 )
                 reason = (
-                    f"{lid}: used {effective_used - reservation_7d:.2f}"
-                    f" + unaccounted {reservation_7d:.2f}"
+                    f"{lid}: used {effective_used - res.gate_7d:.2f}"
+                    f" + unaccounted {res.gate_7d:.2f}"
                     f" = {effective_used:.2f} >= ramp {elapsed_frac:.2f}"
                 )
                 if prio and not is_exhausted:
-                    # Pacing waived: grant with headroom to hard limit
-                    headroom_frac = max(0.0, 1.0 - effective_used)
+                    # Pacing waived: grant with headroom to hard limit.
+                    # Budgeting view: this job's own cost is what the cap
+                    # is for, so it must not also be spent reserving.
+                    headroom_frac = max(0.0, 1.0 - capacity.effective_used(w, res.budget_7d))
                     cap = self._frac_to_tokens(headroom_frac, "7d")
                     if cap <= 0:
                         return Denied(reason, retry_at=retry)
@@ -154,7 +203,7 @@ class OmpScavengeBackend:
         if w5 is not None and (w5.status == "exhausted" or w5.used_fraction is not None):
             allowed = capacity.ramp_5h(w5.resets_at, now_ms)
             if allowed is not None:
-                effective_used = capacity.effective_used(w5, reservation_5h)
+                effective_used = capacity.effective_used(w5, res.gate_5h)
                 if effective_used >= allowed:
                     is_exhausted = w5.status == "exhausted"
                     retry = (
@@ -163,12 +212,12 @@ class OmpScavengeBackend:
                         else capacity.retry_at_5h(w5.resets_at, effective_used)
                     )
                     reason = (
-                        f"5h: used {effective_used - reservation_5h:.2f}"
-                        f" + unaccounted {reservation_5h:.2f}"
+                        f"5h: used {effective_used - res.gate_5h:.2f}"
+                        f" + unaccounted {res.gate_5h:.2f}"
                         f" = {effective_used:.2f} >= ramp {allowed:.2f}"
                     )
                     if prio and not is_exhausted:
-                        headroom_frac = max(0.0, 1.0 - effective_used)
+                        headroom_frac = max(0.0, 1.0 - capacity.effective_used(w5, res.budget_5h))
                         cap = self._frac_to_tokens(headroom_frac, "5h")
                         if cap <= 0:
                             return Denied(reason, retry_at=retry)
@@ -177,14 +226,13 @@ class OmpScavengeBackend:
 
         # -- All checks passed ------------------------------------------------
         # Compute normal-work headroom: min across all windows' (ramp - used)
-        headroom = self._compute_headroom(windows, reservation_5h, reservation_7d, prio=prio)
+        headroom = self._compute_headroom(windows, res, prio=prio)
         return Granted(cap_tokens=headroom, reason="ok")
 
     def _compute_headroom(
         self,
         windows: dict[str, capacity.WindowState],
-        res_5h: float,
-        res_7d: float,
+        res: _Reservation,
         *,
         prio: bool,
     ) -> int | None:
@@ -192,6 +240,10 @@ class OmpScavengeBackend:
 
         For normal work: headroom = (ramp - effective_used) * capacity.
         For prio work:   headroom = (1.0 - effective_used) * capacity.
+
+        This is the granted job's own budget, so it is computed against the
+        budgeting view of the reservation -- the job's anticipated cost is
+        what the headroom is being handed out to pay for.
         """
         now_ms = time.time() * 1000
         caps: list[int] = []
@@ -201,7 +253,7 @@ class OmpScavengeBackend:
                 continue
             if ":7d" in lid:
                 ceiling = 1.0 if prio else capacity.ramp_7d(w.resets_at, now_ms)
-                eff = capacity.effective_used(w, res_7d)
+                eff = capacity.effective_used(w, res.budget_7d)
                 frac = max(0.0, ceiling - eff)
                 tok = self._frac_to_tokens(frac, "7d")
                 caps.append(tok)
@@ -209,7 +261,7 @@ class OmpScavengeBackend:
                 allowed = capacity.ramp_5h(w.resets_at, now_ms)
                 if allowed is not None:
                     ceiling = 1.0 if prio else allowed
-                    eff = capacity.effective_used(w, res_5h)
+                    eff = capacity.effective_used(w, res.budget_5h)
                     frac = max(0.0, ceiling - eff)
                     tok = self._frac_to_tokens(frac, "5h")
                     caps.append(tok)
@@ -218,29 +270,28 @@ class OmpScavengeBackend:
 
     def _frac_to_tokens(self, frac: float, dim: str) -> int:
         """Convert a fraction of window capacity to tokens using calibrated capacity."""
-        cap_5h = self.ledger.estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H
+        cap_5h, cap_7d = self._capacities()
         if dim == "5h" or ":5h" in dim:
             return int(frac * cap_5h)
-        cap_7d = self.ledger.estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)
         return int(frac * cap_7d)
 
     def decide(self, *, anticipated_tokens: int) -> Outlook:
         """May background work spend now?  Returns paired verdicts."""
         windows = capacity.read_windows()
-        res_5h, res_7d = self._unaccounted_fraction(windows, anticipated_tokens)
+        res = self._reservation(windows, anticipated_tokens)
 
-        normal = self._decide_inner(windows, res_5h, res_7d, prio=False)
+        normal = self._decide_inner(windows, res, prio=False)
         # Monotonicity: if normal is granted, prioritized is at least as permissive.
         if isinstance(normal, Granted):
             prioritized: Verdict = normal
             # But recompute with prio headroom if normal passed
-            prio_headroom = self._compute_headroom(windows, res_5h, res_7d, prio=True)
+            prio_headroom = self._compute_headroom(windows, res, prio=True)
             if prio_headroom is not None and (
                 normal.cap_tokens is None or prio_headroom > normal.cap_tokens
             ):
                 prioritized = Granted(cap_tokens=prio_headroom, reason="ok")
         else:
-            prioritized = self._decide_inner(windows, res_5h, res_7d, prio=True)
+            prioritized = self._decide_inner(windows, res, prio=True)
 
         return Outlook(normal=normal, prioritized=prioritized)
 

@@ -435,6 +435,89 @@ def test_healthy_allow(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# The granted cap must not have the job's own anticipated cost subtracted
+# from it.  The gate asks "if this job runs, do we cross the ramp?" (so the
+# anticipated cost belongs in that reservation); the cap IS the budget that
+# same job then runs on, so subtracting its cost there too hands it the
+# headroom left over AFTER it has already run.
+# ---------------------------------------------------------------------------
+
+
+def test_granted_cap_covers_the_job_it_was_granted_for(monkeypatch):
+    """A narrow pass through the 5h gate must still fund the whole job.
+
+    5h ramp is 0.889 (4.5h elapsed) and 0.785 is already used, so a
+    200k-token job (0.10 of the 2M default capacity) clears the gate with
+    0.004 to spare.  The headroom this grant may hand out is
+    (0.889 - 0.785) = 0.104 -> ~208k tokens.  Counting the job's own cost
+    against that headroom as well leaves 0.004 -> ~7.8k tokens, i.e. a job
+    cleared to spend 200k gets killed by the watchdog under a cap smaller
+    than its own session floor, having produced nothing.
+    """
+    windows = _healthy_windows(w5_used=0.785, w5_elapsed_h=4.5)
+    outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=200_000)
+    assert isinstance(outlook.normal, Granted), outlook.normal.reason
+    assert outlook.normal.cap_tokens is not None
+    assert outlook.normal.cap_tokens >= 200_000, (
+        "the cap is the anticipated job's own budget: granting less than the "
+        "cost that just passed the gate guarantees a cap-kill"
+    )
+    assert outlook.normal.cap_tokens == pytest.approx(207_777, abs=2_000)
+
+
+def test_cap_is_the_same_headroom_whatever_the_job_anticipates(monkeypatch):
+    """Same window state, same headroom.
+
+    The ramp headroom belongs to the window, not to the applicant, so the
+    cap a grant carries cannot shrink as the applicant's anticipated cost
+    grows -- that is the double count.  (The gate can still refuse a bigger
+    job; this asserts only what a grant is worth.)
+    """
+    windows = _healthy_windows(w5_used=0.785, w5_elapsed_h=4.5)
+    b = _backend(windows=windows, monkeypatch=monkeypatch)
+    cold = b.decide(anticipated_tokens=0).normal
+    warm = b.decide(anticipated_tokens=200_000).normal
+    assert isinstance(cold, Granted)
+    assert isinstance(warm, Granted), warm.reason
+    assert warm.cap_tokens == pytest.approx(cold.cap_tokens, abs=2_000)
+
+
+def test_5h_prio_override_cap_excludes_the_anticipated_job(monkeypatch):
+    """The prio arm waives pacing; its cap must not double-count either.
+
+    0.80 used + a 200k job (0.10) trips the 0.889 ramp, so normal work is
+    denied and prioritized work overrides with the headroom to the hard
+    limit: (1.0 - 0.80) = 0.20 -> 400k tokens.  Counting the job's own cost
+    there too yields 0.10 -> 200k, exactly the job's cost with nothing left
+    for the work the override exists to let through.
+    """
+    windows = _healthy_windows(w5_used=0.80, w5_elapsed_h=4.5)
+    outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=200_000)
+    assert isinstance(outlook.normal, Denied)
+    assert isinstance(outlook.prioritized, Granted)
+    assert "prio override" in outlook.prioritized.reason
+    assert outlook.prioritized.cap_tokens == pytest.approx(400_000, abs=2_000)
+
+
+def test_7d_prio_override_cap_excludes_the_anticipated_job(monkeypatch):
+    """Same for the 7d deny branch's override arm.
+
+    0.60 used against a 0.5 ramp denies normal work; the override's
+    headroom to the hard limit is (1.0 - 0.60) = 0.40 of the 7d window.
+    """
+    windows = {
+        "anthropic:5h": _ws("anthropic:5h", used_fraction=0.05, resets_at=_NOW_MS + _1H_MS // 2),
+        "anthropic:7d": _ws("anthropic:7d", used_fraction=0.60),
+    }
+    outlook = _backend(windows=windows, monkeypatch=monkeypatch).decide(anticipated_tokens=200_000)
+    assert isinstance(outlook.normal, Denied)
+    assert "7d" in outlook.normal.reason
+    assert isinstance(outlook.prioritized, Granted)
+    cap_7d = 2_000_000 / (_5H_MS / _WEEK_MS)
+    assert outlook.prioritized.cap_tokens == pytest.approx(0.40 * cap_7d, abs=50_000)
+
+
+# ---------------------------------------------------------------------------
 # read_windows(): expired-cycle windows must not even be surfaced
 # ---------------------------------------------------------------------------
 
