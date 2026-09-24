@@ -1,0 +1,19 @@
+-- What the budget ramp reserved for a job, recorded when the job is created.
+--
+-- The inflight reservation -- the tokens a running job has been promised
+-- but not yet spent -- was read as SUM(cap_tokens) over running jobs.
+-- That only holds while every job carries a finite cap. The cap is a
+-- kill threshold, not a reservation: the ramp decides how much headroom
+-- a job may have, then grants a cap to enforce it. Once headroom is the
+-- only bound, a job can run with no finite cap and its contribution to
+-- SUM(cap_tokens) becomes zero -- the budget would see a job spending
+-- hundreds of thousands of tokens as costing nothing at all.
+--
+-- The anticipated cost the ramp already computed before granting the job
+-- is the number that was actually reserved, so store it and sum that
+-- instead.
+--
+-- Nullable by necessity: rows written before this column existed have no
+-- estimate to recover. They fall back to their cap, which is what the
+-- reservation meant for them when they were written.
+ALTER TABLE jobs ADD COLUMN estimated_tokens INTEGER;
