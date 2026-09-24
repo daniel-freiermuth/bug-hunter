@@ -9,36 +9,34 @@
 //! dates/times in UTC, while the Python store used `datetime.now()` (local
 //! time). Notes are informational free text, never parsed — accepted.
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use hunter::backend::SpendLedger;
 use hunter::domain::{ForgeName, JobState, RepoJobKind};
 use hunter::store::{RepoUpdate, Store, StoreWriteError};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
+use support::TempDir;
 
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn unique_temp_path(stem: &str, ext: &str) -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("{stem}-{}-{nanos}-{n}{ext}", std::process::id()))
-}
-
-/// Copy dev.db (WAL, checkpointed, no rows) to a unique temp path and open
-/// a WRITABLE pool on the copy for fixture inserts and verification reads.
-async fn fresh_db() -> (PathBuf, SqlitePool) {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("dev.db");
-    let path = unique_temp_path("hunter-store-write-test", ".db");
-    std::fs::copy(&src, &path).unwrap();
-    let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path))
-        .await
-        .unwrap();
-    (path, pool)
+/// Copy dev.db (WAL, checkpointed, no rows) into a scratch directory and
+/// open a WRITABLE pool on the copy for fixture inserts and verification
+/// reads.
+///
+/// The guard comes FIRST in the tuple so every caller binds it first:
+/// locals drop in reverse declaration order, so the directory outlives the
+/// seed pool and the read-write `Store` opened on `path` — which holds its
+/// own SQLite pool over that file — and is removed only once both have let
+/// it go. Binding it after the `Store`, or discarding it as `_`, deletes
+/// the database out from under whoever is still using it. Removing the
+/// files by hand at the end of the test body was worse: a failing
+/// assertion unwinds straight past it, leaking the copy plus its
+/// `-wal`/`-shm` sidecars into a tmpfs that other tests share.
+async fn fresh_db() -> (TempDir, PathBuf, SqlitePool) {
+    let dir = TempDir::new("store-write");
+    let (path, pool) = support::fresh_pool(&dir, "hunter").await;
+    (dir, path, pool)
 }
 
 /// Read-write Store on the same file (the round-2 serve path). The seed
@@ -46,14 +44,6 @@ async fn fresh_db() -> (PathBuf, SqlitePool) {
 /// the two connections safe for this sequential test flow.
 async fn rw_store(path: &Path) -> Store {
     Store::connect(path).await.unwrap()
-}
-
-fn cleanup(path: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut p = path.as_os_str().to_owned();
-        p.push(suffix);
-        std::fs::remove_file(PathBuf::from(p)).ok();
-    }
 }
 
 async fn seed_repo_and_findings(pool: &SqlitePool) {
@@ -81,7 +71,7 @@ async fn seed_repo_and_findings(pool: &SqlitePool) {
 
 #[tokio::test]
 async fn set_status_updates_row_and_preserves_reason_when_none() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     let store = rw_store(&path).await;
 
@@ -112,16 +102,13 @@ async fn set_status_updates_row_and_preserves_reason_when_none() {
     let other = store.get_finding(3).await.unwrap().unwrap();
     assert_eq!(other.status, hunter::domain::FindingStatus::New);
     assert_eq!(other.updated_at, 1000);
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- 2. budget overrides --------------------------------------------------
 
 #[tokio::test]
 async fn budget_override_set_clear_and_clear_all_only_touches_non_null() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     let store = rw_store(&path).await;
 
@@ -153,16 +140,13 @@ async fn budget_override_set_clear_and_clear_all_only_touches_non_null() {
 
     // Nothing left to clear.
     assert_eq!(store.clear_all_overrides().await.unwrap(), 0);
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- 3. delete_repo -------------------------------------------------------
 
 #[tokio::test]
 async fn delete_repo_refusal_message_is_byte_exact_and_clean_delete_works() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     sqlx::raw_sql(
         r"
         INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at)
@@ -207,9 +191,6 @@ async fn delete_repo_refusal_message_is_byte_exact_and_clean_delete_works() {
     );
     store.forget_deleted_repo(2).await.unwrap();
     assert!(store.deleted_repo_ids().await.unwrap().is_empty());
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- 3b. create_job vs a soft-deleted repo --------------------------------
@@ -222,7 +203,7 @@ async fn delete_repo_refusal_message_is_byte_exact_and_clean_delete_works() {
 /// plain DELETE and the FK refuses it while any job references the row.
 #[tokio::test]
 async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     sqlx::raw_sql(
         r"
         INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at)
@@ -284,16 +265,13 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
         .await
         .unwrap();
     assert_eq!(still_there, 0, "the reaped row must be gone for good");
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- 4. add_repo / update_repo --------------------------------------------
 
 #[tokio::test]
 async fn add_repo_defaults_and_update_repo_partial_fields() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, _pool) = fresh_db().await;
     let store = rw_store(&path).await;
 
     let id = store
@@ -352,9 +330,6 @@ async fn add_repo_defaults_and_update_repo_partial_fields() {
 
     // All-None is a no-op, not an SQL error.
     store.update_repo(id, &RepoUpdate::default()).await.unwrap();
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- helper for ledger job fixtures ----------------------------------------
@@ -395,7 +370,7 @@ async fn insert_job(
 
 #[tokio::test]
 async fn running_estimate_sums_cap_tokens_of_running_jobs_only() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     insert_job(&pool, "running", Some(100_000), None, None).await;
     insert_job(&pool, "running", Some(50_000), None, None).await;
@@ -404,16 +379,13 @@ async fn running_estimate_sums_cap_tokens_of_running_jobs_only() {
     let store = rw_store(&path).await;
 
     assert_eq!(store.running_estimate().await.unwrap(), 150_000);
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- 6. finished_since ------------------------------------------------------
 
 #[tokio::test]
 async fn finished_since_is_strictly_after_and_skips_denied_null_tokens() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     insert_job(&pool, "done", None, Some(111), Some(10_000)).await; // == ts: excluded
     insert_job(&pool, "done", None, Some(222), Some(10_001)).await; // strictly after
@@ -425,16 +397,13 @@ async fn finished_since_is_strictly_after_and_skips_denied_null_tokens() {
     assert_eq!(store.finished_since(10_000).await.unwrap(), 222);
     // Empty range still COALESCEs to 0.
     assert_eq!(store.finished_since(99_999).await.unwrap(), 0);
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- 7. finished_between ----------------------------------------------------
 
 #[tokio::test]
 async fn finished_between_is_half_open_start_excluded_end_included() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     insert_job(&pool, "done", None, Some(5), Some(1_000)).await; // == start: excluded
     insert_job(&pool, "done", None, Some(7), Some(1_500)).await; // inside
@@ -443,9 +412,6 @@ async fn finished_between_is_half_open_start_excluded_end_included() {
     let store = rw_store(&path).await;
 
     assert_eq!(store.finished_between(1_000, 2_000).await.unwrap(), 18);
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- 8. window_log: log + last observation -----------------------------------
@@ -453,7 +419,7 @@ async fn finished_between_is_half_open_start_excluded_end_included() {
 #[allow(clippy::items_after_statements)]
 #[tokio::test]
 async fn last_window_observation_groups_by_resets_at_and_newest_wins() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     const R: i64 = 9_999_999;
     let (a, b, c) = (R + 4_000, R - 4_000, R + 9_000);
     sqlx::query!(
@@ -526,9 +492,6 @@ async fn last_window_observation_groups_by_resets_at_and_newest_wins() {
     assert!(row.0 > 0);
     assert_eq!(row.1, Some(0.3));
     assert_eq!(row.2, Some(5), "source_age_s is truncated, not rounded");
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- 9. estimate_capacity ----------------------------------------------------
@@ -536,7 +499,7 @@ async fn last_window_observation_groups_by_resets_at_and_newest_wins() {
 #[allow(clippy::items_after_statements)]
 #[tokio::test]
 async fn estimate_capacity_returns_max_spend_per_completed_cycle() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
 
     let now = std::time::SystemTime::now()
@@ -592,14 +555,11 @@ async fn estimate_capacity_returns_max_spend_per_completed_cycle() {
     );
     // Different lid: no window_log cycles for 7d -> None (zero spend).
     assert_eq!(store.estimate_capacity("anthropic:7d").await.unwrap(), None);
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn estimate_capacity_zero_spend_returns_none() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -619,20 +579,17 @@ async fn estimate_capacity_zero_spend_returns_none() {
     let store = rw_store(&path).await;
 
     assert_eq!(store.estimate_capacity("anthropic:5h").await.unwrap(), None);
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- append_repo_note (UTC deviation documented at file top) -----------------
 
 #[test]
 fn append_repo_note_header_category_and_entry_format() {
-    let work_root = unique_temp_path("hunter-notes-test", "");
-    std::fs::create_dir_all(&work_root).unwrap();
+    let dir = TempDir::new("notes");
+    let work_root: &Path = dir.path();
 
     // First write creates dir + header.
-    let notes = Store::append_repo_note(&work_root, 7, "alpha", "first note", None).unwrap();
+    let notes = Store::append_repo_note(work_root, 7, "alpha", "first note", None).unwrap();
     let lines: Vec<&str> = notes.lines().collect();
     assert_eq!(lines[0], "# Notes: alpha");
     assert_eq!(lines[1], "");
@@ -650,7 +607,7 @@ fn append_repo_note_header_category_and_entry_format() {
 
     // Second write appends (no second header), category becomes a heading.
     let notes =
-        Store::append_repo_note(&work_root, 7, "alpha", "categorized", Some("perf")).unwrap();
+        Store::append_repo_note(work_root, 7, "alpha", "categorized", Some("perf")).unwrap();
     assert_eq!(notes.matches("Last updated:").count(), 1);
     assert!(notes.contains("\n## perf\n- ["));
     assert!(notes.contains("] categorized\n\n"));
@@ -658,10 +615,8 @@ fn append_repo_note_header_category_and_entry_format() {
     // Bounded re-read is what the POST handler returns. Through
     // `notes_path`, not a hand-built path: notes moved out of the clone
     // once already, and a literal here would have to be found again.
-    let on_disk = std::fs::read_to_string(Store::notes_path(&work_root, 7)).unwrap();
+    let on_disk = std::fs::read_to_string(Store::notes_path(work_root, 7)).unwrap();
     assert_eq!(notes, on_disk);
-
-    std::fs::remove_dir_all(&work_root).ok();
 }
 
 /// A brand-new install: `Store::connect` on a path that does not exist yet
@@ -675,7 +630,8 @@ fn append_repo_note_header_category_and_entry_format() {
 /// were already WAL, which made the pragma a silent no-op and hid it.
 #[tokio::test]
 async fn connect_creates_and_migrates_a_brand_new_database() {
-    let path = unique_temp_path("hunter-store-bootstrap", ".db");
+    let dir = TempDir::new("store-bootstrap");
+    let path = dir.join("hunter.db");
     assert!(!path.exists(), "precondition: nothing at the path yet");
 
     let store = Store::connect(&path)
@@ -729,9 +685,6 @@ async fn connect_creates_and_migrates_a_brand_new_database() {
         legacy.is_none(),
         "migration 003 applied on a fresh database"
     );
-
-    pool.close().await;
-    cleanup(&path);
 }
 
 // -- 10. sync_pr_open atomicity -------------------------------------------
@@ -791,7 +744,7 @@ async fn pr_state_row(pool: &SqlitePool) -> PrStateRow {
 /// to decide the fate of the UPSERT — which is exactly the question.
 #[tokio::test]
 async fn sync_pr_open_rolls_back_the_upsert_when_a_later_statement_fails() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed_repo_and_findings(&pool).await;
     let store = rw_store(&path).await;
 
@@ -852,7 +805,4 @@ async fn sync_pr_open_rolls_back_the_upsert_when_a_later_statement_fails() {
             synced_at: Some(5000),
         }
     );
-
-    pool.close().await;
-    cleanup(&path);
 }

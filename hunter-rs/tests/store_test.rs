@@ -4,35 +4,30 @@
 //! closes the writer, then reopens through `Store::connect_read_only` —
 //! exercising the same read-only path the server uses.
 
+mod support;
+
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use hunter::domain::{FindingStatus, FindingType};
 use hunter::store::{FindingFilter, Store};
-use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};
+use support::TempDir;
 
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn unique_temp_path(stem: &str, ext: &str) -> PathBuf {
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("{stem}-{}-{nanos}-{n}{ext}", std::process::id()))
-}
-
-/// Copy dev.db (WAL, checkpointed, no rows) to a unique temp path and open
-/// a WRITABLE pool on the copy for fixture inserts.
-async fn fresh_db() -> (PathBuf, SqlitePool) {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("dev.db");
-    let path = unique_temp_path("hunter-store-test", ".db");
-    std::fs::copy(&src, &path).unwrap();
-    let pool = SqlitePool::connect_with(SqliteConnectOptions::new().filename(&path))
-        .await
-        .unwrap();
-    (path, pool)
+/// Copy dev.db (WAL, checkpointed, no rows) into a scratch directory and
+/// open a WRITABLE pool on the copy for fixture inserts.
+///
+/// The guard comes FIRST in the tuple so every caller binds it first:
+/// locals drop in reverse declaration order, so the directory outlives the
+/// pool and any `Store` later opened on `path`, and is removed only once
+/// both have closed the file. Binding it after the `Store`, or discarding
+/// it as `_`, deletes the database out from under whoever is still reading
+/// it. Removing the files by hand at the end of the test body was worse: a
+/// failing assertion unwinds straight past it, leaking the copy plus its
+/// `-wal`/`-shm` sidecars into a tmpfs that other tests share.
+async fn fresh_db() -> (TempDir, PathBuf, SqlitePool) {
+    let dir = TempDir::new("store");
+    let (path, pool) = support::fresh_pool(&dir, "hunter").await;
+    (dir, path, pool)
 }
 
 /// Standard fixture set: one repo, findings across statuses/types/severities,
@@ -77,17 +72,9 @@ async fn open_store(pool: SqlitePool, path: &Path) -> Store {
     Store::connect_read_only(path).await.unwrap()
 }
 
-fn cleanup(path: &Path) {
-    for suffix in ["", "-wal", "-shm"] {
-        let mut p = path.as_os_str().to_owned();
-        p.push(suffix);
-        std::fs::remove_file(PathBuf::from(p)).ok();
-    }
-}
-
 #[tokio::test]
 async fn status_counts_zero_fills_all_statuses() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed(&pool).await;
     let store = open_store(pool, &path).await;
 
@@ -106,13 +93,11 @@ async fn status_counts_zero_fills_all_statuses() {
     assert_eq!(counts["rejected"], 0);
     assert_eq!(counts["wontfix"], 0);
     assert_eq!(counts["note"], 0);
-
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn list_findings_severity_and_combined_filters() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed(&pool).await;
     let store = open_store(pool, &path).await;
 
@@ -156,13 +141,11 @@ async fn list_findings_severity_and_combined_filters() {
 
     // The old "bogus status matches nothing" test is gone: FindingFilter.status
     // is now Option<FindingStatus>, so invalid values are a compile error.
-
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn stats_totals_empty_db_preserves_sum_null_semantics() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     // No seeding: zero job rows.
     let store = open_store(pool, &path).await;
 
@@ -173,14 +156,12 @@ async fn stats_totals_empty_db_preserves_sum_null_semantics() {
     assert_eq!(totals.total_usage_delta, None);
     assert_eq!(totals.done, None);
     assert_eq!(totals.denied, None);
-
-    cleanup(&path);
 }
 
 #[tokio::test]
 async fn current_job_populates_finding_keys_only_with_a_finding() {
     // Newest running job HAS a finding -> summary/fingerprint populated.
-    let (path, pool) = fresh_db().await;
+    let (_dir, path, pool) = fresh_db().await;
     seed(&pool).await;
     sqlx::raw_sql(
         "INSERT INTO jobs (id, kind, repo_id, finding_id, state) \
@@ -196,10 +177,9 @@ async fn current_job_populates_finding_keys_only_with_a_finding() {
     assert_eq!(job.repo_name, "alpha");
     assert_eq!(job.finding_summary.as_deref(), Some("high gap"));
     assert_eq!(job.finding_fingerprint.as_deref(), Some("fp-high"));
-    cleanup(&path);
 
     // Newest running job has NO finding -> both keys None (serialized absent).
-    let (path2, pool2) = fresh_db().await;
+    let (_dir2, path2, pool2) = fresh_db().await;
     seed(&pool2).await;
     sqlx::raw_sql(
         "INSERT INTO jobs (id, kind, repo_id, finding_id, state) \
@@ -214,35 +194,33 @@ async fn current_job_populates_finding_keys_only_with_a_finding() {
     assert_eq!(job2.finding_id, None);
     assert_eq!(job2.finding_summary, None);
     assert_eq!(job2.finding_fingerprint, None);
-    cleanup(&path2);
 }
 
 #[test]
 fn repo_notes_missing_short_and_truncated() {
-    let work_root = unique_temp_path("hunter-notes-test", "");
+    let dir = TempDir::new("notes");
+    let work_root: &Path = dir.path();
     // Built by the production path helper rather than by hand: notes have
     // moved out of the clone once already.
-    let notes_file = Store::notes_path(&work_root, 1);
+    let notes_file = Store::notes_path(work_root, 1);
     std::fs::create_dir_all(notes_file.parent().unwrap()).unwrap();
 
     // Missing file -> "".
-    assert_eq!(Store::repo_notes(&work_root, 2), "");
+    assert_eq!(Store::repo_notes(work_root, 2), "");
 
     // Short file passes through untouched.
     std::fs::write(&notes_file, "short note").unwrap();
-    assert_eq!(Store::repo_notes(&work_root, 1), "short note");
+    assert_eq!(Store::repo_notes(work_root, 1), "short note");
 
     // >4000 chars -> prefix + exactly the tail 4000 chars.
     let content = "abcde".repeat(1000); // 5000 chars
     std::fs::write(&notes_file, &content).unwrap();
-    let notes = Store::repo_notes(&work_root, 1);
+    let notes = Store::repo_notes(work_root, 1);
     let prefix = "...(older notes truncated)...\n";
     assert!(notes.starts_with(prefix));
     let tail = &notes[prefix.len()..];
     assert_eq!(tail.chars().count(), 4000);
     assert_eq!(tail, &content[1000..]);
-
-    std::fs::remove_dir_all(&work_root).ok();
 }
 
 /// The SQL of `Store::{name}`, read out of `src/store.rs` itself.
@@ -292,7 +270,7 @@ fn production_sql(name: &str) -> String {
 /// from `src/store.rs` by `production_sql`.
 #[tokio::test]
 async fn ledger_window_sums_use_the_finished_at_index() {
-    let (path, pool) = fresh_db().await;
+    let (_dir, _path, pool) = fresh_db().await;
 
     sqlx::query(
         "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
@@ -338,7 +316,4 @@ async fn ledger_window_sums_use_the_finished_at_index() {
             "{name} should use the partial index, planned as: {plan}\nSQL: {sql}"
         );
     }
-
-    pool.close().await;
-    std::fs::remove_file(&path).ok();
 }
