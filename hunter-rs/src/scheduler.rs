@@ -549,7 +549,9 @@ async fn sync_repo(
         let url = repo_url.to_owned();
         let rp = rpath.to_owned();
         let (rc, out) = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(&["git", "clone", &url, &rp.to_string_lossy()], 600)
+            // `--` before the operands: even a URL that slipped past
+            // validation cannot be read as an option here.
+            run_cmd_sync(&["git", "clone", "--", &url, &rp.to_string_lossy()], 600)
         })
         .await
         .unwrap_or((127, "spawn error".to_owned()));

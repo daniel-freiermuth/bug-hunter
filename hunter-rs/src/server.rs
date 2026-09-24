@@ -990,6 +990,15 @@ async fn repoint_clone_origin(rid: i64, dir: &Path, old_url: &str, new_url: &str
 /// scheme at all — the colon belongs to the scp-like syntax — so the
 /// rule is: if there is a URL scheme, it must be http, https or ssh.
 fn valid_repo_url(url: &str) -> bool {
+    // A leading `-` makes git read the value as an option rather than a
+    // URL: `git clone --upload-pack=<cmd> <dir>` runs <cmd>. The clone
+    // is built from the stored URL, so accepting one here is what turns
+    // a repo row into an argument. Belt and braces -- the clone also
+    // passes `--` now -- because this is the field an operator pastes
+    // and every other consumer of it would need the same guard.
+    if url.starts_with('-') {
+        return false;
+    }
     let Some(colon) = url.find(':') else {
         return true; // no scheme at all (scp-like or a bare path)
     };

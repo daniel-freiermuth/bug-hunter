@@ -1451,3 +1451,37 @@ async fn the_scratch_dir_is_removed_with_the_state() {
         root.display()
     );
 }
+
+/// A URL git would read as an option is refused at the door.
+///
+/// `git clone --upload-pack=<cmd> <dir>` runs `<cmd>`, and the clone is
+/// built from whatever URL the row holds, so accepting one here is what
+/// turns a repo row into an argument. The clone passes `--` as well;
+/// this is the half that keeps the value out of the database.
+#[tokio::test]
+async fn a_url_that_looks_like_a_git_option_is_refused() {
+    let state = test_state().await;
+
+    for bad in [
+        "--upload-pack=touch /tmp/pwned",
+        "-u../../etc/passwd",
+        "--config=core.sshCommand=id",
+    ] {
+        let (status, body) =
+            post(&state, "/api/repos", json!({ "name": "probe", "url": bad })).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "{bad} must not be accepted; body: {body}"
+        );
+    }
+
+    // A hyphen anywhere else is ordinary and must still work.
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "fine", "url": "https://github.com/acme/my-repo.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+}
