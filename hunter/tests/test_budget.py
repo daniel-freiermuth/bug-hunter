@@ -35,8 +35,6 @@ def _cfg(**overrides) -> Config:
     defaults = {
         "work_root": Path("/tmp"),
         "db_path": Path("/tmp/test.db"),
-        "hunt_cap_tokens": 200_000,
-        "fix_cap_tokens": 150_000,
         "stale_after_s": 1800,
     }
     defaults.update(overrides)

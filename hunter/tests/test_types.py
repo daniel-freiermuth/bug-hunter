@@ -171,10 +171,8 @@ class TestConfig:
     def test_defaults(self, tmp_path):
         cfg = Config(work_root=tmp_path, db_path=tmp_path / "h.db")
         assert cfg.omp_bin == "omp"
-        assert cfg.hunt_cap_tokens == 200_000
         assert cfg.hunt_max_wall_s == 1800
         assert cfg.hunt_max_findings == 8
-        assert cfg.fix_cap_tokens == 150_000
         assert cfg.fix_max_wall_s == 2700
         assert cfg.stale_after_s == 300
         assert cfg.serve_port == 8377
@@ -221,8 +219,8 @@ class TestConfig:
             "workRoot": str(tmp_path / "wr"),
             "dbPath": str(tmp_path / "my.db"),
             "ompBin": "/usr/bin/omp",
-            "hunt": {"capNewTokens": 100_000, "maxWallS": 600, "maxFindings": 3},
-            "fix": {"capNewTokens": 50_000, "maxWallS": 900},
+            "hunt": {"maxWallS": 600, "maxFindings": 3},
+            "fix": {"maxWallS": 900},
             "budget": {
                 "staleAfterS": 900,
             },
@@ -242,10 +240,8 @@ class TestConfig:
         assert cfg.work_root == tmp_path / "wr"
         assert cfg.db_path == tmp_path / "my.db"
         assert cfg.omp_bin == "/usr/bin/omp"
-        assert cfg.hunt_cap_tokens == 100_000
         assert cfg.hunt_max_wall_s == 600
         assert cfg.hunt_max_findings == 3
-        assert cfg.fix_cap_tokens == 50_000
         assert cfg.fix_max_wall_s == 900
         assert cfg.stale_after_s == 900
         assert cfg.serve_port == 9999
@@ -257,7 +253,7 @@ class TestConfig:
 
     def test_load_missing_file_uses_defaults(self, tmp_path):
         cfg = Config.load(tmp_path / "nonexistent.json")
-        assert cfg.hunt_cap_tokens == 200_000
+        assert cfg.hunt_max_wall_s == 1800
         assert cfg.serve_port == 8377
         assert cfg.model_default is None
 
@@ -267,6 +263,27 @@ class TestConfig:
         cfg_path.write_text(json.dumps({"workRoot": "data"}))
         cfg = Config.load(cfg_path)
         assert cfg.work_root.is_absolute()
+
+    def test_load_ignores_a_retired_cap_key(self, tmp_path):
+        """A deployed config.json still carries hunt.capNewTokens from
+        before the per-kind cap was retired. Rolling the daemon forward
+        must not require editing it first, and the rest of the block has
+        to keep parsing."""
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(
+            json.dumps(
+                {
+                    "hunt": {"capNewTokens": 200_000, "maxWallS": 600, "maxFindings": 3},
+                    "fix": {"capNewTokens": 150_000, "maxWallS": 900},
+                }
+            )
+        )
+
+        cfg = Config.load(cfg_path)
+
+        assert cfg.hunt_max_wall_s == 600
+        assert cfg.hunt_max_findings == 3
+        assert cfg.fix_max_wall_s == 900
 
 
 # ── RunResult ────────────────────────────────────────────────────────

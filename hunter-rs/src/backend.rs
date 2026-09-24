@@ -35,8 +35,8 @@ impl JobClass {
 
 /// Granted/Denied verdict (backend.py:37-65).
 ///
-/// - `Granted.cap_tokens`: backend's own spend ceiling; None = no ceiling.
-///   Core still min()s against its config caps — the backend never sees them.
+/// - `Granted.cap_tokens`: the backend's headroom for the job, and the
+///   only token bound it gets; None = no token bound at all.
 /// - `Denied.retry_at`: epoch ms the denial is expected to resolve; None = no
 ///   informed estimate (callers use a generic 30-min backoff).
 /// - reason strings are prose for notes/events/UI — never machine-matched
@@ -153,13 +153,14 @@ pub trait Backend: Send + Sync {
     /// (innerHTML'd by the UI every 5 s; byte-parity spec in
     /// BACKEND-CONTRACT.md §2.3).
     async fn status_html(&self) -> anyhow::Result<String>;
-    /// Execute a worker job. `cap_tokens` is the EFFECTIVE cap (already
-    /// min'd by the caller); `job_class` drives model selection.
+    /// Execute a worker job. `cap_tokens` is the token bound the ramp
+    /// granted, `None` for a job that has none; `job_class` drives model
+    /// selection.
     async fn run(
         &self,
         cwd: &std::path::Path,
         prompt: &str,
-        cap_tokens: i64,
+        cap_tokens: Option<i64>,
         max_wall_s: i64,
         job_class: JobClass,
     ) -> anyhow::Result<crate::types::RunResult>;
@@ -193,7 +194,7 @@ impl Backend for NullBackend {
         &self,
         _cwd: &std::path::Path,
         _prompt: &str,
-        _cap_tokens: i64,
+        _cap_tokens: Option<i64>,
         _max_wall_s: i64,
         _job_class: JobClass,
     ) -> anyhow::Result<crate::types::RunResult> {

@@ -42,10 +42,14 @@ class Granted:
     """Backend allows spending.
 
     cap_tokens: the backend's own spend ceiling for this verdict -- the
-    maximum it considers safe given current accounting state.  None means
-    the backend imposes no ceiling (e.g. an unlimited local model).
-    Core still applies min(granted.cap_tokens, cfg.*_cap_tokens) --
-    workload-policy caps are core's business, not the backend's.
+    maximum it considers safe given current accounting state, and the
+    whole of what the job is granted: core passes it through verbatim.
+    None means the backend imposes no ceiling, and the job then runs
+    under its wall-clock limit alone.  There is deliberately no second,
+    core-side cap on top: a fixed per-kind number cannot track the
+    backend's live headroom, and the one that existed sat below the
+    measured typical cost of the work it governed, killing jobs that the
+    budget had in fact funded.
 
     reason: prose, flows into job notes and the UI.  Never machine-matched.
     """
@@ -175,14 +179,14 @@ class Backend(Protocol):
         cwd: Path,
         prompt: str,
         *,
-        cap_tokens: int,
+        cap_tokens: int | None,
         max_wall_s: int,
         job_class: JobClass,
     ) -> RunResult:
         """Execute a worker job.
 
-        cap_tokens: the effective cap -- already min'd by the caller from
-        the Granted verdict's cap and core config.
+        cap_tokens: the Granted verdict's cap, verbatim.  None means no
+        token bound -- max_wall_s is then the only stop condition.
         job_class: drives model selection (the backend owns model config).
         """
         ...

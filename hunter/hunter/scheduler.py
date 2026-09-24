@@ -57,10 +57,13 @@ def _kind_token_history(store: Store, kind: str) -> list[int]:
 
     Killed jobs are excluded because their tokens_new is not a measurement
     of what the work costs -- it is whatever bound killed them, so they
-    cluster just above the cap and the estimator ends up measuring its own
-    failures. Live data: 64 of 259 hunt jobs were killed, and including
-    them put the cold p90 at 204,173 -- within 2% of the 200,000 cap that
-    did the killing -- against 73,724 for the 189 that finished.
+    cluster just above that bound and the estimator ends up measuring its
+    own failures. Live data from when a fixed 200,000-token per-kind cap
+    was still in force: 64 of 259 hunt jobs were killed, and including
+    them put the cold p90 at 204,173 -- within 2% of the cap that did the
+    killing -- against 73,724 for the 189 that finished. The per-kind cap
+    is gone, but the ramp's headroom and the wall-clock limit still
+    truncate jobs the same way.
     """
     sql = "SELECT tokens_new FROM jobs WHERE kind = ? AND tokens_new IS NOT NULL"
     done = [
@@ -78,22 +81,25 @@ def _kind_token_history(store: Store, kind: str) -> list[int]:
 
 
 def anticipated_tokens(store: Store, cfg: Config, repo_id: int, kind: str) -> int:
-    """Realistic anticipated cost of the job about to be decided on -- not
-    its nominal cap_tokens. A cold prompt-cache first call for a given
-    (repo, kind) pair can cost 2-5x cap_tokens in one atomic LLM call the
-    runner's watchdog cannot interrupt mid-flight (see runner.py): sizing
-    the pre-start reservation on cap_tokens systematically under-estimates
-    exactly the jobs most likely to blow through it (observed in
-    production: dep_update/refactor jobs cold-starting at 2-4x their
-    200k cap while the scheduler's own accounting still assumed 200k).
+    """Realistic anticipated cost of the job about to be decided on.
+
+    This number IS the pre-start reservation: create_job writes it to
+    jobs.estimated_tokens and store.running_estimate sums that column,
+    so an under-estimate here is what lets rapid cycles overshoot a
+    ramp. It has to be an estimate of the likely cost and not any kind
+    of allowance, because a cold prompt-cache first call for a given
+    (repo, kind) pair arrives as one atomic LLM call the harness cannot
+    interrupt mid-flight (see harness.py) -- observed in production with
+    dep_update/refactor jobs spending 2-4x what the scheduler had
+    reserved for them, in a single call.
 
     If this exact (repo, kind) pair has finished within the configured
     cache TTL (cfg.cache_ttl_s, default 1h -- Anthropic's observed prompt-
     cache lifetime), its prompt cache is probably still warm -- anticipate
     its historical p90: a cold cache-write is likely, and a
     handful of jobs having been merely cheap doesn't mean this one will be.
-    No history for this kind yet -> nothing to anticipate beyond whatever
-    cap_tokens/inflight accounting already covers.
+    No history for this kind yet -> 0: nothing observed, nothing to
+    reserve.
     """
     cache_ttl_ms = cfg.cache_ttl_s * 1000
     warm = (
@@ -308,7 +314,6 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         diff_range = f"{base}..{head}"
         scope_note = f"First hunt for this repo: {scope} (base {base[:12]})."
 
-    cfg_cap = cfg.hunt_cap_tokens
     anticipated = anticipated_tokens(store, cfg, rid, "hunt")
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.normal
@@ -316,9 +321,8 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         case Denied(reason=reason, retry_at=retry_at):
             store.log_event("deny", f"hunt {rname}: {reason}")
             return {"denied": reason, "retry_at": retry_at}
-        case Granted(cap_tokens=backend_cap):
+        case Granted(cap_tokens=cap):
             pass
-    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
     try:
         job = store.create_job(
             "hunt", rid, cap_tokens=cap, state="running", estimated_tokens=anticipated
@@ -444,7 +448,6 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
 
     # Budget gate -- recheck is investigative, like hunt.
     override = finding.get("budget_override")
-    cfg_cap = cfg.hunt_cap_tokens
     anticipated = anticipated_tokens(store, cfg, repo["id"], "recheck")
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
@@ -452,9 +455,8 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
         case Denied(reason=reason, retry_at=retry_at):
             store.log_event("deny", f"recheck #{fid}: {reason}", finding_id=fid)
             return {"denied": reason, "retry_at": retry_at}
-        case Granted(cap_tokens=backend_cap):
+        case Granted(cap_tokens=cap):
             pass
-    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
     try:
         job = store.create_job(
             "recheck",
@@ -632,7 +634,6 @@ def _run_analysis_job(
             return {"error": f"{' '.join(cmd)} failed"}
 
     # Budget check -- analysis jobs share the hunt budget/model for now
-    cfg_cap = cfg.hunt_cap_tokens
     anticipated = anticipated_tokens(store, cfg, rid, kind)
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.normal
@@ -640,9 +641,8 @@ def _run_analysis_job(
         case Denied(reason=reason, retry_at=retry_at):
             store.log_event("deny", f"{kind} {rname}: {reason}")
             return {"denied": reason, "retry_at": retry_at}
-        case Granted(cap_tokens=backend_cap):
+        case Granted(cap_tokens=cap):
             pass
-    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
     try:
         job = store.create_job(
             kind, rid, cap_tokens=cap, state="running", estimated_tokens=anticipated
@@ -940,7 +940,6 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
             run_cmd(["git", "-C", rpath, "branch", "-D", branch])
 
     override = finding.get("budget_override")
-    cfg_cap = cfg.fix_cap_tokens
     anticipated = anticipated_tokens(store, cfg, repo["id"], "fix")
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
@@ -949,9 +948,8 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
             _drop_worktree(delete_branch=True)
             store.log_event("deny", f"fix #{fid}: {reason}", finding_id=fid)
             return {"denied": reason, "retry_at": retry_at}
-        case Granted(cap_tokens=backend_cap):
+        case Granted(cap_tokens=cap):
             pass
-    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
     try:
         job = store.create_job(
             "fix",
@@ -1502,7 +1500,6 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
         )
 
     override = finding.get("budget_override")
-    cfg_cap = cfg.fix_cap_tokens
     anticipated = anticipated_tokens(store, cfg, repo["id"], "engage")
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
@@ -1511,9 +1508,8 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
             _drop_worktree()
             store.log_event("deny", f"engage #{fid}: {reason}", finding_id=fid)
             return {"denied": reason, "retry_at": retry_at}
-        case Granted(cap_tokens=backend_cap):
+        case Granted(cap_tokens=cap):
             pass
-    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
 
     rc, pr, raw = forge.view_pr_engage(owner_slug, num)
     if pr is None:
@@ -1788,7 +1784,6 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
         return {"error": f"worktree add failed: {out[-300:]}"}
 
     override = finding.get("budget_override")
-    cfg_cap = cfg.fix_cap_tokens
     anticipated = anticipated_tokens(store, cfg, repo["id"], "harvest")
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
@@ -1797,9 +1792,8 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
             _drop_worktree()
             store.log_event("deny", f"harvest #{fid}: {reason}", finding_id=fid)
             return {"denied": reason, "retry_at": retry_at}
-        case Granted(cap_tokens=backend_cap):
+        case Granted(cap_tokens=cap):
             pass
-    cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
 
     rc, pr, raw = forge.view_pr_engage(owner_slug, num)
     if pr is None:

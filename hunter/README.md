@@ -165,14 +165,17 @@ linear ramps, never letting spend get ahead of either:
   `HEADROOM_MS` in `budget.py`) so a freshly-opened window is never
   immediately claimed, then ramps 0→1 over what's left. Unspent capacity at
   reset is wasted — there's no rollover.
-- **In-flight accounting**: a running job's *anticipated* cost (not its
-  nominal cap — cold-cache first calls have been observed running
-  2-5x cap_tokens in one atomic, uninterruptible LLM call) is reserved
+- **In-flight accounting**: a running job's *anticipated* cost is reserved
   before the next decision, so concurrent/rapid cycles can't overshoot
-  either ramp.
-- Workers are metered **externally**: `runner.py` tails the worker's live
-  session JSONL and SIGTERMs the process group at the token cap — it never
-  depends on the worker cooperating with its own limit.
+  either ramp. It is an estimate from history, not the job's granted cap:
+  a cold-cache first call arrives as one atomic, uninterruptible LLM call
+  that has been observed spending 2-4x what was reserved for it.
+- A granted job's token cap is the ramp's remaining headroom, verbatim —
+  there is no separate configured per-kind cap. Workers are metered
+  **externally**: `harness.py` tails the worker's live session JSONL and
+  SIGTERMs the process group at that cap, never depending on the worker
+  cooperating with its own limit. A grant with no headroom figure carries
+  no token bound, and `maxWallS` alone stops it.
 - Stale or missing usage data → conservative denial, never an optimistic
   guess.
 
@@ -298,15 +301,15 @@ column docs — most have inline comments explaining *why*, not just *what*):
   "workRoot": "data",           // repo clones, worktrees, job output
   "dbPath": "data/hunter.db",
   "ompBin": "omp",
-  "hunt":  { "capNewTokens": 200000, "maxWallS": 1800, "maxFindings": 8 },
-  "fix":   { "capNewTokens": 150000, "maxWallS": 2700 },
+  "hunt":  { "maxWallS": 1800, "maxFindings": 8 },
+  "fix":   { "maxWallS": 2700 },
   "budget": { "deny5hAbove": 0.85, "staleAfterS": 300 },
   "serve": { "port": 8377 },
   "models": { "default": "opus", "smol": "sonnet", "hunt": null, "fix": null }
 }
 ```
 
-- `hunt`/`fix` caps apply to their whole job family (hunt also covers
+- `hunt`/`fix` settings apply to their whole job family (hunt also covers
   test\_gap/dep\_update/refactor/modernization/recheck; fix also covers
   engage/harvest/apply\_\*).
 - `budget.deny5hAbove` / `staleAfterS` — see § Budget policy.

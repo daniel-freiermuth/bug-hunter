@@ -174,13 +174,11 @@ class Config:
     work_root: Path
     db_path: Path
     omp_bin: str = "omp"
-    hunt_cap_tokens: int = 200_000
     hunt_max_wall_s: int = 1800
     hunt_max_findings: int = 8
     hunt_rehunt_days: int = 90  # Full re-hunt interval
     scan_interval_days: float = 1  # min days between scans per repo per kind (default 24h)
     modernization_interval_days: int = 30  # override for modernization (strategic, less frequent)
-    fix_cap_tokens: int = 150_000
     fix_max_wall_s: int = 2700
     stale_after_s: int = 300  # usage-probe refresh threshold (see server._usage_prober_loop)
     cache_ttl_s: int = 3600  # prompt-cache lifetime for anticipated_tokens warm/cold split
@@ -210,13 +208,11 @@ class Config:
             work_root=rp(raw.get("workRoot", "data")),
             db_path=rp(raw.get("dbPath", "data/hunter.db")),
             omp_bin=raw.get("ompBin", "omp"),
-            hunt_cap_tokens=raw.get("hunt", {}).get("capNewTokens", 200_000),
             hunt_max_wall_s=raw.get("hunt", {}).get("maxWallS", 1800),
             hunt_max_findings=raw.get("hunt", {}).get("maxFindings", 8),
             hunt_rehunt_days=raw.get("hunt", {}).get("rehuntDays", 90),
             scan_interval_days=raw.get("scan", {}).get("intervalDays", 1),
             modernization_interval_days=raw.get("modernization", {}).get("intervalDays", 30),
-            fix_cap_tokens=raw.get("fix", {}).get("capNewTokens", 150_000),
             fix_max_wall_s=raw.get("fix", {}).get("maxWallS", 2700),
             stale_after_s=raw.get("budget", {}).get("staleAfterS", 300),
             cache_ttl_s=raw.get("budget", {}).get("cacheTtlS", 3600),

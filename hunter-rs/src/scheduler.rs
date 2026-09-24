@@ -602,11 +602,13 @@ async fn sync_repo(
 
 /// Budget gate: check with backend, return the grant or a denied summary.
 enum BudgetDecision {
-    /// The cap to enforce, and the anticipated cost the ramp reserved to
-    /// grant it — the job row records the latter so the inflight
-    /// reservation can read it back while the job runs.
+    /// The token bound to enforce — `None` for a job the ramp put no
+    /// ceiling on, which then runs under `maxWallS` alone — and the
+    /// anticipated cost the ramp reserved to grant it. The job row records
+    /// the latter so the inflight reservation can read it back while the
+    /// job runs.
     Approved {
-        cap: i64,
+        cap: Option<i64>,
         anticipated: i64,
     },
     Denied(Box<CycleSummary>),
@@ -618,7 +620,6 @@ async fn budget_gate(
     cfg: &Config,
     repo_id: i64,
     kind: JobKind,
-    cfg_cap: i64,
     use_override: bool,
     log_prefix: &str,
     finding_id: Option<i64>,
@@ -647,13 +648,15 @@ async fn budget_gate(
         Verdict::Granted {
             cap_tokens: backend_cap,
             ..
-        } => {
-            let cap = match backend_cap {
-                Some(bc) => cfg_cap.min(*bc),
-                None => cfg_cap,
-            };
-            Ok(BudgetDecision::Approved { cap, anticipated })
-        }
+        } => Ok(BudgetDecision::Approved {
+            // Verbatim: the ramp's headroom IS the budget for this job,
+            // and it is the only token bound. A config constant beside it
+            // could only ever be a second, static guess at the same
+            // quantity — and the one that shipped had drifted below what
+            // the jobs it governed cost, killing them on its own.
+            cap: *backend_cap,
+            anticipated,
+        }),
     }
 }
 
@@ -830,7 +833,6 @@ pub async fn run_hunt(
         cfg,
         rid,
         RepoJobKind::Hunt.into(),
-        cfg.hunt_cap_tokens,
         false,
         &format!("hunt {rname}"),
         None,
@@ -1081,7 +1083,6 @@ pub async fn run_recheck(
         cfg,
         repo.id,
         FindingJobKind::Recheck.into(),
-        cfg.hunt_cap_tokens,
         override_mode.is_some(),
         &format!("recheck #{fid}"),
         Some(fid),
@@ -1360,7 +1361,6 @@ async fn run_analysis_job(
         cfg,
         rid,
         JobKind::from(kind),
-        cfg.hunt_cap_tokens,
         false,
         &format!("{kind} {rname}"),
         None,
@@ -1803,7 +1803,6 @@ pub async fn run_fix(
         cfg,
         repo.id,
         FindingJobKind::Fix.into(),
-        cfg.fix_cap_tokens,
         override_mode.is_some(),
         &format!("fix #{fid}"),
         Some(fid),
@@ -2688,7 +2687,6 @@ pub async fn run_engage(
         cfg,
         repo.id,
         FindingJobKind::Engage.into(),
-        cfg.fix_cap_tokens,
         override_mode.is_some(),
         &format!("engage #{fid}"),
         Some(fid),
@@ -3172,7 +3170,6 @@ pub async fn run_harvest(
         cfg,
         repo.id,
         FindingJobKind::Harvest.into(),
-        cfg.fix_cap_tokens,
         override_mode.is_some(),
         &format!("harvest #{fid}"),
         Some(fid),

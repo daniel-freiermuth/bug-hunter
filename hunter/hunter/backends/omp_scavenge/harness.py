@@ -6,6 +6,9 @@ the process group at the token threshold. The ledger survives kills cleanly
 (observed: zero corrupt lines after SIGTERM; partial trailing line possible
 mid-write -- skipped).
 
+``cap_tokens`` may be None, which means the budget granted this job no token
+bound at all and ``max_wall_s`` is the only thing that stops it.
+
 Every run gets its own ``--session-dir``. omp's ``autoResume`` setting makes a
 bare ``omp -p`` continue the newest session for the same cwd whenever no
 session flag or session directory is passed, and a resumed worker re-caches the
@@ -150,7 +153,7 @@ def run_worker(
     cfg: Config,
     cwd: Path,
     prompt: str,
-    cap_tokens: int,
+    cap_tokens: int | None,
     max_wall_s: int,
     model: str | None = None,
 ) -> RunResult:
@@ -208,7 +211,7 @@ def run_worker(
             session, tokens, calls = metered
         if rc is not None:
             break
-        if tokens >= cap_tokens:
+        if cap_tokens is not None and tokens >= cap_tokens:
             killed = "cap"
             _kill_tree(proc)
             break

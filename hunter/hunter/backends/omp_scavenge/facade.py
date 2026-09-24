@@ -302,7 +302,7 @@ class OmpScavengeBackend:
         cwd: Path,
         prompt: str,
         *,
-        cap_tokens: int,
+        cap_tokens: int | None,
         max_wall_s: int,
         job_class: JobClass,
     ) -> RunResult:

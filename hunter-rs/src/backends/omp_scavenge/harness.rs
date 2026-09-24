@@ -219,7 +219,11 @@ fn tail_str(s: &str) -> &str {
 // Worker execution (harness.py:103-163)
 // ---------------------------------------------------------------------------
 
-/// Spawn `omp -p`, meter its JSONL session ledger, kill at cap.
+/// Spawn `omp -p`, meter its JSONL session ledger, kill at the cap.
+///
+/// `cap_tokens` is the ramp's headroom for this run. `None` is a run with
+/// no token bound — the ramp found no ceiling to impose — and `max_wall_s`
+/// is then the only thing that stops a worker that will not stop itself.
 ///
 /// Blocking — call via `spawn_blocking` from async contexts.
 #[allow(
@@ -233,7 +237,7 @@ pub fn run_worker(
     cfg: &Config,
     cwd: &Path,
     prompt: &str,
-    cap_tokens: i64,
+    cap_tokens: Option<i64>,
     max_wall_s: i64,
     model: Option<&str>,
 ) -> RunResult {
@@ -357,7 +361,7 @@ pub fn run_worker(
             kill_tree(&mut proc);
             break;
         }
-        if tokens >= cap_tokens {
+        if cap_tokens.is_some_and(|cap| tokens >= cap) {
             killed = Some("cap".to_owned());
             kill_tree(&mut proc);
             break;
