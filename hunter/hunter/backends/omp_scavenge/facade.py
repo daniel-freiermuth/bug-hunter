@@ -305,6 +305,7 @@ class OmpScavengeBackend:
         cap_tokens: int | None,
         max_wall_s: int,
         job_class: JobClass,
+        resume_from: Path | None = None,
     ) -> RunResult:
         """Execute a worker job, internalizing the usage-delta sandwich."""
         pre = self._usage_snapshot()
@@ -316,6 +317,7 @@ class OmpScavengeBackend:
             cap_tokens,
             max_wall_s,
             model=model,
+            resume_from=resume_from,
         )
         post = self._usage_snapshot()
         rr.usage_delta = (post - pre) if pre is not None and post is not None else None

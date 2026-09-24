@@ -80,6 +80,7 @@ class _RecordingBackend:
         cap_tokens: int | None,
         max_wall_s: float,
         job_class: object,
+        resume_from: Path | None = None,
     ) -> RunResult:
         self.ran_with.append(cap_tokens)
         m = re.search(r"Create (\S+) containing", prompt)

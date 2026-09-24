@@ -38,7 +38,14 @@ class _FakeBackend:
         return Outlook(normal=Granted(cap_tokens=200_000), prioritized=Granted(cap_tokens=200_000))
 
     def run(
-        self, cwd: Path, prompt: str, *, cap_tokens: int, max_wall_s: float, job_class: object
+        self,
+        cwd: Path,
+        prompt: str,
+        *,
+        cap_tokens: int,
+        max_wall_s: float,
+        job_class: object,
+        resume_from: Path | None = None,
     ) -> RunResult:
         return self._fn(None, cwd, prompt, cap_tokens, max_wall_s)  # type: ignore[misc]
 

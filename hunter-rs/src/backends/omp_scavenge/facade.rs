@@ -739,6 +739,7 @@ impl Backend for OmpScavengeBackend {
         cap_tokens: Option<i64>,
         max_wall_s: i64,
         job_class: JobClass,
+        resume_from: Option<&std::path::Path>,
     ) -> anyhow::Result<crate::types::RunResult> {
         // Usage-delta sandwich (facade.py:244-268): snapshot the max 7d
         // used_fraction before and after run_worker.
@@ -754,6 +755,7 @@ impl Backend for OmpScavengeBackend {
         let cfg = self.cfg.clone();
         let cwd_owned = cwd.to_owned();
         let prompt_owned = prompt.to_owned();
+        let resume_owned = resume_from.map(std::path::Path::to_owned);
         let mut rr = tokio::task::spawn_blocking(move || {
             super::harness::run_worker(
                 &cfg,
@@ -762,6 +764,7 @@ impl Backend for OmpScavengeBackend {
                 cap_tokens,
                 max_wall_s,
                 model.as_deref(),
+                resume_owned.as_deref(),
             )
         })
         .await?;

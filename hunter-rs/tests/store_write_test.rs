@@ -228,6 +228,7 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
             Some(100_000),
             JobState::Running,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -251,6 +252,7 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
             None,
             Some(100_000),
             JobState::Running,
+            None,
             None,
         )
         .await
@@ -851,4 +853,307 @@ async fn sync_pr_open_rolls_back_the_upsert_when_a_later_statement_fails() {
             synced_at: Some(5000),
         }
     );
+}
+
+// -- 11. resume chains ------------------------------------------------------
+
+async fn seed_second_repo(pool: &SqlitePool) {
+    sqlx::raw_sql(
+        r"
+        INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at)
+        VALUES (2, 'beta', 'u', '/tmp/b', 'github', 'main', 1, 1000);
+        ",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_job_with_session(
+    pool: &SqlitePool,
+    id: i64,
+    repo_id: i64,
+    state: &str,
+    session_file: Option<&str>,
+) {
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, repo_id, state, session_file, started_at, finished_at) \
+         VALUES (?1, 'hunt', ?2, ?3, ?4, 1, 2)",
+    )
+    .bind(id)
+    .bind(repo_id)
+    .bind(state)
+    .bind(session_file)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_suspended_job(
+    pool: &SqlitePool,
+    id: i64,
+    repo_id: i64,
+    session_file: Option<&str>,
+) {
+    insert_job_with_session(pool, id, repo_id, "suspended", session_file).await;
+}
+
+async fn set_tokens(pool: &SqlitePool, job_id: i64, tokens: i64) {
+    sqlx::query("UPDATE jobs SET tokens_new = ?1 WHERE id = ?2")
+        .bind(tokens)
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// Only `suspended` is resumable, and the freshest suspension comes
+/// first. A wallclock kill sits in the same table looking similar and
+/// must never appear here: an unbounded overrun is the runaway
+/// signature, and resuming it would only repeat it.
+#[tokio::test]
+async fn resumable_jobs_are_the_suspended_ones_newest_first() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    insert_suspended_job(&pool, 10, 1, Some("/s/10/session.jsonl")).await;
+    insert_suspended_job(&pool, 11, 1, Some("/s/11/session.jsonl")).await;
+    // Both left a session behind, so only `state` can keep them out.
+    insert_job_with_session(&pool, 12, 1, "killed", Some("/s/12/session.jsonl")).await;
+    insert_job_with_session(&pool, 13, 1, "done", Some("/s/13/session.jsonl")).await;
+    let store = rw_store(&path).await;
+
+    let ids: Vec<i64> = store
+        .list_resumable_jobs()
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+        .collect();
+
+    assert_eq!(ids, vec![11, 10]);
+}
+
+/// A suspended job whose repo has been soft-deleted is not a candidate.
+/// The clone behind it is being reaped and `create_job` refuses that repo
+/// outright, so offering it would hand the scheduler a pick it cannot
+/// act on.
+///
+/// The flag is set by the real `soft_delete_repo`, so the row is in
+/// exactly the shape the daemon produces. The job is written directly
+/// afterwards because both halves of the write path refuse this pairing
+/// — which is the point: this filter is the read-side half of a
+/// guarantee `create_job` enforces on the write side, and it is what
+/// keeps the candidate list agreeing with it when a delete lands between
+/// the scheduler reading the list and acting on it.
+#[tokio::test]
+async fn resumable_jobs_skip_a_soft_deleted_repo() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_second_repo(&pool).await;
+    let store = rw_store(&path).await;
+    store.soft_delete_repo(2).await.unwrap();
+    insert_suspended_job(&pool, 10, 1, Some("/s/10/session.jsonl")).await;
+    insert_suspended_job(&pool, 11, 2, Some("/s/11/session.jsonl")).await;
+    let store = rw_store(&path).await;
+
+    let ids: Vec<i64> = store
+        .list_resumable_jobs()
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+        .collect();
+
+    assert_eq!(
+        ids,
+        vec![10],
+        "the deleted repo's suspension must not be offered"
+    );
+}
+
+/// Resuming means handing omp one exact session path. A suspended job
+/// with no path has nothing to continue, and a resume that falls back to
+/// "the newest session for this cwd" is the behaviour that once
+/// re-cached an unrelated 290-call transcript for 508,709 tokens on a
+/// single call.
+#[tokio::test]
+async fn resumable_jobs_skip_a_suspension_with_no_session_file() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    insert_suspended_job(&pool, 10, 1, Some("/s/10/session.jsonl")).await;
+    insert_suspended_job(&pool, 11, 1, None).await;
+    let store = rw_store(&path).await;
+
+    let ids: Vec<i64> = store
+        .list_resumable_jobs()
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+        .collect();
+
+    assert_eq!(
+        ids,
+        vec![10],
+        "a suspension with no session path cannot be resumed"
+    );
+}
+
+/// A suspension that something already continues is not offered again.
+///
+/// The successor row IS the record that this work has been picked up,
+/// which is why no `resumed` state exists — a state flag beside the
+/// link would be a second copy of the same fact, free to disagree with
+/// it. Without this filter the scheduler would resume one transcript
+/// every cycle forever, each attempt paying to re-cache the same
+/// context: the loop this feature exists to end, rebuilt one level up.
+///
+/// The successor is left `running` on purpose. That is the state it has
+/// for the whole time the filter matters — while the resumed attempt is
+/// in flight and the scheduler is picking the next candidate.
+#[tokio::test]
+async fn resumable_jobs_skip_a_suspension_that_already_has_a_successor() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    insert_suspended_job(&pool, 10, 1, Some("/s/10/session.jsonl")).await;
+    insert_suspended_job(&pool, 11, 1, Some("/s/11/session.jsonl")).await;
+    let store = rw_store(&path).await;
+    store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            1,
+            None,
+            None,
+            JobState::Running,
+            Some(250_000),
+            Some(11),
+        )
+        .await
+        .unwrap();
+
+    let ids: Vec<i64> = store
+        .list_resumable_jobs()
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+        .collect();
+
+    assert_eq!(
+        ids,
+        vec![10],
+        "job 11 is already being continued and must not be handed out twice"
+    );
+}
+
+/// Three attempts at one piece of work cost what all three cost, and the
+/// answer is the same whichever link you ask from — the scheduler holds
+/// the newest, a UI would hold whichever row it rendered.
+#[tokio::test]
+async fn resume_chain_tokens_sums_every_attempt_from_any_link() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    let store = rw_store(&path).await;
+
+    let mut chain = Vec::new();
+    let mut previous = None;
+    for tokens in [120_000, 90_000, 30_000] {
+        let id = store
+            .create_job(
+                RepoJobKind::Hunt.into(),
+                1,
+                None,
+                None,
+                JobState::Suspended,
+                None,
+                previous,
+            )
+            .await
+            .unwrap();
+        set_tokens(&pool, id, tokens).await;
+        chain.push(id);
+        previous = Some(id);
+    }
+
+    for link in &chain {
+        assert_eq!(
+            store.resume_chain_tokens(*link).await.unwrap(),
+            240_000,
+            "asked from job {link}"
+        );
+    }
+
+    // Unrelated work is not swept in: the walk follows the link, not the repo.
+    let loner = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            1,
+            None,
+            None,
+            JobState::Done,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    set_tokens(&pool, loner, 7_000).await;
+    assert_eq!(store.resume_chain_tokens(loner).await.unwrap(), 7_000);
+}
+
+/// A cyclic link makes the walk terminate anyway.
+///
+/// The write path cannot produce this — `resumed_from` is set once at
+/// INSERT, naming a row that already exists — so the cycle is written
+/// here the only way one can arise in the wild: by hand, as a repaired
+/// or partially restored database would carry it.
+///
+/// Bounded in time on purpose. "Terminates" is not observable from a
+/// query that never returns, and without the depth cap this one does not
+/// return at all: `UNION` de-duplicates, but each revisit of a node
+/// arrives carrying a larger `depth` and is therefore a new row. The
+/// capped walk over three rows finishes immediately; the budget exists
+/// only to turn a non-terminating query into a failure this test can
+/// report, instead of one nextest kills at its own timeout two minutes
+/// later.
+#[tokio::test]
+async fn resume_chain_tokens_terminates_on_a_cyclic_link() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    let store = rw_store(&path).await;
+
+    let mut chain = Vec::new();
+    let mut previous = None;
+    for tokens in [120_000, 90_000, 30_000] {
+        let id = store
+            .create_job(
+                RepoJobKind::Hunt.into(),
+                1,
+                None,
+                None,
+                JobState::Suspended,
+                None,
+                previous,
+            )
+            .await
+            .unwrap();
+        set_tokens(&pool, id, tokens).await;
+        chain.push(id);
+        previous = Some(id);
+    }
+    sqlx::query("UPDATE jobs SET resumed_from = ?1 WHERE id = ?2")
+        .bind(chain[2])
+        .bind(chain[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let total = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        store.resume_chain_tokens(chain[0]),
+    )
+    .await
+    .expect("the walk must terminate on a cycle, not run until the harness kills it")
+    .unwrap();
+
+    assert_eq!(total, 240_000, "every attempt counted exactly once");
 }

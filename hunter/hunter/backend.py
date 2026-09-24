@@ -182,12 +182,16 @@ class Backend(Protocol):
         cap_tokens: int | None,
         max_wall_s: int,
         job_class: JobClass,
+        resume_from: Path | None = None,
     ) -> RunResult:
         """Execute a worker job.
 
         cap_tokens: the Granted verdict's cap, verbatim.  None means no
         token bound -- max_wall_s is then the only stop condition.
         job_class: drives model selection (the backend owns model config).
+        resume_from: the session file of an earlier attempt to continue
+        instead of starting cold.  None is a cold run, which is what every
+        job was before resume existed.
         """
         ...
 

@@ -168,7 +168,7 @@ async fn failed_close_does_not_record_the_withdrawal() {
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
-    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend)
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .expect("run_engage should not error, it should decline to record");
 
@@ -206,7 +206,7 @@ async fn successful_close_records_the_withdrawal() {
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
-    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend)
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
 
@@ -244,7 +244,7 @@ async fn failed_close_marks_the_attention_addressed_so_it_stops_being_repicked()
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
-    hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend)
+    hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
 
@@ -294,7 +294,7 @@ async fn a_clone_of_a_different_repository_is_refused() {
     // Never reached: the sync refuses before any worker is spawned, which
     // is itself part of the contract.
     let backend = ScriptedBackend::writing("findings.json", "[]");
-    let err = hunter::scheduler::run_hunt(&store, &cfg, &row, &backend)
+    let err = hunter::scheduler::run_hunt(&store, &cfg, &row, &backend, None)
         .await
         .expect_err("a clone of another repository must not be hunted");
     let msg = err.to_string();

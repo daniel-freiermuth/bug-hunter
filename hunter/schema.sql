@@ -101,7 +101,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   repo_id       INTEGER NOT NULL REFERENCES repos(id),
   finding_id    INTEGER REFERENCES findings(id),
   state         TEXT NOT NULL DEFAULT 'queued',
-    -- queued | running | done | failed | killed | denied
+    -- queued | running | done | failed | killed | suspended | denied
+    -- 'suspended' is a job that ran out of window headroom rather than
+    -- one that went wrong: it is resumable, see jobs.resumed_from.
   pid           INTEGER,
   session_file  TEXT,                      -- worker's JSONL ledger path
   cap_tokens    INTEGER,
@@ -114,7 +116,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   model         TEXT,                      -- model used for this job
   usage_delta   REAL,                      -- 7d used_fraction increase observed during job
   started_at    INTEGER,
-  finished_at   INTEGER
+  finished_at   INTEGER,
+  resumed_from  INTEGER REFERENCES jobs(id) ON DELETE SET NULL
+    -- the suspended attempt this job continues; see migration 014
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS jobs_finished_at ON jobs(finished_at)

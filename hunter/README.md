@@ -139,7 +139,17 @@ what actually runs):
 3. **Harvest** the oldest merged PR still pending follow-up review.
 4. **Recheck** the oldest finding stuck in `rechecking`.
 5. **Fix** the oldest queued finding.
-6. Otherwise, **hunt/test_gap/dep_update/refactor** — whichever is most
+6. **Resume** the newest suspended attempt that can still be continued.
+   A worker killed for running out of window headroom (and only that:
+   never a wallclock overrun, which is the runaway signature) keeps its
+   session and comes back as `suspended` rather than `killed`, and the
+   next cycle hands omp that exact session instead of starting cold.
+   Ranked here because a suspension has already been paid for — it
+   outranks *starting* new background work, never a human waiting on a
+   PR. Restarting costs a flat ~37k-token session floor and then redoes
+   the work; continuing costs re-caching the context the worker was
+   already carrying.
+7. Otherwise, **hunt/test_gap/dep_update/refactor** — whichever is most
    overdue for the least-recently-scanned enabled repo (a never-cloned repo
    always hunts first). **Modernization** joins this rotation too, but only
    once `modernization.intervalDays` (config, default 30) has passed since it last ran for that
@@ -148,7 +158,10 @@ what actually runs):
 
 A repeatedly-failing item (same failure reason, consecutive attempts) gives
 up after a bounded streak rather than looping forever — this applies
-uniformly to fix retries, recheck retries, and harvest retries.
+uniformly to fix retries, recheck retries, and harvest retries. A resume
+chain has the same kind of ceiling: once its attempts have cost three
+times what that kind of job typically costs, the suspension is marked
+`failed` (reason `give-up`) instead of being continued again.
 
 ### Budget policy
 
@@ -279,8 +292,11 @@ column docs — most have inline comments explaining *why*, not just *what*):
   missing\_tests, refactor smell\_type, modernization\_class), and retry
   streak tracking (fix/recheck) for the give-up mechanism.
 - **`jobs`** — one row per worker invocation: kind, cap/actual tokens,
-  exit/kill reason, timing. The audit trail for "what did hunter actually
-  spend, and on what."
+  exit/kill reason, timing, and `resumed_from` (the suspended attempt this
+  one continues). States are `queued | running | done | failed | killed |
+  suspended | denied`; `suspended` is a pause with a session file to
+  continue, everything else killed is terminal. The audit trail for "what
+  did hunter actually spend, and on what."
 - **`pr_state`** — one row per finding with an open/merged PR: forge state,
   attention fingerprint + suppression marker (state-based, see § PR
   follow-up loop), harvest tracking.

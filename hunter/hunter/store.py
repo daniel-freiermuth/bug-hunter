@@ -67,6 +67,14 @@ _JOB_COLUMNS = {
     "finding_id",
 }
 
+# How far Store.resume_chain_tokens() will walk a resume chain.
+#
+# Purely a termination guarantee for a graph that should not need one:
+# far beyond any chain a give-up ceiling would let form, so it never
+# truncates a real answer, and small enough that a cyclic row from a
+# hand-repaired database costs a bounded query instead of a hung one.
+_RESUME_CHAIN_MAX_DEPTH = 64
+
 _PR_STATE_COLUMNS = {
     "pr_number",
     "state",
@@ -286,6 +294,21 @@ class Store:
                 "estimated_tokens",
                 "jobs",
                 "ALTER TABLE jobs ADD COLUMN estimated_tokens INTEGER",
+            ),
+            # The suspended attempt this job continues. A job killed for
+            # running out of window headroom advanced no watermark, so
+            # the next cycle redid its work from nothing; the successor
+            # links back instead, which keeps each attempt's measured
+            # cost its own and makes a chain's total summable.
+            # ON DELETE SET NULL so job retention, which deletes the
+            # oldest rows first, is not vetoed by a link pointing at them.
+            (
+                "resumed_from",
+                "jobs",
+                (
+                    "ALTER TABLE jobs ADD COLUMN resumed_from INTEGER"
+                    " REFERENCES jobs(id) ON DELETE SET NULL"
+                ),
             ),
         ]:
             try:
@@ -1164,6 +1187,7 @@ class Store:
         cap_tokens: int | None = None,
         state: str = "queued",
         estimated_tokens: int | None = None,
+        resumed_from: int | None = None,
     ) -> int:
         """'queued' is a transient default a caller immediately overwrites
         (via update_job) with the real outcome -- nothing ever reads a job
@@ -1190,11 +1214,17 @@ class Store:
         `estimated_tokens` is what the budget ramp reserved for this job
         before granting it -- not its cap. The inflight reservation is
         read back from this column, so a job that omits it is invisible
-        to the budget while it runs."""
+        to the budget while it runs.
+
+        `resumed_from` names the suspended attempt this job continues, or
+        None for work starting fresh. It is written only here and never
+        updated, so a row can only point at an id that already existed --
+        which is what keeps the chain acyclic."""
         cur = self.db.execute(
             "INSERT INTO jobs"
-            " (kind, repo_id, finding_id, cap_tokens, estimated_tokens, state, started_at)"
-            " SELECT ?,?,?,?,?,?,?"
+            " (kind, repo_id, finding_id, cap_tokens, estimated_tokens, state, started_at,"
+            " resumed_from)"
+            " SELECT ?,?,?,?,?,?,?,?"
             " WHERE EXISTS (SELECT 1 FROM repos WHERE id = ? AND deleted_at IS NULL)",
             (
                 kind,
@@ -1204,6 +1234,7 @@ class Store:
                 estimated_tokens,
                 state,
                 now_ms(),
+                resumed_from,
                 repo_id,
             ),
         )
@@ -1232,7 +1263,12 @@ class Store:
     # estimated_tokens: the budget's own bookkeeping, meaningful only
     # while the job is running and already reported to clients as the
     # ramp's reservation, not as a property of the job.
-    _INTERNAL_JOB_COLS = ("estimated_tokens",)
+    #
+    # resumed_from: the scheduler's link between attempts at one piece of
+    # work. Nothing the UI renders reads it, and the number a client
+    # would actually want from a chain -- what it has cost so far --
+    # comes from resume_chain_tokens(), not from the raw link.
+    _INTERNAL_JOB_COLS = ("estimated_tokens", "resumed_from")
 
     @classmethod
     def _public_job(cls, row: Row) -> Row:
@@ -1324,6 +1360,100 @@ class Store:
             "usage_delta",
             shape=JobDict,
         )
+
+    def list_resumable_jobs(self) -> list[Row]:
+        """Suspended jobs that could actually be picked up again, newest
+        first.
+
+        Newest first because a suspended transcript loses value as its
+        repo moves on: the freshest one was reasoning about a tree
+        closest to today's HEAD, so continuing it redoes the least. That
+        also matches every other job read here, so the scheduler's
+        candidate list runs in the same direction as the UI's job feed.
+        The starvation this ordering permits is the intended outcome, not
+        a defect -- a suspension nothing has come back to for many cycles
+        is stale work, and the scheduler's give-up ceiling ends it.
+
+        Three filters make "could be picked up again" true rather than
+        merely claimed:
+
+        - the repo must still be live, since a soft-deleted repo's clone
+          is being reaped and create_job() would refuse the successor;
+        - session_file must be present, because resume means handing omp
+          that exact session path. A suspended job with no path has
+          nothing to continue and would silently become a fresh run --
+          the implicit-resume behaviour that once re-cached an unrelated
+          290-call transcript for 508,709 tokens on a single call;
+        - no successor may already name it. A resumed attempt continues
+          the transcript in place, so offering the predecessor a second
+          time would hand two workers one session. This is also why the
+          scheduler needs no 'resumed' state: the successor row IS the
+          record that this suspension has been taken, and it is written
+          by the same INSERT that starts the continuation, so there is no
+          window where the link exists but the claim does not.
+
+        Carries the same columns as the Rust port's Job, so both
+        schedulers see one shape.
+        """
+        return [
+            self._public_job(r)
+            for r in _rows(
+                self.db.execute(
+                    "SELECT j.*, r.name AS repo_name FROM jobs j"
+                    " JOIN repos r ON r.id = j.repo_id"
+                    " WHERE j.state = 'suspended'"
+                    " AND r.deleted_at IS NULL"
+                    " AND j.session_file IS NOT NULL"
+                    " AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)"
+                    " ORDER BY j.id DESC"
+                )
+            )
+        ]
+
+    def resume_chain_tokens(self, job_id: int) -> int:
+        """Every token the chain containing `job_id` has spent, across all
+        its attempts.
+
+        A resumed attempt is its own row, so tokens_new alone answers
+        "what did this attempt cost" and never "what has this work
+        cost". The second question is the one a give-up ceiling has to
+        ask, so it is answered by walking the link.
+
+        Walks BOTH ways -- to predecessors via resumed_from and to
+        successors via the rows that name this one -- because `job_id`
+        can be any link, not just the newest.
+
+        The depth cap is the termination guarantee. UNION de-duplicates
+        against rows already produced, but cannot stop a cycle once
+        `depth` is carried: each revisit arrives with a larger depth and
+        is therefore a genuinely new row, so the recursion would run
+        forever. The write path cannot produce a cycle -- resumed_from is
+        set once at INSERT to an id that already exists, so ids strictly
+        decrease along the link -- but this read must not hang on a
+        database that did not come from that write path (a hand repair, a
+        partial restore). _RESUME_CHAIN_MAX_DEPTH sits far above any
+        chain length worth resuming, so the cap costs a healthy chain
+        nothing.
+
+        Carrying `depth` is what forces the final sum to go through `id
+        IN (SELECT ...)` rather than a join: a node reachable by several
+        paths appears once per depth, and joining on it would count that
+        job's tokens once per appearance.
+        """
+        r = self.db.execute(
+            "WITH RECURSIVE chain(id, resumed_from, depth) AS ("
+            "  SELECT id, resumed_from, 0 FROM jobs WHERE id = ?"
+            "  UNION"
+            "  SELECT j.id, j.resumed_from, c.depth + 1"
+            "  FROM jobs j, chain c"
+            "  WHERE c.depth < ?"
+            "   AND (j.id = c.resumed_from OR j.resumed_from = c.id)"
+            ")"
+            " SELECT COALESCE(SUM(tokens_new), 0) AS total"
+            " FROM jobs WHERE id IN (SELECT id FROM chain)",
+            (job_id, _RESUME_CHAIN_MAX_DEPTH),
+        ).fetchone()
+        return int(r["total"])
 
     def set_scheduler_state(self, state: str, detail: str, next_wake_at: int | None) -> None:
         """Persist the daemon loop's own read of "what am I doing and

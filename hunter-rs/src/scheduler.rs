@@ -13,6 +13,43 @@ use crate::store::{FindingFilter, Store, StoreWriteError, SyncPrData};
 use crate::types::{Finding, Repo};
 use crate::util::now_ms;
 
+/// Everything a resumed attempt needs and a cold one does not.
+///
+/// A resume is not a seventh job kind: it runs through the executor of
+/// whatever kind was suspended, so it ingests, advances watermarks and
+/// handles PRs exactly as that kind always does. Only four things
+/// differ, and they are all in here — which budget the gate reserves,
+/// which row the new job points back at, which transcript omp is handed,
+/// and which output path the continuing worker is still writing to.
+#[derive(Debug, Clone)]
+pub struct ResumePlan {
+    pub kind: JobKind,
+    pub repo_id: i64,
+    /// Repo name, carried because the events this plan's outcome logs
+    /// fire from `record_job`, which never reads a repo row.
+    pub repo: String,
+    pub finding_id: Option<i64>,
+    /// The suspended attempt being continued.
+    pub predecessor_id: i64,
+    /// The first attempt in the chain. Its id is the one the playbook
+    /// baked into the output path, and a continuing worker is still
+    /// writing there (`Store::resume_origin_job`).
+    pub origin_job_id: i64,
+    /// The predecessor's transcript, handed to omp verbatim.
+    pub session_file: PathBuf,
+    /// The reservation from [`resume_reservation`], standing in for the
+    /// per-kind estimate at the budget gate.
+    pub anticipated: i64,
+    /// The three terms `anticipated` was computed from, kept so the
+    /// event logged at dispatch can show its arithmetic. An operator
+    /// looking at a large reservation needs to see whether it is a large
+    /// context or a chain that has overrun, and re-deriving them at the
+    /// log site would mean re-reading the transcript and the chain.
+    pub ctx: i64,
+    pub typical: i64,
+    pub chain_spent: i64,
+}
+
 /// What `run_cycle` would act on right now, if invoked (scheduler.py
 /// `pick_next` docstring). Enough for the summary preview and for
 /// `anticipated_tokens(repo_id`, kind).
@@ -30,6 +67,11 @@ pub enum Candidate {
         label: Option<String>,
         budget_override: Option<String>,
     },
+    /// Continue a suspended attempt instead of redoing it.
+    Resume {
+        label: Option<String>,
+        plan: ResumePlan,
+    },
 }
 
 impl Candidate {
@@ -37,18 +79,22 @@ impl Candidate {
         match self {
             Self::Repo { kind, .. } => (*kind).into(),
             Self::Finding { kind, .. } => (*kind).into(),
+            Self::Resume { plan, .. } => plan.kind,
         }
     }
 
     pub fn repo_id(&self) -> i64 {
         match self {
             Self::Repo { repo_id, .. } | Self::Finding { repo_id, .. } => *repo_id,
+            Self::Resume { plan, .. } => plan.repo_id,
         }
     }
 
     pub fn label(&self) -> Option<&str> {
         match self {
-            Self::Repo { label, .. } | Self::Finding { label, .. } => label.as_deref(),
+            Self::Repo { label, .. } | Self::Finding { label, .. } | Self::Resume { label, .. } => {
+                label.as_deref()
+            }
         }
     }
 
@@ -57,6 +103,7 @@ impl Candidate {
         match self {
             Self::Repo { repo_id, .. } => *repo_id,
             Self::Finding { finding_id, .. } => *finding_id,
+            Self::Resume { plan, .. } => plan.finding_id.unwrap_or(plan.repo_id),
         }
     }
 
@@ -65,7 +112,7 @@ impl Candidate {
             Self::Finding {
                 budget_override, ..
             } => budget_override.as_deref(),
-            Self::Repo { .. } => None,
+            Self::Repo { .. } | Self::Resume { .. } => None,
         }
     }
 }
@@ -150,18 +197,26 @@ async fn list_pending_harvest(store: &Store) -> sqlx::Result<Vec<Finding>> {
     Ok(rows.into_iter().map(|(_, f)| f).collect())
 }
 
-/// Pure selection — replicates `scheduler.pick_next`'s priority order and
-/// per-kind eligibility conditions. Read-only.
+/// Selection — replicates `scheduler.pick_next`'s priority order and
+/// per-kind eligibility conditions.
 ///
 /// Priority (scheduler.py:1824-1925): a budget-overridden finding (any
 /// category) jumps the queue -> flagged PR (oldest-outstanding reason
 /// first) -> oldest merged PR pending follow-up review -> oldest
-/// rechecking -> oldest queued fix -> the most stale-of-rotation job
-/// type for the least-recently-hunted enabled repo (hunt if never
-/// cloned, else whichever of `hunt/test_gap/dep_update/refactor` is
-/// oldest/never-run subject to `cfg.scan_interval_days`; modernization
-/// gated by `cfg.modernization_interval_days`). All types gated for one
-/// repo -> the next-stalest repo is tried. None = nothing to do.
+/// rechecking -> oldest queued fix -> resumable suspended work -> the
+/// most stale-of-rotation job type for the least-recently-hunted enabled
+/// repo (hunt if never cloned, else whichever of
+/// `hunt/test_gap/dep_update/refactor` is oldest/never-run subject to
+/// `cfg.scan_interval_days`; modernization gated by
+/// `cfg.modernization_interval_days`). All types gated for one repo ->
+/// the next-stalest repo is tried. None = nothing to do.
+///
+/// Read-only but for one write: retiring a chain that has blown the
+/// give-up ceiling, which [`pick_resume`] does as it skips over it. That
+/// write is best-effort precisely because this function is also the
+/// `/api/summary` preview, which may hold a read-only handle — the
+/// candidate is skipped either way, and the scheduler's own next cycle
+/// records it.
 pub async fn pick_next(
     store: &Store,
     cfg: &Config,
@@ -217,7 +272,20 @@ pub async fn pick_next(
         return Ok(Some(finding_candidate(FindingJobKind::Fix, f)));
     }
 
-    // (6) Repo rotation: enabled repos in staleness order — never-hunted
+    // (6) Work already paid for: a suspended attempt whose transcript is
+    // still on disk. This sits below every tier above it because those
+    // are all a human waiting on a pull request — a flagged review, a
+    // merged branch, a recheck they asked for, a fix they queued. A
+    // resume is background work, and it outranks *starting* background
+    // work because continuing costs the context at suspension (median
+    // re-cache ratio 1.00 across 112 production events) where restarting
+    // costs a flat ~37,000-token session floor plus every token already
+    // spent, and advances no watermark to show for it.
+    if let Some(c) = pick_resume(store, cfg, force_id).await? {
+        return Ok(Some(c));
+    }
+
+    // (7) Repo rotation: enabled repos in staleness order — never-hunted
     // first, then oldest last_hunt_at first; ties keep list_repos' name
     // order (Python sorted() and Vec::sort_by_key are both stable).
     let mut repos: Vec<Repo> = store
@@ -285,6 +353,161 @@ pub async fn pick_next(
         }
     }
 
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Resume policy
+// ---------------------------------------------------------------------------
+
+/// Floor on the progress half of a resumed attempt's reservation.
+///
+/// The reservation is `ctx_at_suspension + max(z - chain_spent, this)`.
+/// A suspension may already have cost more than the per-kind typical
+/// `z`, which makes `z - chain_spent` negative — and a negative budget
+/// for the work still to do is not a small budget, it is a meaningless
+/// one. Floored here at enough for the worker to do real work after
+/// re-caching, rather than exactly enough to re-cache and be killed
+/// again with nothing to show, which would turn every resume into
+/// another suspension.
+const MIN_PROGRESS_TOKENS: i64 = 25_000;
+
+/// Multiple of the per-kind typical cost at which a chain is abandoned.
+///
+/// Work that has cost three times what its kind typically costs and is
+/// still not finished is not going to finish. Without a ceiling the
+/// chain resumes forever, each link cheap enough to look reasonable —
+/// the exact loop this feature exists to end, only slower.
+const GIVE_UP_MULTIPLE: i64 = 3;
+
+/// The whole prompt a resumed attempt gets.
+///
+/// Short by necessity, not by preference: the session already contains
+/// the original playbook, the diff range, the suppression list and
+/// everything the worker has done since. Re-sending it would re-send a
+/// prompt the model is already looking at, for full price.
+const RESUME_PROMPT: &str = "Continue the work you were doing in this session. You were interrupted; \
+     pick up where you left off.";
+
+/// What to reserve for a resumed attempt.
+///
+/// `ctx_at_suspension` is what the first call costs: a resumed session
+/// re-establishes its whole context, measured median ratio 1.00 across
+/// 112 production re-cache events. The second term is what is left of
+/// the per-kind typical estimate after everything the chain has already
+/// spent, floored at [`MIN_PROGRESS_TOKENS`].
+fn resume_reservation(ctx_at_suspension: i64, z: i64, chain_spent: i64) -> i64 {
+    ctx_at_suspension + (z - chain_spent).max(MIN_PROGRESS_TOKENS)
+}
+
+/// Where a job of this kind ran — and where a resumed attempt must run,
+/// because the session is full of absolute paths inside it.
+///
+/// Derived rather than stored: it is a pure function of the kind and its
+/// target, and a column would be a second copy free to disagree with the
+/// executors that build these paths.
+fn job_cwd(cfg: &Config, kind: JobKind, repo_path: &str, finding_id: Option<i64>) -> PathBuf {
+    let wt = |prefix: char, fid: i64| cfg.work_root.join("wt").join(format!("{prefix}{fid}"));
+    match (kind, finding_id) {
+        (JobKind::Finding(FindingJobKind::Fix), Some(fid)) => wt('f', fid),
+        (JobKind::Finding(FindingJobKind::Engage), Some(fid)) => wt('e', fid),
+        (JobKind::Finding(FindingJobKind::Harvest), Some(fid)) => wt('h', fid),
+        // hunt, recheck and every analysis kind run in the clone itself.
+        _ => PathBuf::from(repo_path),
+    }
+}
+
+/// The resume tier of [`pick_next`]: the newest suspension that is still
+/// worth continuing, or `None`.
+///
+/// Candidates are walked newest-first and each is checked against two
+/// things the database cannot know. The working directory must still
+/// exist — a resumed worker continues a conversation, not a filesystem,
+/// so pointing it at a worktree that has since been reclaimed would have
+/// it edit files that are gone. And the chain must be under the give-up
+/// ceiling; one that is not is retired here and skipped, which is what
+/// "fall through to normal selection" means.
+///
+/// Skipping rather than refusing from inside the executor is deliberate.
+/// A refusal would leave the row `suspended`, so the next cycle would
+/// offer it again, and the one after that — and because this tier
+/// outranks repo rotation, that is not a cheap no-op but permanent
+/// starvation of every rotation kind.
+async fn pick_resume(
+    store: &Store,
+    cfg: &Config,
+    force_id: Option<i64>,
+) -> anyhow::Result<Option<Candidate>> {
+    for job in store.list_resumable_jobs().await? {
+        if force_id.is_some_and(|rid| job.repo_id != rid) {
+            continue;
+        }
+        // Non-NULL by the query's own filter; a row that lost its path
+        // between the read and here is simply not resumable.
+        let Some(session_file) = job.session_file.as_deref().map(PathBuf::from) else {
+            continue;
+        };
+        let Some(repo) = store.get_repo_by_id(job.repo_id).await? else {
+            continue;
+        };
+        if !job_cwd(cfg, job.kind, &repo.path, job.finding_id).exists() {
+            continue;
+        }
+
+        let z = anticipated_tokens(store, cfg, job.repo_id, job.kind)
+            .await
+            .unwrap_or(0);
+        let chain_spent = store.resume_chain_tokens(job.id).await?;
+        if chain_spent > GIVE_UP_MULTIPLE * z {
+            let msg = format!(
+                "resume {} {}: giving up after {chain_spent} tok across the chain \
+                 (> {GIVE_UP_MULTIPLE}x {z} typical)",
+                job.kind, repo.name
+            );
+            // Best-effort: the summary preview runs this same function
+            // over a read-only handle. Either way the candidate is
+            // skipped, so a failed write only defers the record.
+            let _ = store
+                .retire_suspended_job(job.id, JobState::Failed, Some("give-up"), &msg)
+                .await;
+            let _ = store
+                .log_event("resume", &msg, Some(job.id), job.finding_id)
+                .await;
+            continue;
+        }
+
+        // An unreadable transcript, or one with no usage record at all,
+        // leaves the first call's cost unknown. `z` is the only other
+        // estimate of this work that exists, so it stands in — better a
+        // per-kind typical than a zero that would reserve nothing and
+        // let the ramp grant a job it cannot afford.
+        let ctx =
+            crate::backends::omp_scavenge::harness::ctx_at_suspension(&session_file).unwrap_or(z);
+        let anticipated = resume_reservation(ctx, z, chain_spent);
+        let origin_job_id = store.resume_origin_job(job.id).await?;
+
+        // No "resuming" event here: this function is also the
+        // /api/summary preview, which polls every few seconds, and an
+        // event per poll would bury the log. `run_cycle_inner` logs it
+        // when the cycle actually acts on the candidate.
+
+        return Ok(Some(Candidate::Resume {
+            label: (!repo.name.is_empty()).then(|| repo.name.clone()),
+            plan: ResumePlan {
+                kind: job.kind,
+                repo_id: job.repo_id,
+                repo: repo.name,
+                finding_id: job.finding_id,
+                predecessor_id: job.id,
+                origin_job_id,
+                session_file,
+                anticipated,
+                ctx,
+                typical: z,
+                chain_spent,
+            },
+        }));
+    }
     Ok(None)
 }
 
@@ -395,13 +618,35 @@ pub struct CycleSummary {
 const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 
 /// Map `RunResult` to job state.
+///
+/// A cap kill that left a transcript behind is a PAUSE, not a failure.
+/// The worker ran out of window headroom mid-thought and the record of
+/// that thought is still on disk, so the work can be continued for the
+/// price of re-caching it — measured median ratio 1.00 across 112
+/// production re-cache events — instead of redone for a flat
+/// ~37,000-token session floor plus everything already paid for. Calling
+/// that outcome `killed` is what let one repo run ten consecutive hunts
+/// over an identical diff range for 1.48M tokens, eight of them finding
+/// nothing: a killed job advances no watermark, so the same work was
+/// re-selected from scratch every cycle.
+///
+/// The session file is load-bearing, not incidental: resuming means
+/// handing omp one exact path, and a cap kill with no transcript has
+/// nothing to hand it.
+///
+/// Every other `killed_reason` stays `Killed` and is never resumed.
+/// Wallclock above all: an unbounded overrun is the runaway signature,
+/// and continuing a runaway only buys it more wall clock.
+///
+/// `resume-unavailable` is `Failed` rather than `Killed` because nothing
+/// was spawned — there was no run to kill, the attempt could not start.
 fn job_state(rr: &RunResult) -> JobState {
-    if rr.killed_reason.is_some() {
-        JobState::Killed
-    } else if rr.exit_code == Some(0) {
-        JobState::Done
-    } else {
-        JobState::Failed
+    match rr.killed_reason.as_deref() {
+        Some("cap") if rr.session_file.is_some() => JobState::Suspended,
+        Some("resume-unavailable") => JobState::Failed,
+        Some(_) => JobState::Killed,
+        None if rr.exit_code == Some(0) => JobState::Done,
+        None => JobState::Failed,
     }
 }
 
@@ -431,11 +676,17 @@ fn job_refused(
 }
 
 /// Record a completed job's outcome (scheduler.py:87-110).
+///
+/// `resume` is the plan this attempt ran under, if it was a resume. It
+/// is here rather than in each executor because every executor funnels
+/// through this one call, and the one outcome that needs it —
+/// `resume-unavailable` — is identical for all six.
 pub async fn record_job(
     store: &Store,
     job_id: i64,
     rr: &RunResult,
     model: Option<&str>,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<JobState> {
     let state = job_state(rr);
     let notes = if state != JobState::Done && !rr.stdout_tail.is_empty() {
@@ -460,6 +711,33 @@ pub async fn record_job(
             now,
         )
         .await?;
+
+    // The transcript this attempt was to continue is gone, so nothing
+    // ran. The predecessor is retired `killed`: leaving it `suspended`
+    // would offer the same missing session every cycle forever.
+    //
+    // Deliberately NOT restarting the work cold in this same cycle. omp
+    // treats an unresolvable `--resume` path as permission to start a
+    // FRESH session, write it at that path and exit 0, which is
+    // indistinguishable downstream from a real continuation — so
+    // "cannot resume" quietly becoming "start cold here" would pay a
+    // full session floor while believing it had continued. The next
+    // cycle picks the work up through normal selection, cold and
+    // knowing it.
+    if let Some(plan) = resume
+        && rr.killed_reason.as_deref() == Some("resume-unavailable")
+    {
+        let msg = format!(
+            "resume {} {}: session gone, predecessor job {} marked killed",
+            plan.kind, plan.repo, plan.predecessor_id
+        );
+        store
+            .retire_suspended_job(plan.predecessor_id, JobState::Killed, None, &msg)
+            .await?;
+        let _ = store
+            .log_event("error", &msg, Some(job_id), plan.finding_id)
+            .await;
+    }
     Ok(state)
 }
 
@@ -623,10 +901,19 @@ async fn budget_gate(
     use_override: bool,
     log_prefix: &str,
     finding_id: Option<i64>,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<BudgetDecision> {
-    let anticipated = anticipated_tokens(store, cfg, repo_id, kind)
-        .await
-        .unwrap_or(0);
+    // A resumed attempt costs its context back plus whatever is left of
+    // the per-kind typical, not the per-kind typical on its own: the
+    // first call re-establishes a transcript that may be far larger than
+    // a cold session's floor. Reserving `z` for it would under-reserve
+    // by exactly the amount that makes resuming worth doing.
+    let anticipated = match resume {
+        Some(plan) => plan.anticipated,
+        None => anticipated_tokens(store, cfg, repo_id, kind)
+            .await
+            .unwrap_or(0),
+    };
     let outlook = backend.decide(anticipated).await?;
     let verdict = if use_override {
         &outlook.prioritized
@@ -661,6 +948,10 @@ async fn budget_gate(
 }
 
 /// Run a hunt job (scheduler.py:145-351).
+///
+/// `resume` continues a suspended attempt: same sync, same diff range,
+/// same ingest and same watermark rule, but the worker is handed its own
+/// transcript and a one-line "carry on" instead of a fresh playbook.
 #[allow(
     clippy::too_many_lines,
     reason = "linear job pipeline: sync, resolve diff range, gate budget, \
@@ -673,6 +964,7 @@ pub async fn run_hunt(
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     // Git's empty tree — the implicit parent of all root commits.
     // Using this as diff base includes the root commit itself.
@@ -683,9 +975,17 @@ pub async fn run_hunt(
     let rpath = PathBuf::from(&repo.path);
     let db = &repo.default_branch;
 
-    sync_repo(store, &repo.url, &rpath, db, &format!("hunt {rname}"), None)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Never on a resume. Fast-forwarding the clone moves the tree out
+    // from under a live session whose transcript describes the old one —
+    // and worse, HEAD is read below and written back as the hunt
+    // watermark on Done, so a resume that pulled first would mark
+    // commits reviewed that no worker ever looked at. Without the sync,
+    // HEAD is still the suspension's HEAD and the watermark stays exact.
+    if resume.is_none() {
+        sync_repo(store, &repo.url, &rpath, db, &format!("hunt {rname}"), None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
     // Get HEAD
     let rp_str = rpath.to_string_lossy().to_string();
@@ -716,7 +1016,12 @@ pub async fn run_hunt(
         .map(std::borrow::ToOwned::to_owned);
     let last_full = repo.last_full_hunt_at;
     let rehunt_interval_ms = cfg.hunt_rehunt_days * 86_400_000;
-    let rehunt_due = last_full.is_some_and(|lf| (now_ms() - lf) > rehunt_interval_ms);
+    // Both of the decisions below answer "should this work START", and
+    // on a resume that question was settled in an earlier cycle. Firing
+    // the periodic full re-hunt here would re-scope work already in
+    // flight, and the no-new-commits skip would abandon a live session.
+    let rehunt_due =
+        resume.is_none() && last_full.is_some_and(|lf| (now_ms() - lf) > rehunt_interval_ms);
     let mut full_rehunt_triggered = false;
     let last = if rehunt_due {
         let _ = store.clear_last_hunt_sha(rid).await;
@@ -736,7 +1041,7 @@ pub async fn run_hunt(
     } else {
         last
     };
-    if last.as_deref() == Some(&head) {
+    if resume.is_none() && last.as_deref() == Some(&head) {
         let _ = store.set_last_hunt(rid, &head).await;
         let _ = store
             .log_event(
@@ -836,6 +1141,7 @@ pub async fn run_hunt(
         false,
         &format!("hunt {rname}"),
         None,
+        resume,
     )
     .await?
     {
@@ -851,16 +1157,22 @@ pub async fn run_hunt(
             cap,
             JobState::Running,
             Some(anticipated),
+            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => return job_refused(RepoJobKind::Hunt.into(), Some(rname), None, e),
     };
+    // A resumed worker is still writing to the path its ORIGINAL prompt
+    // named, so the attempt that ingests has to look there. Using this
+    // job's own id would find nothing, advance no watermark, and put the
+    // same work back in the rotation next cycle.
+    let out_job = resume.map_or(job, |r| r.origin_job_id);
     let out_path = cfg
         .work_root
         .join("out")
-        .join(format!("job{job}.findings.json"));
+        .join(format!("job{out_job}.findings.json"));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
     let suppressions = store
@@ -872,22 +1184,32 @@ pub async fn run_hunt(
         .await
         .unwrap_or_default();
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
-    let prompt = playbooks::build_hunt_prompt(
-        &cfg.root,
-        repo,
-        &diff_range,
-        &scope_note,
-        &suppressions,
-        &known,
-        &out_path,
-        cfg.hunt_max_findings,
-        &repo_notes,
-    )?;
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => playbooks::build_hunt_prompt(
+            &cfg.root,
+            repo,
+            &diff_range,
+            &scope_note,
+            &suppressions,
+            &known,
+            &out_path,
+            cfg.hunt_max_findings,
+            &repo_notes,
+        )?,
+    };
     let model = cfg.model_for("hunt");
     let rr = backend
-        .run(&rpath, &prompt, cap, cfg.hunt_max_wall_s, JobClass::Hunt)
+        .run(
+            &rpath,
+            &prompt,
+            cap,
+            cfg.hunt_max_wall_s,
+            JobClass::Hunt,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await?;
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
 
@@ -1005,6 +1327,7 @@ pub async fn run_recheck(
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     #[derive(Debug, Clone)]
     enum RecheckOutcome {
@@ -1065,16 +1388,20 @@ pub async fn run_recheck(
         anyhow::bail!("repo missing");
     };
     let rpath = PathBuf::from(&repo.path);
-    sync_repo(
-        store,
-        &repo.url,
-        &rpath,
-        &repo.default_branch,
-        &format!("recheck #{fid}"),
-        Some(fid),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Never on a resume: see `run_hunt`. Moving the tree under a live
+    // session invalidates the transcript that describes it.
+    if resume.is_none() {
+        sync_repo(
+            store,
+            &repo.url,
+            &rpath,
+            &repo.default_branch,
+            &format!("recheck #{fid}"),
+            Some(fid),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
     let (cap, anticipated) = match budget_gate(
@@ -1086,6 +1413,7 @@ pub async fn run_recheck(
         override_mode.is_some(),
         &format!("recheck #{fid}"),
         Some(fid),
+        resume,
     )
     .await?
     {
@@ -1101,6 +1429,7 @@ pub async fn run_recheck(
             cap,
             JobState::Running,
             Some(anticipated),
+            resume.map(|r| r.predecessor_id),
         )
         .await
     {
@@ -1116,18 +1445,33 @@ pub async fn run_recheck(
     };
     let out_path = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
-    // Remove stale output from a previous crashed attempt — a leftover verdict
-    // file would be read as this attempt's result.
-    let _ = std::fs::remove_file(&out_path);
+    // Only on a cold run: the verdict file is finding-keyed, so on a
+    // resume this path is the one the continuing worker was told to
+    // write, and deleting it would discard a verdict it may already
+    // have produced before the suspension.
+    if resume.is_none() {
+        // Remove stale output from a previous crashed attempt — a
+        // leftover verdict file would be read as this attempt's result.
+        let _ = std::fs::remove_file(&out_path);
+    }
 
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
-    let prompt =
-        playbooks::build_recheck_prompt(&cfg.root, finding, &repo, &out_path, &repo_notes)?;
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => playbooks::build_recheck_prompt(&cfg.root, finding, &repo, &out_path, &repo_notes)?,
+    };
     let model = cfg.model_for("hunt");
     let rr = backend
-        .run(&rpath, &prompt, cap, cfg.hunt_max_wall_s, JobClass::Hunt)
+        .run(
+            &rpath,
+            &prompt,
+            cap,
+            cfg.hunt_max_wall_s,
+            JobClass::Hunt,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await?;
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
     let mut summary = CycleSummary {
@@ -1326,6 +1670,7 @@ async fn run_analysis_job(
     repo: &Repo,
     spec: &AnalysisSpec,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let rid = repo.id;
     let rname = &repo.name;
@@ -1344,16 +1689,20 @@ async fn run_analysis_job(
         anyhow::bail!("repo not cloned");
     }
     let db = &repo.default_branch;
-    sync_repo(
-        store,
-        &repo.url,
-        &rpath,
-        db,
-        &format!("{kind} {rname}"),
-        None,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Never on a resume: see `run_hunt`. Moving the tree under a live
+    // session invalidates the transcript that describes it.
+    if resume.is_none() {
+        sync_repo(
+            store,
+            &repo.url,
+            &rpath,
+            db,
+            &format!("{kind} {rname}"),
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
     let (cap, anticipated) = match budget_gate(
         backend,
@@ -1364,6 +1713,7 @@ async fn run_analysis_job(
         false,
         &format!("{kind} {rname}"),
         None,
+        resume,
     )
     .await?
     {
@@ -1378,16 +1728,20 @@ async fn run_analysis_job(
             cap,
             JobState::Running,
             Some(anticipated),
+            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => return job_refused(kind.into(), Some(rname), None, e),
     };
+    // The continuing worker still writes the path its original prompt
+    // named; see `run_hunt`.
+    let out_job = resume.map_or(job, |r| r.origin_job_id);
     let out_path = cfg
         .work_root
         .join("out")
-        .join(format!("job{job}.{}.json", spec.out_plural));
+        .join(format!("job{out_job}.{}.json", spec.out_plural));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
     let suppressions = store
@@ -1399,21 +1753,31 @@ async fn run_analysis_job(
         .await
         .unwrap_or_default();
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
-    let prompt = (spec.prompt_builder)(
-        &cfg.root,
-        repo,
-        spec.scope_note,
-        &suppressions,
-        &known,
-        &out_path,
-        cfg.hunt_max_findings,
-        &repo_notes,
-    )?;
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => (spec.prompt_builder)(
+            &cfg.root,
+            repo,
+            spec.scope_note,
+            &suppressions,
+            &known,
+            &out_path,
+            cfg.hunt_max_findings,
+            &repo_notes,
+        )?,
+    };
     let model = cfg.model_for("hunt");
     let rr = backend
-        .run(&rpath, &prompt, cap, cfg.hunt_max_wall_s, JobClass::Hunt)
+        .run(
+            &rpath,
+            &prompt,
+            cap,
+            cfg.hunt_max_wall_s,
+            JobClass::Hunt,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await?;
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
     let mut summary = CycleSummary {
@@ -1472,15 +1836,34 @@ pub async fn run_test_gap(
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &TEST_GAP_SPEC, backend).await
+    run_analysis_job(store, cfg, repo, &TEST_GAP_SPEC, backend, resume).await
 }
+/// Dependency scan. Renovate answers it for free when it is installed
+/// and finds something; otherwise an AI worker does.
+#[allow(
+    clippy::too_many_lines,
+    reason = "two alternative bodies for one job kind — the zero-token \
+              Renovate path and the AI fallback — and the choice between \
+              them is a single `match` on what the scan returned"
+)]
 pub async fn run_dep_update(
     store: &Store,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    // A resume continues a suspended AI worker, so the Renovate
+    // shortcut below is not an option for it: that path spends no
+    // tokens, creates no job row, and would leave the suspension
+    // uncontinued and still resumable. `run_analysis_job` repeats the
+    // clone check and the sync, so nothing is skipped by going straight
+    // there.
+    if resume.is_some() {
+        return run_analysis_job(store, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
+    }
     let rpath = std::path::PathBuf::from(&repo.path);
     if !rpath.exists() {
         let _ = store
@@ -1587,7 +1970,7 @@ pub async fn run_dep_update(
                 "dep_update {}: renovate unavailable or empty, falling back to AI",
                 repo.name
             );
-            run_analysis_job(store, cfg, repo, &DEP_UPDATE_SPEC, backend).await
+            run_analysis_job(store, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await
         }
     }
 }
@@ -1596,24 +1979,27 @@ pub async fn run_refactor(
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &REFACTOR_SPEC, backend).await
+    run_analysis_job(store, cfg, repo, &REFACTOR_SPEC, backend, resume).await
 }
 pub async fn run_modernize(
     store: &Store,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &MODERNIZATION_SPEC, backend).await
+    run_analysis_job(store, cfg, repo, &MODERNIZATION_SPEC, backend, resume).await
 }
 pub async fn run_standards(
     store: &Store,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &STANDARDS_SPEC, backend).await
+    run_analysis_job(store, cfg, repo, &STANDARDS_SPEC, backend, resume).await
 }
 
 fn extract_pr_url(text: &str) -> Option<String> {
@@ -1645,6 +2031,7 @@ pub async fn run_fix(
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let fid = finding.id;
     if finding.status != FindingStatus::Queued {
@@ -1698,87 +2085,96 @@ pub async fn run_fix(
     let worktree = cfg.work_root.join("wt").join(format!("f{fid}"));
     let _ = std::fs::create_dir_all(worktree.parent().unwrap_or(Path::new(".")));
 
-    // Clean up old worktree if exists
-    if worktree.exists() {
+    // Only a cold attempt builds the worktree. A resume is continuing a
+    // session whose every path points inside this directory: the reclaim
+    // would `worktree remove --force` the exact tree the worker believes
+    // it is sitting in, and the `add` would then hand it a clean
+    // checkout of the default branch with all of its work gone.
+    // `pick_resume` has already established that the directory is there,
+    // which is what makes skipping both steps safe.
+    if resume.is_none() {
+        // Clean up old worktree if exists
+        if worktree.exists() {
+            let rps = rpath.to_string_lossy().to_string();
+            let wts = worktree.to_string_lossy().to_string();
+            let br = branch.clone();
+            tokio::task::spawn_blocking(move || {
+                run_cmd_sync(
+                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                    30,
+                );
+                run_cmd_sync(&["git", "-C", &rps, "branch", "-D", &br], 30);
+            })
+            .await
+            .ok();
+            let _ = store
+                .log_event(
+                    "fix",
+                    &format!("#{fid}: reclaimed stale worktree from prior attempt"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+        }
+
+        // Create worktree
+        let db = repo.default_branch.clone();
         let rps = rpath.to_string_lossy().to_string();
         let wts = worktree.to_string_lossy().to_string();
         let br = branch.clone();
-        tokio::task::spawn_blocking(move || {
-            run_cmd_sync(
-                &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                30,
-            );
+        let db2 = db.clone();
+        let (rc, out) = tokio::task::spawn_blocking(move || {
+            let add = |start_point: &str| {
+                run_cmd_sync(
+                    &[
+                        "git",
+                        "-C",
+                        &rps,
+                        "worktree",
+                        "add",
+                        "-b",
+                        &br,
+                        &wts,
+                        start_point,
+                    ],
+                    30,
+                )
+            };
+            let (rc, out) = add(&format!("origin/{db2}"));
+            if rc == 0 {
+                return (rc, out);
+            }
+            let (rc, out) = add(&db2);
+            if rc == 0 {
+                return (rc, out);
+            }
+            // A prior attempt can leave the branch behind with its worktree
+            // gone: the branch is only deleted on the path where the worktree
+            // directory still exists. `worktree add -b` then fails with
+            // "a branch named ... already exists" on every later cycle, which
+            // is a retry loop no amount of waiting resolves — observed
+            // 2026-09-15, broken only by restarting the daemon. The branch
+            // belongs to this finding and its work was abandoned when the
+            // attempt failed, so reclaiming the name is safe: a finding whose
+            // branch reached a PR is `pr_open` and never re-enters `fix`.
+            run_cmd_sync(&["git", "-C", &rps, "worktree", "prune"], 30);
             run_cmd_sync(&["git", "-C", &rps, "branch", "-D", &br], 30);
+            add(&format!("origin/{db2}"))
         })
         .await
-        .ok();
-        let _ = store
-            .log_event(
-                "fix",
-                &format!("#{fid}: reclaimed stale worktree from prior attempt"),
-                None,
-                Some(fid),
-            )
-            .await;
-    }
-
-    // Create worktree
-    let db = repo.default_branch.clone();
-    let rps = rpath.to_string_lossy().to_string();
-    let wts = worktree.to_string_lossy().to_string();
-    let br = branch.clone();
-    let db2 = db.clone();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        let add = |start_point: &str| {
-            run_cmd_sync(
-                &[
-                    "git",
-                    "-C",
-                    &rps,
-                    "worktree",
-                    "add",
-                    "-b",
-                    &br,
-                    &wts,
-                    start_point,
-                ],
-                30,
-            )
-        };
-        let (rc, out) = add(&format!("origin/{db2}"));
-        if rc == 0 {
-            return (rc, out);
+        .unwrap_or((127, "spawn error".to_owned()));
+        if rc != 0 {
+            let tail = crate::util::tail(&out, 300);
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("fix #{fid}: worktree add failed: {tail}"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            anyhow::bail!("worktree add failed: {tail}");
         }
-        let (rc, out) = add(&db2);
-        if rc == 0 {
-            return (rc, out);
-        }
-        // A prior attempt can leave the branch behind with its worktree
-        // gone: the branch is only deleted on the path where the worktree
-        // directory still exists. `worktree add -b` then fails with
-        // "a branch named ... already exists" on every later cycle, which
-        // is a retry loop no amount of waiting resolves — observed
-        // 2026-09-15, broken only by restarting the daemon. The branch
-        // belongs to this finding and its work was abandoned when the
-        // attempt failed, so reclaiming the name is safe: a finding whose
-        // branch reached a PR is `pr_open` and never re-enters `fix`.
-        run_cmd_sync(&["git", "-C", &rps, "worktree", "prune"], 30);
-        run_cmd_sync(&["git", "-C", &rps, "branch", "-D", &br], 30);
-        add(&format!("origin/{db2}"))
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
-    if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("fix #{fid}: worktree add failed: {tail}"),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("worktree add failed: {tail}");
     }
 
     let drop_worktree = |delete_branch: bool| {
@@ -1806,12 +2202,18 @@ pub async fn run_fix(
         override_mode.is_some(),
         &format!("fix #{fid}"),
         Some(fid),
+        resume,
     )
     .await?
     {
         BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => {
-            let _ = drop_worktree(true).await;
+            // Never on a resume: the worktree IS the suspended attempt's
+            // state, and a denial is "not now", not "never". Dropping it
+            // would turn a postponed continuation into a discarded one.
+            if resume.is_none() {
+                let _ = drop_worktree(true).await;
+            }
             return Ok(*d);
         }
     };
@@ -1824,12 +2226,15 @@ pub async fn run_fix(
             cap,
             JobState::Running,
             Some(anticipated),
+            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => {
-            let _ = drop_worktree(true).await;
+            if resume.is_none() {
+                let _ = drop_worktree(true).await;
+            }
             return job_refused(FindingJobKind::Fix.into(), Some(&repo.name), Some(fid), e);
         }
     };
@@ -1867,9 +2272,24 @@ pub async fn run_fix(
             anyhow::bail!("{e}");
         }
     };
+    // The session already holds the playbook, the finding and the branch
+    // name; the builders above still run because their failure is a real
+    // configuration fault worth surfacing on either path.
+    let prompt = if resume.is_some() {
+        RESUME_PROMPT.to_owned()
+    } else {
+        prompt
+    };
     let model = cfg.model_for("fix");
     let rr = match backend
-        .run(&worktree, &prompt, cap, cfg.fix_max_wall_s, JobClass::Fix)
+        .run(
+            &worktree,
+            &prompt,
+            cap,
+            cfg.fix_max_wall_s,
+            JobClass::Fix,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await
     {
         Ok(r) => r,
@@ -1880,7 +2300,7 @@ pub async fn run_fix(
             anyhow::bail!("{e}");
         }
     };
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
     let mut summary = CycleSummary {
@@ -2512,6 +2932,7 @@ pub async fn run_engage(
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let fid = finding.id;
     let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
@@ -2589,96 +3010,102 @@ pub async fn run_engage(
     let rpath = PathBuf::from(&repo.path);
     let worktree = cfg.work_root.join("wt").join(format!("e{fid}"));
     let _ = std::fs::create_dir_all(worktree.parent().unwrap_or(Path::new(".")));
-    if worktree.exists() {
+    // Only a cold attempt builds the worktree. A resume continues a
+    // session that believes it is inside this directory, so reclaiming
+    // it would delete exactly the tree the worker is working in.
+    // `pick_resume` has already established the directory is there.
+    if resume.is_none() {
+        if worktree.exists() {
+            let rps = rpath.to_string_lossy().to_string();
+            let wts = worktree.to_string_lossy().to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                run_cmd_sync(
+                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                    30,
+                );
+            })
+            .await;
+            let _ = store
+                .log_event(
+                    "engage",
+                    &format!("#{fid}: reclaimed stale worktree from prior attempt"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+        }
+
+        // Fetch PR branch, create worktree
+        let rps = rpath.to_string_lossy().to_string();
+        let hr = head_ref.clone();
+        let (rc, out) = tokio::task::spawn_blocking(move || {
+            run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &hr], 600)
+        })
+        .await
+        .unwrap_or((127, "spawn error".to_owned()));
+        if rc != 0 {
+            let tail = crate::util::tail(&out, 300);
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("engage #{fid}: fetch {head_ref} failed: {tail}"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            anyhow::bail!("fetch failed: {tail}");
+        }
         let rps = rpath.to_string_lossy().to_string();
         let wts = worktree.to_string_lossy().to_string();
+        let hr = head_ref.clone();
+        let (rc, out) = tokio::task::spawn_blocking(move || {
+            run_cmd_sync(
+                &[
+                    "git",
+                    "-C",
+                    &rps,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    &wts,
+                    &format!("origin/{hr}"),
+                ],
+                30,
+            )
+        })
+        .await
+        .unwrap_or((127, "spawn error".to_owned()));
+        if rc != 0 {
+            let tail = crate::util::tail(&out, 300);
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("engage #{fid}: worktree add failed: {tail}"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            anyhow::bail!("worktree add failed: {tail}");
+        }
+        // Checkout branch
+        let wts = worktree.to_string_lossy().to_string();
+        let hr = head_ref.clone();
         let _ = tokio::task::spawn_blocking(move || {
             run_cmd_sync(
-                &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                &[
+                    "git",
+                    "-C",
+                    &wts,
+                    "checkout",
+                    "-B",
+                    &hr,
+                    &format!("origin/{hr}"),
+                ],
                 30,
-            );
+            )
         })
         .await;
-        let _ = store
-            .log_event(
-                "engage",
-                &format!("#{fid}: reclaimed stale worktree from prior attempt"),
-                None,
-                Some(fid),
-            )
-            .await;
     }
-
-    // Fetch PR branch, create worktree
-    let rps = rpath.to_string_lossy().to_string();
-    let hr = head_ref.clone();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &hr], 600)
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
-    if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("engage #{fid}: fetch {head_ref} failed: {tail}"),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("fetch failed: {tail}");
-    }
-    let rps = rpath.to_string_lossy().to_string();
-    let wts = worktree.to_string_lossy().to_string();
-    let hr = head_ref.clone();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(
-            &[
-                "git",
-                "-C",
-                &rps,
-                "worktree",
-                "add",
-                "--detach",
-                &wts,
-                &format!("origin/{hr}"),
-            ],
-            30,
-        )
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
-    if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("engage #{fid}: worktree add failed: {tail}"),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("worktree add failed: {tail}");
-    }
-    // Checkout branch
-    let wts = worktree.to_string_lossy().to_string();
-    let hr = head_ref.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(
-            &[
-                "git",
-                "-C",
-                &wts,
-                "checkout",
-                "-B",
-                &hr,
-                &format!("origin/{hr}"),
-            ],
-            30,
-        )
-    })
-    .await;
 
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
     let (cap, anticipated) = match budget_gate(
@@ -2690,20 +3117,25 @@ pub async fn run_engage(
         override_mode.is_some(),
         &format!("engage #{fid}"),
         Some(fid),
+        resume,
     )
     .await?
     {
         BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => {
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
+            // Never on a resume: the worktree IS the suspended
+            // attempt's state, and a denial is "not now", not "never".
+            if resume.is_none() {
+                let rps = rpath.to_string_lossy().to_string();
+                let wts = worktree.to_string_lossy().to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    run_cmd_sync(
+                        &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                        30,
+                    );
+                })
+                .await;
+            }
             return Ok(*d);
         }
     };
@@ -2720,15 +3152,18 @@ pub async fn run_engage(
                     Some(fid),
                 )
                 .await;
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
+            // See the denial arm above: never discard a resume's tree.
+            if resume.is_none() {
+                let rps = rpath.to_string_lossy().to_string();
+                let wts = worktree.to_string_lossy().to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    run_cmd_sync(
+                        &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                        30,
+                    );
+                })
+                .await;
+            }
             anyhow::bail!("PR/MR view failed");
         }
     };
@@ -2741,20 +3176,24 @@ pub async fn run_engage(
             cap,
             JobState::Running,
             Some(anticipated),
+            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => {
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
+            // See the denial arm above: never discard a resume's tree.
+            if resume.is_none() {
+                let rps = rpath.to_string_lossy().to_string();
+                let wts = worktree.to_string_lossy().to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    run_cmd_sync(
+                        &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                        30,
+                    );
+                })
+                .await;
+            }
             return job_refused(
                 FindingJobKind::Engage.into(),
                 Some(&repo.name),
@@ -2765,21 +3204,31 @@ pub async fn run_engage(
     };
 
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
-    let prompt = playbooks::build_engage_prompt(
-        &cfg.root,
-        finding,
-        &worktree,
-        &head_ref,
-        &repo,
-        &pr,
-        &ps,
-        &repo_notes,
-    )?;
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => playbooks::build_engage_prompt(
+            &cfg.root,
+            finding,
+            &worktree,
+            &head_ref,
+            &repo,
+            &pr,
+            &ps,
+            &repo_notes,
+        )?,
+    };
     let model = cfg.model_for("fix");
     let rr = backend
-        .run(&worktree, &prompt, cap, cfg.fix_max_wall_s, JobClass::Fix)
+        .run(
+            &worktree,
+            &prompt,
+            cap,
+            cfg.fix_max_wall_s,
+            JobClass::Fix,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await?;
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
     let mut summary = CycleSummary {
@@ -3037,6 +3486,7 @@ pub async fn run_harvest(
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let fid = finding.id;
     let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
@@ -3090,77 +3540,83 @@ pub async fn run_harvest(
     let rpath = PathBuf::from(&repo.path);
     let worktree = cfg.work_root.join("wt").join(format!("h{fid}"));
     let _ = std::fs::create_dir_all(worktree.parent().unwrap_or(Path::new(".")));
-    if worktree.exists() {
+    // Only a cold attempt builds the worktree. A resume continues a
+    // session that believes it is inside this directory, so reclaiming
+    // it would delete exactly the tree the worker is working in.
+    // `pick_resume` has already established the directory is there.
+    if resume.is_none() {
+        if worktree.exists() {
+            let rps = rpath.to_string_lossy().to_string();
+            let wts = worktree.to_string_lossy().to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                run_cmd_sync(
+                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                    30,
+                );
+            })
+            .await;
+            let _ = store
+                .log_event(
+                    "harvest",
+                    &format!("#{fid}: reclaimed stale worktree from prior attempt"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+        }
+
+        let db = repo.default_branch.clone();
+        let rps = rpath.to_string_lossy().to_string();
+        let db2 = db.clone();
+        let (rc, out) = tokio::task::spawn_blocking(move || {
+            run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &db2], 600)
+        })
+        .await
+        .unwrap_or((127, "spawn error".to_owned()));
+        if rc != 0 {
+            let tail = crate::util::tail(&out, 300);
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("harvest #{fid}: fetch {db} failed: {tail}"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            anyhow::bail!("fetch failed: {tail}");
+        }
         let rps = rpath.to_string_lossy().to_string();
         let wts = worktree.to_string_lossy().to_string();
-        let _ = tokio::task::spawn_blocking(move || {
+        let db2 = db.clone();
+        let (rc, out) = tokio::task::spawn_blocking(move || {
             run_cmd_sync(
-                &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                &[
+                    "git",
+                    "-C",
+                    &rps,
+                    "worktree",
+                    "add",
+                    "--detach",
+                    &wts,
+                    &format!("origin/{db2}"),
+                ],
                 30,
-            );
+            )
         })
-        .await;
-        let _ = store
-            .log_event(
-                "harvest",
-                &format!("#{fid}: reclaimed stale worktree from prior attempt"),
-                None,
-                Some(fid),
-            )
-            .await;
-    }
-
-    let db = repo.default_branch.clone();
-    let rps = rpath.to_string_lossy().to_string();
-    let db2 = db.clone();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &db2], 600)
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
-    if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("harvest #{fid}: fetch {db} failed: {tail}"),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("fetch failed: {tail}");
-    }
-    let rps = rpath.to_string_lossy().to_string();
-    let wts = worktree.to_string_lossy().to_string();
-    let db2 = db.clone();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(
-            &[
-                "git",
-                "-C",
-                &rps,
-                "worktree",
-                "add",
-                "--detach",
-                &wts,
-                &format!("origin/{db2}"),
-            ],
-            30,
-        )
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
-    if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("harvest #{fid}: worktree add failed: {tail}"),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("worktree add failed: {tail}");
+        .await
+        .unwrap_or((127, "spawn error".to_owned()));
+        if rc != 0 {
+            let tail = crate::util::tail(&out, 300);
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("harvest #{fid}: worktree add failed: {tail}"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            anyhow::bail!("worktree add failed: {tail}");
+        }
     }
 
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
@@ -3173,20 +3629,25 @@ pub async fn run_harvest(
         override_mode.is_some(),
         &format!("harvest #{fid}"),
         Some(fid),
+        resume,
     )
     .await?
     {
         BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => {
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
+            // Never on a resume: the worktree IS the suspended
+            // attempt's state, and a denial is "not now", not "never".
+            if resume.is_none() {
+                let rps = rpath.to_string_lossy().to_string();
+                let wts = worktree.to_string_lossy().to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    run_cmd_sync(
+                        &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                        30,
+                    );
+                })
+                .await;
+            }
             return Ok(*d);
         }
     };
@@ -3203,15 +3664,18 @@ pub async fn run_harvest(
                     Some(fid),
                 )
                 .await;
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
+            // See the denial arm above: never discard a resume's tree.
+            if resume.is_none() {
+                let rps = rpath.to_string_lossy().to_string();
+                let wts = worktree.to_string_lossy().to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    run_cmd_sync(
+                        &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                        30,
+                    );
+                })
+                .await;
+            }
             anyhow::bail!("PR/MR view failed");
         }
     };
@@ -3224,20 +3688,24 @@ pub async fn run_harvest(
             cap,
             JobState::Running,
             Some(anticipated),
+            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => {
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
+            // See the denial arm above: never discard a resume's tree.
+            if resume.is_none() {
+                let rps = rpath.to_string_lossy().to_string();
+                let wts = worktree.to_string_lossy().to_string();
+                let _ = tokio::task::spawn_blocking(move || {
+                    run_cmd_sync(
+                        &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
+                        30,
+                    );
+                })
+                .await;
+            }
             return job_refused(
                 FindingJobKind::Harvest.into(),
                 Some(&repo.name),
@@ -3247,21 +3715,31 @@ pub async fn run_harvest(
         }
     };
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
-    let prompt = playbooks::build_harvest_prompt(
-        &cfg.root,
-        finding,
-        &worktree,
-        &repo.default_branch,
-        &repo,
-        &pr,
-        pr_number,
-        &repo_notes,
-    )?;
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => playbooks::build_harvest_prompt(
+            &cfg.root,
+            finding,
+            &worktree,
+            &repo.default_branch,
+            &repo,
+            &pr,
+            pr_number,
+            &repo_notes,
+        )?,
+    };
     let model = cfg.model_for("fix");
     let rr = backend
-        .run(&worktree, &prompt, cap, cfg.fix_max_wall_s, JobClass::Fix)
+        .run(
+            &worktree,
+            &prompt,
+            cap,
+            cfg.fix_max_wall_s,
+            JobClass::Fix,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await?;
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
 
@@ -3414,10 +3892,10 @@ async fn run_cycle_inner(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("finding {finding_id} not found"))?;
             match kind {
-                FindingJobKind::Engage => run_engage(store, cfg, &finding, backend).await?,
-                FindingJobKind::Harvest => run_harvest(store, cfg, &finding, backend).await?,
-                FindingJobKind::Recheck => run_recheck(store, cfg, &finding, backend).await?,
-                FindingJobKind::Fix => run_fix(store, cfg, &finding, backend).await?,
+                FindingJobKind::Engage => run_engage(store, cfg, &finding, backend, None).await?,
+                FindingJobKind::Harvest => run_harvest(store, cfg, &finding, backend, None).await?,
+                FindingJobKind::Recheck => run_recheck(store, cfg, &finding, backend, None).await?,
+                FindingJobKind::Fix => run_fix(store, cfg, &finding, backend, None).await?,
             }
         }
         Candidate::Repo { kind, repo_id, .. } => {
@@ -3426,12 +3904,90 @@ async fn run_cycle_inner(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
             match kind {
-                RepoJobKind::Hunt => run_hunt(store, cfg, &repo, backend).await?,
-                RepoJobKind::TestGap => run_test_gap(store, cfg, &repo, backend).await?,
-                RepoJobKind::DepUpdate => run_dep_update(store, cfg, &repo, backend).await?,
-                RepoJobKind::Refactor => run_refactor(store, cfg, &repo, backend).await?,
-                RepoJobKind::Modernization => run_modernize(store, cfg, &repo, backend).await?,
-                RepoJobKind::Standards => run_standards(store, cfg, &repo, backend).await?,
+                RepoJobKind::Hunt => run_hunt(store, cfg, &repo, backend, None).await?,
+                RepoJobKind::TestGap => run_test_gap(store, cfg, &repo, backend, None).await?,
+                RepoJobKind::DepUpdate => run_dep_update(store, cfg, &repo, backend, None).await?,
+                RepoJobKind::Refactor => run_refactor(store, cfg, &repo, backend, None).await?,
+                RepoJobKind::Modernization => {
+                    run_modernize(store, cfg, &repo, backend, None).await?
+                }
+                RepoJobKind::Standards => run_standards(store, cfg, &repo, backend, None).await?,
+            }
+        }
+        // A resume runs through the executor of the kind that was
+        // suspended — so ingest, watermarks and PR handling are that
+        // kind's own, unchanged. Logged here rather than in `pick_next`,
+        // which the summary endpoint also calls on every poll.
+        Candidate::Resume { plan, .. } => {
+            let _ = store
+                .log_event(
+                    "resume",
+                    &format!(
+                        "resume {} {}: job {} -> reserving {} tok \
+                         (ctx {} + max({} - {}, {MIN_PROGRESS_TOKENS}))",
+                        plan.kind,
+                        plan.repo,
+                        plan.predecessor_id,
+                        plan.anticipated,
+                        plan.ctx,
+                        plan.typical,
+                        plan.chain_spent
+                    ),
+                    Some(plan.predecessor_id),
+                    plan.finding_id,
+                )
+                .await;
+            let resume = Some(plan);
+            match plan.kind {
+                JobKind::Repo(kind) => {
+                    let repo = store
+                        .get_repo_by_id(plan.repo_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("repo {} not found", plan.repo_id))?;
+                    match kind {
+                        RepoJobKind::Hunt => run_hunt(store, cfg, &repo, backend, resume).await?,
+                        RepoJobKind::TestGap => {
+                            run_test_gap(store, cfg, &repo, backend, resume).await?
+                        }
+                        RepoJobKind::DepUpdate => {
+                            run_dep_update(store, cfg, &repo, backend, resume).await?
+                        }
+                        RepoJobKind::Refactor => {
+                            run_refactor(store, cfg, &repo, backend, resume).await?
+                        }
+                        RepoJobKind::Modernization => {
+                            run_modernize(store, cfg, &repo, backend, resume).await?
+                        }
+                        RepoJobKind::Standards => {
+                            run_standards(store, cfg, &repo, backend, resume).await?
+                        }
+                    }
+                }
+                JobKind::Finding(kind) => {
+                    // A finding-kind job always recorded its target, so a
+                    // row without one is corrupt rather than merely odd.
+                    let fid = plan
+                        .finding_id
+                        .ok_or_else(|| anyhow::anyhow!("resume of a {kind} job with no finding"))?;
+                    let finding = store
+                        .get_finding(fid)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("finding {fid} not found"))?;
+                    match kind {
+                        FindingJobKind::Engage => {
+                            run_engage(store, cfg, &finding, backend, resume).await?
+                        }
+                        FindingJobKind::Harvest => {
+                            run_harvest(store, cfg, &finding, backend, resume).await?
+                        }
+                        FindingJobKind::Recheck => {
+                            run_recheck(store, cfg, &finding, backend, resume).await?
+                        }
+                        FindingJobKind::Fix => {
+                            run_fix(store, cfg, &finding, backend, resume).await?
+                        }
+                    }
+                }
             }
         }
     };

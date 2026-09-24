@@ -1324,3 +1324,164 @@ class TestResponseShapesMatchRust:
         assert all("estimated_tokens" not in j for j in store.list_jobs())
         assert all("estimated_tokens" not in j for j in store.jobs_by_finding(fid))
         assert "estimated_tokens" not in (store.current_job() or {})
+
+    def test_resumed_from_is_not_in_the_jobs_shape(self, store: Store) -> None:
+        rid = store.add_repo(
+            "w", "https://github.com/a/w.git", store.cfg.work_root / "repos", "main", "github"
+        )
+        fid, _ = store.upsert_finding(rid, _make_finding())
+        first = store.create_job("fix", rid, finding_id=fid, state="suspended")
+        second = store.create_job("fix", rid, finding_id=fid, state="running", resumed_from=first)
+
+        # The column is written -- this is not passing because nothing set it.
+        row = store.db.execute("SELECT resumed_from FROM jobs WHERE id = ?", (second,)).fetchone()
+        assert row["resumed_from"] == first
+
+        assert all("resumed_from" not in j for j in store.list_jobs())
+        assert all("resumed_from" not in j for j in store.jobs_by_finding(fid))
+        assert "resumed_from" not in (store.current_job() or {})
+        assert all("resumed_from" not in j for j in store.list_resumable_jobs())
+
+
+def _suspend(store: Store, job_id: int, session_file: str | None) -> None:
+    """Leave a job in the state a token-cap kill produces."""
+    store.update_job(
+        job_id,
+        state="suspended",
+        killed_reason="cap",
+        session_file=session_file,
+        finished_at=now_ms(),
+    )
+
+
+class TestResumableJobs:
+    """The suspended jobs a later cycle could actually pick up again."""
+
+    def test_only_suspended_jobs_are_offered_newest_first(self, store: Store) -> None:
+        """A wallclock kill and a completed job sit in the same table and
+        both leave a session file behind, so only `state` keeps them out.
+        Resuming a wallclock kill would repeat the runaway that caused it.
+
+        Newest first: a suspended transcript loses value as its repo moves
+        on, so the freshest one redoes the least work.
+        """
+        rid = store.add_repo("r", "https://r", "/r")
+        older = store.create_job("hunt", rid)
+        newer = store.create_job("hunt", rid)
+        killed = store.create_job("hunt", rid)
+        done = store.create_job("hunt", rid)
+        _suspend(store, older, "/s/older/session.jsonl")
+        _suspend(store, newer, "/s/newer/session.jsonl")
+        store.update_job(killed, state="killed", session_file="/s/killed/session.jsonl")
+        store.update_job(done, state="done", session_file="/s/done/session.jsonl")
+
+        assert [j["id"] for j in store.list_resumable_jobs()] == [newer, older]
+
+    def test_a_soft_deleted_repos_suspension_is_not_offered(self, store: Store) -> None:
+        """The clone behind it is being reaped and create_job refuses that
+        repo outright, so offering it would hand the scheduler a pick it
+        cannot act on.
+
+        The flag is set by the real soft_delete_repo, so the row is in
+        exactly the shape the daemon produces. The job is written
+        afterwards because both halves of the write path refuse this
+        pairing -- which is the point: this filter is the read-side half
+        of a guarantee create_job enforces on the write side, and it is
+        what keeps the candidate list agreeing with it when a delete lands
+        between the scheduler reading the list and acting on it.
+        """
+        live = store.add_repo("live", "https://live", "/live")
+        doomed = store.add_repo("doomed", "https://doomed", "/doomed")
+        kept = store.create_job("hunt", live)
+        _suspend(store, kept, "/s/kept/session.jsonl")
+        store.soft_delete_repo(doomed)
+        store.db.execute(
+            "INSERT INTO jobs (kind, repo_id, state, session_file, started_at, finished_at)"
+            " VALUES ('hunt', ?, 'suspended', '/s/orphan/session.jsonl', 1, 2)",
+            (doomed,),
+        )
+        store.db.commit()
+
+        assert [j["id"] for j in store.list_resumable_jobs()] == [kept]
+
+    def test_a_suspension_with_no_session_file_is_not_offered(self, store: Store) -> None:
+        """Resuming means handing omp one exact session path. A suspended
+        job with no path has nothing to continue, and a resume that falls
+        back to "the newest session for this cwd" is the behaviour that
+        once re-cached an unrelated 290-call transcript for 508,709 tokens
+        on a single call.
+        """
+        rid = store.add_repo("r", "https://r", "/r")
+        resumable = store.create_job("hunt", rid)
+        pathless = store.create_job("hunt", rid)
+        _suspend(store, resumable, "/s/resumable/session.jsonl")
+        _suspend(store, pathless, None)
+
+        assert [j["id"] for j in store.list_resumable_jobs()] == [resumable]
+
+
+class TestResumeChainTokens:
+    """What one piece of work has cost across every attempt at it."""
+
+    @staticmethod
+    def _chain(store: Store, repo_id: int, costs: list[int]) -> list[int]:
+        ids: list[int] = []
+        previous: int | None = None
+        for cost in costs:
+            jid = store.create_job("hunt", repo_id, state="suspended", resumed_from=previous)
+            store.update_job(jid, tokens_new=cost)
+            ids.append(jid)
+            previous = jid
+        return ids
+
+    def test_every_attempt_counts_from_any_link(self, store: Store) -> None:
+        """The scheduler holds the newest link, a detail view would hold
+        whichever row it rendered, so the walk has to run both ways."""
+        rid = store.add_repo("r", "https://r", "/r")
+        chain = self._chain(store, rid, [120_000, 90_000, 30_000])
+
+        for link in chain:
+            assert store.resume_chain_tokens(link) == 240_000, f"asked from job {link}"
+
+        # Unrelated work is not swept in: the walk follows the link, not the repo.
+        loner = store.create_job("hunt", rid)
+        store.update_job(loner, tokens_new=7_000)
+        assert store.resume_chain_tokens(loner) == 7_000
+
+    def test_a_cyclic_link_still_terminates(self, store: Store) -> None:
+        """The write path cannot produce a cycle -- resumed_from is set
+        once at INSERT, naming a row that already exists, and update_job
+        refuses the column -- so the cycle is written here the only way
+        one can arise in the wild: by hand, as a repaired or partially
+        restored database would carry it.
+
+        Bounded in work on purpose. "Terminates" is not observable from a
+        query that never returns, and without the depth cap this one does
+        not return: UNION de-duplicates, but each revisit of a node
+        arrives carrying a larger depth and is therefore a new row. The
+        capped walk over three rows takes nine of these callbacks, i.e.
+        about nine thousand VM instructions, against a budget of a
+        million -- far too wide a gap to flake.
+        """
+        rid = store.add_repo("r", "https://r", "/r")
+        chain = self._chain(store, rid, [120_000, 90_000, 30_000])
+        with pytest.raises(ValueError, match="invalid job fields"):
+            store.update_job(chain[0], resumed_from=chain[2])
+        store.db.execute("UPDATE jobs SET resumed_from = ? WHERE id = ?", (chain[2], chain[0]))
+        store.db.commit()
+
+        budget = 1_000
+        spent = 0
+
+        def over_budget() -> int:
+            nonlocal spent
+            spent += 1
+            return int(spent > budget)
+
+        store.db.set_progress_handler(over_budget, 1_000)
+        try:
+            total = store.resume_chain_tokens(chain[0])
+        finally:
+            store.db.set_progress_handler(None, 0)
+
+        assert total == 240_000, "every attempt counted exactly once"

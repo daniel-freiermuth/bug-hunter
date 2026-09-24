@@ -280,13 +280,20 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 picked = None
             if picked is not None:
-                kind, target = picked
+                kind, target, resume = picked
                 is_finding = kind in ("engage", "harvest", "recheck", "fix")
                 override = target.get("budget_override") if is_finding else None
                 repo_id = target["repo_id"] if is_finding else target["id"]
-                outlook = self.backend.decide(
-                    anticipated_tokens=scheduler.anticipated_tokens(store, self.cfg, repo_id, kind)
+                # A resume carries its own reservation (context at
+                # suspension plus what is left of a typical job), so
+                # re-deriving the cold per-kind estimate here would show a
+                # budget decision the scheduler is not going to make.
+                anticipated = (
+                    resume.anticipated
+                    if resume is not None
+                    else scheduler.anticipated_tokens(store, self.cfg, repo_id, kind)
                 )
+                outlook = self.backend.decide(anticipated_tokens=anticipated)
                 verdict = outlook.prioritized if override else outlook.normal
                 match verdict:
                     case Denied(reason=reason, retry_at=retry_at):

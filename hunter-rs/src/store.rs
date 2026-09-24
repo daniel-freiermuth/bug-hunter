@@ -34,6 +34,14 @@ pub enum StoreWriteError {
     Db(#[from] sqlx::Error),
 }
 
+/// How far [`Store::resume_chain_tokens`] will walk a resume chain.
+///
+/// Purely a termination guarantee for a graph that should not need one:
+/// far beyond any chain a give-up ceiling would let form, so it never
+/// truncates a real answer, and small enough that a cyclic row from a
+/// hand-repaired database costs a bounded query instead of a hung one.
+const RESUME_CHAIN_MAX_DEPTH: i64 = 64;
+
 /// Allowed /api/repo update fields, post-coercion (WRITES contract §6).
 #[derive(Debug, Default)]
 pub struct RepoUpdate {
@@ -1091,6 +1099,187 @@ impl Store {
         .await
     }
 
+    /// Suspended jobs that could actually be picked up again, newest first.
+    ///
+    /// Newest first because a suspended transcript loses value as its
+    /// repo moves on: the freshest one was reasoning about a tree closest
+    /// to today's HEAD, so continuing it redoes the least. That also
+    /// matches every other job read here, so the scheduler's candidate
+    /// list runs in the same direction as the UI's job feed. The
+    /// starvation this ordering permits is the intended outcome, not a
+    /// defect — a suspension nothing has come back to for many cycles is
+    /// stale work, and the scheduler's give-up ceiling ends it.
+    ///
+    /// Three filters make "could be picked up again" true rather than
+    /// merely claimed:
+    /// - the repo must still be live, since a soft-deleted repo's clone
+    ///   is being reaped and `create_job` would refuse the successor;
+    /// - `session_file` must be present, because resume means handing
+    ///   omp that exact session path. A suspended job with no path has
+    ///   nothing to continue and would silently become a fresh run —
+    ///   the implicit-resume behaviour that once re-cached an unrelated
+    ///   290-call transcript for 508,709 tokens on a single call;
+    /// - nothing may already continue it. A successor row IS the record
+    ///   that this suspension has been picked up, which is why no
+    ///   `resumed` state exists: the link carries the fact, and a state
+    ///   flag beside it would be a second copy of the same truth, free
+    ///   to disagree. Without this clause one transcript would be
+    ///   resumed once per cycle forever, every attempt re-caching the
+    ///   same context — the loop this feature exists to end, rebuilt
+    ///   one level up.
+    pub async fn list_resumable_jobs(&self) -> sqlx::Result<Vec<Job>> {
+        let suspended = JobState::Suspended;
+        sqlx::query_as!(
+            Job,
+            r#"
+            SELECT j.id AS "id!", j.kind AS "kind!: JobKind", j.repo_id AS "repo_id!",
+                   j.finding_id, j.state AS "state!: JobState", j.pid, j.session_file,
+                   j.cap_tokens, j.tokens_new, j.calls, j.exit_code,
+                   j.killed_reason, j.notes, j.model, j.usage_delta,
+                   j.started_at, j.finished_at, r.name AS "repo_name!",
+                   NULL AS "finding_summary?: String",
+                   NULL AS "finding_fingerprint?: String"
+            FROM jobs j
+            JOIN repos r ON r.id = j.repo_id
+            WHERE j.state = ?1
+              AND r.deleted_at IS NULL
+              AND j.session_file IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
+            ORDER BY j.id DESC
+            "#,
+            suspended
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Every token the chain containing `job_id` has spent, across all
+    /// its attempts.
+    ///
+    /// A resumed attempt is its own row, so `tokens_new` alone answers
+    /// "what did this attempt cost" and never "what has this work cost".
+    /// The second question is the one a give-up ceiling has to ask, so it
+    /// is answered by walking the link.
+    ///
+    /// Walks BOTH ways — to predecessors via `resumed_from` and to
+    /// successors via the rows that name this one — because `job_id` can
+    /// be any link, not just the newest.
+    ///
+    /// The depth cap is the termination guarantee. `UNION` de-duplicates
+    /// against rows already produced, but cannot stop a cycle once
+    /// `depth` is carried: each revisit arrives with a larger depth and
+    /// is therefore a genuinely new row, so the recursion would run
+    /// forever. The write path cannot produce a cycle — `resumed_from`
+    /// is set once at INSERT to an id that already exists, so ids
+    /// strictly decrease along the link — but this read must not hang on
+    /// a database that did not come from that write path (a hand repair,
+    /// a partial restore). [`RESUME_CHAIN_MAX_DEPTH`] sits far above any
+    /// chain length worth resuming, so the cap costs a healthy chain
+    /// nothing.
+    ///
+    /// Carrying `depth` is what forces the final sum to go through `id
+    /// IN (SELECT ...)` rather than a join: a node reachable by several
+    /// paths appears once per depth, and joining on it would count that
+    /// job's tokens once per appearance.
+    pub async fn resume_chain_tokens(&self, job_id: i64) -> sqlx::Result<i64> {
+        sqlx::query_scalar!(
+            r#"
+            WITH RECURSIVE chain(id, resumed_from, depth) AS (
+                SELECT id, resumed_from, 0 FROM jobs WHERE id = ?1
+                UNION
+                SELECT j.id, j.resumed_from, c.depth + 1
+                FROM jobs j, chain c
+                WHERE c.depth < ?2
+                  AND (j.id = c.resumed_from OR j.resumed_from = c.id)
+            )
+            SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64"
+            FROM jobs WHERE id IN (SELECT id FROM chain)
+            "#,
+            job_id,
+            RESUME_CHAIN_MAX_DEPTH
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// The first attempt in `job_id`'s chain — the one that ran from a
+    /// real playbook prompt.
+    ///
+    /// A resumed worker is continuing a transcript, and that transcript
+    /// names an output file: the hunt playbook bakes
+    /// `<work_root>/out/job<N>.findings.json` into the prompt, the
+    /// analysis playbooks bake `job<N>.<plural>.json`. `N` is the id of
+    /// the job whose prompt was written, so every later attempt in the
+    /// chain writes to the FIRST attempt's path. An executor that
+    /// ingested its own id's path would find nothing, advance no
+    /// watermark, and re-select the same work next cycle — the loop
+    /// resume exists to end, rebuilt one level up.
+    ///
+    /// One hop back is not enough: a resume of a resume still writes the
+    /// original's path. So this walks `resumed_from` to the top.
+    ///
+    /// `MIN(id)` is exact rather than a heuristic: `resumed_from` is
+    /// written once at INSERT naming a row that already exists, so ids
+    /// strictly decrease along the link and the ancestor walk's smallest
+    /// id is its root. Depth-capped for the same reason
+    /// [`Self::resume_chain_tokens`] is — a hand-repaired database can
+    /// carry a cycle the write path cannot produce. Falls back to
+    /// `job_id` when the row is gone (retention prunes oldest-first, and
+    /// `ON DELETE SET NULL` means a pruned root leaves the successor
+    /// looking like a root, which is the honest answer).
+    pub async fn resume_origin_job(&self, job_id: i64) -> sqlx::Result<i64> {
+        sqlx::query_scalar!(
+            r#"
+            WITH RECURSIVE ancestry(id, resumed_from, depth) AS (
+                SELECT id, resumed_from, 0 FROM jobs WHERE id = ?1
+                UNION
+                SELECT j.id, j.resumed_from, a.depth + 1
+                FROM jobs j, ancestry a
+                WHERE a.depth < ?2
+                  AND j.id = a.resumed_from
+            )
+            SELECT COALESCE(MIN(id), ?1) AS "origin!: i64" FROM ancestry
+            "#,
+            job_id,
+            RESUME_CHAIN_MAX_DEPTH
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
+    /// Take a suspended attempt out of the resumable pool for good.
+    ///
+    /// The two ways a suspension ends without being continued: the
+    /// scheduler's give-up ceiling retires it `failed` with
+    /// `killed_reason = "give-up"`, and a resume that found the
+    /// transcript gone retires it `killed`. Both are terminal states, so
+    /// [`Self::list_resumable_jobs`] stops offering the row.
+    ///
+    /// `killed_reason` is `Option` so the second case can leave the
+    /// original reason alone: that attempt really was killed for `cap`,
+    /// and overwriting that with the successor's problem would lose the
+    /// only record of why the work stopped. `notes` carries the new fact
+    /// instead.
+    pub async fn retire_suspended_job(
+        &self,
+        job_id: i64,
+        state: JobState,
+        killed_reason: Option<&str>,
+        notes: &str,
+    ) -> sqlx::Result<()> {
+        sqlx::query!(
+            "UPDATE jobs SET state = ?1, killed_reason = COALESCE(?2, killed_reason), \
+             notes = ?3 WHERE id = ?4",
+            state,
+            killed_reason,
+            notes,
+            job_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // -- events / scheduler ----------------------------------------------------
 
     /// ORDER BY id DESC LIMIT ?.
@@ -1163,6 +1352,11 @@ impl Store {
     /// granted the job, not the job's cap. The inflight reservation is
     /// read back from that column, so a job that omits it is invisible
     /// to the budget for as long as it runs.
+    ///
+    /// `resumed_from` names the suspended attempt this job continues, or
+    /// `None` for work starting fresh. It is written here and never
+    /// updated, so a row can only ever point at an id that already
+    /// existed — which is what keeps the chain acyclic.
     pub async fn create_job(
         &self,
         kind: JobKind,
@@ -1171,12 +1365,14 @@ impl Store {
         cap_tokens: Option<i64>,
         state: JobState,
         estimated_tokens: Option<i64>,
+        resumed_from: Option<i64>,
     ) -> Result<i64, StoreWriteError> {
         let now = now_ms();
         let result = sqlx::query!(
             "INSERT INTO jobs \
-             (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens) \
-             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7 \
+             (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
+              resumed_from) \
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
              WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
             kind,
             repo_id,
@@ -1184,7 +1380,8 @@ impl Store {
             cap_tokens,
             state,
             now,
-            estimated_tokens
+            estimated_tokens,
+            resumed_from
         )
         .execute(&self.pool)
         .await?;

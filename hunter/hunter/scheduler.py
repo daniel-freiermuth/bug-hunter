@@ -11,9 +11,16 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from .backend import Backend, Denied, Granted, JobClass
+
+# The one place the scheduler reads a worker transcript rather than going
+# through the Backend facade: the reservation for a resumed attempt needs
+# the context size at the moment of suspension, which only the ledger
+# holds. Kept as a plain read of the file format that wrote it rather than
+# widening the Backend protocol for a single number.
+from .backends.omp_scavenge.harness import ctx_at_suspension
 from .forge import forge_for
 from .ingest import ingest_findings
 from .playbooks import (
@@ -117,10 +124,132 @@ def anticipated_tokens(store: Store, cfg: Config, repo_id: int, kind: str) -> in
     return int(history[idx])
 
 
+# -- resume policy ----------------------------------------------------------
+
+
+# What a resumed attempt is still allowed to expect to need, once its
+# chain has already outspent the per-kind estimate. `z - chain_spent` is
+# the honest "what is left of a typical job's budget", but a suspended
+# attempt has usually already spent MORE than typical -- that is why it
+# ran out of headroom -- which makes the term negative and meaningless.
+# Floored here at enough budget for the worker to make real progress:
+# anything smaller buys an attempt that re-caches its context and dies
+# before doing any work, paying the whole re-cache for nothing.
+MIN_PROGRESS_TOKENS = 25_000
+
+# Multiple of the per-kind estimate at which a resume chain is abandoned
+# rather than continued. A chain that has cost three times what this kind
+# of job typically costs and still has not finished is not going to, and
+# without a ceiling this tier would continue it forever -- the exact loop
+# the feature exists to end, only now with a session file attached.
+GIVE_UP_MULTIPLE = 3
+
+# The entire prompt for a resumed attempt. The session already holds the
+# original instructions and everything the worker concluded from them;
+# re-sending the full prompt would only push that context further back
+# while paying to re-cache it.
+RESUME_PROMPT = (
+    "Continue the work you were doing in this session."
+    " You were interrupted; pick up where you left off."
+)
+
+# Ancestry hops _resume_origin will walk. Mirrors store's own chain cap
+# for the same reason: the write path cannot produce a cycle (resumed_from
+# is set once at INSERT to an id that already exists), but a hand-repaired
+# or partially restored database must not be able to hang the scheduler.
+_RESUME_ORIGIN_MAX_DEPTH = 64
+
+# Kinds whose target is a finding row rather than a repo row, and the
+# worktree each parks its worker in (see run_fix/run_engage/run_harvest).
+# recheck is the odd one out: it is finding-driven but runs in the clone.
+_FINDING_KINDS = ("engage", "harvest", "recheck", "fix")
+_WORKTREE_PREFIX = {"fix": "f", "engage": "e", "harvest": "h"}
+
+
+@dataclass(frozen=True)
+class ResumePlan:
+    """Everything an executor needs to continue a suspended attempt
+    instead of starting one cold.
+
+    Built by pick_next -- the policy lives with the selection it drives --
+    and threaded into the ordinary run_* body, so a resumed attempt
+    ingests findings, advances watermarks and ships PRs through exactly
+    the same code as a cold one.
+
+    `origin_job_id` is the job whose prompt the worker is still following
+    (see _resume_origin); `ctx`/`typical`/`chain_spent` are the three
+    measurements `anticipated` was computed from, kept so the event log
+    can show the reservation's arithmetic rather than just its result.
+    """
+
+    predecessor_id: int
+    session_file: Path
+    origin_job_id: int
+    repo_name: str
+    anticipated: int
+    ctx: int
+    typical: int
+    chain_spent: int
+
+
 def _job_state(rr: RunResult) -> str:
+    """The row state an outcome earns.
+
+    A cap kill that left a session file behind is a PAUSE, not a failure:
+    the worker ran out of window headroom with its context intact on
+    disk. Continuing it costs the context it was carrying (across 112
+    production re-cache events the re-cache / prior-context ratio had
+    median 1.00 and p10 1.00), where restarting it pays a flat ~37,000
+    token session floor -- measured as call #1 cacheWrite even in a
+    4,255-call session -- before doing any work at all. With no session
+    file there is nothing to continue, so it stays an ordinary kill.
+
+    Every other killed_reason stays 'killed' and is never resumed. That
+    is aimed squarely at wallclock: an unbounded overrun is the runaway
+    signature, and continuing the session that produced it would only
+    reproduce it with the clock reset.
+
+    'resume-unavailable' is not an outcome of the work at all -- nothing
+    was spawned (see harness._resume_unavailable) -- so the attempt is
+    recorded as failed rather than killed.
+    """
+    if rr.killed_reason == "cap" and rr.session_file:
+        return "suspended"
+    if rr.killed_reason == "resume-unavailable":
+        return "failed"
     if rr.killed_reason:
         return "killed"
     return "done" if rr.exit_code == 0 else "failed"
+
+
+def _retire_lost_predecessor(store: Store, job_id: int) -> None:
+    """A resume omp could not honour: retire the predecessor instead of
+    offering it again.
+
+    The predecessor becomes 'killed', not 'suspended': its session is
+    gone, so every later cycle would make the identical failed attempt.
+    Nothing is started cold in its place this cycle either -- omp silently
+    starts a FRESH session when a --resume path will not resolve, so
+    treating "cannot resume" as "start cold right here" would pay a full
+    session floor while believing it had continued. The work is not lost:
+    with the suspension retired, the next cycle selects it through the
+    ordinary priorities and pays the cold price knowingly.
+    """
+    row = store.db.execute(
+        "SELECT j.resumed_from, j.kind, r.name AS repo_name FROM jobs j"
+        " JOIN repos r ON r.id = j.repo_id WHERE j.id = ?",
+        (job_id,),
+    ).fetchone()
+    if row is None or row["resumed_from"] is None:
+        return
+    predecessor = int(row["resumed_from"])
+    store.update_job(predecessor, state="killed")
+    store.log_event(
+        "error",
+        f"resume {row['kind']} {row['repo_name']}: session gone,"
+        f" predecessor job {predecessor} marked killed",
+        job_id=job_id,
+    )
 
 
 def _record_job(
@@ -146,6 +275,11 @@ def _record_job(
         notes=notes,
         finished_at=now_ms(),
     )
+    if rr.killed_reason == "resume-unavailable":
+        # Handled here rather than in each executor: every kind reaches
+        # this one function, and the row just written is the only place
+        # that knows which suspension this attempt was continuing.
+        _retire_lost_predecessor(store, job_id)
     return state
 
 
@@ -181,33 +315,47 @@ def _ingest_followups(
 # -- hunt -------------------------------------------------------------------
 
 
-def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool = False) -> Row:
+def run_hunt(
+    store: Store,
+    cfg: Config,
+    repo: Row,
+    backend: Backend,
+    force: bool = False,
+    *,
+    resume: ResumePlan | None = None,
+) -> Row:
     rid: int = repo["id"]
     rname: str = repo["name"]
     rpath = Path(repo["path"])
     db: str = repo["default_branch"]
 
-    # Ensure clone + fast-forward to origin's default branch.
-    if not rpath.exists():
-        rpath.parent.mkdir(parents=True, exist_ok=True)
-        # `--` before the operands: even a URL that slipped past
-        # validation cannot be read as an option here.
-        rc, out = run_cmd(["git", "clone", "--", repo["url"], str(rpath)], timeout=600)
-        if rc != 0:
-            store.log_event("error", f"hunt {rname}: clone failed: {out[-300:]}")
-            return {"error": f"clone failed: {out[-300:]}"}
-    for cmd in (
-        ["git", "fetch", "origin"],
-        ["git", "checkout", db],
-        ["git", "pull", "--ff-only"],
-    ):
-        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
-        if rc != 0:
-            store.log_event(
-                "error",
-                f"hunt {rname}: {' '.join(cmd)} failed: {out[-300:]}",
-            )
-            return {"error": f"{' '.join(cmd)} failed: {out[-300:]}"}
+    # Ensure clone + fast-forward to origin's default branch -- skipped
+    # whole for a resume: the worker is mid-hunt over the tree its
+    # transcript describes, so fast-forwarding would move the ground under
+    # a live session and then let the watermark below claim commits nobody
+    # read. The clone is known to exist: pick_next refuses to offer a
+    # suspension whose working directory is gone.
+    if resume is None:
+        if not rpath.exists():
+            rpath.parent.mkdir(parents=True, exist_ok=True)
+            # `--` before the operands: even a URL that slipped past
+            # validation cannot be read as an option here.
+            rc, out = run_cmd(["git", "clone", "--", repo["url"], str(rpath)], timeout=600)
+            if rc != 0:
+                store.log_event("error", f"hunt {rname}: clone failed: {out[-300:]}")
+                return {"error": f"clone failed: {out[-300:]}"}
+        for cmd in (
+            ["git", "fetch", "origin"],
+            ["git", "checkout", db],
+            ["git", "pull", "--ff-only"],
+        ):
+            rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+            if rc != 0:
+                store.log_event(
+                    "error",
+                    f"hunt {rname}: {' '.join(cmd)} failed: {out[-300:]}",
+                )
+                return {"error": f"{' '.join(cmd)} failed: {out[-300:]}"}
 
     rc, head = run_cmd(["git", "-C", str(rpath), "rev-parse", "HEAD"])
     if rc != 0 or not head:
@@ -225,7 +373,11 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
     rehunt_due = last_full and (now_ms() - last_full) > rehunt_interval_ms
     full_rehunt_triggered = False
 
-    if rehunt_due and not force:
+    # Both of the next two branches are cold-attempt business and are
+    # suppressed for a resume: clearing the watermark mid-chain would
+    # re-scope a hunt that is already in flight, and "no new commits" is
+    # about whether to START work, not about work already half done.
+    if rehunt_due and not force and resume is None:
         # Clear watermark → triggers full-history hunt below
         store.db.execute(
             "UPDATE repos SET last_hunt_sha = NULL WHERE id = ?",
@@ -239,7 +391,7 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         last = None  # Force full hunt
         full_rehunt_triggered = True
 
-    if last == head and not force:
+    if last == head and not force and resume is None:
         # No new commits — update timestamp so scheduler rotates to next repo.
         store.set_last_hunt(repo["id"], head)
         store.log_event(
@@ -314,7 +466,9 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         diff_range = f"{base}..{head}"
         scope_note = f"First hunt for this repo: {scope} (base {base[:12]})."
 
-    anticipated = anticipated_tokens(store, cfg, rid, "hunt")
+    anticipated = (
+        resume.anticipated if resume is not None else anticipated_tokens(store, cfg, rid, "hunt")
+    )
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.normal
     match verdict:
@@ -325,26 +479,44 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
             pass
     try:
         job = store.create_job(
-            "hunt", rid, cap_tokens=cap, state="running", estimated_tokens=anticipated
+            "hunt",
+            rid,
+            cap_tokens=cap,
+            state="running",
+            estimated_tokens=anticipated,
+            resumed_from=resume.predecessor_id if resume is not None else None,
         )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
         return {"skipped": str(e)}
-    out_path = cfg.work_root / "out" / f"job{job}.findings.json"
+    # A resumed worker writes where the ORIGINAL prompt told it to, so the
+    # findings file to ingest belongs to the chain's first job, not to
+    # this row (see _resume_origin).
+    out_job = resume.origin_job_id if resume is not None else job
+    out_path = cfg.work_root / "out" / f"job{out_job}.findings.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    prompt = build_hunt_prompt(
-        repo,
-        diff_range,
-        scope_note,
-        store.suppressions(rid),
-        store.known_active(rid),
-        out_path,
-        cfg.hunt_max_findings,
-        store.repo_notes(rid),
+    prompt = (
+        RESUME_PROMPT
+        if resume is not None
+        else build_hunt_prompt(
+            repo,
+            diff_range,
+            scope_note,
+            store.suppressions(rid),
+            store.known_active(rid),
+            out_path,
+            cfg.hunt_max_findings,
+            store.repo_notes(rid),
+        )
     )
     model = cfg.model_for("hunt")
     rr = backend.run(
-        rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT
+        rpath,
+        prompt,
+        cap_tokens=cap,
+        max_wall_s=cfg.hunt_max_wall_s,
+        job_class=JobClass.HUNT,
+        resume_from=resume.session_file if resume is not None else None,
     )
     state = _record_job(store, job, rr, model=model)
 
@@ -358,6 +530,8 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         "head": head,
         "full_rehunt": full_rehunt_triggered,
     }
+    if resume is not None:
+        summary["resumed_from"] = resume.predecessor_id
     if out_path.exists():
         counts = ingest_findings(store, rid, out_path, job=job)
         summary["ingest"] = counts
@@ -401,7 +575,14 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
 # -- recheck ----------------------------------------------------------------
 
 
-def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
+def run_recheck(
+    store: Store,
+    cfg: Config,
+    finding: Row,
+    backend: Backend,
+    *,
+    resume: ResumePlan | None = None,
+) -> Row:
     """Re-evaluate a finding against the current codebase. Human-triggered."""
     fid: int = finding["id"]
     if finding["status"] != "rechecking":
@@ -419,36 +600,44 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     rpath = Path(repo["path"])
     db: str = repo["default_branch"]
 
-    # Ensure clone + fast-forward to latest default branch.
-    if not rpath.exists():
-        rpath.parent.mkdir(parents=True, exist_ok=True)
-        # `--` before the operands: even a URL that slipped past
-        # validation cannot be read as an option here.
-        rc, out = run_cmd(["git", "clone", "--", repo["url"], str(rpath)], timeout=600)
-        if rc != 0:
-            store.log_event(
-                "error",
-                f"recheck #{fid}: clone failed: {out[-300:]}",
-                finding_id=fid,
-            )
-            return {"error": f"clone failed: {out[-300:]}"}
-    for cmd in (
-        ["git", "fetch", "origin"],
-        ["git", "checkout", db],
-        ["git", "pull", "--ff-only"],
-    ):
-        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
-        if rc != 0:
-            store.log_event(
-                "error",
-                f"recheck #{fid}: {' '.join(cmd)} failed: {out[-300:]}",
-                finding_id=fid,
-            )
-            return {"error": f"{' '.join(cmd)} failed: {out[-300:]}"}
+    # Ensure clone + fast-forward to latest default branch. A resume skips
+    # it: the worker is already reasoning about the tree its transcript
+    # describes, and moving that tree under a live session invalidates
+    # every line number it has read.
+    if resume is None:
+        if not rpath.exists():
+            rpath.parent.mkdir(parents=True, exist_ok=True)
+            # `--` before the operands: even a URL that slipped past
+            # validation cannot be read as an option here.
+            rc, out = run_cmd(["git", "clone", "--", repo["url"], str(rpath)], timeout=600)
+            if rc != 0:
+                store.log_event(
+                    "error",
+                    f"recheck #{fid}: clone failed: {out[-300:]}",
+                    finding_id=fid,
+                )
+                return {"error": f"clone failed: {out[-300:]}"}
+        for cmd in (
+            ["git", "fetch", "origin"],
+            ["git", "checkout", db],
+            ["git", "pull", "--ff-only"],
+        ):
+            rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+            if rc != 0:
+                store.log_event(
+                    "error",
+                    f"recheck #{fid}: {' '.join(cmd)} failed: {out[-300:]}",
+                    finding_id=fid,
+                )
+                return {"error": f"{' '.join(cmd)} failed: {out[-300:]}"}
 
     # Budget gate -- recheck is investigative, like hunt.
     override = finding.get("budget_override")
-    anticipated = anticipated_tokens(store, cfg, repo["id"], "recheck")
+    anticipated = (
+        resume.anticipated
+        if resume is not None
+        else anticipated_tokens(store, cfg, repo["id"], "recheck")
+    )
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
@@ -465,18 +654,34 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
             cap_tokens=cap,
             state="running",
             estimated_tokens=anticipated,
+            resumed_from=resume.predecessor_id if resume is not None else None,
         )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
         return {"skipped": str(e)}
+    # Finding-keyed, so a resumed attempt writes the same path its own
+    # prompt named -- no chain-origin lookup needed here.
     out_path = cfg.work_root / "out" / f"recheck{fid}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    if out_path.exists():
+    if out_path.exists() and resume is None:
+        # Only a cold attempt clears the file: any verdict sitting there
+        # during a resume was written by this same chain (the cold attempt
+        # that started it deleted whatever preceded it), so it is this
+        # run's own partial output rather than a stale one.
         out_path.unlink()
-    prompt = build_recheck_prompt(finding, repo, out_path, store.repo_notes(repo["id"]))
+    prompt = (
+        RESUME_PROMPT
+        if resume is not None
+        else build_recheck_prompt(finding, repo, out_path, store.repo_notes(repo["id"]))
+    )
     model = cfg.model_for("hunt")
     rr = backend.run(
-        rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT
+        rpath,
+        prompt,
+        cap_tokens=cap,
+        max_wall_s=cfg.hunt_max_wall_s,
+        job_class=JobClass.HUNT,
+        resume_from=resume.session_file if resume is not None else None,
     )
     state = _record_job(store, job, rr, model=model)
     summary: Row = {
@@ -607,7 +812,12 @@ class _AnalysisSpec:
 
 
 def _run_analysis_job(
-    store: Store, cfg: Config, repo: Row, spec: _AnalysisSpec, backend: Backend
+    store: Store,
+    cfg: Config,
+    repo: Row,
+    spec: _AnalysisSpec,
+    backend: Backend,
+    resume: ResumePlan | None = None,
 ) -> Row:
     """Shared body for the four repo-level analysis job types: sync the repo
     to its default branch, budget-gate, run the worker, ingest output, and
@@ -623,18 +833,24 @@ def _run_analysis_job(
         store.log_event("error", f"{kind} {rname}: repo not cloned")
         return {"error": "repo not cloned"}
 
-    for cmd in (
-        ["git", "fetch", "origin"],
-        ["git", "checkout", repo["default_branch"]],
-        ["git", "pull", "--ff-only"],
-    ):
-        rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
-        if rc != 0:
-            store.log_event("error", f"{kind} {rname}: {' '.join(cmd)} failed: {out[-300:]}")
-            return {"error": f"{' '.join(cmd)} failed"}
+    # A resume does not sync: the worker is mid-scan over the tree its
+    # transcript describes, and fast-forwarding it would move that tree
+    # under a live session.
+    if resume is None:
+        for cmd in (
+            ["git", "fetch", "origin"],
+            ["git", "checkout", repo["default_branch"]],
+            ["git", "pull", "--ff-only"],
+        ):
+            rc, out = run_cmd(["git", "-C", str(rpath), *cmd[1:]], timeout=600)
+            if rc != 0:
+                store.log_event("error", f"{kind} {rname}: {' '.join(cmd)} failed: {out[-300:]}")
+                return {"error": f"{' '.join(cmd)} failed"}
 
     # Budget check -- analysis jobs share the hunt budget/model for now
-    anticipated = anticipated_tokens(store, cfg, rid, kind)
+    anticipated = (
+        resume.anticipated if resume is not None else anticipated_tokens(store, cfg, rid, kind)
+    )
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.normal
     match verdict:
@@ -645,29 +861,44 @@ def _run_analysis_job(
             pass
     try:
         job = store.create_job(
-            kind, rid, cap_tokens=cap, state="running", estimated_tokens=anticipated
+            kind,
+            rid,
+            cap_tokens=cap,
+            state="running",
+            estimated_tokens=anticipated,
+            resumed_from=resume.predecessor_id if resume is not None else None,
         )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
         return {"skipped": str(e)}
-    out_path = cfg.work_root / "out" / f"job{job}.{spec.out_plural}.json"
+    # A resumed worker writes where the ORIGINAL prompt told it to, so the
+    # file to ingest belongs to the chain's first job (see _resume_origin).
+    out_job = resume.origin_job_id if resume is not None else job
+    out_path = cfg.work_root / "out" / f"job{out_job}.{spec.out_plural}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    suppressions = store.suppressions(rid, finding_type=kind)
-    known = store.known_active(rid, finding_type=kind)
-    prompt = spec.prompt_builder(
-        repo,
-        spec.scope_note,
-        suppressions,
-        known,
-        out_path,
-        cfg.hunt_max_findings,  # reuse hunt max for now
-        store.repo_notes(rid),
+    prompt = (
+        RESUME_PROMPT
+        if resume is not None
+        else spec.prompt_builder(
+            repo,
+            spec.scope_note,
+            store.suppressions(rid, finding_type=kind),
+            store.known_active(rid, finding_type=kind),
+            out_path,
+            cfg.hunt_max_findings,  # reuse hunt max for now
+            store.repo_notes(rid),
+        )
     )
 
     model = cfg.model_for("hunt")
     rr = backend.run(
-        rpath, prompt, cap_tokens=cap, max_wall_s=cfg.hunt_max_wall_s, job_class=JobClass.HUNT
+        rpath,
+        prompt,
+        cap_tokens=cap,
+        max_wall_s=cfg.hunt_max_wall_s,
+        job_class=JobClass.HUNT,
+        resume_from=resume.session_file if resume is not None else None,
     )
     state = _record_job(store, job, rr, model=model)
 
@@ -678,6 +909,8 @@ def _run_analysis_job(
         "state": state,
         "tokens_new": rr.tokens_new,
     }
+    if resume is not None:
+        summary["resumed_from"] = resume.predecessor_id
 
     if out_path.exists():
         counts = ingest_findings(store, rid, out_path, finding_type=kind, job=job)
@@ -738,12 +971,26 @@ _MODERNIZATION_SPEC = _AnalysisSpec(
 )
 
 
-def run_test_gap(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
+def run_test_gap(
+    store: Store,
+    cfg: Config,
+    repo: Row,
+    backend: Backend,
+    *,
+    resume: ResumePlan | None = None,
+) -> Row:
     """Hunt for test coverage gaps in a repo."""
-    return _run_analysis_job(store, cfg, repo, _TEST_GAP_SPEC, backend)
+    return _run_analysis_job(store, cfg, repo, _TEST_GAP_SPEC, backend, resume)
 
 
-def run_dep_update(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
+def run_dep_update(
+    store: Store,
+    cfg: Config,
+    repo: Row,
+    backend: Backend,
+    *,
+    resume: ResumePlan | None = None,
+) -> Row:
     """Check for outdated dependencies using Renovate's local scanner.
 
     Zero AI tokens: Renovate handles ecosystem detection, registry queries,
@@ -753,7 +1000,14 @@ def run_dep_update(store: Store, cfg: Config, repo: Row, backend: Backend) -> Ro
 
     Falls back to the AI-based analysis job if Renovate fails (not installed,
     timeout, etc.).
+
+    A suspended dep_update can only have come from that AI fallback --
+    the Renovate path spawns no worker and so can never be cap-killed --
+    so a resume goes straight there rather than re-running the scanner.
     """
+    if resume is not None:
+        return _run_analysis_job(store, cfg, repo, _DEP_UPDATE_SPEC, backend, resume)
+
     from .dep_scan import scan_repo  # noqa: PLC0415
 
     rid = repo["id"]
@@ -812,17 +1066,31 @@ def run_dep_update(store: Store, cfg: Config, repo: Row, backend: Backend) -> Ro
     }
 
 
-def run_refactor(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
+def run_refactor(
+    store: Store,
+    cfg: Config,
+    repo: Row,
+    backend: Backend,
+    *,
+    resume: ResumePlan | None = None,
+) -> Row:
     """Hunt for mechanical refactoring opportunities."""
-    return _run_analysis_job(store, cfg, repo, _REFACTOR_SPEC, backend)
+    return _run_analysis_job(store, cfg, repo, _REFACTOR_SPEC, backend, resume)
 
 
-def run_modernize(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row:
+def run_modernize(
+    store: Store,
+    cfg: Config,
+    repo: Row,
+    backend: Backend,
+    *,
+    resume: ResumePlan | None = None,
+) -> Row:
     """Hunt for SOTA-drift modernization opportunities -- deprecated or
     unmaintained dependencies, language-feature gaps, format/protocol
     shifts, major version debt, platform EOL. Explicitly NOT bounded to
     safe/mechanical changes like refactor/dep_update; see modernization.md."""
-    return _run_analysis_job(store, cfg, repo, _MODERNIZATION_SPEC, backend)
+    return _run_analysis_job(store, cfg, repo, _MODERNIZATION_SPEC, backend, resume)
 
 
 # -- fix --------------------------------------------------------------------
@@ -841,7 +1109,14 @@ def run_modernize(store: Store, cfg: Config, repo: Row, backend: Backend) -> Row
 MAX_CONSECUTIVE_SAME_FAILURE = 3
 
 
-def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
+def run_fix(
+    store: Store,
+    cfg: Config,
+    finding: Row,
+    backend: Backend,
+    *,
+    resume: ResumePlan | None = None,
+) -> Row:
     fid: int = finding["id"]
     if finding["status"] != "queued":
         return {
@@ -870,39 +1145,32 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
     # Retry after a kill/failure: reclaim the salvage worktree and branch --
     # committed proof/fix steps live on the branch, but a fresh worker starts
     # from a clean base (its playbook re-verifies the bug anyway).
-    if worktree.exists():
-        run_cmd(
-            [
-                "git",
-                "-C",
-                rpath,
-                "worktree",
-                "remove",
-                "--force",
-                str(worktree),
-            ]
-        )
-        run_cmd(["git", "-C", rpath, "branch", "-D", branch])
-        store.log_event(
-            "fix",
-            f"#{fid}: reclaimed stale worktree from prior attempt",
-            finding_id=fid,
-        )
+    #
+    # Neither the reclaim nor the add happens on a resume: this is the
+    # exact tree the session being continued believes it is sitting in,
+    # and rebuilding it from origin would delete the worker's uncommitted
+    # work and leave it reading files it has already reasoned about.
+    # pick_next only offers a suspension whose worktree is still there.
+    if resume is None:
+        if worktree.exists():
+            run_cmd(
+                [
+                    "git",
+                    "-C",
+                    rpath,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree),
+                ]
+            )
+            run_cmd(["git", "-C", rpath, "branch", "-D", branch])
+            store.log_event(
+                "fix",
+                f"#{fid}: reclaimed stale worktree from prior attempt",
+                finding_id=fid,
+            )
 
-    rc, out = run_cmd(
-        [
-            "git",
-            "-C",
-            rpath,
-            "worktree",
-            "add",
-            "-b",
-            branch,
-            str(worktree),
-            f"origin/{db}",
-        ]
-    )
-    if rc != 0:
         rc, out = run_cmd(
             [
                 "git",
@@ -913,16 +1181,30 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
                 "-b",
                 branch,
                 str(worktree),
-                db,
+                f"origin/{db}",
             ]
         )
-    if rc != 0:
-        store.log_event(
-            "error",
-            f"fix #{fid}: worktree add failed: {out[-300:]}",
-            finding_id=fid,
-        )
-        return {"error": f"worktree add failed: {out[-300:]}"}
+        if rc != 0:
+            rc, out = run_cmd(
+                [
+                    "git",
+                    "-C",
+                    rpath,
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch,
+                    str(worktree),
+                    db,
+                ]
+            )
+        if rc != 0:
+            store.log_event(
+                "error",
+                f"fix #{fid}: worktree add failed: {out[-300:]}",
+                finding_id=fid,
+            )
+            return {"error": f"worktree add failed: {out[-300:]}"}
 
     def _drop_worktree(delete_branch: bool) -> None:
         run_cmd(
@@ -940,12 +1222,21 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
             run_cmd(["git", "-C", rpath, "branch", "-D", branch])
 
     override = finding.get("budget_override")
-    anticipated = anticipated_tokens(store, cfg, repo["id"], "fix")
+    anticipated = (
+        resume.anticipated
+        if resume is not None
+        else anticipated_tokens(store, cfg, repo["id"], "fix")
+    )
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
-            _drop_worktree(delete_branch=True)
+            # A resume that cannot be funded right now keeps its worktree:
+            # dropping it would destroy the suspended session's tree over a
+            # decision that is purely about timing, and the next cycle
+            # would find nothing to continue.
+            if resume is None:
+                _drop_worktree(delete_branch=True)
             store.log_event("deny", f"fix #{fid}: {reason}", finding_id=fid)
             return {"denied": reason, "retry_at": retry_at}
         case Granted(cap_tokens=cap):
@@ -958,10 +1249,12 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
             cap_tokens=cap,
             state="running",
             estimated_tokens=anticipated,
+            resumed_from=resume.predecessor_id if resume is not None else None,
         )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
-        _drop_worktree(delete_branch=True)
+        if resume is None:
+            _drop_worktree(delete_branch=True)
         return {"skipped": str(e)}
     with store.in_progress(fid, "fixing", fallback="queued"):
         build_prompt = (
@@ -971,10 +1264,19 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
             if is_modernization
             else build_apply_improvement_prompt
         )
-        prompt = build_prompt(finding, worktree, branch, repo, store.repo_notes(repo["id"]))
+        prompt = (
+            RESUME_PROMPT
+            if resume is not None
+            else build_prompt(finding, worktree, branch, repo, store.repo_notes(repo["id"]))
+        )
         model = cfg.model_for("fix")
         rr = backend.run(
-            worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX
+            worktree,
+            prompt,
+            cap_tokens=cap,
+            max_wall_s=cfg.fix_max_wall_s,
+            job_class=JobClass.FIX,
+            resume_from=resume.session_file if resume is not None else None,
         )
         state = _record_job(store, job, rr, model=model)
         summary: Row = {
@@ -985,6 +1287,8 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
             "branch": branch,
             "tokens_new": rr.tokens_new,
         }
+        if resume is not None:
+            summary["resumed_from"] = resume.predecessor_id
 
         # (a) Worker declined this finding, or hit a blocker.
         decline_file = worktree / ("NOT-A-BUG.md" if is_bug else "DECLINED.md")
@@ -1383,7 +1687,14 @@ def sync_prs(store: Store, cfg: Config) -> Row:  # noqa: ARG001
 # -- engage -----------------------------------------------------------------
 
 
-def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
+def run_engage(
+    store: Store,
+    cfg: Config,
+    finding: Row,
+    backend: Backend,
+    *,
+    resume: ResumePlan | None = None,
+) -> Row:
     fid: int = finding["id"]
     repo = store.get_repo(finding["repo_id"])
     if repo is None:
@@ -1428,63 +1739,68 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
 
     worktree = cfg.work_root / "wt" / f"e{fid}"
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    if worktree.exists():
-        run_cmd(
+    # A resume touches none of this: the worktree below is the tree the
+    # session being continued believes it is in, so reclaiming and
+    # re-adding it would delete the worker's work in progress. pick_next
+    # only offers a suspension whose worktree is still present.
+    if resume is None:
+        if worktree.exists():
+            run_cmd(
+                [
+                    "git",
+                    "-C",
+                    rpath,
+                    "worktree",
+                    "remove",
+                    "--force",
+                    str(worktree),
+                ]
+            )
+            store.log_event(
+                "engage",
+                f"#{fid}: reclaimed stale worktree from prior attempt",
+                finding_id=fid,
+            )
+
+        rc, out = run_cmd(["git", "-C", rpath, "fetch", "origin", head_ref], timeout=600)
+        if rc != 0:
+            store.log_event(
+                "error",
+                f"engage #{fid}: fetch {head_ref} failed: {out[-300:]}",
+                finding_id=fid,
+            )
+            return {"error": f"fetch failed: {out[-300:]}"}
+        rc, out = run_cmd(
             [
                 "git",
                 "-C",
                 rpath,
                 "worktree",
-                "remove",
-                "--force",
+                "add",
+                "--detach",
                 str(worktree),
+                f"origin/{head_ref}",
             ]
         )
-        store.log_event(
-            "engage",
-            f"#{fid}: reclaimed stale worktree from prior attempt",
-            finding_id=fid,
+        if rc != 0:
+            store.log_event(
+                "error",
+                f"engage #{fid}: worktree add failed: {out[-300:]}",
+                finding_id=fid,
+            )
+            return {"error": f"worktree add failed: {out[-300:]}"}
+        # Best effort: put the branch itself on HEAD (push works detached too).
+        run_cmd(
+            [
+                "git",
+                "-C",
+                str(worktree),
+                "checkout",
+                "-B",
+                head_ref,
+                f"origin/{head_ref}",
+            ]
         )
-
-    rc, out = run_cmd(["git", "-C", rpath, "fetch", "origin", head_ref], timeout=600)
-    if rc != 0:
-        store.log_event(
-            "error",
-            f"engage #{fid}: fetch {head_ref} failed: {out[-300:]}",
-            finding_id=fid,
-        )
-        return {"error": f"fetch failed: {out[-300:]}"}
-    rc, out = run_cmd(
-        [
-            "git",
-            "-C",
-            rpath,
-            "worktree",
-            "add",
-            "--detach",
-            str(worktree),
-            f"origin/{head_ref}",
-        ]
-    )
-    if rc != 0:
-        store.log_event(
-            "error",
-            f"engage #{fid}: worktree add failed: {out[-300:]}",
-            finding_id=fid,
-        )
-        return {"error": f"worktree add failed: {out[-300:]}"}
-    # Best effort: put the branch itself on HEAD (push works detached too).
-    run_cmd(
-        [
-            "git",
-            "-C",
-            str(worktree),
-            "checkout",
-            "-B",
-            head_ref,
-            f"origin/{head_ref}",
-        ]
-    )
 
     def _drop_worktree() -> None:
         run_cmd(
@@ -1500,12 +1816,19 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
         )
 
     override = finding.get("budget_override")
-    anticipated = anticipated_tokens(store, cfg, repo["id"], "engage")
+    anticipated = (
+        resume.anticipated
+        if resume is not None
+        else anticipated_tokens(store, cfg, repo["id"], "engage")
+    )
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
-            _drop_worktree()
+            # Keep a resumed attempt's worktree: it holds a live session's
+            # work, and a denial is about timing, not about that work.
+            if resume is None:
+                _drop_worktree()
             store.log_event("deny", f"engage #{fid}: {reason}", finding_id=fid)
             return {"denied": reason, "retry_at": retry_at}
         case Granted(cap_tokens=cap):
@@ -1518,7 +1841,8 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
             f"engage #{fid}: PR/MR view failed: {(raw or '')[-300:]}",
             finding_id=fid,
         )
-        _drop_worktree()
+        if resume is None:
+            _drop_worktree()
         return {"error": "PR/MR view failed"}
 
     try:
@@ -1529,22 +1853,33 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
             cap_tokens=cap,
             state="running",
             estimated_tokens=anticipated,
+            resumed_from=resume.predecessor_id if resume is not None else None,
         )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
-        _drop_worktree()
+        if resume is None:
+            _drop_worktree()
         return {"skipped": str(e)}
-    prompt = build_engage_prompt(
-        worktree,
-        head_ref,
-        repo,
-        pr,
-        ps.get("needs_attention") or "",
-        store.repo_notes(repo["id"]),
+    prompt = (
+        RESUME_PROMPT
+        if resume is not None
+        else build_engage_prompt(
+            worktree,
+            head_ref,
+            repo,
+            pr,
+            ps.get("needs_attention") or "",
+            store.repo_notes(repo["id"]),
+        )
     )
     model = cfg.model_for("fix")
     rr = backend.run(
-        worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX
+        worktree,
+        prompt,
+        cap_tokens=cap,
+        max_wall_s=cfg.fix_max_wall_s,
+        job_class=JobClass.FIX,
+        resume_from=resume.session_file if resume is not None else None,
     )
     state = _record_job(store, job, rr, model=model)
     summary: Row = {
@@ -1555,6 +1890,8 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
         "pr": num,
         "tokens_new": rr.tokens_new,
     }
+    if resume is not None:
+        summary["resumed_from"] = resume.predecessor_id
 
     # (a) Worker concluded the fix should be abandoned.
     withdraw = worktree / "WITHDRAW.md"
@@ -1694,7 +2031,14 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
 # -- harvest ------------------------------------------------------------
 
 
-def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
+def run_harvest(
+    store: Store,
+    cfg: Config,
+    finding: Row,
+    backend: Backend,
+    *,
+    resume: ResumePlan | None = None,
+) -> Row:
     """Review a just-merged PR's complete lifetime (title, body, every
     comment/review, and the actual shipped diff) to propose genuine
     follow-up findings.
@@ -1744,7 +2088,9 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
 
     worktree = cfg.work_root / "wt" / f"h{fid}"
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    if worktree.exists():
+    # Left alone on a resume: this is the tree the continued session
+    # believes it is in (see run_fix for the same reasoning).
+    if worktree.exists() and resume is None:
         run_cmd(["git", "-C", rpath, "worktree", "remove", "--force", str(worktree)])
         store.log_event(
             "harvest",
@@ -1755,41 +2101,49 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     def _drop_worktree() -> None:
         run_cmd(["git", "-C", rpath, "worktree", "remove", "--force", str(worktree)])
 
-    rc, out = run_cmd(["git", "-C", rpath, "fetch", "origin", default_branch], timeout=600)
-    if rc != 0:
-        store.log_event(
-            "error",
-            f"harvest #{fid}: fetch {default_branch} failed: {out[-300:]}",
-            finding_id=fid,
+    if resume is None:
+        rc, out = run_cmd(["git", "-C", rpath, "fetch", "origin", default_branch], timeout=600)
+        if rc != 0:
+            store.log_event(
+                "error",
+                f"harvest #{fid}: fetch {default_branch} failed: {out[-300:]}",
+                finding_id=fid,
+            )
+            return {"error": f"fetch failed: {out[-300:]}"}
+        rc, out = run_cmd(
+            [
+                "git",
+                "-C",
+                rpath,
+                "worktree",
+                "add",
+                "--detach",
+                str(worktree),
+                f"origin/{default_branch}",
+            ]
         )
-        return {"error": f"fetch failed: {out[-300:]}"}
-    rc, out = run_cmd(
-        [
-            "git",
-            "-C",
-            rpath,
-            "worktree",
-            "add",
-            "--detach",
-            str(worktree),
-            f"origin/{default_branch}",
-        ]
-    )
-    if rc != 0:
-        store.log_event(
-            "error",
-            f"harvest #{fid}: worktree add failed: {out[-300:]}",
-            finding_id=fid,
-        )
-        return {"error": f"worktree add failed: {out[-300:]}"}
+        if rc != 0:
+            store.log_event(
+                "error",
+                f"harvest #{fid}: worktree add failed: {out[-300:]}",
+                finding_id=fid,
+            )
+            return {"error": f"worktree add failed: {out[-300:]}"}
 
     override = finding.get("budget_override")
-    anticipated = anticipated_tokens(store, cfg, repo["id"], "harvest")
+    anticipated = (
+        resume.anticipated
+        if resume is not None
+        else anticipated_tokens(store, cfg, repo["id"], "harvest")
+    )
     outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
-            _drop_worktree()
+            # Keep a resumed attempt's worktree: a denial is about timing,
+            # not about the live session's work sitting in it.
+            if resume is None:
+                _drop_worktree()
             store.log_event("deny", f"harvest #{fid}: {reason}", finding_id=fid)
             return {"denied": reason, "retry_at": retry_at}
         case Granted(cap_tokens=cap):
@@ -1802,7 +2156,8 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
             f"harvest #{fid}: PR/MR view failed: {(raw or '')[-300:]}",
             finding_id=fid,
         )
-        _drop_worktree()
+        if resume is None:
+            _drop_worktree()
         return {"error": "PR/MR view failed"}
 
     try:
@@ -1813,15 +2168,26 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
             cap_tokens=cap,
             state="running",
             estimated_tokens=anticipated,
+            resumed_from=resume.predecessor_id if resume is not None else None,
         )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
-        _drop_worktree()
+        if resume is None:
+            _drop_worktree()
         return {"skipped": str(e)}
-    prompt = build_harvest_prompt(finding, worktree, repo, pr, num, store.repo_notes(repo["id"]))
+    prompt = (
+        RESUME_PROMPT
+        if resume is not None
+        else build_harvest_prompt(finding, worktree, repo, pr, num, store.repo_notes(repo["id"]))
+    )
     model = cfg.model_for("fix")
     rr = backend.run(
-        worktree, prompt, cap_tokens=cap, max_wall_s=cfg.fix_max_wall_s, job_class=JobClass.FIX
+        worktree,
+        prompt,
+        cap_tokens=cap,
+        max_wall_s=cfg.fix_max_wall_s,
+        job_class=JobClass.FIX,
+        resume_from=resume.session_file if resume is not None else None,
     )
     state = _record_job(store, job, rr, model=model)
 
@@ -1830,6 +2196,8 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     _drop_worktree()
 
     summary: Row = {"kind": "harvest", "finding": fid, "job": job, "state": state, "pr": num}
+    if resume is not None:
+        summary["resumed_from"] = resume.predecessor_id
     if state != "done":
         failure = f"worker {state}"
         streak = store.record_harvest_attempt(fid, failure)
@@ -1898,23 +2266,157 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
 _JOB_TYPE_PRIORITY = ("hunt", "test_gap", "dep_update", "refactor", "modernization")
 
 
+def _resume_origin(store: Store, job_id: int) -> int:
+    """The job whose prompt the resumed worker is still following.
+
+    hunt and the analysis kinds bake `out/job{N}.findings.json` into the
+    prompt, and a resumed worker is continuing that same transcript: it
+    writes where the ORIGINAL prompt told it to, not where the new row's
+    id would put it. Ingesting the successor's path would find nothing,
+    and since the watermark only advances once output has been ingested,
+    every resumed hunt would leave the watermark exactly where it was --
+    rebuilding the loop this feature exists to end (one repo ran 10
+    consecutive hunts over the identical diff range for 1.48M tokens, 8
+    of them producing nothing, because a killed job advanced no watermark
+    and was re-selected from scratch).
+
+    Walking, rather than taking the immediate predecessor: the second
+    resume of a chain is still following the FIRST job's prompt.
+    Depth-capped for the same reason store.resume_chain_tokens is -- the
+    write path cannot produce a cycle (resumed_from is set once at INSERT
+    to an id that already exists, so ids strictly decrease along the
+    link), but a hand-repaired database must not be able to hang a cycle.
+    """
+    origin = job_id
+    for _ in range(_RESUME_ORIGIN_MAX_DEPTH):
+        row = store.db.execute("SELECT resumed_from FROM jobs WHERE id = ?", (origin,)).fetchone()
+        if row is None or row["resumed_from"] is None:
+            break
+        origin = int(row["resumed_from"])
+    return origin
+
+
+def _resume_cwd(cfg: Config, kind: str, repo: Row, finding_id: int | None) -> Path | None:
+    """Where a resumed worker for this job would have to run, or None when
+    that cannot be derived. Mirrors each executor's own choice: the clone
+    for repo-level work and for recheck, the per-finding worktree for the
+    three kinds that build one.
+    """
+    prefix = _WORKTREE_PREFIX.get(kind)
+    if prefix is None:
+        return Path(repo["path"])
+    if finding_id is None:
+        return None
+    return cfg.work_root / "wt" / f"{prefix}{finding_id}"
+
+
+def _pick_resume(store: Store, cfg: Config) -> tuple[str, Row, ResumePlan] | None:
+    """The suspended attempt this cycle should continue, if any.
+
+    Ranked after everything finding-driven and before repo rotation:
+    those earlier tiers are user-visible PR interactions with a person
+    waiting on them, while a resume is background work that has ALREADY
+    been paid for -- so it outranks STARTING new background work, but
+    never a human.
+
+    The give-up ceiling is applied here, which makes this the one place
+    selection writes. It has to be: leaving a hopeless chain Suspended
+    would re-offer it every cycle, and because this tier outranks
+    rotation that is not a cheap no-op but permanent starvation of every
+    hunt behind it. The write is best effort -- this function also backs
+    the Status page's read-only preview, and the candidate is skipped
+    either way, so a failed write only defers the marking one cycle.
+    """
+    for job in store.list_resumable_jobs():
+        kind = str(job["kind"])
+        repo_id = int(job["repo_id"])
+        repo = store.get_repo(repo_id)
+        if repo is None:
+            continue
+        typical = anticipated_tokens(store, cfg, repo_id, kind)
+        chain_spent = store.resume_chain_tokens(int(job["id"]))
+        if chain_spent > GIVE_UP_MULTIPLE * typical:
+            with contextlib.suppress(Exception):
+                store.update_job(int(job["id"]), state="failed", killed_reason="give-up")
+                store.log_event(
+                    "resume",
+                    f"resume {kind} {repo['name']}: giving up after {chain_spent} tok"
+                    f" across the chain (> {GIVE_UP_MULTIPLE}x {typical} typical)",
+                    job_id=int(job["id"]),
+                )
+            continue
+        # The executor's own target shape: a finding row for the kinds
+        # driven by one, the repo row for the rest.
+        finding_id = job["finding_id"]
+        target: Row | None = repo
+        if kind in _FINDING_KINDS:
+            target = store.get_finding(int(finding_id)) if finding_id is not None else None
+        if target is None:
+            continue
+        cwd = _resume_cwd(cfg, kind, repo, finding_id)
+        if cwd is None or not cwd.exists():
+            # Nothing to continue INTO: the transcript describes a tree
+            # that is gone. Skipped at selection rather than refused in
+            # the executor, because a refusal would leave the row
+            # Suspended and re-offered every cycle -- and this tier
+            # outranks rotation, so that would starve it permanently.
+            continue
+        session_file = Path(str(job["session_file"]))
+        ctx = ctx_at_suspension(session_file)
+        if ctx is None:
+            # Unreadable transcript, or one with no usage record yet: fall
+            # back to the per-kind estimate. It answers a different
+            # question (a whole job's spend, not one call's context) but
+            # it is the only other measured number available, and
+            # reserving nothing here is what lets a cycle overshoot the
+            # ramp.
+            ctx = typical
+        return (
+            kind,
+            target,
+            ResumePlan(
+                predecessor_id=int(job["id"]),
+                session_file=session_file,
+                origin_job_id=_resume_origin(store, int(job["id"])),
+                repo_name=str(repo["name"]),
+                # What the suspension was carrying, plus what is left of a
+                # typical job for this kind -- floored, because a chain
+                # that has already outspent the typical job still needs
+                # enough budget to do real work rather than re-cache and
+                # die.
+                anticipated=ctx + max(typical - chain_spent, MIN_PROGRESS_TOKENS),
+                ctx=ctx,
+                typical=typical,
+                chain_spent=chain_spent,
+            ),
+        )
+    return None
+
+
 def pick_next(
     store: Store,
     cfg: Config,
     force_repo: str | None = None,
-) -> tuple[str, Row] | None:
-    """Pure selection: what run_cycle would act on right now, if invoked --
-    no side effects, no budget check (each run_* function evaluates its
-    own budget when actually executed; this only answers "what", not
-    "would it currently be allowed"). This is the single place the
-    priority order is expressed; run_cycle and the Status page's
-    "what's next" preview both call it, so the preview can never drift
-    from what actually runs.
+) -> tuple[str, Row, ResumePlan | None] | None:
+    """Selection: what run_cycle would act on right now, if invoked -- no
+    budget check (each run_* function evaluates its own budget when
+    actually executed; this only answers "what", not "would it currently
+    be allowed"). This is the single place the priority order is
+    expressed; run_cycle and the Status page's "what's next" preview both
+    call it, so the preview can never drift from what actually runs.
+
+    Side-effect-free except on one path: a resume chain past the give-up
+    ceiling is retired here (see _pick_resume for why it cannot be left
+    to the executor). That write is best effort and idempotent -- the row
+    leaves 'suspended' -- so the preview calling this remains safe.
 
     Priority: a budget-overridden finding (any category) jumps the
     queue -> flagged PR (oldest-outstanding reason first) -> oldest merged PR pending
     follow-up review (oldest merge first) -> oldest rechecking -> oldest
-    queued fix -> the most stale-of-rotation job type for the
+    queued fix -> the oldest-paid-for suspended attempt that can still be
+    continued (see _pick_resume: already-paid-for background work
+    outranks starting new background work, but never a person waiting on
+    a PR) -> the most stale-of-rotation job type for the
     least-recently-hunted enabled repo (hunt if never cloned, else
     whichever of hunt/test_gap/dep_update/refactor/modernization is
     oldest/never-run, subject to minimum intervals: each scan type
@@ -1923,11 +2425,13 @@ def pick_next(
     cfg.modernization_interval_days (default 30 days). If all types
     are gated for one repo, the next-stalest repo is tried).
 
-    Returns (kind, target): target is a finding row for
+    Returns (kind, target, resume): target is a finding row for
     engage/harvest/recheck/fix, a repo row for
-    hunt/test_gap/dep_update/refactor/modernization. None means nothing
-    to do (no queued/attention/pending-harvest/rechecking work and no
-    enabled repos).
+    hunt/test_gap/dep_update/refactor/modernization. `resume` is the plan
+    for continuing a suspended attempt of that same kind, or None for
+    work starting cold. None means nothing to do (no
+    queued/attention/pending-harvest/rechecking work, nothing resumable,
+    and no enabled repos).
     """
     rechecking = store.list_findings(status="rechecking")
     attention = store.list_attention()
@@ -1942,16 +2446,20 @@ def pick_next(
     ):
         for f in items:
             if f.get("budget_override"):
-                return kind, f
+                return kind, f, None
 
     if attention:
-        return "engage", attention[0]  # oldest-flagged reason first (see list_attention)
+        return "engage", attention[0], None  # oldest-flagged reason first (see list_attention)
     if pending_harvest:
-        return "harvest", pending_harvest[0]  # oldest merge first
+        return "harvest", pending_harvest[0], None  # oldest merge first
     if rechecking:
-        return "recheck", rechecking[-1]  # DESC -> last = oldest
+        return "recheck", rechecking[-1], None  # DESC -> last = oldest
     if queued:
-        return "fix", queued[-1]  # DESC -> last = oldest
+        return "fix", queued[-1], None  # DESC -> last = oldest
+
+    resumable = _pick_resume(store, cfg)
+    if resumable is not None:
+        return resumable
 
     repos = [r for r in store.list_repos() if r["enabled"]]
     if force_repo:
@@ -1978,7 +2486,7 @@ def pick_next(
     for target in candidates:
         rpath = Path(target["path"])
         if not rpath.exists():
-            return "hunt", target  # not cloned yet -> hunt does the clone
+            return "hunt", target, None  # not cloned yet -> hunt does the clone
 
         job_times: dict[str, int] = {}
         for kind, key in (
@@ -2004,12 +2512,31 @@ def pick_next(
             if never_run
             else min(job_times, key=lambda k: job_times[k])
         )
-        return job_type, target
+        return job_type, target, None
 
     return None
 
 
-_RUNNERS: dict[str, Callable[[Store, Config, Row, Backend], Row]] = {
+class _Runner(Protocol):
+    """Every executor's shape once resume exists: the four positional
+    arguments run_cycle dispatches with, plus the optional plan that turns
+    the run into a continuation of a suspended attempt. Positional-only so
+    the concrete functions keep their own parameter names (repo/finding).
+    """
+
+    def __call__(
+        self,
+        store: Store,
+        cfg: Config,
+        target: Row,
+        backend: Backend,
+        /,
+        *,
+        resume: ResumePlan | None = None,
+    ) -> Row: ...
+
+
+_RUNNERS: dict[str, _Runner] = {
     "engage": run_engage,
     "harvest": run_harvest,
     "recheck": run_recheck,
@@ -2036,11 +2563,22 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None, *, backe
             store.log_event("cycle", "idle: nothing to do")
             return result
 
-        kind, target = picked
-        result = _RUNNERS[kind](store, cfg, target, backend)
+        kind, target, resume = picked
+        if resume is not None:
+            # Logged here rather than in pick_next: the Status page calls
+            # that function on every poll, and an event per poll would
+            # bury the log in previews of work nobody ran.
+            store.log_event(
+                "resume",
+                f"resume {kind} {resume.repo_name}: job {resume.predecessor_id}"
+                f" -> reserving {resume.anticipated} tok (ctx {resume.ctx}"
+                f" + max({resume.typical} - {resume.chain_spent}, {MIN_PROGRESS_TOKENS}))",
+                job_id=resume.predecessor_id,
+            )
+        result = _RUNNERS[kind](store, cfg, target, backend, resume=resume)
 
         # Prevent starvation of repo-level rotation jobs: if this attempt
-        # didn't succeed (failed, killed, or done without output), still
+        # didn't succeed (failed, errored, or done without output), still
         # bump the timestamp so this job type stops being the perpetual
         # "oldest" pick. Without this, a job type that succeeded once and
         # then fails persistently keeps a frozen-old timestamp while its
@@ -2049,6 +2587,13 @@ def run_cycle(store: Store, cfg: Config, force_repo: str | None = None, *, backe
         # cycle forever, starving hunt/test_gap/dep_update/refactor/
         # modernization of their turns. hunt has its own watermark logic
         # (set_last_hunt) and is exempt.
+        #
+        # A cap kill no longer arrives here as 'killed': it is 'suspended'
+        # and therefore deliberately NOT bumped. Re-selection of that work
+        # is no longer this bump's job -- the resume tier claims it by id
+        # at a priority above rotation entirely. If the chain later proves
+        # hopeless the give-up ceiling retires it, and the still-old
+        # timestamp is then the honest record that this scan has not run.
         if kind in ("test_gap", "dep_update", "refactor", "modernization"):
             failed = (
                 result.get("state") in ("killed", "failed")

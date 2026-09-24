@@ -14,6 +14,12 @@
 //! whose session had accumulated 290 calls since 2026-09-06, which trips
 //! any cap before the worker does a single useful thing. Passing an
 //! explicit, empty session directory is what makes each job start cold.
+//!
+//! The exception is a deliberate continuation: `run_worker` can be handed
+//! the session file of a job that ran out of window headroom mid-flight
+//! and continue *that* transcript by naming its path. That is a different
+//! mechanism from `autoResume` and the two must not be confused — see the
+//! `--resume` argument in `run_worker` for what was measured.
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -146,6 +152,52 @@ pub fn ledger_usage(session_file: &Path) -> (i64, i64) {
     (tokens, calls)
 }
 
+/// The context a session had reached when it stopped: the LAST usage
+/// record's `input + cacheRead + cacheWrite`.
+///
+/// Same file and same records [`ledger_usage`] walks, different
+/// question. `ledger_usage` sums what a run ADDED, deliberately
+/// excluding `cacheRead` because a cache hit is not new spend. Resuming
+/// asks the opposite: the first call of a resumed session re-establishes
+/// the whole context, so what it will cost is the context size at the
+/// moment of suspension — cache reads included. Measured across 112
+/// production re-cache events the re-cache / prior-context ratio had
+/// median 1.00 and p10 1.00, so the last record's total is the estimate,
+/// not a lower bound to pad.
+///
+/// The LAST record rather than the largest: context grows monotonically
+/// within a session, and the final call is the one the resumed session
+/// picks up from.
+///
+/// `None` when the file is unreadable or holds no usage record at all —
+/// the caller has a documented fallback, and inventing a number here
+/// would hide a missing transcript inside a plausible-looking estimate.
+pub fn ctx_at_suspension(session_file: &Path) -> Option<i64> {
+    let file = fs::File::open(session_file).ok()?;
+    let reader = BufReader::new(file);
+    let mut last: Option<i64> = None;
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue; // partial trailing line mid-write
+        };
+        let Some(msg) = rec.get("message").and_then(|v| v.as_object()) else {
+            continue;
+        };
+        if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        if let Some(u) = msg.get("usage").and_then(|v| v.as_object()) {
+            let field = |name: &str| u.get(name).and_then(serde_json::Value::as_i64).unwrap_or(0);
+            last = Some(field("input") + field("cacheRead") + field("cacheWrite"));
+        }
+    }
+    last
+}
+
 /// Meter a worker's whole private session directory: every `*.jsonl` omp
 /// wrote for this run, summed. One file is the norm; summing rather than
 /// picking one means an extra transcript (a nested session) is counted as
@@ -215,6 +267,42 @@ fn tail_str(s: &str) -> &str {
     crate::util::tail(s, TAIL_BYTES)
 }
 
+/// First line of a file, or empty on any IO error.
+///
+/// Only ever compared against itself: omp writes a `{"type":"title"…}`
+/// header as a session's opening record and never rewrites it, so that
+/// line is a cheap identity for "still the same session".
+fn first_line(path: &Path) -> Vec<u8> {
+    let Ok(file) = fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut line = Vec::new();
+    let _ = BufReader::new(file).read_until(b'\n', &mut line);
+    line
+}
+
+/// A resume that cannot happen, reported rather than silently downgraded.
+///
+/// The caller asked to continue one specific transcript. If that
+/// transcript is gone, spawning a cold worker here would be
+/// indistinguishable from a successful resume anywhere downstream — same
+/// exit code, same session path — while paying a fresh session floor and
+/// redoing the work the resume existed to avoid. Whether to start clean
+/// is the scheduler's decision, so the scheduler is the one told.
+fn resume_unavailable(session_file: &Path, why: &str) -> RunResult {
+    tracing::warn!("harness: cannot resume {}: {why}", session_file.display());
+    RunResult {
+        exit_code: None,
+        killed_reason: Some("resume-unavailable".to_owned()),
+        tokens_new: 0,
+        calls: 0,
+        session_file: None,
+        duration_s: 0.0,
+        stdout_tail: format!("cannot resume {}: {why}", session_file.display()),
+        usage_delta: None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Worker execution (harness.py:103-163)
 // ---------------------------------------------------------------------------
@@ -224,6 +312,13 @@ fn tail_str(s: &str) -> &str {
 /// `cap_tokens` is the ramp's headroom for this run. `None` is a run with
 /// no token bound — the ramp found no ceiling to impose — and `max_wall_s`
 /// is then the only thing that stops a worker that will not stop itself.
+///
+/// `resume_from` is the session file of an earlier attempt to continue.
+/// `None` starts cold in a private directory, which is what every job did
+/// before resume existed. `Some` continues that transcript in place and
+/// meters only what this attempt adds to it; a source that is no longer
+/// on disk is refused outright (`killed_reason = "resume-unavailable"`)
+/// rather than quietly downgraded to a cold run.
 ///
 /// Blocking — call via `spawn_blocking` from async contexts.
 #[allow(
@@ -240,14 +335,47 @@ pub fn run_worker(
     cap_tokens: Option<i64>,
     max_wall_s: i64,
     model: Option<&str>,
+    resume_from: Option<&Path>,
 ) -> RunResult {
     let t0 = Instant::now();
     let spawn_ms = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    prune_sessions(&cfg.work_root);
-    let run_dir = run_session_dir(&cfg.work_root, cwd, spawn_ms);
+    // A resume continues one named transcript, so this attempt's run
+    // directory is the predecessor's rather than a new one: omp writes the
+    // continued session at the `--resume` path and `--session-dir` does
+    // not move it (see the argument below).
+    let mut resume_head: Option<Vec<u8>> = None;
+    let run_dir = if let Some(sf) = resume_from {
+        let Some(dir) = sf.parent().filter(|d| d.is_dir()) else {
+            return resume_unavailable(sf, "session directory is gone");
+        };
+        // Empty counts as gone: omp treats an unreadable resume source
+        // as "start fresh here", which is the failure this refuses.
+        if fs::metadata(sf).map_or(0, |m| m.len()) == 0 {
+            return resume_unavailable(sf, "session file is missing or empty");
+        }
+        resume_head = Some(first_line(sf));
+        dir.to_owned()
+    } else {
+        // Pruning is only safe for a directory this run is about to
+        // create: it keeps the newest N by mtime, and a transcript
+        // worth resuming is old by construction.
+        prune_sessions(&cfg.work_root);
+        run_session_dir(&cfg.work_root, cwd, spawn_ms)
+    };
+    // Attribution baseline. A resumed worker appends to the predecessor's
+    // ledger and `ledger_dir_usage` sums the whole directory, so every
+    // token already in it was paid for by the predecessor's job row.
+    // Subtracting the pre-spawn totals is what keeps this attempt's
+    // `tokens_new` this attempt's — without it a resumed chain re-bills
+    // its own history on every link.
+    let (base_tokens, base_calls) = if resume_from.is_some() {
+        ledger_dir_usage(&run_dir).map_or((0, 0), |(_, t, c)| (t, c))
+    } else {
+        (0, 0)
+    };
     if let Err(e) = fs::create_dir_all(&run_dir) {
         // Without a private directory the worker would fall back to omp's
         // cwd-keyed session and resume it. Refusing is cheaper than the
@@ -268,6 +396,34 @@ pub fn run_worker(
     let mut cmd = Command::new(&cfg.omp_bin);
     cmd.arg("-p").arg(prompt);
     cmd.arg(format!("--session-dir={}", run_dir.display()));
+    if let Some(sf) = resume_from {
+        // Measured against omp v18.2.6 on 2026-09-24, because the obvious
+        // reading of these two flags is that they conflict and they do
+        // not: `--resume=<path>` and `--session-dir=<dir>` coexist, and
+        // under `-p` the named session continues non-interactively. Proof
+        // from the probe: the resumed run's transcript kept the first
+        // exchange byte for byte and chained its new records onto the old
+        // file's last one, while the same prompt in a fresh session
+        // directory answered "there is no earlier reply in this
+        // conversation". This is emphatically not omp's `autoResume`,
+        // which continues "the newest session for this cwd" — naming the
+        // path is what makes the continuation the one we meant.
+        //
+        // `--resume` also decides where the transcript is written: omp
+        // appends to the named file and `--session-dir` does not override
+        // that. An unresolvable path is not an error — omp starts a fresh
+        // session, writes it at that path, and exits 0 with no diagnostic
+        // — which is why the source is checked before this spawn instead
+        // of trusted after it.
+        //
+        // Cost shape, same probe: the cold call wrote 22 976 `cacheWrite`
+        // and read 0; the resumed call wrote 28 and read 22 976. Inside
+        // the prompt-cache TTL a resume re-caches essentially nothing.
+        // Past it the re-cache costs the context size at suspension (112
+        // production re-cache events, median ratio 1.00) — still bounded
+        // by the transcript, never by redoing the work that produced it.
+        cmd.arg(format!("--resume={}", sf.display()));
+    }
     if let Some(m) = model {
         cmd.arg(format!("--model={m}"));
     }
@@ -348,8 +504,12 @@ pub fn run_worker(
         let exited = matches!(proc.try_wait(), Ok(Some(_)));
         if let Some((path, t, c)) = ledger_dir_usage(&run_dir) {
             session = Some(path);
-            tokens = t;
-            calls = c;
+            // Clamped because the subtraction has one way to go negative:
+            // the transcript shrinking, i.e. being replaced rather than
+            // appended to. A negative running total would sit below every
+            // cap and disarm the watchdog outright.
+            tokens = (t - base_tokens).max(0);
+            calls = (c - base_calls).max(0);
         }
         if exited {
             // Reap the group even though the worker left of its own
@@ -366,7 +526,16 @@ pub fn run_worker(
             kill_tree(&mut proc);
             break;
         }
-        if session.is_none() && t0.elapsed().as_secs() >= cfg.session_grace_s {
+        // On a resume the directory already holds the predecessor's
+        // transcript, so "a ledger exists" says nothing about this
+        // attempt; the equivalent signal is "this attempt has recorded no
+        // call yet".
+        let unmetered = if resume_from.is_some() {
+            calls == 0
+        } else {
+            session.is_none()
+        };
+        if unmetered && t0.elapsed().as_secs() >= cfg.session_grace_s {
             tracing::warn!(
                 "harness: no session ledger under {} after {}s — \
                  killing worker rather than running it unmetered",
@@ -387,11 +556,38 @@ pub fn run_worker(
 
     let exit_code = proc.wait().ok().and_then(|s| s.code());
 
+    // Did the resume take? omp answers in the one place it costs nothing
+    // to look: a fresh session written at the `--resume` path replaces the
+    // file's opening record, where a real continuation appends and leaves
+    // it untouched. Nothing in the exit code distinguishes the two, and
+    // missing it means believing work was continued that was in fact
+    // redone from scratch at full price.
+    let mut resume_lost = false;
+    if let (Some(sf), Some(head)) = (resume_from, &resume_head) {
+        resume_lost = first_line(sf) != *head;
+        if resume_lost {
+            tracing::warn!(
+                "harness: --resume {} did not continue that session — omp \
+                 started a fresh one at the same path, so this attempt \
+                 redid the work it was meant to continue",
+                sf.display()
+            );
+        }
+    }
+    // A lost resume took the predecessor's transcript with it, so the
+    // baseline measured against it no longer describes anything on disk:
+    // whatever records remain were all written by this attempt.
+    let (base_tokens, base_calls) = if resume_lost {
+        (0, 0)
+    } else {
+        (base_tokens, base_calls)
+    };
+
     // Final ledger read after exit.
     if let Some((path, t, c)) = ledger_dir_usage(&run_dir) {
         session = Some(path);
-        tokens = t;
-        calls = c;
+        tokens = (t - base_tokens).max(0);
+        calls = (c - base_calls).max(0);
     }
 
     // Exited before the grace period with no ledger: `tokens_new = 0` here
@@ -399,7 +595,12 @@ pub fn run_worker(
     // worker cost nothing, which also drags the anticipated_tokens
     // percentiles down. An existing reason (cap, wallclock) already marks
     // the run as not-Done and is more specific, so it wins.
-    if session.is_none() {
+    let unmetered = if resume_from.is_some() {
+        calls == 0
+    } else {
+        session.is_none()
+    };
+    if unmetered {
         if killed.is_none() {
             killed = Some("unmetered".to_owned());
         }
@@ -418,7 +619,14 @@ pub fn run_worker(
     let mut bytes = so.join().unwrap_or_default();
     bytes.extend_from_slice(&se.join().unwrap_or_default());
     let text = String::from_utf8_lossy(&bytes);
-    let stdout_tail = tail_str(&text).to_owned();
+    // The marker rides on the output tail because that is what a killed
+    // run leaves an operator to read; it is worth the few bytes over
+    // `TAIL_BYTES` that it costs.
+    let stdout_tail = if resume_lost {
+        format!("[resume-lost] {}", tail_str(&text))
+    } else {
+        tail_str(&text).to_owned()
+    };
 
     RunResult {
         exit_code,

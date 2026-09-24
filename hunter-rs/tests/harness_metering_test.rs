@@ -88,14 +88,33 @@ impl Fixture {
     }
 
     fn run(&self, cap_tokens: Option<i64>, max_wall_s: i64) -> RunResult {
-        harness::run_worker(&self.cfg, &self.cwd, PROMPT, cap_tokens, max_wall_s, None)
+        harness::run_worker(
+            &self.cfg, &self.cwd, PROMPT, cap_tokens, max_wall_s, None, None,
+        )
+    }
+
+    /// Continue `session_file` instead of starting cold.
+    fn resume(&self, session_file: &std::path::Path) -> RunResult {
+        harness::run_worker(
+            &self.cfg,
+            &self.cwd,
+            PROMPT,
+            Some(1_000_000),
+            30,
+            None,
+            Some(session_file),
+        )
     }
 }
 
-/// Shell that writes an omp-style session ledger into the private session
-/// directory this run was handed, one assistant record per
-/// `(input, output, cacheWrite)` triple. Resolving `--session-dir` from
-/// argv is the point: a worker that ignored the flag would write where
+/// Shell that writes an omp-style session ledger, one assistant record per
+/// `(input, output, cacheWrite)` triple.
+///
+/// Target resolution mirrors what omp actually does (measured against
+/// v18.2.6): with `--resume=<path>` the records are appended to that file
+/// and `--session-dir` does not move them; without one they go into the
+/// private session directory this run was handed. Resolving both from
+/// argv is the point — a worker that ignored the flags would write where
 /// nothing looks.
 fn ledger_sh(records: &[(i64, i64, i64)]) -> String {
     // fd 0 must be /dev/null. Inherited, an open pipe makes the real omp
@@ -105,9 +124,11 @@ fn ledger_sh(records: &[(i64, i64, i64)]) -> String {
     // spawned process rather than by reading the builder, because what
     // matters is the descriptor the child actually gets.
     let mut sh = "test \"$(readlink /proc/$$/fd/0)\" = /dev/null || exit 93\n\
-                  SDIR=\"\"\nfor a in \"$@\"; do\n  case \"$a\" in \
-                  --session-dir=*) SDIR=\"${a#--session-dir=}\";; esac\ndone\n\
-                  mkdir -p \"$SDIR\"\nTS=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')\n"
+                  SDIR=\"\"\nRESUME=\"\"\nfor a in \"$@\"; do\n  case \"$a\" in \
+                  --session-dir=*) SDIR=\"${a#--session-dir=}\";; \
+                  --resume=*) RESUME=\"${a#--resume=}\";; esac\ndone\n\
+                  mkdir -p \"$SDIR\"\nLEDGER=\"${RESUME:-$SDIR/session-01.jsonl}\"\n\
+                  TS=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')\n"
         .to_owned();
     for &(input, output, cache_write) in records {
         let record = serde_json::json!({
@@ -123,10 +144,7 @@ fn ledger_sh(records: &[(i64, i64, i64)]) -> String {
         })
         .to_string()
         .replace("@TS@", "%s");
-        let _ = writeln!(
-            sh,
-            "printf '{record}\\n' \"$TS\" >> \"$SDIR/session-01.jsonl\""
-        );
+        let _ = writeln!(sh, "printf '{record}\\n' \"$TS\" >> \"$LEDGER\"");
     }
     sh
 }
@@ -166,6 +184,7 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
         Some(1_000_000),
         30,
         Some("test-model"),
+        None,
     );
 
     assert_eq!(res.killed_reason, None, "a metered run carries no flag");
@@ -551,7 +570,7 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
     );
 
     let t0 = std::time::Instant::now();
-    let res = harness::run_worker(&fx.cfg, &fx.cwd, PROMPT, Some(1_000_000), 30, None);
+    let res = harness::run_worker(&fx.cfg, &fx.cwd, PROMPT, Some(1_000_000), 30, None, None);
     let elapsed = t0.elapsed();
 
     assert!(
@@ -618,4 +637,198 @@ fn old_worker_transcripts_are_pruned_newest_first() {
         hunter::backends::omp_scavenge::harness::prune_sessions(&work_root),
         0
     );
+}
+
+// ---------------------------------------------------------------------------
+// Resume
+// ---------------------------------------------------------------------------
+
+/// Without a resume source nothing changes: a private, empty session
+/// directory and no `--resume`.
+///
+/// This is the branch every job took before resume existed, and it is the
+/// one that costs a whole session floor if it silently stops being cold.
+/// The absent flag is the assertion: `--resume` pointing anywhere at all
+/// hands the worker a transcript to re-cache.
+#[test]
+fn a_run_without_a_resume_source_starts_cold() {
+    let fx = Fixture::new("resume-absent");
+    fx.bins.script(
+        "omp",
+        &format!("{ledger}exit 0", ledger = ledger_sh(&[(1000, 200, 50)])),
+    );
+
+    let res = fx.run(Some(1_000_000), 30);
+
+    assert_eq!(res.killed_reason, None);
+    assert_eq!(res.tokens_new, 1250);
+    let calls = fx.bins.calls_to("omp");
+    let argv = calls.first().expect("omp was invoked");
+    assert!(
+        !argv.iter().any(|a| a.starts_with("--resume")),
+        "a cold run must name no session to continue, got {argv:?}"
+    );
+    let sdir = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("--session-dir="))
+        .expect("worker handed a session dir");
+    assert!(
+        std::path::Path::new(sdir).starts_with(harness::sessions_root(&fx.cfg.work_root)),
+        "got {sdir}"
+    );
+}
+
+/// A resume names the transcript to continue, by path, and runs in the
+/// directory that holds it.
+///
+/// Both flags, and both pointing at the predecessor: omp writes the
+/// continued session at the `--resume` path and `--session-dir` does not
+/// move it, so a run directory anywhere else would simply be empty and the
+/// run would be killed as unmetered. Naming the path is also what
+/// distinguishes this from `autoResume`, which continues whatever session
+/// is newest for the cwd.
+#[test]
+fn a_resume_source_is_continued_by_explicit_path() {
+    let fx = Fixture::new("resume-argv");
+    fx.bins.script(
+        "omp",
+        &format!("{ledger}exit 0", ledger = ledger_sh(&[(1000, 200, 50)])),
+    );
+
+    let first = fx.run(Some(1_000_000), 30);
+    let ledger = PathBuf::from(first.session_file.expect("first run wrote a ledger"));
+    let second = fx.resume(&ledger);
+
+    assert_eq!(second.killed_reason, None, "{:?}", second.stdout_tail);
+    let calls = fx.bins.calls_to("omp");
+    let argv = calls.get(1).expect("omp was invoked twice");
+    assert!(
+        argv.contains(&format!("--resume={}", ledger.display())),
+        "got {argv:?}"
+    );
+    assert!(
+        argv.contains(&format!(
+            "--session-dir={}",
+            ledger.parent().expect("ledger has a parent").display()
+        )),
+        "the resumed run belongs in the directory holding that transcript, \
+         got {argv:?}"
+    );
+    assert_eq!(
+        second.session_file.as_deref(),
+        Some(ledger.to_string_lossy().as_ref()),
+        "a resumed attempt continues one transcript, it does not open another"
+    );
+}
+
+/// The attribution invariant: a resumed attempt is billed for what IT
+/// added, never for the transcript it inherited.
+///
+/// `ledger_dir_usage` sums the whole run directory, and a resumed worker
+/// appends to the predecessor's file in that same directory — so without a
+/// pre-spawn baseline every link of a resume chain re-bills its own
+/// history. That would double-count the window, and because `tokens_new`
+/// feeds the `anticipated_tokens` percentiles it would also inflate the
+/// estimate for every later job of the same kind.
+#[test]
+fn a_resumed_run_meters_only_what_this_attempt_added() {
+    let fx = Fixture::new("resume-metering");
+    fx.bins.script(
+        "omp",
+        &format!("{ledger}exit 0", ledger = ledger_sh(&[(1000, 200, 50)])),
+    );
+    let first = fx.run(Some(1_000_000), 30);
+    assert_eq!(first.tokens_new, 1250);
+    let ledger = PathBuf::from(first.session_file.expect("first run wrote a ledger"));
+
+    // The resumed attempt appends two calls to that same file.
+    fx.bins.script(
+        "omp",
+        &format!(
+            "{ledger}exit 0",
+            ledger = ledger_sh(&[(2000, 300, 100), (400, 50, 10)])
+        ),
+    );
+    let second = fx.resume(&ledger);
+
+    assert_eq!(
+        second.tokens_new, 2860,
+        "(2000+300+100) + (400+50+10); the predecessor's 1250 is already \
+         billed to its own job row"
+    );
+    assert_eq!(second.calls, 2, "two new calls, not the transcript's three");
+    // The inherited history is still on disk — the subtraction is an
+    // attribution rule, not a truncation of the transcript.
+    let (total_tokens, total_calls) = harness::ledger_usage(&ledger);
+    assert_eq!((total_tokens, total_calls), (4110, 3));
+}
+
+/// A resume source that is gone is refused, not quietly restarted.
+///
+/// omp does not help here: an unresolvable `--resume` path makes it start
+/// a fresh session, write it at that path, and exit 0. From the outside
+/// that is indistinguishable from a successful continuation, so the daemon
+/// would pay a full session floor and redo the work while believing it had
+/// resumed. Whether to start clean is the scheduler's call, so the harness
+/// hands the decision back instead of making it invisibly.
+#[test]
+fn a_missing_resume_source_is_refused_rather_than_restarted() {
+    let fx = Fixture::new("resume-missing");
+    fx.bins.script("omp", "printf 'should not run\\n'\nexit 0");
+    let gone = fx
+        .cfg
+        .work_root
+        .join("sessions/pruned-away/session-01.jsonl");
+
+    let res = fx.resume(&gone);
+
+    assert_eq!(
+        res.killed_reason.as_deref(),
+        Some("resume-unavailable"),
+        "the caller asked for a continuation and must be told it cannot happen"
+    );
+    assert_eq!(res.exit_code, None, "nothing was spawned");
+    assert_eq!(res.tokens_new, 0);
+    assert!(
+        fx.bins.calls_to("omp").is_empty(),
+        "a refused resume must not spend a session floor finding out"
+    );
+}
+
+/// A resume that silently did not take is reported.
+///
+/// The source existed, so the pre-check passed, but omp began a new
+/// session over it anyway — a corrupt or unparseable transcript does this.
+/// Exit code and session path are identical to a real continuation; the
+/// opening record is not, because a continuation appends and leaves it
+/// alone.
+#[test]
+fn a_resume_that_did_not_take_is_reported() {
+    let fx = Fixture::new("resume-lost");
+    fx.bins.script(
+        "omp",
+        &format!("{ledger}exit 0", ledger = ledger_sh(&[(1000, 200, 50)])),
+    );
+    let first = fx.run(Some(1_000_000), 30);
+    let ledger = PathBuf::from(first.session_file.expect("first run wrote a ledger"));
+
+    // Truncate-and-write is exactly what omp does when it decides the
+    // named session is not resumable.
+    fx.bins.script(
+        "omp",
+        &format!(
+            "RESUME=\"\"\nfor a in \"$@\"; do case \"$a\" in \
+             --resume=*) RESUME=\"${{a#--resume=}}\";; esac\ndone\n\
+             printf '%s\\n' '{record}' > \"$RESUME\"\nexit 0",
+            record = r#"{"message":{"role":"assistant","usage":{"input":900,"output":100,"cacheWrite":0}}}"#
+        ),
+    );
+    let second = fx.resume(&ledger);
+
+    assert!(
+        second.stdout_tail.starts_with("[resume-lost]"),
+        "a continuation that did not happen must not read as one, got {:?}",
+        second.stdout_tail
+    );
+    assert_eq!(second.tokens_new, 1000, "still metered, just not continued");
 }

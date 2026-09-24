@@ -97,7 +97,7 @@ async fn leftover_branch_without_a_worktree_does_not_wedge_the_fix() {
     // Declining needs no forge: the run ends at NOT-A-BUG.md, so what is
     // under test is the worktree setup that precedes it.
     let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code");
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend)
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .expect("a leftover branch is reclaimable, not a permanent failure");
 
@@ -117,7 +117,7 @@ async fn clean_repo_runs_the_fix() {
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code");
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend)
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
 
@@ -145,7 +145,7 @@ async fn granted_cap_is_the_backend_headroom_verbatim() {
     // surviving min() shows up as the config number instead.
     let backend =
         ScriptedBackend::writing("NOT-A-BUG.md", "misread the code").granting(Some(777_000));
-    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend)
+    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
 
@@ -167,7 +167,7 @@ async fn backend_without_a_ceiling_leaves_the_job_unbounded() {
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code").granting(None);
-    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend)
+    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
 

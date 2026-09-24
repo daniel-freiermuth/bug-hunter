@@ -26,7 +26,7 @@ class _FakeBackend:
         d = Denied("test")
         return Outlook(normal=d, prioritized=d)
 
-    def run(self, cwd, prompt, *, cap_tokens, max_wall_s, job_class):
+    def run(self, cwd, prompt, *, cap_tokens, max_wall_s, job_class, resume_from=None):
         pass
 
     def keep_fresh(self):

@@ -385,6 +385,7 @@ impl Backend for ScriptedBackend {
         _cap_tokens: Option<i64>,
         _max_wall_s: i64,
         _job_class: JobClass,
+        _resume_from: Option<&Path>,
     ) -> anyhow::Result<RunResult> {
         Ok((self.run)(cwd))
     }
