@@ -731,7 +731,8 @@ def valid_repo_url(url: str) -> bool:
     `data:` and friends are an XSS vector. Mirrors hunter-rs's
     `valid_repo_url`: anything without a scheme is fine (scp-style
     `git@host:owner/repo.git` and bare paths both hit this), and a real
-    scheme must be http or https.
+    scheme must be http, https or ssh -- see the comment on the return
+    for why ssh belongs there.
 
     A colon alone does not make a scheme -- RFC 3986 requires ALPHA
     *(ALPHA / DIGIT / "+" / "-" / "."), so `git@host:owner/repo.git`
