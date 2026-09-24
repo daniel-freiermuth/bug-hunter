@@ -106,6 +106,17 @@ def _scheme_is(url: str, scheme: str) -> bool:
     return url[: len(scheme) + 3].lower() == f"{scheme}://"
 
 
+def _is_web_scheme(url: str) -> bool:
+    """Whether `url` carries one of the schemes `ssh_url` rewrites.
+
+    `http://` counts alongside `https://`: `valid_repo_url` accepts it,
+    and a plain-HTTP remote carries none of the SSH key material the
+    push path depends on, so leaving it unrewritten sent
+    `git push --force` over an unauthenticated, unencrypted hop.
+    """
+    return _scheme_is(url, "https") or _scheme_is(url, "http")
+
+
 def _url_path(url: str) -> str:
     """Path half of a git remote URL, for every form the API accepts.
 
@@ -163,7 +174,7 @@ class GitHubForge(Forge):
     def ssh_url(self, https_url: str) -> str:
         # Enterprise hosts too: rewriting a self-hosted GitHub remote to
         # github.com would push an internal repo at the public forge.
-        if not _scheme_is(https_url, "https"):
+        if not _is_web_scheme(https_url):
             return https_url
         host = _extract_host(https_url)
         if not is_github_host(host):
@@ -304,15 +315,15 @@ class GitLabForge(Forge):
         self.host = host
         self._self_hosted = host != "gitlab.com"
 
-    def _origin_re(self) -> str:
-        """``https://<host>``, matched without regard to case.
+    def _origin_re(self, scheme_re: str = "https") -> str:
+        """``<scheme_re>://<host>``, matched without regard to case.
 
         Scheme and host are both case-insensitive per RFC 3986, and
         `valid_repo_url` admits `HTTPS://...` because it lowercases
         before checking its allow-list. The group stops before the
         path, which carries the case-sensitive project slug.
         """
-        return f"(?i:https://{re.escape(self.host)})"
+        return f"(?i:{scheme_re}://{re.escape(self.host)})"
 
     def _scp_re(self) -> str:
         """``git@<host>``, the scp-like remote form, host case folded."""
@@ -321,7 +332,9 @@ class GitLabForge(Forge):
     # -- URL helpers --------------------------------------------------------
 
     def ssh_url(self, https_url: str) -> str:
-        m = re.match(rf"^{self._origin_re()}/(.+?)(?:\.git)?/?$", https_url)
+        # `http://` too: an unrewritten plain-HTTP remote would carry the
+        # force push over an unauthenticated, unencrypted hop.
+        m = re.match(rf"^{self._origin_re('https?')}/(.+?)(?:\.git)?/?$", https_url)
         if m:
             return f"git@{self.host}:{m.group(1)}.git"
         return https_url
@@ -436,9 +449,13 @@ class GitLabForge(Forge):
         except ValueError:
             return 1, None, out
 
-        # Notes are a separate endpoint.
+        # Notes are a separate endpoint. GitLab caps `per_page` at 100 and
+        # this reads a single page, so ask for the NEWEST one: the recent
+        # reviewer feedback is exactly what engage and sync_prs act on,
+        # and an oldest-first page silently dropped it on any MR with a
+        # long thread. Flipped back, since consumers want oldest-first.
         rc2, out2 = self._api(
-            f"projects/{enc}/merge_requests/{number}/notes?sort=asc&per_page=100",
+            f"projects/{enc}/merge_requests/{number}/notes?sort=desc&per_page=100",
             timeout=timeout,
         )
         notes: list[Any] = []
@@ -446,7 +463,7 @@ class GitLabForge(Forge):
             try:
                 parsed = json.loads(out2)
                 if isinstance(parsed, list):
-                    notes = parsed
+                    notes = parsed[::-1]
             except ValueError:
                 pass
         mr["_notes"] = notes

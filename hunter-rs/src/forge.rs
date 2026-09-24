@@ -317,6 +317,16 @@ fn strip_any_scheme(url: &str) -> Option<&str> {
         .find_map(|s| strip_scheme(url, s))
 }
 
+/// Whether `url` carries one of the web schemes `ssh_url` rewrites.
+///
+/// `http://` counts alongside `https://`: `valid_repo_url` accepts it,
+/// and a plain-HTTP remote carries none of the SSH key material the
+/// push path depends on, so leaving it unrewritten sent
+/// `git push --force` over an unauthenticated, unencrypted hop.
+fn is_web_scheme(url: &str) -> bool {
+    strip_scheme(url, "https").is_some() || strip_scheme(url, "http").is_some()
+}
+
 /// Split a remote URL into (host, path), for every form the write path
 /// accepts: `https://`, `http://`, `ssh://` and scp-like `git@host:path`.
 /// Any `user@` and `:port` are stripped from the host.
@@ -326,7 +336,12 @@ fn url_host_path(url: &str) -> Option<(&str, &str)> {
     let path = match after_scheme {
         // Past the authority, which is everything up to the first slash.
         Some(rest) => rest.split_once('/').map(|(_, p)| p)?,
-        None => url.split_once(':').map(|(_, p)| p)?,
+        // Same bound as `url_host`: no slash before the colon, or it is
+        // not the scp form.
+        None => url
+            .split_once(':')
+            .filter(|(a, _)| !a.contains('/'))
+            .map(|(_, p)| p)?,
     };
     (!path.is_empty()).then_some((host, path))
 }
@@ -483,14 +498,19 @@ fn gitlab_fetch_mr(
     }
     let mr: GlMergeRequest = serde_json::from_str(out.trim())?;
 
-    // Notes are a separate endpoint.
-    let notes_path = format!("projects/{enc}/merge_requests/{number}/notes?sort=asc&per_page=100");
+    // Notes are a separate endpoint. GitLab caps `per_page` at 100 and
+    // this reads a single page, so ask for the NEWEST one: the recent
+    // reviewer feedback is exactly what `engage` and `sync_prs` act on,
+    // and an oldest-first page silently dropped it on any MR with a long
+    // thread. Flipped back below, since consumers want oldest-first.
+    let notes_path = format!("projects/{enc}/merge_requests/{number}/notes?sort=desc&per_page=100");
     let (rc2, out2) = gitlab_api(url, &notes_path, None, &[]);
-    let notes: Vec<GlNote> = if rc2 == 0 {
+    let mut notes: Vec<GlNote> = if rc2 == 0 {
         serde_json::from_str(out2.trim()).unwrap_or_default()
     } else {
         Vec::new()
     };
+    notes.reverse();
     Ok((mr, notes))
 }
 
@@ -529,7 +549,7 @@ impl Forge for GitHubForge {
         // Enterprise hosts too: a self-hosted GitHub's clone URL is
         // `git@<its host>:owner/repo.git`, and rewriting it to
         // github.com would push an internal repo at the public forge.
-        if strip_scheme(https_url, "https").is_some()
+        if is_web_scheme(https_url)
             && let Some((host, path)) = url_host_path(https_url)
             && is_github_host(host)
         {
@@ -675,7 +695,7 @@ impl Forge for GitHubForge {
 impl Forge for GitLabForge {
     fn ssh_url(&self, https_url: &str) -> String {
         if let Some((host, path)) = gitlab_host_path(https_url)
-            && strip_scheme(https_url, "https").is_some()
+            && is_web_scheme(https_url)
         {
             return format!("git@{host}:{path}.git");
         }
@@ -857,9 +877,16 @@ pub fn url_host(url: &str) -> Option<&str> {
     let authority = match after_scheme {
         // scheme://[user@]host[:port]/path
         Some(rest) => rest.split('/').next()?,
-        // scp-like: [user@]host:path — the colon separates the path, not
-        // a port, so split there and not on ':'.
-        None => url.split_once(':').map(|(a, _)| a)?,
+        // scp-like: [user@]host:path — the colon separates the path,
+        // not a port, so split there and not on ':'. The authority half
+        // may not contain a slash: `github.com/x:y` is not scp syntax,
+        // and reading it as host `github.com/x` split this daemon from
+        // the Python one, which rejects it — the same POST would store
+        // forge=github here and forge=gitlab there.
+        None => url
+            .split_once(':')
+            .map(|(a, _)| a)
+            .filter(|a| !a.contains('/'))?,
     };
     let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     // Only scheme URLs can carry a port; in the scp form the colon is
