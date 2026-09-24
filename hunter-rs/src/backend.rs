@@ -79,7 +79,7 @@ pub struct Outlook {
 /// thread-safe). Exact SQL: BACKEND-CONTRACT.md §1.6.
 #[async_trait]
 pub trait SpendLedger: Send + Sync {
-    /// `SUM(cap_tokens)` over running jobs.
+    /// `SUM(COALESCE(estimated_tokens, cap_tokens, 0))` over running jobs.
     async fn running_estimate(&self) -> sqlx::Result<i64>;
     /// `SUM(tokens_new)` of non-running jobs finished strictly after `ts_ms`.
     async fn finished_since(&self, ts_ms: i64) -> sqlx::Result<i64>;
