@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import json
+from typing import Any
+
 import pytest
 
 from hunter.forge import (
@@ -31,6 +34,11 @@ class TestGitHubForgeSSHUrl:
 
     def test_https_trailing_slash(self) -> None:
         assert self.f.ssh_url("https://github.com/owner/repo/") == "git@github.com:owner/repo.git"
+
+    def test_http_to_ssh(self) -> None:
+        # valid_repo_url accepts http://, and an unrewritten plain-HTTP
+        # remote would carry the force push over an unencrypted hop.
+        assert self.f.ssh_url("http://github.com/owner/repo") == "git@github.com:owner/repo.git"
 
     def test_non_github_passthrough(self) -> None:
         url = "https://gitlab.com/owner/repo"
@@ -114,6 +122,11 @@ class TestGitLabForgeSSHUrl:
         assert (
             self.f.ssh_url("https://gitlab.com/group/sub/project")
             == "git@gitlab.com:group/sub/project.git"
+        )
+
+    def test_http_to_ssh(self) -> None:
+        assert (
+            self.f.ssh_url("http://gitlab.com/group/project") == "git@gitlab.com:group/project.git"
         )
 
     def test_non_gitlab_passthrough(self) -> None:
@@ -219,6 +232,54 @@ class TestGitLabNormMergeable:
             "merge_status": "cannot_be_merged",
         }
         assert GitLabForge._norm_mergeable(mr) == "MERGEABLE"
+
+
+class _NotesStubGitLab(GitLabForge):
+    """GitLabForge with the `glab api` hop replaced by canned payloads."""
+
+    def __init__(self, notes: list[Any]) -> None:
+        super().__init__()
+        self.paths: list[str] = []
+        self._notes = notes
+
+    def _api(
+        self,
+        path: str,
+        timeout: int = 30,
+        method: str | None = None,
+        fields: dict[str, str] | None = None,
+    ) -> tuple[int, str]:
+        self.paths.append(path)
+        payload: Any = self._notes if "/notes" in path else {"state": "opened"}
+        return 0, json.dumps(payload)
+
+
+class TestGitLabFetchNotes:
+    """GitLab caps per_page at 100 and _fetch_mr makes a single request,
+    so it must ask for the NEWEST page: an MR with a longer thread would
+    otherwise lose exactly the recent reviewer feedback engage and
+    sync_prs exist to act on. Consumers read notes oldest-first, so the
+    page is flipped back.
+    """
+
+    def test_newest_page_is_requested_and_order_restored(self) -> None:
+        # Newest-first, as sort=desc returns them.
+        f = _NotesStubGitLab(
+            [
+                {"body": "third", "created_at": "2026-01-03T00:00:00Z"},
+                {"body": "second", "created_at": "2026-01-02T00:00:00Z"},
+                {"body": "first", "created_at": "2026-01-01T00:00:00Z"},
+            ]
+        )
+
+        rc, mr, _ = f._fetch_mr("group/project", 7)
+
+        assert rc == 0
+        assert mr is not None
+        assert (
+            f.paths[1] == "projects/group%2Fproject/merge_requests/7/notes?sort=desc&per_page=100"
+        )
+        assert [n["body"] for n in mr["_notes"]] == ["first", "second", "third"]
 
 
 # ---------------------------------------------------------------------------

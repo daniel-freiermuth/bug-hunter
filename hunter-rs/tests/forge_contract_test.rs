@@ -474,6 +474,10 @@ fn gitlab_create_pr_propagates_a_non_zero_exit() {
 /// Pushes go to a raw SSH URL, never a named remote: `--force-with-lease`
 /// cannot resolve a tracking ref for a bare URL, so the pair (raw URL,
 /// plain `--force`) has to stay together.
+///
+/// `http://` remotes are rewritten too. They are accepted by
+/// `valid_repo_url`, and pushing to one unrewritten would carry a force
+/// push over an unauthenticated, unencrypted hop instead of SSH.
 #[test]
 fn push_forces_to_a_raw_ssh_url_for_both_forges() {
     let bins = FakeBins::acquire("forge-push-ok");
@@ -486,11 +490,31 @@ fn push_forces_to_a_raw_ssh_url_for_both_forges() {
     forge_for(ForgeName::Gitlab)
         .push(dir.path(), GL_REPO, "fix/x")
         .unwrap();
+    forge_for(ForgeName::Github)
+        .push(dir.path(), "http://github.com/acme/widget", "fix/x")
+        .unwrap();
+    forge_for(ForgeName::Gitlab)
+        .push(dir.path(), "http://gitlab.com/group/widget", "fix/x")
+        .unwrap();
 
     let calls = bins.calls_to("git");
     assert_eq!(
         calls,
         vec![
+            vec![
+                "git",
+                "push",
+                "--force",
+                "git@github.com:acme/widget.git",
+                "HEAD:fix/x",
+            ],
+            vec![
+                "git",
+                "push",
+                "--force",
+                "git@gitlab.com:group/widget.git",
+                "HEAD:fix/x",
+            ],
             vec![
                 "git",
                 "push",
@@ -726,7 +750,46 @@ fn gitlab_view_encodes_nested_group_paths() {
         [
             "glab",
             "api",
-            "projects/group%2Fsub%2Fwidget/merge_requests/7/notes?sort=asc&per_page=100",
+            "projects/group%2Fsub%2Fwidget/merge_requests/7/notes?sort=desc&per_page=100",
+        ]
+    );
+}
+
+/// GitLab caps `per_page` at 100 and this is a single request, so it asks
+/// for the newest page — an MR whose thread is longer than that would
+/// otherwise lose exactly the recent feedback `engage` exists to act on.
+/// Consumers still want oldest-first, so the page is flipped back.
+#[test]
+fn gitlab_view_fetches_the_newest_notes_and_restores_order() {
+    let bins = FakeBins::acquire("forge-gl-view-notes-order");
+    // Newest-first, as `sort=desc` returns them.
+    let notes = r#"[{"body":"third","created_at":"2026-01-03T00:00:00Z"},{"body":"second","created_at":"2026-01-02T00:00:00Z"},{"body":"first","created_at":"2026-01-01T00:00:00Z"}]"#;
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$*\" in\n  *notes*) cat <<'__NOTES_EOF__'\n{notes}\n__NOTES_EOF__\n  exit 0 ;;\nesac\ncat <<'__MR_EOF__'\n{GL_MR_JSON}\n__MR_EOF__\nexit 0"
+        ),
+    );
+
+    let view = forge_for(ForgeName::Gitlab)
+        .view_pr_sync(GL_REPO, PR)
+        .expect("MR view with notes");
+
+    let bodies: Vec<&str> = view.comments.iter().map(|c| c.body.as_str()).collect();
+    assert_eq!(
+        bodies,
+        ["first", "second", "third"],
+        "notes must reach consumers oldest-first"
+    );
+
+    let notes_call =
+        position_containing(&bins.calls(), "glab", "/notes").expect("a notes request must be made");
+    assert_eq!(
+        bins.calls()[notes_call],
+        [
+            "glab",
+            "api",
+            "projects/group%2Fwidget/merge_requests/7/notes?sort=desc&per_page=100",
         ]
     );
 }
