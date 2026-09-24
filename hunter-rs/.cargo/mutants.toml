@@ -37,6 +37,13 @@
 # mutant run fails its baseline and tests nothing. Both are contract tests
 # between two directories rather than unit tests, so excluding them here
 # costs no mutation signal.
+# Named here, not only on the command line: `-E` below is a nextest
+# filter expression, so a plain `cargo mutants` would hand it to
+# `cargo test`, which does not understand it -- the baseline fails and
+# nothing is ever mutated. The tool and the filter that depends on it
+# have to travel together.
+test_tool = "nextest"
+
 additional_cargo_test_args = [
     "-E",
     "not binary(playbook_contract_test) and not binary(ui_contract_test)",
