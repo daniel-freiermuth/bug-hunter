@@ -37,6 +37,8 @@ function bodyFor(path: string): unknown {
 interface FakeNet {
   paths: string[];
   release(count: number): Promise<void>;
+  /** Complete the `count` NEWEST requests, leaving older ones parked. */
+  releaseNewest(count: number): Promise<void>;
 }
 
 function installNet(): FakeNet {
@@ -55,14 +57,21 @@ function installNet(): FakeNet {
       } as unknown as Response));
     });
   });
+  // Drain the await chain inside refresh(): fetch, then json(), then
+  // Promise.all, then the state writes. Microtasks only — none of it
+  // depends on the faked clock.
+  const settle = async () => {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  };
   return {
     paths,
     async release(count: number) {
       for (const answer of parked.splice(0, count)) answer();
-      // Drain the await chain inside refresh(): fetch, then json(), then
-      // Promise.all, then the state writes. Microtasks only — none of it
-      // depends on the faked clock.
-      for (let i = 0; i < 20; i++) await Promise.resolve();
+      await settle();
+    },
+    async releaseNewest(count: number) {
+      for (const answer of parked.splice(-count)) answer();
+      await settle();
     },
   };
 }
@@ -134,10 +143,18 @@ describe("poll scheduling", () => {
     const mutation = store.refresh();
     expect(net.paths).toHaveLength(BATCH * 2);
 
-    await net.release(BATCH);
-    await net.release(BATCH);
+    // The mutation answers FIRST, then the older poll. Releasing the
+    // poll first would let the mutation's response land last and write
+    // 42 by arrival order alone, so the assertion would hold with or
+    // without the generation guard -- the exact thing under test.
+    await net.releaseNewest(BATCH);
     await mutation;
+    expect(store.summary?.counts).toEqual({ new: 42 });
 
+    // Now the stale poll, carrying pre-write data. It must not win: a
+    // response that set out before the write cannot be allowed to
+    // overwrite the write's result.
+    await net.release(BATCH);
     expect(store.summary?.counts).toEqual({ new: 42 });
   });
 });
