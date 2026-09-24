@@ -3,9 +3,12 @@
 //!
 //! This markup is not an API, it is presentation: the UI injects it with
 //! `{@html store.summary.backend_status_html}`, and every class name is
-//! load-bearing against the stylesheet in `hunter/ui/index.html`
-//! (`.scv-win`, `.scv-fill`, `.scv-ok`/`.scv-bad`/`.scv-stale`,
-//! `.scv-soft`, `.scv-ramp`, `.scv-sub`). The contract specifies it to
+//! load-bearing against the `:global(.scv-*)` rules in
+//! `hunter/ui-svelte/src/pages/StatusPage.svelte` (`.scv-win`,
+//! `.scv-fill`, `.scv-ok`/`.scv-bad`/`.scv-stale`, `.scv-soft`,
+//! `.scv-ramp`, `.scv-sub`). Not `hunter/ui/index.html`: that is the
+//! generated Vite bundle, gitignored, so a rename chased there would
+//! be edited in a build artefact and lost on the next build. The contract specifies it to
 //! the character, down to the MIDDLE DOT separators and which fields are
 //! HTML-escaped.
 //!
