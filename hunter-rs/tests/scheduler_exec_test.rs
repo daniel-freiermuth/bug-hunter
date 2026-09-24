@@ -69,7 +69,7 @@ async fn record_job_done_state() {
             RepoJobKind::Hunt.into(),
             1,
             None,
-            100_000,
+            Some(100_000),
             hunter::domain::JobState::Running,
             None,
         )
@@ -115,7 +115,7 @@ async fn record_job_failed_state() {
             FindingJobKind::Fix.into(),
             1,
             None,
-            100_000,
+            Some(100_000),
             hunter::domain::JobState::Running,
             None,
         )
@@ -155,7 +155,7 @@ async fn record_job_killed_state() {
             RepoJobKind::Hunt.into(),
             1,
             None,
-            50_000,
+            Some(50_000),
             hunter::domain::JobState::Running,
             None,
         )
@@ -197,7 +197,7 @@ async fn create_and_update_job_round_trip() {
             FindingJobKind::Fix.into(),
             1,
             None,
-            150_000,
+            Some(150_000),
             hunter::domain::JobState::Running,
             None,
         )
@@ -257,7 +257,7 @@ async fn reconcile_orphaned_jobs() {
             FindingJobKind::Fix.into(),
             1,
             Some(3),
-            100_000,
+            Some(100_000),
             hunter::domain::JobState::Running,
             None,
         )

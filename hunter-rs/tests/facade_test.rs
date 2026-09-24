@@ -53,11 +53,9 @@ fn cfg_with(stale_after_s: f64, omp_bin: &str) -> Config {
         model_fix: None,
         backend_type: "omp-scavenge".to_owned(),
         llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
-        hunt_cap_tokens: 200_000,
         hunt_max_wall_s: 1800,
         hunt_max_findings: 8,
         hunt_rehunt_days: 90,
-        fix_cap_tokens: 150_000,
         fix_max_wall_s: 2700,
         scan_interval_days: 1.0,
         modernization_interval_days: 30,
@@ -1996,7 +1994,7 @@ async fn run_reports_how_far_the_long_window_moved_during_the_job() {
         .run(
             &dir.subdir("worktree"),
             "prompt",
-            1_000_000,
+            Some(1_000_000),
             30,
             hunter::backend::JobClass::Hunt,
         )

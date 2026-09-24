@@ -1168,6 +1168,10 @@ impl Store {
     /// referencing job wedges the repo permanently half-deleted —
     /// invisible to every read path, unreapable, still accruing work.
     ///
+    /// `cap_tokens` is the backend's headroom for this job, and `None`
+    /// means it has no token bound at all — `maxWallS` is then the only
+    /// limit the worker runs under.
+    ///
     /// `estimated_tokens` is what the budget ramp reserved before it
     /// granted the job, not the job's cap. The inflight reservation is
     /// read back from that column, so a job that omits it is invisible
@@ -1177,7 +1181,7 @@ impl Store {
         kind: JobKind,
         repo_id: i64,
         finding_id: Option<i64>,
-        cap_tokens: i64,
+        cap_tokens: Option<i64>,
         state: JobState,
         estimated_tokens: Option<i64>,
     ) -> Result<i64, StoreWriteError> {

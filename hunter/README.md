@@ -147,14 +147,20 @@ linear ramps, never letting spend get ahead of either:
   `HEADROOM_MS` in `hunter-rs/src/backends/omp_scavenge/capacity.rs`) so a freshly-opened window is never
   immediately claimed, then ramps 0→1 over what's left. Unspent capacity at
   reset is wasted — there's no rollover.
-- **In-flight accounting**: a running job's *anticipated* cost (not its
-  nominal cap — cold-cache first calls have been observed running
-  2-5x cap_tokens in one atomic, uninterruptible LLM call) is reserved
+- **In-flight accounting**: a running job's *anticipated* cost is reserved
   before the next decision, so concurrent/rapid cycles can't overshoot
-  either ramp.
-- Workers are metered **externally**: the harness tails the worker's live
-  session JSONL and SIGTERMs the process group at the token cap — it never
-  depends on the worker cooperating with its own limit.
+  either ramp. It is an estimate from history, not the job's granted cap:
+  a cold-cache first call arrives as one atomic, uninterruptible LLM call
+  that has been observed spending 2-4x what was reserved for it. The
+  history is the 20 most recent *completed* jobs of that kind, not all of
+  it — a window ages out both rows written under accounting bugs that
+  have since been fixed and repos that have since changed size.
+- A granted job's token cap is the ramp's remaining headroom, verbatim —
+  there is no separate configured per-kind cap. Workers are metered
+  **externally**: the harness tails the worker's live session JSONL and
+  SIGTERMs the process group at that cap, never depending on the worker
+  cooperating with its own limit. A grant with no headroom figure carries
+  no token bound, and `maxWallS` alone stops it.
 - Stale or missing usage data → conservative denial, never an optimistic
   guess.
 
@@ -290,7 +296,7 @@ The templates share operational settings but pair the provider with compatible
 worker models. Do not commit `config.json`; it selects the credentials and
 quota source for one installation.
 
-- `hunt`/`fix` caps apply to their whole job family (hunt also covers
+- `hunt`/`fix` settings apply to their whole job family (hunt also covers
   test\_gap/dep\_update/refactor/modernization/recheck; fix also covers
   engage/harvest/apply\_\*).
 - `budget.deny5hAbove` / `staleAfterS` — see § Budget policy.
