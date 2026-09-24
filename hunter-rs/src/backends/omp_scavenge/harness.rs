@@ -299,7 +299,19 @@ pub fn run_worker(
             cmd.env(&k, &v);
         }
     }
+    // Explicitly null, never inherited: omp reads a piped stdin as extra
+    // prompt text and blocks on EOF before it initialises the session --
+    // "Reading prompt from piped stdin (waiting for EOF)". A worker that
+    // does that writes no ledger at all, so it is killed as `unmetered`
+    // after the grace period, having spent its whole wall-clock slot
+    // doing nothing.
+    //
+    // Today the daemon happens to have /dev/null on fd 0, because the
+    // unit sets no StandardInput and systemd's default is null. That is
+    // an inherited accident, not a decision: run the daemon from a
+    // supervisor or a wrapper that pipes stdin and every worker hangs.
     cmd.current_dir(cwd)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

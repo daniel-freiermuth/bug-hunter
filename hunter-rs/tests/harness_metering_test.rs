@@ -98,7 +98,14 @@ impl Fixture {
 /// argv is the point: a worker that ignored the flag would write where
 /// nothing looks.
 fn ledger_sh(records: &[(i64, i64, i64)]) -> String {
-    let mut sh = "SDIR=\"\"\nfor a in \"$@\"; do\n  case \"$a\" in \
+    // fd 0 must be /dev/null. Inherited, an open pipe makes the real omp
+    // announce "Reading prompt from piped stdin (waiting for EOF)" and
+    // block before the session exists, so the worker writes no ledger
+    // and dies unmetered with its wall-clock slot spent. Asserted on the
+    // spawned process rather than by reading the builder, because what
+    // matters is the descriptor the child actually gets.
+    let mut sh = "test \"$(readlink /proc/$$/fd/0)\" = /dev/null || exit 93\n\
+                  SDIR=\"\"\nfor a in \"$@\"; do\n  case \"$a\" in \
                   --session-dir=*) SDIR=\"${a#--session-dir=}\";; esac\ndone\n\
                   mkdir -p \"$SDIR\"\nTS=$(date -u '+%Y-%m-%dT%H:%M:%S.000Z')\n"
         .to_owned();

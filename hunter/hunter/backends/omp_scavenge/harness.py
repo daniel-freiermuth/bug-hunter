@@ -184,6 +184,14 @@ def run_worker(
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
+        # Explicitly closed, never inherited: omp reads a piped stdin as
+        # extra prompt text and blocks on EOF before it initialises the
+        # session, so the worker writes no ledger and is killed as
+        # unmetered after the grace period, having spent its whole
+        # wall-clock slot. The daemon only has /dev/null on fd 0 today
+        # because the unit sets no StandardInput and systemd defaults to
+        # null -- an inherited accident, not a decision.
+        stdin=subprocess.DEVNULL,
         stdout=out,
         stderr=subprocess.STDOUT,
         start_new_session=True,

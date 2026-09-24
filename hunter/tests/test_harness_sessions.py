@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 from hunter.backends.omp_scavenge import harness
+from hunter.types import Config
 
 
 def test_run_session_dir_lives_under_the_work_root(tmp_path: Path) -> None:
@@ -69,3 +70,46 @@ def test_prune_is_a_noop_when_there_is_nothing_to_prune(tmp_path: Path) -> None:
 
     harness.sessions_root(tmp_path).mkdir(parents=True)
     assert harness.prune_sessions(tmp_path) == 0
+
+
+def test_the_worker_never_inherits_an_open_stdin(tmp_path: Path) -> None:
+    """omp blocks on a piped stdin before the session exists.
+
+    Given one, it prints "Reading prompt from piped stdin (waiting for
+    EOF)" and waits, so the worker writes no ledger at all and is killed
+    as unmetered after the grace period, having spent its whole
+    wall-clock slot doing nothing.
+
+    The daemon only has /dev/null on fd 0 today because its unit sets no
+    StandardInput and systemd defaults to null -- inherited, not chosen.
+    Run it from a supervisor or a wrapper that pipes stdin and every
+    worker hangs. So the test gives ITS OWN stdin a pipe that never
+    closes: without that, fd 0 is already /dev/null under pytest and the
+    assertion would hold whether or not the harness closes anything.
+    """
+    omp = tmp_path / "fake-omp"
+    record = tmp_path / "child-stdin"
+    omp.write_text("#!/bin/sh\nreadlink /proc/$$/fd/0 > " + str(record) + "\nexit 0\n")
+    omp.chmod(0o755)
+
+    cfg = Config(
+        work_root=tmp_path / "wr",
+        db_path=tmp_path / "wr" / "t.db",
+        omp_bin=str(omp),
+    )
+    cwd = tmp_path / "repo"
+    cwd.mkdir()
+
+    read_fd, write_fd = os.pipe()
+    saved = os.dup(0)
+    try:
+        os.dup2(read_fd, 0)  # a pipe with no writer closing it
+        harness.run_worker(cfg, cwd, "prompt", cap_tokens=1000, max_wall_s=5)
+    finally:
+        os.dup2(saved, 0)
+        for fd in (saved, read_fd, write_fd):
+            os.close(fd)
+
+    assert record.read_text().strip() == "/dev/null", (
+        "the worker must be handed /dev/null, not the daemon's stdin"
+    )
