@@ -101,9 +101,10 @@ Title: {{PR_TITLE}}
   re-reads.
 
   A JSON array. Every entry sets its own `"type"`
-  (bug | dep_update | test_gap | refactor | modernization) plus the common
-  fields `fingerprint` ("{{REPO_NAME}}:path/file.ext:short-slug"), `file`,
-  `severity`, `confidence`, `summary`, `detail`, and
+  (bug | dep_update | test_gap | refactor | modernization | standards) plus
+  the common fields `fingerprint`
+  ("{{REPO_NAME}}:path/file.ext:short-slug"), `file`, `severity`,
+  `confidence`, `summary`, `detail`, and
   `"introduced_by": "deferred from PR #{{PR_NUMBER}}"`. Each type ALSO has
   REQUIRED fields, and an entry that omits one — or gets its shape wrong —
   is rejected at ingest: the follow-up is lost, not queued.
@@ -118,4 +119,7 @@ Title: {{PR_TITLE}}
     containing a list — and `test_file`.
   - `refactor`: `smell_type`, `suggested_refactor`.
   - `modernization`: `modernization_class`, `current_approach`,
+    `proposed_approach`.
+  - `standards`: `standard_section` (the heading it violates, e.g.
+    "Type safety / Domain types over primitives"), `current_approach`,
     `proposed_approach`.

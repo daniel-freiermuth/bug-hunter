@@ -330,13 +330,10 @@ fn followup_playbooks_name_every_required_field_they_ask_workers_to_emit() {
         }
         checked += 1;
         let name = path.file_name().unwrap_or_default().to_string_lossy();
-        for ft in [
-            FindingType::Bug,
-            FindingType::DepUpdate,
-            FindingType::TestGap,
-            FindingType::Refactor,
-            FindingType::Modernization,
-        ] {
+        // The exhaustive list, not a hand-written one: a type added to
+        // `FindingType` without matching playbook instructions is exactly
+        // the failure this test exists to catch.
+        for ft in FindingType::ALL {
             for field in hunter::ingest::type_required_fields(ft) {
                 assert!(
                     template.contains(field),
