@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from hunter.scheduler import anticipated_tokens
+from hunter.scheduler import _kind_token_history, anticipated_tokens
 from hunter.store import Store
 from hunter.types import Config, now_ms
 
@@ -117,3 +117,62 @@ def test_denied_job_does_not_count_as_warm(store: Store, cfg: Config) -> None:
     assert anticipated == 700_000, (
         "a denied job must not be mistaken for a warm prompt cache -- it never ran"
     )
+
+
+def _killed_job(store: Store, repo_id: int, kind: str, tokens: int, finished_at: int) -> None:
+    jid = store.create_job(kind, repo_id)
+    store.update_job(jid, state="killed", tokens_new=tokens, notes="cap", finished_at=finished_at)
+
+
+def test_killed_jobs_are_excluded_from_the_history(store: Store, cfg: Config) -> None:
+    """A killed job's tokens_new records the bound that killed it, not what
+    the work costs, so the killed rows pile up at the cap and drag the
+    percentile onto the estimator's own failures."""
+    rid = store.add_repo("r", "https://r", "/r")
+    old = now_ms() - 2 * (cfg.cache_ttl_s * 1000)
+    for i, t in enumerate([1_000, 2_000, 3_000, 4_000, 5_000]):
+        _finished_job(store, rid, "hunt", t, old - i * 1000)
+    for i in range(5):
+        _killed_job(store, rid, "hunt", 200_000, old - 100_000 - i * 1000)
+    assert _kind_token_history(store, "hunt") == [1_000, 2_000, 3_000, 4_000, 5_000]
+    assert anticipated_tokens(store, cfg, rid, "hunt") == 5_000, (
+        "the cold p90 must come from the completed runs, not from the cap the killed ones hit"
+    )
+
+
+def test_fewer_than_three_completed_falls_back_to_the_full_history(
+    store: Store, cfg: Config
+) -> None:
+    """Two completed samples are not a distribution. Filtering down to them
+    would hide the only other evidence there is, and filtering down to none
+    would estimate 0 -- which makes the budget gate reserve nothing and wave
+    through work it cannot fund."""
+    rid = store.add_repo("r", "https://r", "/r")
+    old = now_ms() - 2 * (cfg.cache_ttl_s * 1000)
+    for i, t in enumerate([1_000, 2_000]):
+        _finished_job(store, rid, "hunt", t, old - i * 1000)
+    for i in range(4):
+        _killed_job(store, rid, "hunt", 200_000, old - 100_000 - i * 1000)
+    assert _kind_token_history(store, "hunt") == [
+        1_000,
+        2_000,
+        200_000,
+        200_000,
+        200_000,
+        200_000,
+    ]
+    assert anticipated_tokens(store, cfg, rid, "hunt") == 200_000
+
+
+def test_exactly_three_completed_is_enough_to_filter(store: Store, cfg: Config) -> None:
+    """The boundary: three completed samples is the smallest count at which
+    a percentile index picks something other than an endpoint, so it is the
+    first count that filters."""
+    rid = store.add_repo("r", "https://r", "/r")
+    old = now_ms() - 2 * (cfg.cache_ttl_s * 1000)
+    for i, t in enumerate([1_000, 2_000, 3_000]):
+        _finished_job(store, rid, "hunt", t, old - i * 1000)
+    for i in range(4):
+        _killed_job(store, rid, "hunt", 200_000, old - 100_000 - i * 1000)
+    assert _kind_token_history(store, "hunt") == [1_000, 2_000, 3_000]
+    assert anticipated_tokens(store, cfg, rid, "hunt") == 3_000

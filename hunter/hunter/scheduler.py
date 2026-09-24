@@ -42,6 +42,41 @@ log = logging.getLogger(__name__)
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 
+# Below this many completed samples for a kind, _kind_token_history falls
+# back to the unfiltered history. Three is the smallest count for which a
+# percentile index picks anything other than an endpoint, and the fallback
+# exists because the alternative is worse than a biased estimate: with no
+# completed history at all the estimate is 0, and an anticipated of 0 makes
+# the budget gate reserve nothing and wave through work it cannot fund.
+_MIN_COMPLETED_SAMPLES = 3
+
+
+def _kind_token_history(store: Store, kind: str) -> list[int]:
+    """This kind's observed costs, ascending, from jobs that actually
+    COMPLETED.
+
+    Killed jobs are excluded because their tokens_new is not a measurement
+    of what the work costs -- it is whatever bound killed them, so they
+    cluster just above the cap and the estimator ends up measuring its own
+    failures. Live data: 64 of 259 hunt jobs were killed, and including
+    them put the cold p90 at 204,173 -- within 2% of the 200,000 cap that
+    did the killing -- against 73,724 for the 189 that finished.
+    """
+    sql = "SELECT tokens_new FROM jobs WHERE kind = ? AND tokens_new IS NOT NULL"
+    done = [
+        int(r["tokens_new"])
+        for r in store.db.execute(
+            sql + " AND state = 'done' ORDER BY tokens_new", (kind,)
+        ).fetchall()
+    ]
+    if len(done) >= _MIN_COMPLETED_SAMPLES:
+        return done
+    return [
+        int(r["tokens_new"])
+        for r in store.db.execute(sql + " ORDER BY tokens_new", (kind,)).fetchall()
+    ]
+
+
 def anticipated_tokens(store: Store, cfg: Config, repo_id: int, kind: str) -> int:
     """Realistic anticipated cost of the job about to be decided on -- not
     its nominal cap_tokens. A cold prompt-cache first call for a given
@@ -69,14 +104,7 @@ def anticipated_tokens(store: Store, cfg: Config, repo_id: int, kind: str) -> in
         ).fetchone()
         is not None
     )
-    history = [
-        r["tokens_new"]
-        for r in store.db.execute(
-            "SELECT tokens_new FROM jobs WHERE kind = ? AND tokens_new IS NOT NULL"
-            " ORDER BY tokens_new",
-            (kind,),
-        ).fetchall()
-    ]
+    history = _kind_token_history(store, kind)
     if not history:
         return 0
     idx = min(int(len(history) * (0.5 if warm else 0.9)), len(history) - 1)
@@ -281,7 +309,8 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
         scope_note = f"First hunt for this repo: {scope} (base {base[:12]})."
 
     cfg_cap = cfg.hunt_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, rid, "hunt"))
+    anticipated = anticipated_tokens(store, cfg, rid, "hunt")
+    outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -291,7 +320,9 @@ def run_hunt(store: Store, cfg: Config, repo: Row, backend: Backend, force: bool
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
     try:
-        job = store.create_job("hunt", rid, cap_tokens=cap, state="running")
+        job = store.create_job(
+            "hunt", rid, cap_tokens=cap, state="running", estimated_tokens=anticipated
+        )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
         return {"skipped": str(e)}
@@ -414,9 +445,8 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     # Budget gate -- recheck is investigative, like hunt.
     override = finding.get("budget_override")
     cfg_cap = cfg.hunt_cap_tokens
-    outlook = backend.decide(
-        anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "recheck")
-    )
+    anticipated = anticipated_tokens(store, cfg, repo["id"], "recheck")
+    outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -427,7 +457,12 @@ def run_recheck(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
     try:
         job = store.create_job(
-            "recheck", repo["id"], finding_id=fid, cap_tokens=cap, state="running"
+            "recheck",
+            repo["id"],
+            finding_id=fid,
+            cap_tokens=cap,
+            state="running",
+            estimated_tokens=anticipated,
         )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
@@ -598,7 +633,8 @@ def _run_analysis_job(
 
     # Budget check -- analysis jobs share the hunt budget/model for now
     cfg_cap = cfg.hunt_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, rid, kind))
+    anticipated = anticipated_tokens(store, cfg, rid, kind)
+    outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -608,7 +644,9 @@ def _run_analysis_job(
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
     try:
-        job = store.create_job(kind, rid, cap_tokens=cap, state="running")
+        job = store.create_job(
+            kind, rid, cap_tokens=cap, state="running", estimated_tokens=anticipated
+        )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
         return {"skipped": str(e)}
@@ -903,7 +941,8 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
 
     override = finding.get("budget_override")
     cfg_cap = cfg.fix_cap_tokens
-    outlook = backend.decide(anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "fix"))
+    anticipated = anticipated_tokens(store, cfg, repo["id"], "fix")
+    outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -914,7 +953,14 @@ def run_fix(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row:
             pass
     cap = min(cfg_cap, backend_cap) if backend_cap is not None else cfg_cap
     try:
-        job = store.create_job("fix", repo["id"], finding_id=fid, cap_tokens=cap, state="running")
+        job = store.create_job(
+            "fix",
+            repo["id"],
+            finding_id=fid,
+            cap_tokens=cap,
+            state="running",
+            estimated_tokens=anticipated,
+        )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
         _drop_worktree(delete_branch=True)
@@ -1457,9 +1503,8 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
 
     override = finding.get("budget_override")
     cfg_cap = cfg.fix_cap_tokens
-    outlook = backend.decide(
-        anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "engage")
-    )
+    anticipated = anticipated_tokens(store, cfg, repo["id"], "engage")
+    outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -1487,6 +1532,7 @@ def run_engage(store: Store, cfg: Config, finding: Row, backend: Backend) -> Row
             finding_id=fid,
             cap_tokens=cap,
             state="running",
+            estimated_tokens=anticipated,
         )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
@@ -1743,9 +1789,8 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
 
     override = finding.get("budget_override")
     cfg_cap = cfg.fix_cap_tokens
-    outlook = backend.decide(
-        anticipated_tokens=anticipated_tokens(store, cfg, repo["id"], "harvest")
-    )
+    anticipated = anticipated_tokens(store, cfg, repo["id"], "harvest")
+    outlook = backend.decide(anticipated_tokens=anticipated)
     verdict = outlook.prioritized if override else outlook.normal
     match verdict:
         case Denied(reason=reason, retry_at=retry_at):
@@ -1768,7 +1813,12 @@ def run_harvest(store: Store, cfg: Config, finding: Row, backend: Backend) -> Ro
 
     try:
         job = store.create_job(
-            "harvest", repo["id"], finding_id=fid, cap_tokens=cap, state="running"
+            "harvest",
+            repo["id"],
+            finding_id=fid,
+            cap_tokens=cap,
+            state="running",
+            estimated_tokens=anticipated,
         )
     except ValueError as e:
         # The repo was deleted after this run was picked: skip, don't crash.
