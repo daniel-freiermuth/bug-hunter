@@ -3997,6 +3997,18 @@ async fn run_cycle_inner(
     // kind doesn't monopolise the rotation forever. This is SEPARATE from
     // run_analysis_job's success-gated timestamp (which governs this kind's
     // own retry cadence) — this block ensures OTHER kinds get a turn.
+    //
+    // Suspended is deliberately absent from `failed` below. A cap kill is
+    // a pause, and re-selecting that work is no longer this bump's job:
+    // the resume tier claims it by id at a priority above rotation. Were
+    // it bumped here it would be counted as a turn taken, while the work
+    // itself had not started. A chain that never finishes is retired by
+    // the give-up ceiling, and the still-old timestamp is then the honest
+    // record that this scan has not run.
+    //
+    // `is_analysis()` covers standards here where the Python twin's list
+    // does not, because standards exists only in this daemon — the twin
+    // has no such kind to starve.
     if let Candidate::Repo { kind, repo_id, .. } = &candidate
         && kind.is_analysis()
     {
