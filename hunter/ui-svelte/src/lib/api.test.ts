@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { POLL_MS, store } from "./api.svelte";
+import { GET_TIMEOUT_MS, POLL_MS, store } from "./api.svelte";
 
 // Bodies shaped like what the daemon serves, trimmed to what the
 // validators in validate.ts require — a refresh that fails validation
@@ -44,12 +44,19 @@ interface FakeNet {
 function installNet(): FakeNet {
   const paths: string[] = [];
   const parked: (() => void)[] = [];
-  vi.stubGlobal("fetch", (input: string) => {
+  vi.stubGlobal("fetch", (input: string, init?: RequestInit) => {
     paths.push(input);
     // Captured at request time, like a real server read: a response that
     // set out before a write cannot carry that write's result.
     const body = bodyFor(input);
-    return new Promise<Response>((resolve) => {
+    // Executor form, not Promise.withResolvers: tsconfig.app.json targets
+    // es2023, which does not have it.
+    return new Promise<Response>((resolve, reject) => {
+      // A real fetch rejects with the signal's reason as soon as it
+      // aborts. Without honouring that, a parked request would outlive
+      // its deadline and the store's timeout would look like a no-op.
+      const signal = init?.signal;
+      if (signal) signal.addEventListener("abort", () => reject(signal.reason));
       parked.push(() => resolve({
         status: 200,
         ok: true,
@@ -131,6 +138,54 @@ describe("poll scheduling", () => {
     // stops for good.
     await vi.advanceTimersByTimeAsync(POLL_MS);
     expect(net.paths).toHaveLength(BATCH * 2);
+  });
+
+  it("gives up on a poll the daemon never answers, then polls again", async () => {
+    store.startPolling();
+
+    // Nothing is ever released: the daemon accepted the connections and
+    // went quiet. The gate holds every later tick off, and while it does
+    // the dashboard keeps showing whatever it last read as though it were
+    // live -- ending that silence is the whole job of the deadline.
+    await vi.advanceTimersByTimeAsync(POLL_MS * 3);
+    expect(net.paths).toHaveLength(BATCH);
+    expect(store.error).toBeNull();
+
+    await vi.advanceTimersByTimeAsync(GET_TIMEOUT_MS - POLL_MS * 3);
+
+    // The request rejected and refresh() recorded it, which is what
+    // raises App.svelte's "data may be stale" banner.
+    expect(store.error).not.toBeNull();
+    expect(store.error).toMatch(/GET \/api\/\S+ timed out/);
+
+    // And the gate reopened: the first tick after the failure issues a
+    // fresh batch instead of being skipped for good.
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(net.paths).toHaveLength(BATCH * 2);
+  });
+
+  it("reports a read that stalls mid-body as the timeout it is", async () => {
+    // Headers arrived, the body never follows — the likely shape of a
+    // stall on the largest response, the ~3MB /api/findings. The deadline
+    // covers the body read too, and what it reports has to point at the
+    // dead connection rather than at a response nobody malformed.
+    vi.stubGlobal("fetch", (_input: string, init?: RequestInit) => {
+      const stalledBody = new Promise<never>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (signal) signal.addEventListener("abort", () => reject(signal.reason));
+      });
+      return Promise.resolve({
+        status: 200,
+        ok: true,
+        json: () => stalledBody,
+      } as unknown as Response);
+    });
+
+    const refresh = store.refresh();
+    await vi.advanceTimersByTimeAsync(GET_TIMEOUT_MS);
+    await refresh;
+
+    expect(store.error).toMatch(/GET \/api\/\S+ timed out/);
   });
 
   it("runs a mutation refresh immediately and lets it win", async () => {

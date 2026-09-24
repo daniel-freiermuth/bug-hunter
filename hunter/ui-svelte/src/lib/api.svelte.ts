@@ -34,13 +34,73 @@ async function api<T>(path: string, opts?: RequestInit): Promise<ApiResult<T>> {
   let body: T | null = null;
   try {
     body = (await r.json()) as T;
-  } catch {
-    /* empty body or non-JSON */
+  } catch (err) {
+    // Empty body or non-JSON — unless the read was aborted. The deadline
+    // below covers the body too, and a connection that died halfway
+    // through 3MB of findings reported as an unparseable 200 would send
+    // the operator hunting a malformed response nobody ever sent.
+    if (opts?.signal?.aborted) throw err;
   }
   return { status: r.status, ok: r.ok, body };
 }
 
-/** POST with JSON body, Content-Type set. */
+/**
+ * Upper bound on a read, in ms. Exported so a test can drive the clock by it.
+ *
+ * A GET has to be bounded because nothing else bounds it: `#poll()` skips
+ * every tick while a refresh is in flight, so a daemon that accepts the
+ * connection and then answers nothing wedges the gate shut for good, with
+ * `error` still null — App.svelte then shows frozen data with no staleness
+ * banner, forever. The rejection here is what reopens the gate and lights
+ * the banner.
+ *
+ * 20s = 4 poll periods. The floor is generosity: the slowest read is
+ * /api/findings, ~3.2MB for the 689 findings held today, served in ~85ms
+ * on loopback, and a refresh that merely outlasts a few ticks (daemon
+ * mid-cycle, five requests queued behind the browser's per-origin
+ * connection limit) must still be allowed to land — the store promises
+ * exactly that. The ceiling is the cost of being wrong: this bound plus
+ * one poll period is how long the dashboard can present stale data as
+ * live, so ~25s worst case.
+ *
+ * Deadline built from the global timer rather than `AbortSignal.timeout`,
+ * which the runtime does support: that one runs on an internal clock
+ * nothing can advance, so the bound would be unobservable from the same
+ * clock that drives POLL_MS.
+ */
+export const GET_TIMEOUT_MS = 20_000;
+
+/**
+ * GET with a deadline. Writes deliberately do not get one — see `post`.
+ */
+async function get<T>(path: string): Promise<ApiResult<T>> {
+  const deadline = new AbortController();
+  const timer = setTimeout(
+    () => deadline.abort(new Error(`GET ${path} timed out after ${GET_TIMEOUT_MS}ms`)),
+    GET_TIMEOUT_MS,
+  );
+  try {
+    return await api<T>(path, { signal: deadline.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * POST with JSON body, Content-Type set.
+ *
+ * No deadline, unlike `get`. Three reasons, in order of weight:
+ * a write is user-initiated and its outcome is displayed (button text,
+ * toast, console error), so a hang is visible and retryable, where a
+ * hung poll is silent and self-blocking; aborting a write does not
+ * cancel the server-side work, it only discards the answer, leaving the
+ * caller unable to tell "applied" from "refused" on a request that may
+ * already have been applied; and nothing here can estimate how long a
+ * write should take — POST /api/repo/delete removes the repo's clone
+ * inline, which is as slow as the checkout is large. Nothing queues
+ * behind a write either: a mutation refresh is not gated, so a stuck
+ * one cannot stop the poll.
+ */
 export async function post<T>(path: string, body: Record<string, unknown>): Promise<ApiResult<T>> {
   return api<T>(path, {
     method: "POST",
@@ -95,11 +155,11 @@ class HunterStore {
     const gen = ++this.#refreshGeneration;
     try {
       const [s, f, j, e, st] = await Promise.all([
-        api<Summary>("/api/summary"),
-        api<Finding[]>("/api/findings"),
-        api<Job[]>("/api/jobs"),
-        api<Event[]>("/api/events"),
-        api<Stats>("/api/stats"),
+        get<Summary>("/api/summary"),
+        get<Finding[]>("/api/findings"),
+        get<Job[]>("/api/jobs"),
+        get<Event[]>("/api/events"),
+        get<Stats>("/api/stats"),
       ]);
       if (gen !== this.#refreshGeneration) return;
       if ([s, f, j, e, st].some((r) => r.status !== 200)) {
@@ -187,7 +247,7 @@ class HunterStore {
     // it were the new one — the refresh-triggered reload would then be
     // served this stale body from cache and never see the change.
     const requestedAt = this.#revision;
-    const r = await api<FindingDetail>(`/api/finding?id=${id}`);
+    const r = await get<FindingDetail>(`/api/finding?id=${id}`);
     // Same reasoning as refresh(): a truthy body is not a usable one, and
     // an unusable one must not reach the cache, where it would be served
     // to every reopen until the next poll.
@@ -201,7 +261,7 @@ class HunterStore {
 
   async fetchRepoNotes(id: number): Promise<string> {
     if (this.repoNotesCache.has(id)) return this.repoNotesCache.get(id)!;
-    const r = await api<{ notes: string }>(`/api/repo/notes?id=${id}`);
+    const r = await get<{ notes: string }>(`/api/repo/notes?id=${id}`);
     // An error body carries no `notes`; coercing that to "" and caching it
     // would show "No notes yet" forever with no retry, so fail instead and
     // let the caller's failure path handle it.
