@@ -92,6 +92,24 @@ describe("toggling one option", () => {
     f.toggle("perf", options);
     expect(f.accepts("perf")).toBe(true);
     expect(f.allSelected(options)).toBe(true);
+    // And it is unfiltered again, not merely holding every option that
+    // happens to exist right now: undoing the only exclusion has to
+    // restore the promise that new data shows itself.
+    expect(f.filtering).toBe(false);
+    expect(f.accepts("brand_new_type")).toBe(true);
+  });
+
+  it("stays narrowed while any exclusion remains", () => {
+    const f = new Filter();
+    f.toggle("perf", options);
+    f.toggle("style", options);
+    f.toggle("perf", options);
+    // "style" is still excluded, so this is still an explicit choice
+    // and a newcomer is not silently added to it.
+    expect(f.filtering).toBe(true);
+    expect(f.accepts("perf")).toBe(true);
+    expect(f.accepts("style")).toBe(false);
+    expect(f.accepts("brand_new_type")).toBe(false);
   });
 
   it("remembers a choice while its option is absent from the data", () => {

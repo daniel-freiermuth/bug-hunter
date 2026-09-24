@@ -87,8 +87,18 @@ export class Filter {
       }
       return;
     }
-    if (this.#values.has(option)) this.#values.delete(option);
-    else this.#values.add(option);
+    if (this.#values.has(option)) {
+      this.#values.delete(option);
+      return;
+    }
+    this.#values.add(option);
+    // Undoing the last exclusion undoes the narrowing. Staying in `only`
+    // would leave the UI looking unfiltered -- the All box checked, the
+    // trigger showing no filter -- while a type or repo arriving on a
+    // later poll was still silently hidden, because it is not in the
+    // set. The user has taken back the one thing they excluded, so they
+    // have not "said otherwise" about anything.
+    if (options.every((o) => this.#values.has(o))) this.reset();
   }
 
   /** Flip the All checkbox: everything, or nothing. */
