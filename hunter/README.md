@@ -404,10 +404,16 @@ unit edit plus a restart:
 
 ```sh
 systemctl --user stop hunter.service
-cd hunter && pip install -e . && cd ..     # pydantic, the only runtime dep
+# One interpreter for the install AND the unit. A bare `pip install` can
+# belong to a different Python than /usr/bin/python3, which then cannot
+# import pydantic and the rollback fails at startup; on a PEP 668 distro
+# it refuses outright with externally-managed-environment; and the
+# package needs 3.13+, which /usr/bin/python3 may not be.
+python3 -m venv hunter/.venv                       # must be 3.13+
+hunter/.venv/bin/python -m pip install -e hunter   # pydantic, the only runtime dep
 # then in ~/.config/systemd/user/hunter.service:
 #   WorkingDirectory=<project-root>/hunter
-#   ExecStart=/usr/bin/python3 -m hunter daemon
+#   ExecStart=<project-root>/hunter/.venv/bin/python -m hunter daemon
 systemctl --user daemon-reload
 systemctl --user start hunter.service
 ```

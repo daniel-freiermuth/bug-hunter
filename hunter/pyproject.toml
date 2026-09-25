@@ -7,6 +7,15 @@ dependencies = [
     "pydantic>=2.13.5",
 ]
 
+# Without this, `pip install -e .` fails outright: setuptools' flat-layout
+# autodiscovery finds `ui`, `data`, `playbooks` and `node_modules` beside
+# the package and refuses to guess ("Multiple top-level packages
+# discovered"). The documented rollback runs that exact command, so the
+# rollback did not work -- which is the failure mode the README's own
+# warning is about.
+[tool.setuptools]
+packages = ["hunter", "hunter.backends", "hunter.backends.omp_scavenge"]
+
 [tool.mypy]
 python_version = "3.13"
 strict = true
