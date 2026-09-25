@@ -318,3 +318,66 @@ async fn a_job_given_a_finding_produces_nothing() {
     assert!(entry.produced_finding_ids.is_empty());
     assert_eq!(entry.job.finding_id, Some(found[0]));
 }
+
+/// A confidence that parses but is not a number a worker meant is refused
+/// at validation, with a reason that says so.
+///
+/// `"NaN"` and `"inf"` both parse as `f64`. NaN survives the clamp and binds
+/// as NULL into `confidence REAL NOT NULL`, so the old path also ended in
+/// `invalid == 1` -- via a database error whose message named nothing
+/// useful, which is why this asserts the logged reason and not just the
+/// count. Infinity clamped to 1.0 and was stored as a full-confidence
+/// finding.
+#[tokio::test]
+async fn a_non_finite_confidence_is_refused_by_validation() {
+    for raw in ["NaN", "inf", "-inf"] {
+        let dir = TempDir::new("ingest-nonfinite");
+        let store = Store::connect(&dir.join("hunter.db"))
+            .await
+            .expect("bootstrap");
+        let repo_id = store
+            .add_repo(
+                "widget",
+                "git@github.com:acme/widget.git",
+                Path::new("/tmp/wr/repos"),
+                "main",
+                ForgeName::Github,
+            )
+            .await
+            .unwrap();
+        let entry = serde_json::json!([{
+            "fingerprint": format!("widget:src/lib.rs:parse:{raw}"),
+            "type": "bug",
+            "file": "src/lib.rs",
+            "line": 12,
+            "bug_class": "boundary",
+            "severity": "high",
+            "confidence": raw,
+            "summary": "off-by-one in the parser",
+            "detail": "…",
+            "evidence_plan": "failing test first"
+        }]);
+        let path = dir.join("findings.json");
+        std::fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
+        let res = hunter::ingest::ingest_findings(
+            &store,
+            repo_id,
+            &path,
+            Some(FindingType::Bug),
+            None,
+            None,
+        )
+        .await;
+
+        assert_eq!(res.inserted, 0, "{raw}: nothing may be stored");
+        assert_eq!(res.invalid, 1, "{raw}: the entry is invalid");
+        let events = store.recent_events(10).await.unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains("non-finite confidence")),
+            "{raw}: the refusal must name the reason, got {:?}",
+            events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+    }
+}

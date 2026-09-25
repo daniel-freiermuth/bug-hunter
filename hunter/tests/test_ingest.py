@@ -118,6 +118,19 @@ def test_non_numeric_confidence(env: tuple[Store, int, Path]) -> None:
     assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
 
 
+@pytest.mark.parametrize("raw", ["NaN", "inf", "-inf"])
+def test_non_finite_confidence(env: tuple[Store, int, Path], raw: str) -> None:
+    """float() accepts these, and min/max then map NaN and inf to 1.0.
+
+    Asserting the stored row is absent, not just the count, is what makes
+    this sharp: before the fix these were *inserted*, at full confidence.
+    """
+    store, repo_id, fdir = env
+    entries = [_make_finding(confidence=raw)]
+    result = ingest_findings(store, repo_id, _write_findings(fdir, entries))
+    assert result == {"inserted": 0, "duplicates": 0, "invalid": 1}
+
+
 def test_invalid_mixed_with_valid(env: tuple[Store, int, Path]) -> None:
     store, repo_id, fdir = env
     entries = [

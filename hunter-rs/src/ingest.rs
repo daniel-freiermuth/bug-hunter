@@ -188,11 +188,21 @@ pub async fn ingest_findings(
                     }
                 }
             }
-            if let Some(c) = obj.get("confidence")
-                && !c.is_number()
-                && c.as_str().and_then(|s| s.parse::<f64>().ok()).is_none()
-            {
-                return Some("non-numeric confidence".to_owned());
+            if let Some(c) = obj.get("confidence") {
+                let parsed = c
+                    .as_f64()
+                    .or_else(|| c.as_str().and_then(|s| s.parse::<f64>().ok()));
+                match parsed {
+                    None => return Some("non-numeric confidence".to_owned()),
+                    // `"NaN"` and `"inf"` parse as f64. NaN survives the
+                    // clamp below and binds as NULL into a NOT NULL column;
+                    // infinity clamps to full confidence. Neither is a
+                    // confidence a worker meant, so the entry is invalid.
+                    Some(v) if !v.is_finite() => {
+                        return Some("non-finite confidence".to_owned());
+                    }
+                    Some(_) => {}
+                }
             }
             None
         })();
