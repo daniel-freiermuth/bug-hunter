@@ -13,3 +13,7 @@ __pycache__/
 .ruff_cache/
 hunter/node_modules/
 hunter/ui/
+# The rollback procedure in hunter/README.md creates both of these: a
+# venv for the Python daemon, and the editable install's metadata.
+hunter/.venv/
+*.egg-info/
