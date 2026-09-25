@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -114,6 +115,23 @@ def ingest_findings(
     return result
 
 
+def _confidence_problem(raw: Any) -> str | None:
+    """Why ``raw`` is not a usable confidence, or None if it is.
+
+    float() accepts "NaN" and "inf", and json.loads accepts a bare NaN
+    literal. min/max then map both to 1.0 -- NaN compares false, so
+    min(1.0, nan) is 1.0 -- storing garbage as full confidence. Mirrors
+    hunter-rs ingest.rs.
+    """
+    try:
+        confidence = float(raw)
+    except (TypeError, ValueError):
+        return "non-numeric confidence"
+    if not math.isfinite(confidence):
+        return "non-finite confidence"
+    return None
+
+
 def _validate(f: Any, finding_type: str) -> str | None:
     if not isinstance(f, dict):
         return "not an object"
@@ -140,8 +158,4 @@ def _validate(f: Any, finding_type: str) -> str | None:
                 return (
                     f"required field {field!r} for type {finding_type!r} must be a non-empty string"
                 )
-    try:
-        float(f.get("confidence", 0.0))
-    except (TypeError, ValueError):
-        return "non-numeric confidence"
-    return None
+    return _confidence_problem(f.get("confidence", 0.0))
