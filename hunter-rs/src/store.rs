@@ -16,12 +16,12 @@
 //!   startup. Those transactions close real races; do not unwind them to
 //!   make a method look like the others.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::domain::{
     BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState, RepoJobKind, Severity,
@@ -292,6 +292,337 @@ impl Store {
     }
 }
 
+/// The embedded migration chain.
+///
+/// A named static rather than a fresh `sqlx::migrate!` per use site: the
+/// adoption path below stamps migrations as applied, and it must stamp
+/// exactly the set the normal path would run — same versions, same
+/// checksums — or the next start rejects the database.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// What a table must look like before an unstamped database may be adopted:
+/// the columns the daemon addresses by name, and the column tuples SQLite
+/// enforces as unique.
+///
+/// Plus one table property: whether the integer primary key is
+/// `AUTOINCREMENT`. That is not cosmetic — migration 009 exists to add it
+/// to `repos`, and it is what stops SQLite handing a freed repo id to the
+/// next insert, which a stale client would then mutate. Columns and
+/// uniques alone would pass a `repos` table without it, stamp 009 as
+/// applied, and its rebuild would never run.
+///
+/// Types, defaults and column *order* are deliberately not compared. Every
+/// query in this file uses an explicit column list, so order is
+/// unobservable, and a stricter comparison would reject databases that work
+/// perfectly over cosmetic differences in how two hand-written schemas
+/// spell the same thing.
+#[derive(Debug, Default)]
+struct TableShape {
+    columns: BTreeSet<String>,
+    uniques: BTreeSet<Vec<String>>,
+    autoincrement: bool,
+    /// Explicit indexes (`CREATE INDEX`), by name. Index names are what the
+    /// migrations and `hunter/schema.sql` agree on, so a name is the unit of
+    /// comparison; a same-named index with a different definition is
+    /// tolerated like any other extra structure.
+    indexes: BTreeSet<String>,
+}
+
+/// Whether a `CREATE TABLE` statement declares `AUTOINCREMENT`.
+///
+/// SQLite exposes this only through the statement text it stored, and it
+/// stores the comments too. `hunter/schema.sql` has a comment *inside*
+/// `CREATE TABLE repos` explaining why the key is AUTOINCREMENT, so a plain
+/// substring test would be satisfied by the explanation alone. Comments are
+/// stripped first; the keyword is then matched as a whole word, since
+/// SQLite keywords are case-insensitive.
+fn declares_autoincrement(create_sql: &str) -> bool {
+    let mut code = String::with_capacity(create_sql.len());
+    let mut rest = create_sql;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.find('\n').map_or("", |i| &after[i..]);
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.find("*/").map_or("", |i| &after[i + 2..]);
+            code.push(' ');
+        } else {
+            let mut chars = rest.chars();
+            if let Some(c) = chars.next() {
+                code.push(c);
+            }
+            rest = chars.as_str();
+        }
+    }
+    code.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| word.eq_ignore_ascii_case("AUTOINCREMENT"))
+}
+
+/// Read the column and unique-constraint shape of every non-bookkeeping
+/// table reachable on `conn`.
+async fn read_shape(conn: &mut SqliteConnection) -> sqlx::Result<BTreeMap<String, TableShape>> {
+    let mut shape: BTreeMap<String, TableShape> = BTreeMap::new();
+
+    // `pragma_table_info` used as a table-valued function, correlated with
+    // sqlite_master, so this is one prepared statement instead of a PRAGMA
+    // per table assembled by string concatenation.
+    //
+    // `ESCAPE '\'` because LIKE reads `_` in the pattern as a single-char
+    // wildcard: unescaped, 'sqlite_%' would also hide a table named
+    // `sqlitexyz`.
+    //
+    // The `CAST`s are not cosmetic. sqlx infers a column's nullability by
+    // looking up its origin table and column, and a pragma function has no
+    // row in `table_info`, so naming `ti.name` directly fails to compile
+    // with "no such table column: pragma_table_info.name". Wrapping it in
+    // an expression gives it no origin to look up.
+    let columns = sqlx::query!(
+        r#"
+        SELECT m.name AS "tbl!", CAST(ti.name AS TEXT) AS "col!"
+        FROM sqlite_master m
+        JOIN pragma_table_info(m.name) ti
+        WHERE m.type = 'table'
+          AND m.name NOT LIKE 'sqlite\_%' ESCAPE '\'
+          AND m.name <> '_sqlx_migrations'
+        "#
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for row in columns {
+        shape.entry(row.tbl).or_default().columns.insert(row.col);
+    }
+
+    // Implicit indexes behind `UNIQUE` column and table constraints are
+    // included — that is where `findings UNIQUE(type, fingerprint)`, the
+    // ingest dedup invariant, actually lives, and it has no name of its own
+    // to compare. Partial unique indexes are excluded: they constrain a
+    // subset of rows, and the head schema expresses no uniqueness that way.
+    let uniques = sqlx::query!(
+        r#"
+        SELECT m.name AS "tbl!",
+               CAST(il.name AS TEXT) AS "idx!",
+               CAST(ii.name AS TEXT) AS "col?"
+        FROM sqlite_master m
+        JOIN pragma_index_list(m.name) il
+        JOIN pragma_index_info(il.name) ii
+        WHERE m.type = 'table'
+          AND il."unique" = 1
+          AND il.partial = 0
+          AND m.name NOT LIKE 'sqlite\_%' ESCAPE '\'
+          AND m.name <> '_sqlx_migrations'
+        ORDER BY m.name, il.name, ii.seqno
+        "#
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut by_index: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for row in uniques {
+        // An expression index has no column name. Folding it to one opaque
+        // marker keeps it in the comparison instead of silently dropping it.
+        let col = row.col.unwrap_or_else(|| "<expr>".to_owned());
+        by_index.entry((row.tbl, row.idx)).or_default().push(col);
+    }
+    for ((tbl, _idx), cols) in by_index {
+        shape.entry(tbl).or_default().uniques.insert(cols);
+    }
+
+    let tables = sqlx::query!(
+        r#"
+        SELECT name AS "tbl!", sql AS "sql?"
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name NOT LIKE 'sqlite\_%' ESCAPE '\'
+          AND name <> '_sqlx_migrations'
+        "#
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for row in tables {
+        let autoincrement = row.sql.as_deref().is_some_and(declares_autoincrement);
+        shape.entry(row.tbl).or_default().autoincrement = autoincrement;
+    }
+
+    // `sql IS NOT NULL` keeps only indexes someone wrote: the automatic
+    // ones behind UNIQUE constraints have no statement, and are already
+    // covered by `uniques` above.
+    let indexes = sqlx::query!(
+        r#"
+        SELECT tbl_name AS "tbl!", name AS "idx!"
+        FROM sqlite_master
+        WHERE type = 'index'
+          AND sql IS NOT NULL
+          AND tbl_name NOT LIKE 'sqlite\_%' ESCAPE '\'
+          AND tbl_name <> '_sqlx_migrations'
+        "#
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    for row in indexes {
+        shape.entry(row.tbl).or_default().indexes.insert(row.idx);
+    }
+
+    Ok(shape)
+}
+
+/// The shape a fresh install ends up with.
+///
+/// Derived by running the embedded chain against a throwaway in-memory
+/// database rather than hard-coded. A literal list of expected columns is a
+/// second copy of the schema that goes stale the first time a migration is
+/// added — and it goes stale in the dangerous direction, accepting a
+/// database the daemon then queries wrongly.
+async fn head_shape() -> anyhow::Result<BTreeMap<String, TableShape>> {
+    // One connection, pinned: every connection to `:memory:` opens its own
+    // empty database, so a pool that opened a second one would migrate one
+    // database and introspect another.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .min_connections(1)
+        .idle_timeout(None)
+        .max_lifetime(None)
+        .connect_with(SqliteConnectOptions::new().in_memory(true))
+        .await?;
+    MIGRATOR.run(&pool).await?;
+    let mut conn = pool.acquire().await?;
+    let shape = read_shape(&mut conn).await?;
+    drop(conn);
+    pool.close().await;
+    Ok(shape)
+}
+
+/// Adopt a database that carries the hunter schema but has no sqlx
+/// migration history — i.e. one the Python daemon created — by recording
+/// the embedded migrations as already applied instead of replaying them.
+///
+/// # Why this is needed
+///
+/// Both daemons share one `work_root` and one `hunter.db`, and the Python
+/// daemon builds its schema from `hunter/schema.sql` plus its own
+/// probe-and-ALTER loop, never through sqlx, so `_sqlx_migrations` does not
+/// exist. Handing that file to the migrator replays the whole chain over a
+/// schema that already has its effects. Replayed against that schema in
+/// isolation, three migrations collide with a column that is already
+/// there: 004 on `findings.standard_section`, 008 on `repos.deleted_at`,
+/// and 011 on `findings.found_by_job`. Run in sequence it is worse than
+/// that reads, in both directions — see below.
+///
+/// # Why it cannot be fixed inside those migrations
+///
+/// 004, 008 and 011 are already applied to the live database and sqlx
+/// verifies their checksums on every start. Editing one turns this failure
+/// into "migration N was previously applied but has been modified" for
+/// every existing installation. A *new* migration cannot help either: the
+/// chain dies at 008, long before anything appended to it would run.
+///
+/// # Why stamping is legitimate rather than a lie
+///
+/// Because the two schemas converge. `hunter/schema.sql` and the head of
+/// this chain produce the same tables, the same columns and the same unique
+/// constraints — asserted from both sides by the schema-convergence tests
+/// in the Python and Rust suites. A Python-built database therefore already
+/// *is* at head; the only thing it lacks is the bookkeeping that says so.
+///
+/// Replaying would not merely be redundant, it would destroy data — which
+/// is also why "make the ADD COLUMNs idempotent" is not the fix. Migration
+/// 003 rebuilds `findings` from the column list as of 003, which has
+/// neither `standard_section` nor `found_by_job`, so a sequential replay
+/// silently drops both of the Python database's columns *and their values*
+/// before 004 and 011 re-add them empty. That is why only 008 is observed
+/// to fail: 004 and 011 no longer collide by the time they run, because
+/// 003 has already thrown away what they would have collided with, and
+/// nothing rebuilds `repos` before 008.
+async fn adopt_unstamped_schema(pool: &SqlitePool, db_path: &Path) -> anyhow::Result<()> {
+    // BEGIN IMMEDIATE: this is check-then-act over the whole database. A
+    // deferred transaction takes no write lock until its first write, so two
+    // daemons starting together could both see "no history" and both stamp.
+    // Holding the lock from the first statement also makes the stamping
+    // all-or-nothing: a crash part-way rolls back rather than leaving a
+    // half-written history that the next start would try to "finish" by
+    // replaying 008.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
+    let present = sqlx::query!(
+        r#"
+        SELECT COALESCE(SUM(name = '_sqlx_migrations'), 0) AS "history!: i64",
+               COALESCE(SUM(name IN ('findings', 'repos')), 0) AS "hunter!: i64"
+        FROM sqlite_master
+        WHERE type = 'table'
+        "#
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // Already stamped, or nothing recognisable to adopt (the empty-file
+    // case). Both keep exactly their previous behaviour: run the migrator
+    // against the file as it stands.
+    if present.history > 0 || present.hunter == 0 {
+        return Ok(());
+    }
+
+    let head = head_shape().await?;
+    let actual = read_shape(&mut tx).await?;
+    let mut missing = Vec::new();
+    for (table, want) in &head {
+        let Some(have) = actual.get(table) else {
+            missing.push(format!("table {table}"));
+            continue;
+        };
+        missing.extend(
+            want.columns
+                .difference(&have.columns)
+                .map(|col| format!("{table}.{col}")),
+        );
+        missing.extend(
+            want.uniques
+                .difference(&have.uniques)
+                .map(|cols| format!("UNIQUE({}) on {table}", cols.join(", "))),
+        );
+        if want.autoincrement && !have.autoincrement {
+            missing.push(format!("AUTOINCREMENT on {table}"));
+        }
+        // An index too, although nothing *fails* without one: stamping
+        // records the migration that would have built it as done, so it
+        // is never built, and every query still answers -- by scanning
+        // (`finished_since` over all of `jobs`, on every budget decision).
+        // That is the quietest way this can go wrong, which is why it is
+        // refused here rather than discovered as a slowdown. Recreating it
+        // in place would mean executing unchecked SQL, which check-sql.sh
+        // forbids, or a hard-coded second copy of the schema.
+        missing.extend(
+            want.indexes
+                .difference(&have.indexes)
+                .map(|idx| format!("index {idx} on {table}")),
+        );
+    }
+
+    // Refuse rather than stamp. Stamping a database that is not actually at
+    // head trades one loud failure at startup for wrong answers at runtime:
+    // the migration that would have supplied the missing column is recorded
+    // as done and never runs, so the defect surfaces later, inside a request
+    // handler, as a query naming a column that does not exist.
+    //
+    // Only *missing* structure is fatal. Extra tables and columns are
+    // tolerated on purpose: the Python daemon shares this file and may
+    // legitimately be a release ahead, and since every query here names its
+    // columns explicitly, nothing it added is observable from Rust.
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "{} has the hunter schema but no sqlx migration history, and its schema does \
+             not match this binary's, so it cannot be adopted: missing {}",
+            db_path.display(),
+            missing.join(", ")
+        );
+    }
+
+    // sqlx's own "record as applied without running" path, so the versions,
+    // descriptions and checksums written here are by construction the ones
+    // the migrator verifies on the next start. A hand-rolled INSERT would
+    // have to re-derive the SHA-384 and would fail with "previously applied
+    // but has been modified" the moment it drifted.
+    MIGRATOR.skip(&mut *tx, None).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 impl Store {
     /// Open the DB strictly read-only -- physically unable to write, so a
     /// caller that must not mutate cannot. Used by the tests to assert a
@@ -310,7 +641,8 @@ impl Store {
 
     /// Open the live DB read-write. Runs embedded migrations on connect —
     /// the binary carries its own schema, so deploying a new binary
-    /// automatically migrates the DB.
+    /// automatically migrates the DB. A database the Python daemon built
+    /// is adopted first; see [`adopt_unstamped_schema`].
     pub async fn connect(db_path: &Path) -> anyhow::Result<Self> {
         let opts = SqliteConnectOptions::new()
             .filename(db_path)
@@ -329,7 +661,8 @@ impl Store {
             .max_connections(4)
             .connect_with(opts)
             .await?;
-        sqlx::migrate!("./migrations").run(&pool).await?;
+        adopt_unstamped_schema(&pool, db_path).await?;
+        MIGRATOR.run(&pool).await?;
         Ok(Self { pool })
     }
 

@@ -51,6 +51,24 @@ jobs:
         with:
           tool: cargo-nextest@0.9.115
 
+      # `python_adoption_test` drives the REAL Python daemon to build a
+      # database and then adopts it, which is the only way to prove the
+      # adoption path against the schema Python actually writes rather
+      # than against a fixture that agrees with us by construction.
+      # Without an interpreter here that test skipped itself and the job
+      # still passed -- a gate whose skip path is indistinguishable from
+      # a pass, which this repo has now been bitten by three times.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+
+      - name: Python daemon deps
+        # pydantic only: hunter.types imports it, and Store needs nothing
+        # else. Pinned for the same reason as every other CI tool.
+        run: |
+          pip install pydantic==2.13.5
+          echo "HUNTER_TEST_PYTHON=$(which python)" >> "$GITHUB_ENV"
+
       - name: Test
         run: cargo nextest run --profile ci
 
