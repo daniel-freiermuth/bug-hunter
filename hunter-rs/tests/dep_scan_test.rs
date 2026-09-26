@@ -32,16 +32,19 @@ const NO_UPDATE_LINE: &str = r#"{"name":"renovate","level":20,"msg":"packageFile
 /// Chatter Renovate emits around the useful lines.
 const CHATTER: &str = r#"{"name":"renovate","level":30,"msg":"Repository started"}"#;
 
-/// Assert the fake `npx` was actually reached with Renovate's argv, so a
+/// Assert the fake `renovate` was actually reached with its argv, so a
 /// `None` in the test below is a decision about the *result* and not the
 /// scanner quietly failing to spawn anything.
 fn assert_renovate_invoked(bins: &FakeBins) {
-    let calls = bins.calls_to("npx");
-    assert_eq!(calls.len(), 1, "expected exactly one npx call: {calls:?}");
+    let calls = bins.calls_to("renovate");
+    assert_eq!(
+        calls.len(),
+        1,
+        "expected exactly one renovate call: {calls:?}"
+    );
     assert_eq!(
         calls[0],
         vec![
-            "npx".to_owned(),
             "renovate".to_owned(),
             "--platform=local".to_owned(),
             "--dry-run=lookup".to_owned(),
@@ -53,7 +56,7 @@ fn assert_renovate_invoked(bins: &FakeBins) {
 fn success_with_candidates_parses_them() {
     let bins = FakeBins::acquire("depscan-ok");
     let work = TempDir::new("depscan-ok-repo");
-    bins.ok("npx", &format!("{CHATTER}\n{UPDATE_LINE}"));
+    bins.ok("renovate", &format!("{CHATTER}\n{UPDATE_LINE}"));
 
     let got = scan_repo(work.path(), REPO, 30).expect("renovate succeeded, so Some");
 
@@ -82,7 +85,7 @@ fn success_with_candidates_parses_them() {
 fn success_with_no_updates_is_empty_not_none() {
     let bins = FakeBins::acquire("depscan-empty");
     let work = TempDir::new("depscan-empty-repo");
-    bins.ok("npx", &format!("{CHATTER}\n{NO_UPDATE_LINE}"));
+    bins.ok("renovate", &format!("{CHATTER}\n{NO_UPDATE_LINE}"));
 
     let got = scan_repo(work.path(), REPO, 30);
 
@@ -104,7 +107,7 @@ fn failure_with_output_is_unavailable() {
     // Output on *both* pipes, and the stdout half is exactly the payload
     // the happy-path test above turns into a candidate.
     bins.script(
-        "npx",
+        "renovate",
         &format!(
             "cat <<'__RENO__'\n{CHATTER}\n{UPDATE_LINE}\n__RENO__\n\
              echo 'FATAL: registry lookup aborted' >&2\nexit 1"
@@ -126,7 +129,7 @@ fn failure_with_output_is_unavailable() {
 fn failure_without_output_is_unavailable() {
     let bins = FakeBins::acquire("depscan-fail-quiet");
     let work = TempDir::new("depscan-fail-quiet-repo");
-    bins.script("npx", "exit 3");
+    bins.script("renovate", "exit 3");
 
     let got = scan_repo(work.path(), REPO, 30);
 
@@ -134,12 +137,12 @@ fn failure_without_output_is_unavailable() {
     assert!(got.is_none(), "silent failure is unavailable too: {got:?}");
 }
 
-/// No `npx` on `PATH` at all: the scanner reports unavailable rather than
+/// No `renovate` on `PATH` at all: the scanner reports unavailable rather than
 /// unwrapping the spawn error.
 #[test]
 fn missing_binary_is_unavailable() {
     // `isolate()` drops the real PATH: `FakeBins` normally appends it, so
-    // a developer's own node would answer and this would pass vacuously.
+    // a developer's own renovate would answer and this would pass vacuously.
     let bins = FakeBins::acquire("depscan-missing");
     bins.isolate();
     let work = TempDir::new("depscan-missing-repo");
@@ -160,7 +163,7 @@ fn missing_binary_is_unavailable() {
 fn unspawnable_scan_is_unavailable() {
     let bins = FakeBins::acquire("depscan-nocwd");
     let work = TempDir::new("depscan-nocwd-repo");
-    bins.ok("npx", UPDATE_LINE);
+    bins.ok("renovate", UPDATE_LINE);
     let missing = work.join("no-such-checkout");
 
     let got = scan_repo(&missing, REPO, 30);
@@ -179,7 +182,7 @@ fn malformed_lines_do_not_discard_good_ones() {
     let truncated = r#"{"name":"renovate","config":{"npm":[{"packageFile":"pack"#;
     let second = r#"{"name":"renovate","config":{"cargo":[{"packageFile":"Cargo.toml","deps":[{"depName":"serde","currentValue":"1.0.1","datasource":"crate","updates":[{"newVersion":"2.0.0","updateType":"major"}]}]}]}}"#;
     bins.ok(
-        "npx",
+        "renovate",
         &format!(
             "not json at all\n{UPDATE_LINE}\n{truncated}\n\
              {{\"config\": \"a string, not an object\"}}\n{second}"
@@ -212,14 +215,14 @@ fn renovate_runs_inside_the_repo_checkout() {
     let checkout = work.subdir("checkout");
     let marker = work.join("cwd.txt");
     bins.script(
-        "npx",
+        "renovate",
         &format!("pwd > '{}'\nexit 0", marker.to_string_lossy()),
     );
 
     let got = scan_repo(&checkout, REPO, 30);
 
     assert!(got.is_some(), "clean exit is Some: {got:?}");
-    let recorded = std::fs::read_to_string(&marker).expect("fake npx recorded its cwd");
+    let recorded = std::fs::read_to_string(&marker).expect("fake renovate recorded its cwd");
     assert_eq!(
         Path::new(recorded.trim()).canonicalize().ok(),
         checkout.canonicalize().ok(),
@@ -246,7 +249,7 @@ fn single_candidate(
 ) -> hunter::dep_scan::DepCandidate {
     let bins = FakeBins::acquire(label);
     let work = TempDir::new(label);
-    bins.ok("npx", &update_line(update_type, vulnerability));
+    bins.ok("renovate", &update_line(update_type, vulnerability));
     let got = scan_repo(work.path(), REPO, 30).expect("renovate succeeded");
     assert_eq!(got.len(), 1, "expected one candidate: {got:?}");
     got.into_iter().next().unwrap_or_else(|| unreachable!())
@@ -317,4 +320,133 @@ fn housekeeping_update_types_normalise_to_patch() {
         assert_eq!(c.severity, "low");
         assert!((c.confidence - 0.95).abs() < f64::EPSILON);
     }
+}
+
+/// A `renovate` the scanned repo ships must never run.
+///
+/// This is what `npx renovate` did: npx resolves from the current
+/// directory's `node_modules/.bin` first, and the current directory is the
+/// checkout. The repo copy here is also reachable through a relative
+/// `PATH` entry and an absolute one pointing into the checkout -- the two
+/// other ways the checkout's copy could win -- and the installed one sits
+/// behind both, so a scanner that honoured either would run the repo's.
+#[test]
+fn a_renovate_shipped_by_the_scanned_repo_never_runs() {
+    let bins = FakeBins::acquire("depscan-hijack");
+    let work = TempDir::new("depscan-hijack-repo");
+    let marker = work.join("HIJACKED");
+    let repo_bin = work.subdir("node_modules/.bin");
+    std::fs::create_dir_all(&repo_bin).unwrap();
+    let evil = repo_bin.join("renovate");
+    std::fs::write(&evil, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bins.ok("renovate", NO_UPDATE_LINE);
+    let installed = std::env::var("PATH").unwrap();
+    let hostile = format!("node_modules/.bin:{}:{installed}", repo_bin.display());
+    let _path = bins.env("PATH", Path::new(&hostile));
+
+    let got = scan_repo(work.path(), REPO, 30);
+
+    assert!(
+        !marker.exists(),
+        "the scanned repo's own renovate ran -- repo content executed as the daemon"
+    );
+    assert_renovate_invoked(&bins);
+    assert!(matches!(&got, Some(v) if v.is_empty()), "{got:?}");
+}
+
+/// When the only `renovate` available is the repo's, there is no scan --
+/// and certainly no download: the caller falls back to the model.
+#[test]
+fn a_repo_shipped_renovate_is_not_a_fallback() {
+    let bins = FakeBins::acquire("depscan-only-repo");
+    bins.isolate();
+    let work = TempDir::new("depscan-only-repo-repo");
+    let marker = work.join("HIJACKED");
+    let repo_bin = work.subdir("node_modules/.bin");
+    std::fs::create_dir_all(&repo_bin).unwrap();
+    let evil = repo_bin.join("renovate");
+    std::fs::write(&evil, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let _path = bins.env("PATH", &repo_bin);
+
+    let got = scan_repo(work.path(), REPO, 30);
+
+    assert!(!marker.exists(), "the repo's renovate ran");
+    assert!(
+        got.is_none(),
+        "no installed renovate means fall back: {got:?}"
+    );
+}
+
+/// Renovate runs with a scrubbed environment: a token the daemon holds is
+/// not inherited, while what a Node process needs to start still is.
+#[test]
+fn renovate_does_not_inherit_the_daemons_secrets() {
+    let bins = FakeBins::acquire("depscan-env");
+    let work = TempDir::new("depscan-env-repo");
+    let seen = work.join("env.txt");
+    bins.script(
+        "renovate",
+        &format!("env > '{}'\necho '{NO_UPDATE_LINE}'", seen.display()),
+    );
+    let _token = bins.env("GH_TOKEN", Path::new("s3cret-token"));
+    let _home = bins.env("HOME", work.path());
+
+    let got = scan_repo(work.path(), REPO, 30);
+
+    assert!(got.is_some(), "{got:?}");
+    let env = std::fs::read_to_string(&seen).unwrap();
+    assert!(
+        !env.contains("s3cret-token"),
+        "GH_TOKEN leaked into renovate:\n{env}"
+    );
+    assert!(
+        env.lines().any(|l| l.starts_with("HOME=")),
+        "HOME must be forwarded:\n{env}"
+    );
+    assert!(env.contains("LOG_FORMAT=json"), "{env}");
+}
+
+/// The `PATH` Renovate itself runs with cannot reach into the checkout.
+///
+/// The installed `renovate` is a Node script that starts with
+/// `#!/usr/bin/env node`, so the child looks `node` up on its own `PATH`,
+/// from inside the checkout. A relative entry like `node_modules/.bin`
+/// would find a `node` the repo ships. Here the fake renovate calls `node`
+/// the same way, and the repo ships a `node` that leaves a marker.
+#[test]
+fn renovates_own_path_lookups_cannot_reach_the_checkout() {
+    let bins = FakeBins::acquire("depscan-child-path");
+    let work = TempDir::new("depscan-child-path-repo");
+    let marker = work.join("HIJACKED");
+    let repo_bin = work.subdir("node_modules/.bin");
+    std::fs::create_dir_all(&repo_bin).unwrap();
+    let evil = repo_bin.join("node");
+    std::fs::write(&evil, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bins.script(
+        "renovate",
+        &format!("node --version >/dev/null 2>&1\necho '{NO_UPDATE_LINE}'"),
+    );
+    let installed = std::env::var("PATH").unwrap();
+    let hostile = format!("node_modules/.bin:{installed}");
+    let _path = bins.env("PATH", Path::new(&hostile));
+
+    let got = scan_repo(work.path(), REPO, 30);
+
+    assert!(got.is_some(), "{got:?}");
+    assert!(
+        !marker.exists(),
+        "renovate's child PATH resolved into the checkout and ran the repo's node"
+    );
 }

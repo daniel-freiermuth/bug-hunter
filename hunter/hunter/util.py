@@ -11,14 +11,15 @@ def run_cmd(
     cwd: str | None = None,
     timeout: int = 300,
     env_extra: dict[str, str] | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, str]:
     """Run a command; return (rc, combined stdout+stderr stripped).
 
-    env_extra merges into the current environment (does not replace it).
+    env_extra merges into the current environment (does not replace it);
+    env, when given, IS the child's whole environment.
     Never raises — all errors map to an rc + message pair.
     """
-    env = None
-    if env_extra:
+    if env is None and env_extra:
         env = {**os.environ, **env_extra}
     try:
         p = subprocess.run(
