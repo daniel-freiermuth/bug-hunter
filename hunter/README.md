@@ -164,12 +164,18 @@ forever:
   analysis scans — marks the suspended attempt `killed` (reason
   `superseded`) in the same transaction that creates the fresh job,
   whichever path started it.
-- **Working directory gone.** The transcript describes files in the
-  clone (hunt, recheck, analysis scans) or the per-finding worktree
-  (fix, engage, harvest). If that directory no longer exists the
-  suspension is marked `killed` (reason `workdir-gone`) when selection
-  reaches it, and selection moves on to the next candidate the same
-  cycle.
+- **Working directory gone.** Every kind runs in its chain's own
+  workspace, `<work_root>/jobs/<origin_id>/`, and the transcript is full
+  of absolute paths into it — `tree/`, the git worktree of the repo's
+  clone, and `session/`, the transcript itself. A suspension is only
+  resumable while all three of these still hold: `tree/` is there, its
+  session file lies inside the chain's `session/`, and the row records
+  the commit the tree was pinned to. Failing any of them is permanent —
+  a row from before per-chain workspaces fails by construction, its
+  transcript and tree being in the old layout and its row carrying no
+  pinned commit — so the suspension is marked `killed` (reason
+  `workdir-gone`) when selection reaches it, and selection moves on to
+  the next candidate the same cycle.
 
 ### Budget policy
 

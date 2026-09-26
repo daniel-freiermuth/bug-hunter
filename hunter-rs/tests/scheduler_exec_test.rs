@@ -75,7 +75,8 @@ async fn record_job_done_state() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     let rr = RunResult {
         exit_code: Some(0),
         killed_reason: None,
@@ -122,7 +123,8 @@ async fn record_job_failed_state() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     let rr = RunResult {
         exit_code: Some(1),
         killed_reason: None,
@@ -167,7 +169,8 @@ async fn record_job_cap_kill_without_a_session_stays_killed() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     let rr = RunResult {
         exit_code: None,
         killed_reason: Some("cap".to_owned()),
@@ -213,7 +216,8 @@ async fn record_job_cap_kill_with_a_session_suspends() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     let rr = RunResult {
         exit_code: None,
         killed_reason: Some("cap".to_owned()),
@@ -259,7 +263,8 @@ async fn record_job_wallclock_kill_stays_killed_even_with_a_session() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     let rr = RunResult {
         exit_code: None,
         killed_reason: Some("wallclock".to_owned()),
@@ -300,7 +305,8 @@ async fn create_and_update_job_round_trip() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     assert!(job_id > 0);
 
     // Verify initial state
@@ -361,7 +367,8 @@ async fn reconcile_orphaned_jobs() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
 
     // Finding #3 is at "fixing" (seeded above), job at "running"
     let (stuck_findings, orphaned_jobs) = store.reconcile_orphaned_jobs().await.unwrap();
