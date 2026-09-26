@@ -31,18 +31,16 @@
 # usually to delete the redundant code that made it equivalent, not to
 # add a test that cannot exist. Both happened on the first run here.
 
-# Four tests read files OUTSIDE this crate, and cargo-mutants copies the
+# Three tests read files OUTSIDE this crate, and cargo-mutants copies the
 # crate only: `playbook_contract_test` renders the REAL playbooks in
 # ../hunter, `ui_contract_test` reads the REAL ../hunter/ui-svelte
-# sources, `gates_contract_test` reads ../.github/workflows/ci.yml, and
-# `python_adoption_test` runs the REAL Python daemon out of ../hunter to
-# build the database it then adopts. Left in, they fail against the copied
-# tree, and because that failure lands in the BASELINE the whole run
-# stops having mutated anything -- `*** result: Failure(100)` with the
-# real message (`cannot read /tmp/cargo-mutants-….tmp/../…`) buried
-# hundreds of lines up. All four are contract tests between two
-# directories rather than unit tests, so excluding them costs no
-# mutation signal.
+# sources, and `gates_contract_test` reads ../.github/workflows/ci.yml.
+# Left in, they fail against the copied tree, and because that failure
+# lands in the BASELINE the whole run stops having mutated anything --
+# `*** result: Failure(100)` with the real message (`cannot read
+# /tmp/cargo-mutants-….tmp/../…`) buried hundreds of lines up. All three
+# are contract tests between two directories rather than unit tests, so
+# excluding them costs no mutation signal.
 #
 # Adding a test that reads a sibling directory means adding it here too.
 # That is not a rule anything enforces: mutants is a separate advisory
@@ -56,7 +54,7 @@ test_tool = "nextest"
 
 additional_cargo_test_args = [
     "-E",
-    "not binary(playbook_contract_test) and not binary(ui_contract_test) and not binary(gates_contract_test) and not binary(python_adoption_test)",
+    "not binary(playbook_contract_test) and not binary(ui_contract_test) and not binary(gates_contract_test)",
 ]
 
 timeout_multiplier = 3.0

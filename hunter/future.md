@@ -27,30 +27,22 @@ of 2026-09-06. Runs as a systemd user service. It works; it earned the next
 phase. The Rust port has since taken over the service; this entry stands
 as the record of what it replaced.
 
-### Phase 2 — Rust port, feature parity (in progress)
+### Phase 2 — Rust port, feature parity (done)
 Port the daemon to Rust, single-user, same behavior, same DB file, same
 playbooks. Exit criterion: the Rust binary runs the full cycle (sync → engage
 → fix → hunt) against the live `data/hunter.db` for a week with no regression
 vs the Python daemon; Python daemon is then retired.
 
-Retirement is a single mechanical commit once that week has passed, and is
-worth spelling out because the interim state has a cost: `hunter/hunter/`
-(~7k lines) and `hunter/tests/` (~8k) are not executed in production but
-are still gated by CI, so defects get reported and fixed there. That is
-the price of keeping a rollback and it is paid knowingly — a fallback
-only counts as one while it still works, so the fixes are the point, not
-waste. What the interim buys is the option to fall back; what it costs is
-attention spent on code that will be deleted.
+Retired: `hunter/hunter/`, `hunter/tests/`, `schema.sql`,
+`pyproject.toml`/`uv.lock`, the Python `justfile`, the `python` CI job, and
+the Rust side's adoption of unstamped (Python-built) databases along with
+`python_adoption_test`. `hunter/` itself stays — it is the daemon's root
+(`config.json`, `data/`, `playbooks/`, `ui/`, `ui-svelte/`).
 
-What retirement removes: `hunter/hunter/`, `hunter/tests/`, `schema.sql`,
-`pyproject.toml`/`uv.lock`, and the `python` CI job. `hunter/` itself
-stays — it is the daemon's root (`config.json`, `data/`, `playbooks/`,
-`ui/`, `ui-svelte/`).
-
-One test dies with it and should not be replaced: `test_schema_parity.py`
-compares Python's schema construction against Rust's migrations, and that
-oracle is exactly what retirement discards. The property still worth
-holding is asserted Rust-side and more strongly by
+`test_schema_parity.py` went with it and is not replaced: it compared
+Python's schema construction against Rust's migrations, and that oracle is
+exactly what retirement discards. The property still worth holding is
+asserted Rust-side and more strongly by
 `hunter-rs/tests/migration_states_test.rs` — every reachable migration
 state rolls forward to head, converging on identical schema with its rows
 intact.
@@ -736,12 +728,11 @@ already dispatch-agnostic) carries over verbatim as the design basis.
 ### 8.7 Tooling: frontend lint + SQL lint
 **Status:** frontend lint done; SQL lint still an idea.
 
-CI now runs ruff (format + check), mypy `--strict` and pytest for the
-Python daemon; fmt, clippy `-D warnings`, `check-sql.sh` and nextest for
+CI runs fmt, clippy `-D warnings`, `check-sql.sh` and nextest for
 hunter-rs; and ESLint, `npm run check` (svelte-check), vitest and a Vite
 build for the Svelte frontend. `check-sql.sh` enforces the Rust store's SQL
 encapsulation (compile-time-checked queries only, no QueryBuilder); it does
-not lint SQL text, and nothing covers the Python side.
+not lint SQL text.
 
 - **ESLint for the frontend** — done. It was scoped to the hand-written
   `ui/src/app.ts`, which the Svelte UI replaced; the Svelte sources are

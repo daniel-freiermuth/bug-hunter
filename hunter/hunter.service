@@ -8,7 +8,7 @@ ExecStart=<project-root>/hunter-rs/target/release/hunter --root <project-root>/h
 Restart=on-failure
 RestartSec=30
 
-# SIGTERM means "finish the current cycle, then stop" in both daemons, so
+# SIGTERM means "finish the current cycle, then stop" in the daemon, so
 # the stop timeout has to cover a cycle that is running a worker. The
 # caps are hunt 1800s and fix 2700s of wall clock, so systemd's default
 # (10s here) turned every stop during a cycle into a SIGKILL -- the exact

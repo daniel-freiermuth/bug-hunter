@@ -1,18 +1,8 @@
 # hunter — Idle-Token Bug Hunter
 
-> **The Python daemon in `hunter/` is no longer what runs.** The service
-> executes the Rust binary (`hunter-rs/`), which owns `data/hunter.db` and
-> applies its own migrations. This package is retained only as a rollback
-> until the Phase 2 exit criterion in `future.md` is met — a week of the
-> Rust daemon against the live database with no regression — and is then
-> deleted. Until then it is expected to keep working: a rollback nobody
-> has kept correct is not a rollback. So fix defects found here — just
-> triage them as fallback defects rather than outages, since nothing in
-> production executes this code.
->
-> Everything else under `hunter/` is live: local `config.json`, `data/`,
-> `playbooks/`, generated `ui/`, and `ui-svelte/`. It is the daemon's root
-> directory.
+> The daemon is the Rust binary in `hunter-rs/`. This directory is its
+> root: local `config.json`, `data/`, `playbooks/`, generated `ui/`, and
+> `ui-svelte/`.
 
 Self-hosted [detail.dev](https://detail.dev)-style code analysis pipeline
 funded by spare Claude-subscription capacity. Register a repo; hunter finds
@@ -45,8 +35,7 @@ zero token cost and only spends against a budget it never overshoots.
 Requires a Rust toolchain and Node/npm (the daemon binary and the UI
 bundle), `omp` on `PATH` (the headless worker CLI this project is built
 around), `git`, and the `gh` CLI (or `glab` for GitLab repos)
-authenticated for whatever repos you register. Python 3.13+ is needed only
-for the rollback daemon in this package.
+authenticated for whatever repos you register.
 
 ```sh
 (cd hunter/ui-svelte && npm ci)           # once per checkout, and after a dependency change
@@ -60,22 +49,6 @@ Then open `http://localhost:8377`, go to **Repos**, and add a repository
 verdicts, notes, pausing repos, manual cycle/recheck triggers — happens in
 the UI; the binary itself takes only `--root` and `--port`
 (hunter-rs/src/main.rs:14-15).
-
-The Python rollback daemon in this package keeps its own two commands, and
-serves the same generated `ui/` bundle:
-
-```sh
-cd hunter
-python3 -m venv .venv                       # must be 3.13+
-.venv/bin/python -m pip install -e .        # pydantic, the only runtime dep
-.venv/bin/python -m hunter daemon           # UI + scheduler loop
-.venv/bin/python -m hunter serve            # UI only, no scheduler (local inspection)
-```
-
-One interpreter for the install and the run, for the reasons the rollback
-section below spells out: a bare `pip` may belong to a different Python,
-PEP 668 distros refuse it outright, and the system `python3` may predate
-3.13. It is the same `.venv` the rollback unit points at.
 
 ## How it works
 
@@ -160,7 +133,7 @@ uniformly to fix retries, recheck retries, and harvest retries.
 
 ### Budget policy
 
-`budget.py` reads omp's local usage mirror
+`backends/omp_scavenge` reads omp's local usage mirror
 (`~/.omp/agent/agent.db:usage_history`) and gates every job against two
 linear ramps, never letting spend get ahead of either:
 
@@ -170,7 +143,7 @@ linear ramps, never letting spend get ahead of either:
   crossed (default 75%) — hunter never eats into headroom you need for your
   own interactive sessions.
 - **5-hour ramp**: zero for a headroom period (default 30 min, tunable via
-  `HEADROOM_MS` in `budget.py`) so a freshly-opened window is never
+  `HEADROOM_MS` in `hunter-rs/src/backends/omp_scavenge/capacity.rs`) so a freshly-opened window is never
   immediately claimed, then ramps 0→1 over what's left. Unspent capacity at
   reset is wasted — there's no rollover.
 - **In-flight accounting**: a running job's *anticipated* cost (not its
@@ -178,7 +151,7 @@ linear ramps, never letting spend get ahead of either:
   2-5x cap_tokens in one atomic, uninterruptible LLM call) is reserved
   before the next decision, so concurrent/rapid cycles can't overshoot
   either ramp.
-- Workers are metered **externally**: `runner.py` tails the worker's live
+- Workers are metered **externally**: the harness tails the worker's live
   session JSONL and SIGTERMs the process group at the token cap — it never
   depends on the worker cooperating with its own limit.
 - Stale or missing usage data → conservative denial, never an optimistic
@@ -215,13 +188,12 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 
 ## API
 
-JSON routes — the UI's only client, but usable directly. Both servers
-expose the same set: axum in the Rust daemon (`router` in hunter-rs/src/server.rs),
-hand-rolled on `ThreadingHTTPServer` in the Python rollback.
+JSON routes — the UI's only client, but usable directly. Served by axum
+(`router` in hunter-rs/src/server.rs).
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/api/summary` | Budget windows, counts, activity status, "what's next" preview — validated against a pydantic schema before it ships |
+| GET | `/api/summary` | Budget windows, counts, activity status, "what's next" preview |
 | GET | `/api/findings` | List findings across all types (`status`, `repo`, `severity`, `type` query params) |
 | GET | `/api/finding` | One finding's full job history + PR state |
 | GET | `/api/jobs` | Recent jobs (last 50) |
@@ -242,40 +214,43 @@ hand-rolled on `ThreadingHTTPServer` in the Python rollback.
 ## Architecture
 
 ```
-hunter/
-├── __main__.py     entry point -> cli.py
-├── cli.py          argument parsing: `daemon` | `serve`
-├── types.py        shared dataclasses/TypedDicts, Config, Status/enums
-├── store.py        SQLite access layer (schema.sql + migrations)
-├── budget.py       two-ramp budget policy (§ Budget policy)
-├── runner.py       spawns headless `omp -p`, meters + kills at cap
-├── forge.py        GitHub/GitLab abstraction (gh/glab CLI wrappers)
-├── ingest.py       validates + dedupes a worker's findings.json into the store
-├── playbooks.py    renders playbooks/*.md templates into worker prompts
-├── scheduler.py    one cycle = one job; run_hunt/run_fix/run_engage/
+hunter-rs/src/
+├── main.rs         CLI: `--root`, `--port`
+├── daemon.rs       UI server + scheduler loop + usage prober, lockfile
+├── config.rs       config.json loading
+├── domain.rs       status/kind enums
+├── types.rs        API response + row types (the UI contract)
+├── store.rs        SQLite access layer; migrations in hunter-rs/migrations/
+├── backend.rs      Backend protocol (decide / run / status)
+├── backends/omp_scavenge/
+│                   budget policy (§ Budget policy), `omp -p` harness that
+│                   meters + kills at cap
+├── forge.rs        GitHub/GitLab abstraction (gh/glab CLI wrappers)
+├── ingest.rs       validates + dedupes a worker's findings.json into the store
+├── playbooks.rs    renders playbooks/*.md templates into worker prompts
+├── dep_scan.rs     Renovate-based dependency scan (zero tokens)
+├── scheduler.rs    one cycle = one job; run_hunt/run_fix/run_engage/
 │                   run_harvest/run_recheck/pick_next/run_cycle
-├── server.py       ThreadingHTTPServer + JSON API + serves ui/
-└── util.py         shared subprocess wrapper
+├── server.rs       axum JSON API + serves ui/
+└── util.rs         shared subprocess helpers
 
-playbooks/          worker prompt templates (one per job kind, see table above)
-ui/                 generated Vite bundle (ignored; built by `just build` in hunter-rs/)
-ui-svelte/          tracked Svelte source
-schema.sql           this package's schema; store.py migrates existing DBs. The live
-                     database is migrated by hunter-rs/migrations, and the two converge
-config.json          runtime config (§ Configuration)
-tests/               pytest suite, one file per module/behavior
+hunter/
+├── playbooks/      worker prompt templates (one per job kind, see table above)
+├── ui/             generated Vite bundle (ignored; built by `just build` in hunter-rs/)
+├── ui-svelte/      tracked Svelte source
+└── config.json     runtime config (§ Configuration)
 ```
 
 Each analysis/action kind follows the same shape: build a prompt from a
-`playbooks/*.md` template, run it through `runner.run_worker` under a
+`playbooks/*.md` template, run it through the backend under a
 budget-decided cap, then either ingest structured output (`findings.json`,
 `FOLLOW-UPS.json`) or interpret marker files the worker wrote
 (`NOT-A-BUG.md`, `PR-DESCRIPTION.md`, `WITHDRAW.md`, ...).
 
 ## Data model
 
-SQLite (`data/hunter.db`, WAL mode). Tables (see `schema.sql` for full
-column docs — most have inline comments explaining *why*, not just *what*):
+SQLite (`data/hunter.db`, WAL mode). Tables (see `hunter-rs/migrations/`
+for the schema — most columns carry comments explaining *why*, not just *what*):
 
 - **`repos`** — registered repositories, hunt watermarks, enabled/paused.
 - **`findings`** — one row per finding across all five types (type
@@ -327,40 +302,18 @@ column docs — most have inline comments explaining *why*, not just *what*):
 
 ## Development
 
-```sh
-just test           # pytest tests/
-just test-one NAME  # pytest tests/NAME.py -v
-just fmt-check      # ruff format --check
-just lint           # ruff check
-just typecheck      # mypy --strict
-```
+Rust gates live in `hunter-rs/justfile` (`just lint` and `just test` run fmt,
+clippy, `check-sql.sh` and nextest — the same commands CI runs). The
+frontend lives in `ui-svelte/`; Vite writes the bundle into the generated
+`ui/` (`ui-svelte/vite.config.ts:15`), which `just build` in `hunter-rs/`
+does alongside the release binary. Frontend checks: `npx eslint src/`,
+`npm run check`, `npx vitest run` in `ui-svelte/`.
 
-Or directly:
-
-```sh
-uv run pytest tests/ -q
-uv run mypy --strict hunter/
-uv run ruff check hunter/ tests/
-```
-
-The frontend is not built from here any more: it lives in `ui-svelte/` and
-Vite writes the bundle into the generated `ui/` (`ui-svelte/vite.config.ts:15`),
-which `just build` in `hunter-rs/` does alongside the release binary. This
-package's `build-ui` and `typecheck-ui` recipes still point at
-`ui/src/app.ts` and `ui/tsconfig.json`, both deleted in that move, so they
-fail — and with them `just check`, `just fix`, `just daemon` and `just
-serve`, which depend on them. Use the commands above until the recipes are
-repaired.
-
-Conventions: `mypy --strict` on all Python; strict TypeScript on the
-frontend with hand-rolled structural validation at the network boundary
-(`ui-svelte/src/lib/validate.ts`, which checks exactly what the components
-dereference unconditionally) and a pydantic-validated boundary on the
-backend for `/api/summary`, so a shape drift between them fails loudly
-instead of silently rendering garbage. Tests are colocated
-one file per behavior/module under `tests/`, favoring real fixtures (actual
-git repos in `tmp_path`, an in-memory-equivalent SQLite `Store`) over deep
-mocking.
+Conventions: strict TypeScript on the frontend with hand-rolled structural
+validation at the network boundary (`ui-svelte/src/lib/validate.ts`, which
+checks exactly what the components dereference unconditionally), so a
+shape drift between daemon and UI fails loudly instead of silently
+rendering garbage.
 
 ## Running as a service
 
@@ -393,29 +346,3 @@ decoupled from the token-budget backoff loop, so a long budget-driven sleep
 never delays noticing new PR feedback. Every wake re-checks the budget gate
 before spending anything.
 
-### Rollback: running the Python daemon instead
-
-Kept working on purpose (see the note at the top of this file), so these
-steps stay here — but they are the rollback path, not the normal one. Both
-daemons share `data/hunter.db` and the same generated `ui/` bundle, and the
-Python store migrates whatever database it opens to the same shape
-(`tests/test_schema_parity.py` asserts the two agree), so switching is a
-unit edit plus a restart:
-
-```sh
-systemctl --user stop hunter.service
-# One interpreter for the install AND the unit. A bare `pip install` can
-# belong to a different Python than /usr/bin/python3, which then cannot
-# import pydantic and the rollback fails at startup; on a PEP 668 distro
-# it refuses outright with externally-managed-environment; and the
-# package needs 3.13+, which /usr/bin/python3 may not be.
-python3 -m venv hunter/.venv                       # must be 3.13+
-hunter/.venv/bin/python -m pip install -e hunter   # pydantic, the only runtime dep
-# then in ~/.config/systemd/user/hunter.service:
-#   WorkingDirectory=<project-root>/hunter
-#   ExecStart=<project-root>/hunter/.venv/bin/python -m hunter daemon
-systemctl --user daemon-reload
-systemctl --user start hunter.service
-```
-
-Switching back is the same edit in reverse, against the checked-in unit.

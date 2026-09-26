@@ -1,6 +1,6 @@
-//! Config loading — reads the SAME hunter/config.json the Python side owns
-//! (API-CONTRACT.md §12). `root` is the Python project dir (contains
-//! config.json, ui/, data/); relative paths resolve against it.
+//! Config loading — reads hunter/config.json (API-CONTRACT.md §12).
+//! `root` is the hunter/ project dir (contains config.json, ui/, data/);
+//! relative paths resolve against it.
 
 use std::path::{Path, PathBuf};
 
@@ -86,7 +86,7 @@ struct RawScan {
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// The hunter/ project root (Python side) this serve reads from.
+    /// The hunter/ project root this daemon reads from.
     pub root: PathBuf,
     pub work_root: PathBuf,
     pub db_path: PathBuf,

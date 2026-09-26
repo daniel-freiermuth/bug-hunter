@@ -51,24 +51,6 @@ jobs:
         with:
           tool: cargo-nextest@0.9.115
 
-      # `python_adoption_test` drives the REAL Python daemon to build a
-      # database and then adopts it, which is the only way to prove the
-      # adoption path against the schema Python actually writes rather
-      # than against a fixture that agrees with us by construction.
-      # Without an interpreter here that test skipped itself and the job
-      # still passed -- a gate whose skip path is indistinguishable from
-      # a pass, which this repo has now been bitten by three times.
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.14"
-
-      - name: Python daemon deps
-        # pydantic only: hunter.types imports it, and Store needs nothing
-        # else. Pinned for the same reason as every other CI tool.
-        run: |
-          pip install pydantic==2.13.5
-          echo "HUNTER_TEST_PYTHON=$(which python)" >> "$GITHUB_ENV"
-
       - name: Test
         run: cargo nextest run --profile ci
 
@@ -109,17 +91,6 @@ jobs:
       - uses: taiki-e/install-action@9114bf4d891761788c546334fd37538eae1bf8b3 # v2.87.16
         with:
           tool: cargo-nextest@0.9.115,cargo-llvm-cov@0.6.23
-
-      # Same interpreter as the test job: this one runs the whole suite
-      # too, so `python_adoption_test` reaches its CI guard here as well.
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.14"
-
-      - name: Python daemon deps
-        run: |
-          pip install pydantic==2.13.5
-          echo "HUNTER_TEST_PYTHON=$(which python)" >> "$GITHUB_ENV"
 
       - name: Coverage
         run: cargo llvm-cov nextest --profile ci --summary-only --fail-under-lines 50
@@ -164,40 +135,3 @@ jobs:
 
       - name: Build
         run: npx vite build
-  # ── Python hunter (hunter/) ────────────────────────────────────
-  python:
-    name: Python — lint + typecheck + test
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: hunter
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: "3.14"
-
-      - name: Install deps
-        # Pinned exactly, per CODING_STANDARDS.md: an unpinned `ruff` or
-        # `mypy` means a release elsewhere turns this job red with no
-        # change in this repository, and the first thing anyone does with
-        # a red gate they did not cause is distrust the gate. Bumping is
-        # a commit, which is the point -- the new rules land with someone
-        # looking at them.
-        run: pip install ruff==0.16.0 mypy==2.3.0 pydantic==2.13.5 pytest==9.1.1
-
-      - name: Format check
-        run: ruff format --check hunter/ tests/
-
-      - name: Lint
-        run: ruff check hunter/ tests/
-
-      - name: Typecheck
-        run: mypy --strict hunter/
-
-      - name: Test
-        run: pytest tests/ -q
-

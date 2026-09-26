@@ -53,8 +53,9 @@ reviews:
     # than an edit -- and the cost of not looking was demonstrated: the
     # `LIKE '%/' || name` wildcard bug lives in 007, where `_` in a repo
     # name matches any character, and it was found only because the same
-    # SQL had been copied into the Python daemon where it was reviewable.
-    # The migration itself went unread because this list hid it.
+    # SQL had been copied into the (since deleted) Python daemon where it
+    # was reviewable. The migration itself went unread because this list
+    # hid it.
     #
     # So: freeze what genuinely cannot change, review everything else.
     - "!hunter-rs/migrations/001_initial_schema.sql"
@@ -63,42 +64,25 @@ reviews:
     - "!hunter-rs/migrations/004_findings_add_standard_section.sql"
     - "!hunter-rs/migrations/005_events_finding_id_index.sql"
 
-    # The Python daemon. It is kept only as the rollback for the Phase 2
-    # soak and is expected to be deleted once that passes, so review
-    # attention spent here buys little that outlives the soak.
-    #
-    # This is a real trade, not a free one: a third of the findings in the
-    # last two rounds were in these paths, several of them parity gaps
-    # that exist ONLY on this side. What makes it acceptable is that the
-    # defects worth catching are the ones MIRRORED in hunter-rs, and that
-    # copy is still reviewed — a bug reported against store.rs is a bug
-    # to check in store.py. What is given up is Python-only defects, in a
-    # daemon that is scheduled for deletion.
-    #
-    # Parity itself is still enforced by machinery rather than by
-    # attention: tests/test_schema_parity.py compares the two schemas in
-    # both directions, and API-CONTRACT.md / API-CONTRACT-WRITES.md
-    # document the shared behaviour both must implement.
-    #
-    # REMOVE THIS BLOCK if the Python daemon stops being disposable —
-    # if the soak fails and it becomes the production daemon again, it
-    # needs review more than anything else in this repository.
+    # The retired Python daemon. Every entry is a deletion; reviewing the
+    # removal of code that no longer exists has no outcome.
     - "!hunter/hunter/**"
     - "!hunter/tests/**"
     - "!hunter/schema.sql"
-    # The Python daemon's own toolchain config: ruff, mypy and pytest
-    # settings, and per-file ignores that name hunter/*.py. It configures
-    # nothing but the code excluded just above.
     - "!hunter/pyproject.toml"
+    - "!hunter/uv.lock"
+    - "!hunter/justfile"
 
-    # The retired hand-rolled UI. All three entries are deletions; the
-    # replacement is in ui-svelte/ and fully reviewable. Reviewing the
-    # removal of code that no longer exists has no outcome. (`hunter/ui/`
-    # is now vite's gitignored outDir, so nothing else under it is in the
-    # diff.)
+    # The retired hand-rolled UI and its npm toolchain. Every entry is a
+    # deletion; the replacement is in ui-svelte/ and fully reviewable.
+    # Reviewing the removal of code that no longer exists has no outcome.
+    # (`hunter/ui/` is now vite's gitignored outDir, so nothing else under
+    # it is in the diff.)
     - "!hunter/ui/src/app.ts"
     - "!hunter/ui/tsconfig.json"
     - "!hunter/ui/index.html"
+    - "!hunter/package.json"
+    - "!hunter/package-lock.json"
 
     # Repo plumbing and runner configuration, thin on review surface:
     # ignore globs, the DATABASE_URL that points sqlx's compile-time

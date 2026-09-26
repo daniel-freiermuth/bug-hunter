@@ -1,9 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! Every reachable database state can roll forward to head.
 //!
-//! The bootstrap test covers state 0 (no file) and the Python parity suite
-//! covers state 1. Neither says anything about an installation sitting at
-//! state 2 or 3, and "the migration chain works" is a claim about *all* of
+//! The bootstrap test covers state 0 (no file). It says nothing about an
+//! installation sitting at any later state, and "the migration chain
+//! works" is a claim about *all* of
 //! them: a deployment that has been offline for two releases must be able
 //! to catch up, and it must land on exactly the schema a fresh install
 //! gets, or the two diverge permanently from that point on.
@@ -305,13 +305,9 @@ async fn the_migration_chain_leaves_foreign_keys_enforced() {
 /// Upgrading rewrites name-derived clone paths to id-derived ones.
 ///
 /// Rows written before clone directories were keyed by id point at
-/// `repos/<name>`. Both daemons share one `work_root`, so a database that
-/// kept the old paths would have hunter-rs looking in one place and the
-/// Python daemon in another, and every repo re-cloning on its next job.
-///
-/// Python has covered this since the rewrite was ported to it; the Rust
-/// side did not, which only surfaced on deleting the rewrite from the
-/// migration and watching the whole suite stay green.
+/// `repos/<name>`. A database that kept the old paths would have the
+/// daemon looking in the wrong place, and every repo re-cloning on its
+/// next job.
 ///
 /// Seeded at state 6 so that rolling forward actually executes 007.
 #[tokio::test]
