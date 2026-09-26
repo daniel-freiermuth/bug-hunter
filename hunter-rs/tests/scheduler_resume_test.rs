@@ -10,18 +10,22 @@
 mod support;
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use hunter::backend::{Backend, JobClass, Outlook, Verdict};
 use hunter::config::Config;
 use hunter::domain::{FindingJobKind, FindingStatus, JobKind, JobState, RepoJobKind};
 use hunter::scheduler::{
     Candidate, ResumePlan, pick_next, record_job, run_fix, run_harvest, run_hunt, run_recheck,
 };
+use hunter::server::{AppState, SchedulerHandle, router};
 use hunter::store::{FindingInsert, Store};
 use hunter::types::RunResult;
 use sqlx::SqlitePool;
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, git};
+use tower::util::ServiceExt;
 
 /// The per-kind typical cost every test here is calibrated against.
 ///
@@ -100,42 +104,45 @@ async fn seed_repo(pool: &SqlitePool, dir: &TempDir) -> PathBuf {
 /// Three completed hunts, all costing [`Z`]. Also makes the repo "warm",
 /// which the constant is chosen to be indifferent to.
 async fn seed_history(pool: &SqlitePool) {
+    seed_history_at(pool, Z).await;
+}
+
+/// Three completed hunts, all costing `tokens`, so the per-kind
+/// estimate is `tokens` whichever percentile `anticipated_tokens` reads.
+async fn seed_history_at(pool: &SqlitePool, tokens: i64) {
     for id in 1..=3_i64 {
         sqlx::query(
             "INSERT INTO jobs (id, kind, repo_id, state, tokens_new, started_at, finished_at) \
              VALUES (?1, 'hunt', 1, 'done', ?2, 1000, 2000)",
         )
         .bind(id)
-        .bind(Z)
+        .bind(tokens)
         .execute(pool)
         .await
         .unwrap();
     }
 }
 
+/// A worker transcript whose context at suspension is [`CTX`].
+fn seed_session(dir: &TempDir) -> PathBuf {
+    seed_session_with_ctx(dir, CTX)
+}
+
 /// A worker transcript in omp's session format.
 ///
 /// Two assistant calls. The first is a small opening exchange; the
 /// second is where the session had got to when it was suspended, and its
-/// `input + cacheRead + cacheWrite` is [`CTX`]. Only that last record
+/// `input + cacheRead + cacheWrite` is `ctx`. Only that last record
 /// should count: re-establishing a session costs the context it had
 /// reached, not the sum of every call that built it.
-fn seed_session(dir: &TempDir) -> PathBuf {
+fn seed_session_with_ctx(dir: &TempDir, ctx: i64) -> PathBuf {
     let path = dir.path().join("session.jsonl");
-    std::fs::write(
-        &path,
-        concat!(
-            r#"{"message":{"role":"assistant","usage":"#,
-            r#"{"input":500,"output":200,"cacheRead":0,"cacheWrite":37000}}}"#,
-            "\n",
-            r#"{"message":{"role":"user","content":"noise"}}"#,
-            "\n",
-            r#"{"message":{"role":"assistant","usage":"#,
-            r#"{"input":50000,"output":900,"cacheRead":140000,"cacheWrite":10000}}}"#,
-            "\n",
-        ),
-    )
-    .unwrap();
+    let opening = serde_json::json!({"message": {"role": "assistant", "usage":
+        {"input": 500, "output": 200, "cacheRead": 0, "cacheWrite": 37_000}}});
+    let noise = serde_json::json!({"message": {"role": "user", "content": "noise"}});
+    let last = serde_json::json!({"message": {"role": "assistant", "usage":
+        {"input": 1_000, "output": 900, "cacheRead": ctx - 11_000, "cacheWrite": 10_000}}});
+    std::fs::write(&path, format!("{opening}\n{noise}\n{last}\n")).unwrap();
     path
 }
 
@@ -278,12 +285,16 @@ fn resume_plan_of(c: Option<Candidate>) -> ResumePlan {
 /// 1.00 across 112 production re-cache events. Reserving only the
 /// leftover estimate would under-reserve by exactly the amount that
 /// makes resuming cheaper than restarting.
+///
+/// The context is small here so that the leftover estimate, not the
+/// work floor, is the larger work term.
 #[tokio::test]
 async fn resume_reserves_context_plus_the_remaining_estimate() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
-    let session = seed_session(&dir);
+    let ctx = 20_000;
+    let session = seed_session_with_ctx(&dir, ctx);
     let spent = 40_000;
     seed_suspension(&pool, 10, &session, spent).await;
     let store = rw_store(&path).await;
@@ -296,27 +307,28 @@ async fn resume_reserves_context_plus_the_remaining_estimate() {
     assert_eq!(plan.session_file, session);
     assert_eq!(
         plan.anticipated,
-        CTX + (Z - spent),
-        "ctx {CTX} + max({Z} - {spent}, 25_000)"
+        ctx + (Z - spent),
+        "ctx {ctx} + max({Z} - {spent}, 25_000)"
     );
 }
 
-/// When the chain has already outspent the per-kind typical, the
-/// progress term is floored rather than going negative.
+/// A resume reserves at least as much work as it re-sends context, even
+/// once the chain has spent past the per-kind typical.
 ///
-/// `z - chain_spent` is meaningless once it is below zero: a negative
-/// budget for the work still to do is not a small budget. Floored at
-/// enough for the worker to make real progress after re-caching —
-/// reserving only the re-cache would fund a resume that can do nothing
-/// but re-cache and be killed again, turning every resume into another
-/// suspension.
+/// Re-sending the transcript is pure overhead. Under a flat 25,000
+/// work floor, a 100,000-token transcript whose chain had exhausted the
+/// typical reserved 125,000, and a window with just that much room
+/// admitted an attempt that spent 80% of its budget re-sending and 20%
+/// working. Reserving 200,000 makes the gate wait for a window that can
+/// fund an attempt that is at least half work.
 #[tokio::test]
-async fn resume_reservation_floors_the_progress_term_when_the_chain_overspent() {
+async fn a_resume_reserves_at_least_as_much_work_as_it_resends_context() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
-    let session = seed_session(&dir);
-    // Over the typical, but well under the give-up ceiling of 3x.
+    let session = seed_session_with_ctx(&dir, 100_000);
+    // Over the typical, so `z - chain_spent` is negative, but well under
+    // the give-up ceiling of 3x.
     let spent = Z + 30_000;
     seed_suspension(&pool, 10, &session, spent).await;
     let store = rw_store(&path).await;
@@ -324,11 +336,10 @@ async fn resume_reservation_floors_the_progress_term_when_the_chain_overspent() 
 
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
 
+    assert_eq!(plan.ctx, 100_000);
     assert_eq!(
-        plan.anticipated,
-        CTX + 25_000,
-        "z - chain_spent is {} here, so the floor is what binds",
-        Z - spent
+        plan.anticipated, 200_000,
+        "100_000 of context + at least 100_000 of work"
     );
 }
 
@@ -349,7 +360,15 @@ async fn resume_falls_back_to_the_per_kind_estimate_when_the_transcript_is_unrea
 
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
 
-    assert_eq!(plan.anticipated, Z + (Z - spent));
+    assert_eq!(
+        plan.ctx, Z,
+        "the per-kind typical stands in for the context"
+    );
+    assert_eq!(
+        plan.anticipated,
+        2 * Z,
+        "ctx {Z} + max({Z} - {spent}, as much work as context)"
+    );
 }
 
 // -- the give-up ceiling -----------------------------------------------------
@@ -1058,9 +1077,8 @@ impl Backend for RecordingBackend {
     }
 }
 
-/// A real clone with a bare origin, registered as repo 1, plus history,
-/// a transcript and a suspended hunt whose id is `pred`.
-async fn executable_repo(dir: &TempDir, pool: &SqlitePool, pred: i64) -> (GitRepo, PathBuf) {
+/// A real clone with a bare origin, registered as repo 1.
+async fn cloned_repo(dir: &TempDir, pool: &SqlitePool) -> GitRepo {
     let repo = GitRepo::with_branch(dir, "feature");
     sqlx::query(
         "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
@@ -1071,6 +1089,13 @@ async fn executable_repo(dir: &TempDir, pool: &SqlitePool, pred: i64) -> (GitRep
     .execute(pool)
     .await
     .unwrap();
+    repo
+}
+
+/// [`cloned_repo`] plus history, a transcript and a suspended hunt whose
+/// id is `pred`.
+async fn executable_repo(dir: &TempDir, pool: &SqlitePool, pred: i64) -> (GitRepo, PathBuf) {
+    let repo = cloned_repo(dir, pool).await;
     seed_history(pool).await;
     let session = seed_session(dir);
     seed_suspension(pool, pred, &session, 40_000).await;
@@ -1148,7 +1173,11 @@ async fn a_resumed_hunt_continues_the_session_and_ingests_the_origin_output_path
             .unwrap();
     assert_eq!(kind, "hunt", "a resume runs as the kind that was suspended");
     assert_eq!(resumed_from, Some(10));
-    assert_eq!(estimated, Some(CTX + (Z - 40_000)));
+    assert_eq!(
+        estimated,
+        Some(plan.anticipated),
+        "the row records the resume's reservation, not a cold estimate"
+    );
 
     let after = store.get_repo_by_id(1).await.unwrap().unwrap();
     assert!(
@@ -1224,6 +1253,159 @@ async fn a_cycle_dispatches_a_resume_to_the_suspended_kinds_executor() {
     assert!(
         store.list_resumable_jobs().await.unwrap().is_empty(),
         "the successor row takes the suspension out of the pool"
+    );
+}
+
+// -- the cold reservation ----------------------------------------------------
+
+/// A backend that records the reservation the gate asks about and
+/// refuses it, so an executor stops at the gate and nothing runs.
+#[derive(Default)]
+struct GateProbe {
+    reserved: OnceLock<i64>,
+}
+
+impl GateProbe {
+    fn reserved(&self) -> Option<i64> {
+        self.reserved.get().copied()
+    }
+}
+
+#[async_trait::async_trait]
+impl Backend for GateProbe {
+    async fn decide(&self, anticipated_tokens: i64) -> anyhow::Result<Outlook> {
+        // `set` fails only if one probe gated twice; each run gets its own.
+        let _ = self.reserved.set(anticipated_tokens);
+        let denied = Verdict::Denied {
+            reason: "test: recording the reservation".to_owned(),
+            retry_at: None,
+        };
+        Ok(Outlook {
+            normal: denied.clone(),
+            prioritized: denied,
+        })
+    }
+
+    async fn keep_fresh(&self) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    async fn status_html(&self) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+
+    async fn run(
+        &self,
+        _cwd: &Path,
+        _prompt: &str,
+        _cap_tokens: Option<i64>,
+        _max_wall_s: i64,
+        _job_class: JobClass,
+        _resume_from: Option<&Path>,
+    ) -> anyhow::Result<RunResult> {
+        anyhow::bail!("every reservation was refused, so nothing may run")
+    }
+}
+
+/// A cold start reserves the per-kind history, but never less than a
+/// cold session's fixed context plus as much again for work: 40,000.
+///
+/// Live: mis-metered rows once dragged the history to 1,876 tokens, and
+/// the gate then started hunts with about 10,000 of headroom that died
+/// on their second call. A history above the floor is still what gets
+/// reserved — the floor is a minimum, not a replacement.
+#[tokio::test]
+async fn a_cold_start_reserves_at_least_the_efficiency_floor() {
+    let (dir, path, pool) = fresh_db().await;
+    cloned_repo(&dir, &pool).await;
+    seed_history_at(&pool, 1_876).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+    let row = store.get_repo_by_id(1).await.unwrap().unwrap();
+
+    let collapsed = GateProbe::default();
+    let summary = run_hunt(&store, &cfg, &row, &collapsed, None)
+        .await
+        .unwrap();
+    assert!(summary.denied.is_some(), "the probe refuses: {summary:?}");
+    sqlx::query("UPDATE jobs SET tokens_new = 100000 WHERE state = 'done'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let healthy = GateProbe::default();
+    run_hunt(&store, &cfg, &row, &healthy, None).await.unwrap();
+
+    assert_eq!(
+        (collapsed.reserved(), healthy.reserved()),
+        (Some(40_000), Some(100_000)),
+        "max(history, 15_000 + 15_000): the floor over a collapsed history, \
+         the history over the floor"
+    );
+}
+
+/// The reservation `/api/summary` asked the backend about when it
+/// previewed the next candidate.
+async fn previewed_reservation(store: &Arc<Store>, root: &Path) -> Option<i64> {
+    let probe = Arc::new(GateProbe::default());
+    let mut config = test_config(root);
+    config.ui_dir = root.join("ui");
+    std::fs::create_dir_all(&config.ui_dir).unwrap();
+    let state = AppState {
+        store: Arc::clone(store),
+        config: Arc::new(config),
+        backend: probe.clone(),
+        repo_notes: Arc::new(tokio::sync::Mutex::new(())),
+        scheduler: SchedulerHandle {
+            running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        },
+    };
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    probe.reserved()
+}
+
+/// The summary's "what's next" preview asks the budget about the same
+/// reservation the gate will: a resume's own, and a cold start's
+/// floored estimate.
+///
+/// Anything else previews a budget decision the scheduler is not going
+/// to make — "allowed" for a resume the gate will refuse, or for a hunt
+/// the floor holds back.
+#[tokio::test]
+async fn the_summary_preview_reserves_what_the_gate_reserves() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    let session = seed_session(&dir);
+    seed_suspension(&pool, 10, &session, 40_000).await;
+    let store = Arc::new(rw_store(&path).await);
+
+    let resume = previewed_reservation(&store, dir.path()).await;
+
+    sqlx::query("DELETE FROM jobs WHERE id = 10")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET tokens_new = 1876 WHERE state = 'done'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let cold = previewed_reservation(&store, dir.path()).await;
+
+    assert_eq!(
+        (resume, cold),
+        (Some(CTX + CTX), Some(40_000)),
+        "the resume's ctx {CTX} + as much work as context; a cold hunt's floor over 1_876"
     );
 }
 

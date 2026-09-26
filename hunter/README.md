@@ -193,6 +193,20 @@ linear ramps, never letting spend get ahead of either:
   history is the 20 most recent *completed* jobs of that kind, not all of
   it — a window ages out both rows written under accounting bugs that
   have since been fixed and repos that have since changed size.
+- **Start efficiency**: loading context is pure overhead, so no attempt
+  starts unless the window can fund at least as much work as the context
+  it must load (`MIN_START_EFFICIENCY` = 0.5; never less than 25k of
+  work). A resume re-sends its whole transcript (measured: re-cache cost
+  equals the context at suspension), so it reserves that context plus
+  the larger of what is left of a typical job and that minimum — a
+  100k-token transcript reserves at least 200k. With a flat 25k on top it
+  would reserve 125k, and an attempt granted 125k spends 80% of it
+  re-sending the transcript and 20% working. A cold start reserves the
+  larger of its history estimate and 40k (a 15k system-prompt floor plus
+  25k of work), which also stops a collapsed estimate from starting jobs
+  that die on their second call. A larger reservation does not shrink
+  the granted cap — the cap is computed without the job's own
+  reservation — it makes the gate refuse until the window can fund both.
 - A granted job's token cap is the ramp's remaining headroom, verbatim —
   there is no separate configured per-kind cap. Workers are metered
   **externally**: the harness tails the worker's live session JSONL and
