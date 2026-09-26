@@ -14,7 +14,8 @@
 
 use std::path::Path;
 
-use hunter::domain::FindingType;
+use hunter::domain::{FindingJobKind, FindingType, RepoJobKind};
+use ts_rs::TS;
 
 fn format_ts() -> String {
     let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../hunter/ui-svelte/src/lib/format.ts");
@@ -55,10 +56,10 @@ fn the_ui_renders_every_finding_type() {
     );
 }
 
-/// The fallback stays reachable. `Finding.type` is typed `string` in the
-/// UI because it arrives as unvalidated JSON, so an older UI meeting a
-/// newer daemon must degrade rather than break — which is also why the
-/// compiler cannot enforce the check above.
+/// The fallback stays reachable. `FindingOut.type` is the generated
+/// `FindingType` union, but that only describes the daemon this UI was
+/// built against: an older UI meeting a newer daemon receives a type it
+/// has never heard of and must degrade rather than break.
 #[test]
 fn the_ui_keeps_a_fallback_for_unknown_types() {
     let src = format_ts();
@@ -68,4 +69,27 @@ fn the_ui_keeps_a_fallback_for_unknown_types() {
             "{helper} must keep a default arm for a type this build has not heard of"
         );
     }
+}
+
+/// The generated `JobKind` union spells the wire strings `as_str` sends.
+///
+/// `JobKind` serializes through a hand-written `as_str`, while its
+/// TypeScript type comes from `#[ts(rename_all = "snake_case")]` on the
+/// two kind enums. Every other enum derives both from one serde attribute;
+/// here the two spellings are independent, so a renamed wire string would
+/// leave the UI typed against a value the daemon no longer sends.
+#[test]
+fn the_generated_job_kinds_are_the_wire_strings() {
+    let cfg = ts_rs::Config::new();
+    let generated: Vec<String> = [RepoJobKind::inline(&cfg), FindingJobKind::inline(&cfg)]
+        .iter()
+        .flat_map(|union| union.split(" | ").map(str::to_owned).collect::<Vec<_>>())
+        .collect();
+    let wire: Vec<String> = RepoJobKind::ALL
+        .iter()
+        .map(|k| k.as_str())
+        .chain(FindingJobKind::ALL.iter().map(|k| k.as_str()))
+        .map(|s| format!("\"{s}\""))
+        .collect();
+    assert_eq!(generated, wire);
 }

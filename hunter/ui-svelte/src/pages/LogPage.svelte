@@ -1,6 +1,6 @@
 <script lang="ts">
   import { store } from "../lib/api.svelte";
-  import type { Job } from "../lib/types";
+  import type { JobListEntry } from "../lib/types";
   import { ts, datetime, ktok, dur } from "../lib/format";
 
   let events = $derived(store.events);
@@ -18,7 +18,7 @@
 
   // Absent rather than empty when talking to a daemon that predates the
   // field, so this is the one place that decides what "no data" means.
-  function produced(job: Job): number[] {
+  function produced(job: JobListEntry): number[] {
     return job.produced_finding_ids ?? [];
   }
 

@@ -4,7 +4,7 @@
   import { datetime } from "../lib/format";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { untrack } from "svelte";
-  import type { Repo } from "../lib/types";
+  import type { RepoBrief } from "../lib/types";
 
   // Toast state
   let toasts = $state<{ id: number; msg: string; ok: boolean }[]>([]);
@@ -64,7 +64,7 @@
   // So the cache is invalidated on *identity*, not on the id
   // disappearing. An absence check would not fire for a replacement, and
   // identity costs nothing extra here.
-  function repoIdentity(r: Repo): string {
+  function repoIdentity(r: RepoBrief): string {
     return `${r.url}\u0000${r.added_at}`;
   }
   // SvelteMap for the same reason as the collections it mirrors: the lint
@@ -96,7 +96,7 @@
     });
   });
 
-  async function toggleRepo(repo: Repo) {
+  async function toggleRepo(repo: RepoBrief) {
     const enabled = repo.enabled ? 0 : 1;
     try {
       const r = await post("/api/repo", { id: repo.id, enabled });
@@ -118,7 +118,7 @@
     }
   }
 
-  async function removeRepo(repo: Repo) {
+  async function removeRepo(repo: RepoBrief) {
     if (!confirm(`Remove repo "${repo.name}"? This cannot be undone.`)) return;
     try {
       const r = await post("/api/repo/delete", { id: repo.id });

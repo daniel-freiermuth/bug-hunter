@@ -6,6 +6,7 @@
 //! exhaustive-match guarantee that string comparisons can never provide.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 // ---------------------------------------------------------------------------
 // Finding status
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 /// Finding lifecycle status. The DB column is TEXT; sqlx maps via
 /// `rename_all` = "`snake_case`".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(rename_all = "snake_case")]
 pub enum FindingStatus {
@@ -84,7 +85,7 @@ impl std::fmt::Display for FindingStatus {
 // Job state
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(rename_all = "snake_case")]
 pub enum JobState {
@@ -120,7 +121,7 @@ impl std::fmt::Display for JobState {
 // ---------------------------------------------------------------------------
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, sqlx::Type,
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, sqlx::Type, TS,
 )]
 #[serde(rename_all = "snake_case")]
 #[sqlx(rename_all = "snake_case")]
@@ -167,7 +168,7 @@ impl std::fmt::Display for Severity {
 // Finding type (bug, dep_update, test_gap, …)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(rename_all = "snake_case")]
 pub enum FindingType {
@@ -227,7 +228,8 @@ impl std::str::FromStr for FindingType {
 // DB/JSON traffic keeps using the flat `JobKind` enum below.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TS)]
+#[ts(rename_all = "snake_case")]
 pub enum RepoJobKind {
     Hunt,
     TestGap,
@@ -289,7 +291,8 @@ impl std::str::FromStr for RepoJobKind {
 // Finding job kinds (fix + PR lifecycle).
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TS)]
+#[ts(rename_all = "snake_case")]
 pub enum FindingJobKind {
     Fix,
     Engage,
@@ -336,7 +339,8 @@ impl std::str::FromStr for FindingJobKind {
 // automatically extends JobKind with zero changes here.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TS)]
+#[ts(untagged)]
 pub enum JobKind {
     Repo(RepoJobKind),
     Finding(FindingJobKind),
@@ -447,7 +451,7 @@ impl<'r> sqlx::Decode<'r, sqlx::Sqlite> for JobKind {
 // Bug class (kebab-case: boundary, error-path, race, …)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
 pub enum BugClass {
     #[serde(rename = "boundary")]
     #[sqlx(rename = "boundary")]

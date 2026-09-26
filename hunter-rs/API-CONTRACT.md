@@ -3,7 +3,7 @@
 Extracted from the Python source at commit state of 2026-09-13. Every claim cites `file:line`.
 Sources: `hunter/hunter/server.py` (handler), `hunter/hunter/store.py` (SQL), `hunter/hunter/types.py` (types/config), `hunter/schema.sql` (DDL), `hunter/ui-svelte/src/` (consumer — the vanilla `hunter/ui/src/app.ts` this document was first written against no longer exists; `hunter/ui/` is now the gitignored Vite bundle built from `ui-svelte`, `.gitignore:15`).
 
-Parity bar: the Svelte UI (`hunter/ui-svelte/src/`) must work unchanged. Nothing client-side validates against a schema: `lib/validate.ts` is a structural guard that checks only what a component dereferences without a `?.`, so some missing keys blank the whole dashboard and others degrade to a dash with no signal. Which is which is section 13, and that split is the contract — not the interfaces in `lib/types.ts`, which `api<T>()` casts to without looking at the bytes (`lib/api.svelte.ts:32-45`).
+Parity bar: the Svelte UI (`hunter/ui-svelte/src/`) must work unchanged. Nothing client-side validates against a schema: `lib/validate.ts` is a structural guard that checks only what a component dereferences without a `?.`, so some missing keys blank the whole dashboard and others degrade to a dash with no signal. Which is which is section 13, and that split is the contract — not the TypeScript types ts-rs generates from `src/types.rs` into `lib/generated/`, which `api<T>()` casts to without looking at the bytes (`lib/api.svelte.ts:32-45`).
 
 ---
 
@@ -237,7 +237,7 @@ SELECT COUNT(*) AS jobs,
  SUM(CASE WHEN state='denied' THEN 1 ELSE 0 END) AS denied
 FROM jobs
 ```
-Keys: `jobs:int, total_tokens:int|null, total_calls:int|null, total_usage_delta:float|null, done:int|null, denied:int|null`. With zero job rows: `jobs = 0` and every SUM is null (SQL semantics) — the UI declares `done`/`denied` as nullable (`lib/types.ts:159-160`) and formats them with `?? '–'` (`pages/StatsPage.svelte:38,43`), so null survives and renders as a dash; replicate SQL behavior exactly. (`rows[0] if rows else {}` — the else branch is unreachable for an aggregate.)
+Keys: `jobs:int, total_tokens:int|null, total_calls:int|null, total_usage_delta:float|null, done:int|null, denied:int|null`. With zero job rows: `jobs = 0` and every SUM is null (SQL semantics) — the UI types `done`/`denied` as nullable (`StatsTotals`, generated from `src/types.rs`) and formats them with `?? '–'` (`pages/StatsPage.svelte:38,43`), so null survives and renders as a dash; replicate SQL behavior exactly. (`rows[0] if rows else {}` — the else branch is unreachable for an aggregate.)
 
 ### by_kind — `stats_by_kind()` (store.py:1554-1570), array
 ```sql
@@ -373,7 +373,7 @@ Cite the symbol names below, not the line numbers: the numbers are a hint for fi
 - `/api/events` — `isEventList` (`:154-156`): rows with distinct numeric `id`.
 - `/api/finding` — `isFindingDetail` (`:130-136`): `jobs` rows with distinct numeric `id`; `pr_state` either absent/null or an object.
 
-Nothing else is checked. `api<T>()` casts the parsed JSON to `T` without inspecting it (`api.svelte.ts:32-45`), so `lib/types.ts` states what the server is believed to send, never what the client verified.
+Nothing else is checked. `api<T>()` casts the parsed JSON to `T` without inspecting it (`api.svelte.ts:32-45`), so the generated types in `lib/generated/` state what the server is believed to send, never what the client verified.
 
 ### 13.3 Keys actually rendered — dropping one degrades silently
 
@@ -401,7 +401,7 @@ Serialized by the port and read by nobody in the Svelte UI. A wrong *value* in a
 - Never read: top-level `next_candidate` (the status panel reads `activity_status.candidate` instead, which is the same payload by a different route), `candidate.is_prioritized`, `scheduler_state.{state,updated_at}`, `repos[].{path,last_hunt_sha}`.
 - `/api/jobs` and `current_job`: `pid, session_file, cap_tokens, exit_code, killed_reason, notes, usage_delta`.
 - `/api/finding`: `pr_state.{finding_id,last_activity_at,last_engaged_activity_at,attention_since}` and every pr_state column past those (`hunter-rs/src/types.rs:233-255`).
-- `/api/stats`: `by_kind[].total_calls` — declared (`lib/types.ts:163-175`) and given no column in the table.
+- `/api/stats`: `by_kind[].total_calls` — declared (`StatsByKind`) and given no column in the table.
 - `/api/findings`: `symbol, bug_class, introduced_by, test_file` and the type-specific columns `ecosystem, package, current_version, latest_version, update_type, security_advisory, missing_tests, smell_type, suggested_refactor, modernization_class, current_approach, proposed_approach, standard_section`. The card shows the server-computed `category` (§4) in their place, and `category` *is* derived from them, so they are load-bearing on the server and inert on the wire.
 
 ### 13.5 The error envelope has no UI reader

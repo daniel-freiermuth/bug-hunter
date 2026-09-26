@@ -2,7 +2,7 @@
 // via a singleton store object.
 
 import type {
-  Summary, Finding, Job, Event, Stats, FindingDetail,
+  Event, FindingDetail, FindingOut, JobListEntry, RepoNotesResponse, Stats, Summary,
 } from "./types";
 import {
   isEventList, isFindingDetail, isFindingList, isJobList, isStats, isSummary,
@@ -115,8 +115,8 @@ export async function post<T>(path: string, body: Record<string, unknown>): Prom
 
 class HunterStore {
   summary = $state<Summary | null>(null);
-  findings = $state<Finding[]>([]);
-  jobs = $state<Job[]>([]);
+  findings = $state<FindingOut[]>([]);
+  jobs = $state<JobListEntry[]>([]);
   events = $state<Event[]>([]);
   stats = $state<Stats | null>(null);
   error = $state<string | null>(null);
@@ -156,8 +156,8 @@ class HunterStore {
     try {
       const [s, f, j, e, st] = await Promise.all([
         get<Summary>("/api/summary"),
-        get<Finding[]>("/api/findings"),
-        get<Job[]>("/api/jobs"),
+        get<FindingOut[]>("/api/findings"),
+        get<JobListEntry[]>("/api/jobs"),
         get<Event[]>("/api/events"),
         get<Stats>("/api/stats"),
       ]);
@@ -261,7 +261,7 @@ class HunterStore {
 
   async fetchRepoNotes(id: number): Promise<string> {
     if (this.repoNotesCache.has(id)) return this.repoNotesCache.get(id)!;
-    const r = await get<{ notes: string }>(`/api/repo/notes?id=${id}`);
+    const r = await get<RepoNotesResponse>(`/api/repo/notes?id=${id}`);
     // An error body carries no `notes`; coercing that to "" and caching it
     // would show "No notes yet" forever with no retry, so fail instead and
     // let the caller's failure path handle it.

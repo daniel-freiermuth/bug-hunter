@@ -49,6 +49,7 @@ tower-http = { version = "0.7", features = ["fs", "set-header", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 nix = { version = "0.31.3", features = ["signal", "process"] }
+ts-rs = "12"
 
 [dev-dependencies]
 insta = "1.48.0"

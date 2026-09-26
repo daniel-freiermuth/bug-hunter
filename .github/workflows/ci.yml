@@ -54,6 +54,22 @@ jobs:
       - name: Test
         run: cargo nextest run --profile ci
 
+      # Same two commands as `just bindings`. The UI's API types are
+      # generated from src/types.rs and committed, so the frontend job
+      # typechecks against whatever was committed -- this is what makes
+      # that the current Rust shape rather than the last one someone
+      # remembered to regenerate.
+      - name: TypeScript bindings are current
+        run: |
+          rm -rf ../hunter/ui-svelte/src/lib/generated
+          cargo test --quiet --lib export_bindings
+          changes=$(git status --porcelain -- ../hunter/ui-svelte/src/lib/generated)
+          if [ -n "$changes" ]; then
+            echo "$changes"
+            echo "::error::hunter/ui-svelte/src/lib/generated is stale: run 'just bindings' in hunter-rs/ and commit the result"
+            exit 1
+          fi
+
   # ── Line coverage ─────────────────────────────────────────────
   # A ratchet, not a target. The floor sits just under the current
   # number so an unrelated change cannot drift it downward unnoticed;
