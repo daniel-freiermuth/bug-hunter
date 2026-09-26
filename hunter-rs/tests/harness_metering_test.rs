@@ -17,11 +17,11 @@
 //! `None` + exit 0 to `JobState::Done`.
 //!
 //! The seam: `cfg.omp_bin` is looked up on `PATH` (`FakeBins`). Session
-//! directories need no sandboxing any more — they hang off
-//! `cfg.work_root`, which is already a scratch directory, rather than the
-//! operator's `~/.omp/agent/sessions`. `$OMP_HOME` is still redirected so
-//! that a worker which ignores `--session-dir` writes into the scratch
-//! tree instead of the developer's real one.
+//! directories need no sandboxing — the caller hands `run_worker` a
+//! workspace under a scratch directory, never the operator's
+//! `~/.omp/agent/sessions`. `$OMP_HOME` is still redirected so that a
+//! worker which ignores `--session-dir` writes into the scratch tree
+//! instead of the developer's real one.
 
 mod support;
 
@@ -31,6 +31,7 @@ use std::path::PathBuf;
 use hunter::backends::omp_scavenge::harness;
 use hunter::config::Config;
 use hunter::types::RunResult;
+use hunter::workspace::Workspace;
 use support::{FakeBins, TempDir};
 
 const PROMPT: &str = "hunt the bug";
@@ -49,7 +50,8 @@ const CHUNK_CHARS: usize = 1024;
 // Fixture
 // ---------------------------------------------------------------------------
 
-/// A scripted `omp` on `PATH`, a sandboxed `$OMP_HOME`, and a worktree.
+/// A scripted `omp` on `PATH`, a sandboxed `$OMP_HOME`, and a chain
+/// workspace whose tree the worker runs in.
 ///
 /// Field order is drop order: `OMP_HOME` is restored first, then `PATH`,
 /// then the scratch directory goes away. There is no lock: environment
@@ -60,7 +62,7 @@ struct Fixture {
     _home: support::EnvGuard,
     bins: FakeBins,
     _dir: TempDir,
-    cwd: PathBuf,
+    ws: Workspace,
     cfg: Config,
 }
 
@@ -70,7 +72,6 @@ impl Fixture {
         let dir = TempDir::new(label);
         let omp_home = dir.subdir("omp-home");
         std::fs::create_dir_all(omp_home.join("agent/sessions")).expect("create sessions dir");
-        let cwd = dir.subdir("work");
         // Scoped through FakeBins: acquiring one is what checked that this
         // test owns its process, which is what licenses mutating the
         // environment at all.
@@ -81,19 +82,21 @@ impl Fixture {
         // production poll would make each of these tests a 2 s test.
         let mut cfg = Config::load(dir.path()).expect("load config");
         cfg.poll_s = 0.02;
+        let ws = Workspace::for_chain(&cfg.work_root, &dir.join("clone"), 1);
+        std::fs::create_dir_all(&ws.tree).expect("create the chain's tree");
 
         Self {
             _home: home,
             bins,
             _dir: dir,
-            cwd,
+            ws,
             cfg,
         }
     }
 
     fn run(&self, cap_tokens: Option<i64>, max_wall_s: i64) -> RunResult {
         harness::run_worker(
-            &self.cfg, &self.cwd, PROMPT, cap_tokens, max_wall_s, None, None,
+            &self.cfg, &self.ws, PROMPT, cap_tokens, max_wall_s, None, None,
         )
     }
 
@@ -101,7 +104,7 @@ impl Fixture {
     fn resume(&self, session_file: &std::path::Path) -> RunResult {
         harness::run_worker(
             &self.cfg,
-            &self.cwd,
+            &self.ws,
             PROMPT,
             Some(1_000_000),
             30,
@@ -183,7 +186,7 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
 
     let res = harness::run_worker(
         &fx.cfg,
-        &fx.cwd,
+        &fx.ws,
         PROMPT,
         Some(1_000_000),
         30,
@@ -204,9 +207,9 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
     );
     assert!(res.stdout_tail.contains("worker-done"));
 
-    // The worker is spawned with the prompt, the requested model, and a
-    // session directory of its own — the flag that stops omp's
-    // `autoResume` from continuing this cwd's previous session.
+    // The worker is spawned with the prompt, the requested model, and its
+    // chain's session directory — the flag that stops omp's `autoResume`
+    // from continuing this cwd's previous session.
     let calls = fx.bins.calls_to("omp");
     let argv = calls.first().expect("omp was invoked");
     assert_eq!(calls.len(), 1);
@@ -219,12 +222,11 @@ fn metered_worker_sums_the_ledger_and_is_not_flagged() {
         .iter()
         .find_map(|a| a.strip_prefix("--session-dir="))
         .expect("worker handed a session dir");
-    assert!(
-        std::path::Path::new(sdir).starts_with(
-            hunter::backends::omp_scavenge::harness::sessions_root(&fx.cfg.work_root,)
-        ),
-        "worker transcripts belong under <work_root>/sessions, not in the \
-         operator's own omp session tree, got {sdir}"
+    assert_eq!(
+        std::path::Path::new(sdir),
+        fx.ws.session,
+        "worker transcripts belong in the chain's session directory, not in \
+         the operator's own omp session tree"
     );
 }
 
@@ -250,37 +252,6 @@ fn worker_without_a_ledger_is_flagged_unmetered_despite_exit_zero() {
     assert_eq!(res.tokens_new, 0);
     assert_eq!(res.calls, 0);
     assert_eq!(res.session_file, None);
-}
-
-/// The bug this flag exists for: omp's `autoResume` continues the newest
-/// session for the same cwd whenever no session directory is passed, so
-/// back-to-back jobs in one worktree used to reopen one ever-growing
-/// transcript and re-cache it — half a million `cacheWrite` tokens on
-/// call #1, past any cap, before the worker did anything. Two runs from
-/// the same cwd must therefore meter independently and never share a
-/// session directory.
-#[test]
-fn consecutive_runs_in_one_cwd_never_share_a_session_dir() {
-    let fx = Fixture::new("private-session-dir");
-    fx.bins.script(
-        "omp",
-        &format!("{ledger}exit 0", ledger = ledger_sh(&[(1000, 200, 50)])),
-    );
-
-    let first = fx.run(Some(1_000_000), 30);
-    let second = fx.run(Some(1_000_000), 30);
-
-    assert_eq!(first.tokens_new, 1250);
-    assert_eq!(
-        second.tokens_new, 1250,
-        "the second run meters its own spend, not its own plus the first's"
-    );
-    assert_eq!(second.calls, 1);
-    let (a, b) = (
-        first.session_file.expect("first ledger"),
-        second.session_file.expect("second ledger"),
-    );
-    assert_ne!(a, b, "each run owns its session directory");
 }
 
 // ---------------------------------------------------------------------------
@@ -574,7 +545,7 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
     );
 
     let t0 = std::time::Instant::now();
-    let res = harness::run_worker(&fx.cfg, &fx.cwd, PROMPT, Some(1_000_000), 30, None, None);
+    let res = harness::run_worker(&fx.cfg, &fx.ws, PROMPT, Some(1_000_000), 30, None, None);
     let elapsed = t0.elapsed();
 
     assert!(
@@ -589,57 +560,38 @@ fn worker_leaving_a_descendant_behind_does_not_hang_the_harness() {
     );
 }
 
-/// Worker transcripts are bounded, and the newest survive.
+// ---------------------------------------------------------------------------
+// Build cache
+// ---------------------------------------------------------------------------
+
+/// A worker compiles into its repo clone's `target/`, not into its tree.
 ///
-/// One directory per run, never reused, so without pruning this grows for
-/// the life of the deployment — thousands of transcripts a year at the
-/// observed job rate, each tens of megabytes. Pruning runs before a run
-/// creates its own directory, so the live one is never a candidate.
+/// Every chain starts from a fresh tree, so cargo's default `target/`
+/// beside the sources would be empty every time: a full cold compile
+/// inside the job's wall-clock limit, and up to a gigabyte of disk per
+/// live chain. The clone's own `target/` is already warm and gitignored.
+/// Unset first because the test runner may itself have been started with
+/// a `CARGO_TARGET_DIR`, which the harness deliberately passes through.
 #[test]
-fn old_worker_transcripts_are_pruned_newest_first() {
-    let dir = support::TempDir::new("prune");
-    let work_root = dir.path().join("work");
-    let root = hunter::backends::omp_scavenge::harness::sessions_root(&work_root);
-    std::fs::create_dir_all(&root).unwrap();
-
-    // 60 runs, aged explicitly. Creation order is NOT reliable as age
-    // order: filesystems differ in mtime resolution, and on CI's the
-    // whole loop lands inside one tick, which makes "the oldest ten" an
-    // arbitrary ten. Stamping each directory a minute apart is what makes
-    // this test about pruning rather than about the filesystem.
-    let base = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
-    for i in 0..60u64 {
-        let d = root.join(format!("run-{i:03}"));
-        std::fs::create_dir_all(&d).unwrap();
-        std::fs::write(d.join("session.jsonl"), "{}").unwrap();
-        let when = base + std::time::Duration::from_secs(i * 60);
-        std::fs::File::open(&d)
-            .and_then(|f| f.set_modified(when))
-            .expect("stamp the run directory");
-    }
-
-    let removed = hunter::backends::omp_scavenge::harness::prune_sessions(&work_root);
-    assert_eq!(removed, 10, "60 transcripts, 50 retained");
-
-    let left: std::collections::HashSet<_> = std::fs::read_dir(&root)
-        .unwrap()
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(left.len(), 50);
-    assert!(
-        left.contains("run-059") && left.contains("run-010"),
-        "the newest must survive"
-    );
-    assert!(
-        !left.contains("run-000") && !left.contains("run-009"),
-        "the oldest must go"
+fn a_worker_builds_into_its_clones_shared_cargo_target() {
+    let fx = Fixture::new("cargo-target");
+    let _unset = fx.bins.unset_env("CARGO_TARGET_DIR");
+    let seen = fx.ws.tree.join("cargo-target-dir");
+    fx.bins.script(
+        "omp",
+        &format!(
+            "printf '%s' \"$CARGO_TARGET_DIR\" > '{seen}'\n{ledger}exit 0",
+            seen = seen.display(),
+            ledger = ledger_sh(&[(1000, 200, 50)])
+        ),
     );
 
-    // Idempotent: a second pass at the bound removes nothing.
+    let res = fx.run(Some(1_000_000), 30);
+
+    assert_eq!(res.killed_reason, None, "{:?}", res.stdout_tail);
     assert_eq!(
-        hunter::backends::omp_scavenge::harness::prune_sessions(&work_root),
-        0
+        std::fs::read_to_string(&seen).expect("the worker recorded its environment"),
+        fx.ws.clone.join("target").to_string_lossy(),
     );
 }
 
@@ -676,10 +628,7 @@ fn a_run_without_a_resume_source_starts_cold() {
         .iter()
         .find_map(|a| a.strip_prefix("--session-dir="))
         .expect("worker handed a session dir");
-    assert!(
-        std::path::Path::new(sdir).starts_with(harness::sessions_root(&fx.cfg.work_root)),
-        "got {sdir}"
-    );
+    assert_eq!(std::path::Path::new(sdir), fx.ws.session);
 }
 
 /// A resume names the transcript to continue, by path, and runs in the
@@ -779,10 +728,7 @@ fn a_resumed_run_meters_only_what_this_attempt_added() {
 fn a_missing_resume_source_is_refused_rather_than_restarted() {
     let fx = Fixture::new("resume-missing");
     fx.bins.script("omp", "printf 'should not run\\n'\nexit 0");
-    let gone = fx
-        .cfg
-        .work_root
-        .join("sessions/pruned-away/session-01.jsonl");
+    let gone = fx.ws.session.join("session-01.jsonl");
 
     let res = fx.resume(&gone);
 

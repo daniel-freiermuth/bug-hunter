@@ -153,14 +153,16 @@ pub trait Backend: Send + Sync {
     /// (innerHTML'd by the UI every 5 s; byte-parity spec in
     /// BACKEND-CONTRACT.md §2.3).
     async fn status_html(&self) -> anyhow::Result<String>;
-    /// Execute a worker job. `cap_tokens` is the token bound the ramp
+    /// Execute a worker job in its chain's workspace: the worker runs in
+    /// `ws.tree` and its transcript goes to `ws.session`. `cap_tokens` is
+    /// the token bound the ramp
     /// granted, `None` for a job that has none; `job_class` drives model
     /// selection. `resume_from` is the session file of an earlier attempt
     /// to continue instead of starting cold — `None` is a cold run, which
     /// is what every job was before resume existed.
     async fn run(
         &self,
-        cwd: &std::path::Path,
+        ws: &crate::workspace::Workspace,
         prompt: &str,
         cap_tokens: Option<i64>,
         max_wall_s: i64,
@@ -195,7 +197,7 @@ impl Backend for NullBackend {
 
     async fn run(
         &self,
-        _cwd: &std::path::Path,
+        _ws: &crate::workspace::Workspace,
         _prompt: &str,
         _cap_tokens: Option<i64>,
         _max_wall_s: i64,

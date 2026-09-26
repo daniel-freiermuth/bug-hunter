@@ -1,0 +1,19 @@
+-- The commit a job chain's working tree was created at.
+--
+-- Every chain (a cold job plus the attempts that resume it) runs in a
+-- tree of its own, added from the repo's clone at one commit and never
+-- moved. The hunt watermark has to be THAT commit: the diff range the
+-- worker was told to review ends there, so it is the only commit that
+-- review can vouch for. Reading the clone's HEAD or origin/<default> when
+-- the chain finishes instead would mark every commit fetched in between
+-- as hunted without it ever being in the diff range -- and with resume, a
+-- chain can finish days after it started.
+--
+-- Written once for a cold job, as soon as its tree exists; a resumed
+-- attempt copies it from the attempt it continues at INSERT, so every
+-- link of a chain carries the same value.
+--
+-- Nullable because rows written before this column existed ran in the
+-- shared checkout and have no pinned commit to recover, and because a job
+-- whose tree could not be created never had one.
+ALTER TABLE jobs ADD COLUMN pinned_sha TEXT;

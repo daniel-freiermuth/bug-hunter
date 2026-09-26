@@ -102,6 +102,20 @@ pub async fn reconcile_and_log(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Release finished chains' trees and reclaim old workspaces and the
+/// previous layout's leftovers (`workspace::sweep`). Runs between cycles
+/// only, so no job is mid-flight; best effort, since a failed pass is
+/// retried before the next cycle.
+async fn sweep_workspaces(store: &Store, work_root: &Path) {
+    match crate::workspace::sweep(store, work_root, crate::util::now_ms()).await {
+        Ok(r) if r != crate::workspace::SweepReport::default() => {
+            tracing::info!("workspace sweep: {r:?}");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("workspace sweep failed: {e}"),
+    }
+}
+
 /// (`state_label`, detail) for `scheduler_state` (`server._describe_cycle`).
 pub fn describe_cycle(summary: &CycleSummary) -> (String, String) {
     use std::fmt::Write;
@@ -220,6 +234,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     if reaped > 0 {
         tracing::info!("reclaimed {reaped} repo director(ies) left by earlier deletions");
     }
+    sweep_workspaces(&store, &cfg.work_root).await;
     anyhow::ensure!(
         cfg.backend_type == "omp-scavenge",
         "unknown backend_type: {:?}",
@@ -340,6 +355,13 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
             let _ = store
                 .set_scheduler_state("paused", "scheduler paused by operator", None)
                 .await;
+            // The sweep still runs while paused. Pausing exists to stop
+            // spending tokens; the sweep spends none and only releases
+            // disk. This pass is the one right after the last cycle (often
+            // the job that was running when the pause arrived), so that
+            // chain's tree is released now instead of held on disk for as
+            // long as the pause lasts; each wake repeats it.
+            sweep_workspaces(&store, &cfg.work_root).await;
             // The shared shutdown latch, not a private `ctrl_c()`: that saw
             // only SIGINT, so `systemctl stop` (SIGTERM) on a paused daemon
             // went unanswered until systemd's stop timeout killed it.
@@ -356,6 +378,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         let cycle_result: anyhow::Result<CycleSummary> = async {
             reconcile_and_log(&store).await?;
             crate::server::reap_deleted_repos(&store, &cfg.work_root, &repo_notes).await;
+            sweep_workspaces(&store, &cfg.work_root).await;
             let summary = crate::scheduler::run_cycle(&store, &cfg, &*backend, None).await;
             Ok(summary)
         }

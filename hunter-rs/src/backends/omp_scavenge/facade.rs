@@ -737,7 +737,7 @@ impl Backend for OmpScavengeBackend {
 
     async fn run(
         &self,
-        cwd: &std::path::Path,
+        ws: &crate::workspace::Workspace,
         prompt: &str,
         cap_tokens: Option<i64>,
         max_wall_s: i64,
@@ -756,13 +756,13 @@ impl Backend for OmpScavengeBackend {
             .model_for(job_class.as_str())
             .map(std::borrow::ToOwned::to_owned);
         let cfg = self.cfg.clone();
-        let cwd_owned = cwd.to_owned();
+        let ws_owned = ws.clone();
         let prompt_owned = prompt.to_owned();
         let resume_owned = resume_from.map(std::path::Path::to_owned);
         let mut rr = tokio::task::spawn_blocking(move || {
             super::harness::run_worker(
                 &cfg,
-                &cwd_owned,
+                &ws_owned,
                 &prompt_owned,
                 cap_tokens,
                 max_wall_s,

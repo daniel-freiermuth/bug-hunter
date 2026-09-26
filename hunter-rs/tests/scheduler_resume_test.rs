@@ -23,6 +23,7 @@ use hunter::scheduler::{
 use hunter::server::{AppState, SchedulerHandle, router};
 use hunter::store::{FindingInsert, Store};
 use hunter::types::RunResult;
+use hunter::workspace::Workspace;
 use sqlx::SqlitePool;
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, git};
 use tower::util::ServiceExt;
@@ -123,9 +124,24 @@ async fn seed_history_at(pool: &SqlitePool, tokens: i64) {
     }
 }
 
-/// A worker transcript whose context at suspension is [`CTX`].
+/// A worker transcript whose context at suspension is [`CTX`], in the
+/// workspace of chain 10.
 fn seed_session(dir: &TempDir) -> PathBuf {
     seed_session_with_ctx(dir, CTX)
+}
+
+/// The workspace of the chain whose first job is `origin`, as a resume
+/// expects to find it: a tree directory and a session directory. Returns
+/// the session directory.
+fn seed_workspace(dir: &TempDir, origin: i64) -> PathBuf {
+    let root = test_config(dir.path())
+        .work_root
+        .join("jobs")
+        .join(origin.to_string());
+    std::fs::create_dir_all(root.join("tree")).unwrap();
+    let session = root.join("session");
+    std::fs::create_dir_all(&session).unwrap();
+    session
 }
 
 /// A worker transcript in omp's session format.
@@ -136,7 +152,12 @@ fn seed_session(dir: &TempDir) -> PathBuf {
 /// should count: re-establishing a session costs the context it had
 /// reached, not the sum of every call that built it.
 fn seed_session_with_ctx(dir: &TempDir, ctx: i64) -> PathBuf {
-    let path = dir.path().join("session.jsonl");
+    seed_session_in(dir, 10, ctx)
+}
+
+/// [`seed_session_with_ctx`] in the workspace of chain `origin`.
+fn seed_session_in(dir: &TempDir, origin: i64, ctx: i64) -> PathBuf {
+    let path = seed_workspace(dir, origin).join("session.jsonl");
     let opening = serde_json::json!({"message": {"role": "assistant", "usage":
         {"input": 500, "output": 200, "cacheRead": 0, "cacheWrite": 37_000}}});
     let noise = serde_json::json!({"message": {"role": "user", "content": "noise"}});
@@ -188,8 +209,8 @@ async fn seed_finding_suspension(
     sqlx::query(
         "INSERT INTO jobs \
          (id, kind, repo_id, finding_id, state, session_file, killed_reason, tokens_new, \
-          started_at, finished_at) \
-         VALUES (?1, ?2, 1, ?3, 'suspended', ?4, 'cap', 40000, 1000, 2000)",
+          started_at, finished_at, pinned_sha) \
+         VALUES (?1, ?2, 1, ?3, 'suspended', ?4, 'cap', 40000, 1000, 2000, 'pinned')",
     )
     .bind(id)
     .bind(kind)
@@ -217,8 +238,8 @@ async fn seed_suspension(pool: &SqlitePool, id: i64, session: &Path, tokens: i64
     sqlx::query(
         "INSERT INTO jobs \
          (id, kind, repo_id, state, session_file, killed_reason, tokens_new, \
-          started_at, finished_at) \
-         VALUES (?1, 'hunt', 1, 'suspended', ?2, 'cap', ?3, 1000, 2000)",
+          started_at, finished_at, pinned_sha) \
+         VALUES (?1, 'hunt', 1, 'suspended', ?2, 'cap', ?3, 1000, 2000, 'pinned')",
     )
     .bind(id)
     .bind(session.to_string_lossy().to_string())
@@ -243,8 +264,8 @@ async fn seed_chain(pool: &SqlitePool, session: &Path, tokens: &[i64]) -> i64 {
         sqlx::query(
             "INSERT INTO jobs \
              (id, kind, repo_id, state, session_file, killed_reason, tokens_new, \
-              resumed_from, started_at, finished_at) \
-             VALUES (?1, 'hunt', 1, 'suspended', ?2, 'cap', ?3, ?4, 1000, 2000)",
+              resumed_from, started_at, finished_at, pinned_sha) \
+             VALUES (?1, 'hunt', 1, 'suspended', ?2, 'cap', ?3, ?4, 1000, 2000, 'pinned')",
         )
         .bind(id)
         .bind(session.to_string_lossy().to_string())
@@ -270,7 +291,7 @@ async fn job_row(pool: &SqlitePool, id: i64) -> (String, Option<String>, Option<
 
 fn resume_plan_of(c: Option<Candidate>) -> ResumePlan {
     match c {
-        Some(Candidate::Resume { plan, .. }) => plan,
+        Some(Candidate::Resume { plan, .. }) => *plan,
         other => panic!("expected a resume candidate, got {other:?}"),
     }
 }
@@ -352,7 +373,7 @@ async fn resume_falls_back_to_the_per_kind_estimate_when_the_transcript_is_unrea
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
-    let missing = dir.path().join("never-written.jsonl");
+    let missing = seed_workspace(&dir, 10).join("never-written.jsonl");
     let spent = 40_000;
     seed_suspension(&pool, 10, &missing, spent).await;
     let store = rw_store(&path).await;
@@ -559,11 +580,11 @@ async fn a_queued_fix_outranks_a_resume_which_outranks_rotation() {
     assert_eq!(plan.predecessor_id, 10);
 }
 
-/// A suspension whose working directory is gone is retired, not merely
+/// A suspension whose chain tree is gone is retired, not merely
 /// skipped, and never offered.
 ///
 /// A resumed worker continues a conversation, not a filesystem: its
-/// transcript refers to files in that directory, so no later cycle can
+/// transcript refers to files in that tree, so no later cycle can
 /// continue it either. Skipping it left the row `suspended` forever —
 /// never resumed, never retired. Retiring at selection, in the same
 /// walk, still keeps it from being offered again, which matters because
@@ -571,13 +592,14 @@ async fn a_queued_fix_outranks_a_resume_which_outranks_rotation() {
 #[tokio::test]
 async fn a_suspension_whose_working_directory_is_gone_is_retired() {
     let (dir, path, pool) = fresh_db().await;
-    let clone = seed_repo(&pool, &dir).await;
+    seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
     let session = seed_session(&dir);
     seed_suspension(&pool, 10, &session, 10_000).await;
-    std::fs::remove_dir_all(&clone).unwrap();
-    let store = rw_store(&path).await;
     let cfg = test_config(dir.path());
+    let workspace = cfg.work_root.join("jobs").join("10");
+    std::fs::remove_dir_all(workspace.join("tree")).unwrap();
+    let store = rw_store(&path).await;
 
     let picked = pick_next(&store, &cfg, None).await.unwrap();
 
@@ -589,14 +611,14 @@ async fn a_suspension_whose_working_directory_is_gone_is_retired() {
                 ..
             })
         ),
-        "an uncloned repo is a hunt candidate, never a resume, got {picked:?}"
+        "a suspension with no tree falls through to rotation, got {picked:?}"
     );
     let (state, reason, notes) = job_row(&pool, 10).await;
     assert_eq!(state, JobState::Killed.as_str());
     assert_eq!(reason.as_deref(), Some("workdir-gone"));
     let msg = format!(
-        "resume hunt alpha: job 10 retired, working directory {} is gone",
-        clone.display()
+        "resume hunt alpha: job 10 retired, workspace {} is gone",
+        workspace.display()
     );
     assert_eq!(notes.as_deref(), Some(msg.as_str()));
     assert_eq!(resume_events(&pool, 10).await, vec![(msg, None)]);
@@ -620,14 +642,11 @@ async fn a_flagged_pr_resumes_its_suspended_engage_instead_of_starting_fresh() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     let cfg = test_config(dir.path());
-    let session = seed_session(&dir);
     seed_flagged_finding(&pool, 5).await;
     seed_quiet_finding(&pool, 6).await;
-    seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
-    seed_finding_suspension(&pool, 21, "engage", 6, &session).await;
-    seed_finding_suspension(&pool, 22, "fix", 5, &session).await;
-    for wt in ["e5", "e6", "f5"] {
-        std::fs::create_dir_all(cfg.work_root.join("wt").join(wt)).unwrap();
+    for (id, kind, finding) in [(20, "engage", 5), (21, "engage", 6), (22, "fix", 5)] {
+        let session = seed_session_in(&dir, id, CTX);
+        seed_finding_suspension(&pool, id, kind, finding, &session).await;
     }
     let store = rw_store(&path).await;
 
@@ -658,14 +677,13 @@ async fn an_overridden_finding_resumes_its_suspended_attempt_under_the_override(
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     let cfg = test_config(dir.path());
-    let session = seed_session(&dir);
+    let session = seed_session_in(&dir, 20, CTX);
     seed_flagged_finding(&pool, 5).await;
     sqlx::query("UPDATE findings SET budget_override = 'once' WHERE id = 5")
         .execute(&pool)
         .await
         .unwrap();
     seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
-    std::fs::create_dir_all(cfg.work_root.join("wt").join("e5")).unwrap();
     let store = rw_store(&path).await;
 
     let picked = pick_next(&store, &cfg, None).await.unwrap().unwrap();
@@ -674,10 +692,10 @@ async fn an_overridden_finding_resumes_its_suspended_attempt_under_the_override(
     assert_eq!(resume_plan_of(Some(picked)).predecessor_id, 20);
 }
 
-/// The same flagged pull request, but the suspended engage's worktree
-/// is gone: that suspension is retired and the tier starts fresh.
+/// The same flagged pull request, but the suspended engage's tree is
+/// gone: that suspension is retired and the tier starts fresh.
 ///
-/// This is job 4358 after the fresh engage removed its worktree. It can
+/// This is job 4358 after a fresh engage removed its worktree. It can
 /// never be resumed, so retiring it on the first cycle that sees it is
 /// the only way it leaves `suspended`.
 #[tokio::test]
@@ -685,7 +703,9 @@ async fn a_flagged_pr_whose_suspended_engage_lost_its_worktree_starts_fresh() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     let cfg = test_config(dir.path());
-    let session = seed_session(&dir);
+    let session = seed_session_in(&dir, 20, CTX);
+    let workspace = cfg.work_root.join("jobs").join("20");
+    std::fs::remove_dir_all(workspace.join("tree")).unwrap();
     seed_flagged_finding(&pool, 5).await;
     seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
     let store = rw_store(&path).await;
@@ -706,13 +726,12 @@ async fn a_flagged_pr_whose_suspended_engage_lost_its_worktree_starts_fresh() {
     let (state, reason, _) = job_row(&pool, 20).await;
     assert_eq!(state, JobState::Killed.as_str());
     assert_eq!(reason.as_deref(), Some("workdir-gone"));
-    let wt = cfg.work_root.join("wt").join("e5");
     assert_eq!(
         resume_events(&pool, 20).await,
         vec![(
             format!(
-                "resume engage alpha: job 20 retired, working directory {} is gone",
-                wt.display()
+                "resume engage alpha: job 20 retired, workspace {} is gone",
+                workspace.display()
             ),
             Some(5)
         )]
@@ -741,7 +760,7 @@ async fn fresh_work_on_a_finding_supersedes_its_suspended_attempt() {
     seed_finding_suspension(&pool, 22, "fix", 5, &session).await;
     let store = rw_store(&path).await;
 
-    let fresh = store
+    let created = store
         .create_job(
             FindingJobKind::Engage.into(),
             1,
@@ -753,6 +772,12 @@ async fn fresh_work_on_a_finding_supersedes_its_suspended_attempt() {
         )
         .await
         .unwrap();
+    let fresh = created.id;
+    assert_eq!(
+        created.superseded,
+        vec![20],
+        "the caller is told which chain to release before building its own"
+    );
 
     let (state, reason, notes) = job_row(&pool, 20).await;
     assert_eq!(state, JobState::Killed.as_str());
@@ -813,7 +838,8 @@ async fn fresh_work_on_a_repo_supersedes_its_suspended_attempt() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
 
     let (state, reason, notes) = job_row(&pool, 10).await;
     assert_eq!(state, JobState::Killed.as_str());
@@ -858,10 +884,10 @@ async fn a_forced_cycle_resumes_only_the_forced_repos_suspension() {
     sqlx::query(
         "INSERT INTO jobs \
          (id, kind, repo_id, state, session_file, killed_reason, tokens_new, \
-          started_at, finished_at) \
-         VALUES (20, 'hunt', 2, 'suspended', ?1, 'cap', 10000, 1000, 2000)",
+          started_at, finished_at, pinned_sha) \
+         VALUES (20, 'hunt', 2, 'suspended', ?1, 'cap', 10000, 1000, 2000, 'pinned')",
     )
-    .bind(session.to_string_lossy().to_string())
+    .bind(seed_session_in(&dir, 20, CTX).to_string_lossy().to_string())
     .execute(&pool)
     .await
     .unwrap();
@@ -932,7 +958,8 @@ async fn resume_unavailable_fails_the_attempt_and_retires_the_predecessor() {
             Some(10),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     let plan = ResumePlan {
         kind: RepoJobKind::Hunt.into(),
         repo_id: 1,
@@ -941,6 +968,12 @@ async fn resume_unavailable_fails_the_attempt_and_retires_the_predecessor() {
         predecessor_id: 10,
         origin_job_id: 10,
         session_file: session,
+        workspace: hunter::workspace::Workspace::for_chain(
+            &test_config(dir.path()).work_root,
+            &dir.path().join("repo-1"),
+            10,
+        ),
+        pinned_sha: "pinned".to_owned(),
         anticipated: 260_000,
         ctx: CTX,
         typical: Z,
@@ -1045,7 +1078,7 @@ impl Backend for RecordingBackend {
 
     async fn run(
         &self,
-        cwd: &Path,
+        ws: &Workspace,
         prompt: &str,
         _cap_tokens: Option<i64>,
         _max_wall_s: i64,
@@ -1055,7 +1088,7 @@ impl Backend for RecordingBackend {
         // `set` fails only if this backend ran twice, which no test
         // here does — each one builds its own.
         let _ = self.seen.set(Seen {
-            cwd: cwd.to_path_buf(),
+            cwd: ws.tree.clone(),
             prompt: prompt.to_owned(),
             resume_from: resume_from.map(Path::to_path_buf),
         });
@@ -1097,8 +1130,15 @@ async fn cloned_repo(dir: &TempDir, pool: &SqlitePool) -> GitRepo {
 async fn executable_repo(dir: &TempDir, pool: &SqlitePool, pred: i64) -> (GitRepo, PathBuf) {
     let repo = cloned_repo(dir, pool).await;
     seed_history(pool).await;
-    let session = seed_session(dir);
+    let session = seed_session_in(dir, pred, CTX);
     seed_suspension(pool, pred, &session, 40_000).await;
+    let head = git(&repo.work, &["rev-parse", "HEAD"]);
+    sqlx::query("UPDATE jobs SET pinned_sha = ?1 WHERE id = ?2")
+        .bind(head.trim())
+        .bind(pred)
+        .execute(pool)
+        .await
+        .unwrap();
     (repo, session)
 }
 
@@ -1132,12 +1172,12 @@ fn one_finding() -> String {
 #[tokio::test]
 async fn a_resumed_hunt_continues_the_session_and_ingests_the_origin_output_path() {
     let (dir, path, pool) = fresh_db().await;
-    let (repo, session) = executable_repo(&dir, &pool, 10).await;
+    let (_repo, session) = executable_repo(&dir, &pool, 10).await;
     let store = rw_store(&path).await;
     let cfg = test_config(dir.path());
 
     let plan = match pick_next(&store, &cfg, None).await.unwrap() {
-        Some(Candidate::Resume { plan, .. }) => plan,
+        Some(Candidate::Resume { plan, .. }) => *plan,
         other => panic!("expected a resume candidate, got {other:?}"),
     };
     let backend = RecordingBackend::new(
@@ -1158,7 +1198,11 @@ async fn a_resumed_hunt_continues_the_session_and_ingests_the_origin_output_path
         "a resumed run must not re-send the playbook it is already looking at"
     );
     assert_eq!(seen.resume_from.as_deref(), Some(session.as_path()));
-    assert_eq!(seen.cwd, repo.work);
+    assert_eq!(
+        seen.cwd,
+        cfg.work_root.join("jobs").join("10").join("tree"),
+        "a resume runs in its chain's tree"
+    );
     assert_eq!(
         summary.ingest.map(|i| i.inserted),
         Some(1),
@@ -1202,7 +1246,7 @@ async fn a_resumed_hunt_does_not_sync_the_clone() {
     let store = rw_store(&path).await;
     let cfg = test_config(dir.path());
     let plan = match pick_next(&store, &cfg, None).await.unwrap() {
-        Some(Candidate::Resume { plan, .. }) => plan,
+        Some(Candidate::Resume { plan, .. }) => *plan,
         other => panic!("expected a resume candidate, got {other:?}"),
     };
     git(&repo.work, &["remote", "remove", "origin"]);
@@ -1296,7 +1340,7 @@ impl Backend for GateProbe {
 
     async fn run(
         &self,
-        _cwd: &Path,
+        _ws: &Workspace,
         _prompt: &str,
         _cap_tokens: Option<i64>,
         _max_wall_s: i64,
@@ -1481,8 +1525,10 @@ async fn repeated_suspensions_of_a_fix_are_not_a_stuck_streak() {
     let store = rw_store(&path).await;
     let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Queued).await;
     let cfg = test_config(dir.path());
-    let session = seed_session(&dir);
-    let suspending = ScriptedBackend::new(move |_| suspended_at_cap(&session));
+    // The transcript is in the session directory of the chain being run.
+    let suspending = ScriptedBackend::new(|tree| {
+        suspended_at_cap(&tree.parent().unwrap().join("session").join("session.jsonl"))
+    });
 
     let mut outcomes = Vec::new();
     for _ in 0..3 {
@@ -1509,8 +1555,10 @@ async fn repeated_suspensions_of_a_recheck_are_not_a_stuck_streak() {
     let store = rw_store(&path).await;
     let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
     let cfg = test_config(dir.path());
-    let session = seed_session(&dir);
-    let suspending = ScriptedBackend::new(move |_| suspended_at_cap(&session));
+    // The transcript is in the session directory of the chain being run.
+    let suspending = ScriptedBackend::new(|tree| {
+        suspended_at_cap(&tree.parent().unwrap().join("session").join("session.jsonl"))
+    });
 
     let mut outcomes = Vec::new();
     for _ in 0..3 {
@@ -1556,8 +1604,10 @@ async fn repeated_suspensions_of_a_harvest_are_not_a_stuck_streak() {
     .await
     .unwrap();
     let cfg = test_config(dir.path());
-    let session = seed_session(&dir);
-    let suspending = ScriptedBackend::new(move |_| suspended_at_cap(&session));
+    // The transcript is in the session directory of the chain being run.
+    let suspending = ScriptedBackend::new(|tree| {
+        suspended_at_cap(&tree.parent().unwrap().join("session").join("session.jsonl"))
+    });
 
     let mut outcomes = Vec::new();
     for _ in 0..3 {

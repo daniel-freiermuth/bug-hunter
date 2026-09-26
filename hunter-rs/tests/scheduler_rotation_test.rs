@@ -85,18 +85,26 @@ async fn fixture(label: &str) -> (TempDir, PathBuf, SqlitePool, Config) {
     (dir, path, pool, cfg)
 }
 
-/// A worker that writes no output and stops for `reason`, leaving
-/// `session` behind (or not).
-fn stopped_worker(reason: &'static str, session: Option<PathBuf>) -> ScriptedBackend {
-    ScriptedBackend::new(move |_| RunResult {
-        exit_code: None,
-        killed_reason: Some(reason.to_owned()),
-        tokens_new: 30_000,
-        calls: 4,
-        session_file: session.as_ref().map(|p| p.to_string_lossy().into_owned()),
-        duration_s: 1.0,
-        stdout_tail: "stopped".to_owned(),
-        usage_delta: None,
+/// A worker that writes no output and stops for `reason`, leaving a
+/// transcript in its chain's session directory (or not).
+fn stopped_worker(reason: &'static str, leaves_session: bool) -> ScriptedBackend {
+    ScriptedBackend::new(move |tree| {
+        let session = leaves_session.then(|| {
+            // The chain's `session/` sits beside its `tree/`.
+            let file = tree.parent().unwrap().join("session").join("session.jsonl");
+            std::fs::write(&file, "{}\n").unwrap();
+            file.to_string_lossy().into_owned()
+        });
+        RunResult {
+            exit_code: None,
+            killed_reason: Some(reason.to_owned()),
+            tokens_new: 30_000,
+            calls: 4,
+            session_file: session,
+            duration_s: 1.0,
+            stdout_tail: "stopped".to_owned(),
+            usage_delta: None,
+        }
     })
 }
 
@@ -119,11 +127,11 @@ async fn last_test_gap_at(store: &Store) -> i64 {
 /// never ran again.
 #[tokio::test]
 async fn a_killed_analysis_attempt_bumps_the_rotation_timestamp() {
-    let (dir, path, _pool, cfg) = fixture("rotation-killed").await;
+    let (_dir, path, _pool, cfg) = fixture("rotation-killed").await;
     let store = Store::connect(&path).await.unwrap();
     // A wallclock kill is never a suspension, transcript or not, so this
     // is the plain killed outcome.
-    let backend = stopped_worker("wallclock", Some(dir.path().join("session.jsonl")));
+    let backend = stopped_worker("wallclock", true);
 
     let summary = run_cycle(&store, &cfg, &backend, None).await;
 
@@ -162,13 +170,11 @@ async fn a_killed_analysis_attempt_bumps_the_rotation_timestamp() {
 /// resume tier and skipped by rotation at the same time.
 #[tokio::test]
 async fn a_suspended_analysis_attempt_does_not_bump_the_rotation_timestamp() {
-    let (dir, path, _pool, cfg) = fixture("rotation-suspended").await;
+    let (_dir, path, _pool, cfg) = fixture("rotation-suspended").await;
     let store = Store::connect(&path).await.unwrap();
-    let session = dir.path().join("session.jsonl");
-    std::fs::write(&session, "{}\n").unwrap();
     // A cap kill that left a transcript is what the harness reports when
     // the window ran out of headroom mid-run.
-    let backend = stopped_worker("cap", Some(session));
+    let backend = stopped_worker("cap", true);
 
     let summary = run_cycle(&store, &cfg, &backend, None).await;
 
