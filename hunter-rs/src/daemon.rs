@@ -102,6 +102,20 @@ pub async fn reconcile_and_log(store: &Store) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Release finished chains' trees and reclaim old workspaces and the
+/// previous layout's leftovers (`workspace::sweep`). Runs between cycles
+/// only, so no job is mid-flight; best effort, since a failed pass is
+/// retried before the next cycle.
+async fn sweep_workspaces(store: &Store, work_root: &Path) {
+    match crate::workspace::sweep(store, work_root, crate::util::now_ms()).await {
+        Ok(r) if r != crate::workspace::SweepReport::default() => {
+            tracing::info!("workspace sweep: {r:?}");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("workspace sweep failed: {e}"),
+    }
+}
+
 /// (`state_label`, detail) for `scheduler_state` (`server._describe_cycle`).
 pub fn describe_cycle(summary: &CycleSummary) -> (String, String) {
     use std::fmt::Write;
@@ -220,6 +234,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
     if reaped > 0 {
         tracing::info!("reclaimed {reaped} repo director(ies) left by earlier deletions");
     }
+    sweep_workspaces(&store, &cfg.work_root).await;
     anyhow::ensure!(
         cfg.backend_type == "omp-scavenge",
         "unknown backend_type: {:?}",
@@ -355,6 +370,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         let cycle_result: anyhow::Result<CycleSummary> = async {
             reconcile_and_log(&store).await?;
             crate::server::reap_deleted_repos(&store, &cfg.work_root, &repo_notes).await;
+            sweep_workspaces(&store, &cfg.work_root).await;
             let summary = crate::scheduler::run_cycle(&store, &cfg, &*backend, None).await;
             Ok(summary)
         }

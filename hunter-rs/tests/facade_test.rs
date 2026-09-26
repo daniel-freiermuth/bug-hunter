@@ -1983,6 +1983,8 @@ async fn run_reports_how_far_the_long_window_moved_during_the_job() {
     let mut config = cfg_with(1800.0, omp.to_str().unwrap());
     config.work_root = dir.subdir("work-root");
     config.poll_s = 0.02;
+    let ws = hunter::workspace::Workspace::for_chain(&config.work_root, &dir.subdir("clone"), 1);
+    std::fs::create_dir_all(&ws.tree).unwrap();
     let b = OmpScavengeBackend {
         cfg: config,
         ledger: Arc::new(FakeLedger::new(0, 0)),
@@ -1992,7 +1994,7 @@ async fn run_reports_how_far_the_long_window_moved_during_the_job() {
 
     let rr = b
         .run(
-            &dir.subdir("worktree"),
+            &ws,
             "prompt",
             Some(1_000_000),
             30,

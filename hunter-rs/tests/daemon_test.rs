@@ -1,20 +1,22 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! `run_daemon` end to end: the loop, the pause, stopping while paused, and
-//! what the daemon binds.
+//! `run_daemon` end to end, run for real against a scratch root: the
+//! loop, the pause, stopping while paused, what the daemon binds, and the
+//! startup sweep.
 //!
 //! Everything else in the suite drives the router or the scheduler
 //! directly, so nothing ran the daemon loop itself — mutation testing
 //! showed that replacing `run_daemon` with `Ok(())`, or never entering its
-//! loop, left every test green. This runs the real thing against a scratch
-//! root: a fake `omp` on `PATH`, `HOME` pointed at scratch so omp's real
-//! usage database is never read, and a port nothing else uses.
+//! loop, left every test green. Everything the daemon could reach outside
+//! the root is redirected first: a fake `omp` on `PATH`, `HOME` pointed at
+//! scratch so omp's real usage database is never read, and a port nothing
+//! else uses.
 //!
 //! It also pins a bug found while rebasing the pause feature: the paused
 //! wait listened for a private `ctrl_c()`, which sees only SIGINT, so
 //! `systemctl stop` (SIGTERM) on a paused daemon went unanswered until
 //! systemd's stop timeout killed it.
 //!
-//! Both tests stop their daemon by sending SIGTERM to `Pid::this()`. That
+//! Two tests stop their daemon by sending SIGTERM to `Pid::this()`. That
 //! reaches only the test that sent it: `FakeBins::acquire` refuses to run
 //! outside nextest's process-per-test mode.
 
@@ -202,4 +204,45 @@ async fn the_daemon_binds_the_configured_address() {
         .join()
         .expect("run_daemon thread panicked")
         .expect("run_daemon failed");
+}
+
+/// A daemon that starts reclaims the trees earlier runs left behind.
+///
+/// A crash or a restart mid-job leaves a tree on disk that no job will
+/// ever use again -- here one from the previous layout, referenced by
+/// nothing. The sweep is the only thing that removes it, and it only
+/// runs if the daemon runs it: every tree is a full checkout on the disk
+/// the clones share, so a daemon that never swept would fill that disk
+/// one killed job at a time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_starting_daemon_reclaims_leftover_trees() {
+    let dir = TempDir::new("daemon-sweep");
+    let bins = FakeBins::acquire("daemon-sweep");
+    bins.fail("omp", 1, "fake omp: no usage data here");
+    let _home = bins.env("HOME", dir.path());
+    let mut cfg = Config::load(dir.path()).expect("load config");
+    cfg.work_root = dir.subdir("work_root");
+    cfg.db_path = support::db_copy(&dir, "hunter");
+    cfg.serve_port = free_port();
+    cfg.omp_bin = "omp".to_owned();
+    let leftover = cfg.work_root.join("wt").join("f57");
+    std::fs::create_dir_all(leftover.join("src")).unwrap();
+    std::fs::write(leftover.join("src").join("lib.rs"), "half removed\n").unwrap();
+
+    let daemon = tokio::spawn(hunter::daemon::run_daemon(cfg));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while leftover.exists() {
+        assert!(
+            !daemon.is_finished(),
+            "the daemon exited instead of running: {:?}",
+            daemon.await
+        );
+        assert!(
+            Instant::now() < deadline,
+            "a running daemon never reclaimed {}",
+            leftover.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    daemon.abort();
 }

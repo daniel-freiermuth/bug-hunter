@@ -75,4 +75,10 @@ exclude_globs = [
 exclude_re = [
     "impl Display",
     "fn fmt",
+    # The match guard in `sweep_workspaces` only decides whether a pass
+    # is worth a log line: both arms have already swept, so forcing the
+    # guard either way or inverting it changes what is logged and
+    # nothing else. Whether the daemon sweeps at all is tested
+    # (`daemon_test`), and that mutant is not excluded.
+    "(match guard .*|replace != with ==) in sweep_workspaces",
 ]

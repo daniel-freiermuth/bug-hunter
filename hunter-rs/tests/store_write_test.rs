@@ -256,7 +256,8 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     assert!(job > 0);
 
     // And the deletion can still finish: no job row is holding repo 2's
@@ -1121,7 +1122,8 @@ async fn resume_chain_stats_measure_every_attempt_from_any_link() {
                 previous,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .id;
         set_tokens(&pool, id, tokens).await;
         chain.push(id);
         previous = Some(id);
@@ -1151,7 +1153,8 @@ async fn resume_chain_stats_measure_every_attempt_from_any_link() {
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     set_tokens(&pool, loner, 7_000).await;
     assert_eq!(
         store.resume_chain_stats(loner).await.unwrap(),
@@ -1198,7 +1201,8 @@ async fn resume_chain_stats_terminate_on_a_cyclic_link() {
                 previous,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .id;
         set_tokens(&pool, id, tokens).await;
         chain.push(id);
         previous = Some(id);
