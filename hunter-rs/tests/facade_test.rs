@@ -39,6 +39,8 @@ fn cfg_with(stale_after_s: f64, omp_bin: &str) -> Config {
         work_root: PathBuf::from("/tmp"),
         db_path: PathBuf::from("/tmp/test.db"),
         serve_port: 8378,
+        serve_host: std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+        allowed_hosts: hunter::config::HostAllowList::default(),
         ui_dir: PathBuf::from("/tmp/ui"),
         omp_bin: omp_bin.to_owned(),
         stale_after_s,
