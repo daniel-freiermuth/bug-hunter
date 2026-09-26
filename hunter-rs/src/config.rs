@@ -67,8 +67,6 @@ struct RawBackend {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawCaps {
-    #[serde(rename = "capNewTokens")]
-    cap_new_tokens: Option<i64>,
     #[serde(rename = "maxWallS")]
     max_wall_s: Option<i64>,
     #[serde(rename = "maxFindings")]
@@ -114,11 +112,9 @@ pub struct Config {
     pub model_fix: Option<String>,
     /// backend.type discriminator; only "omp-scavenge" exists.
     pub backend_type: String,
-    pub hunt_cap_tokens: i64,
     pub hunt_max_wall_s: i64,
     pub hunt_max_findings: i64,
     pub hunt_rehunt_days: i64,
-    pub fix_cap_tokens: i64,
     pub fix_max_wall_s: i64,
     /// scan.intervalDays — per-repo hunt cadence gate
     /// (`types.Config.scan_interval_days`, read in `Config.load`).
@@ -189,10 +185,10 @@ impl Config {
             "{}: sessionGraceS must be greater than 0",
             cfg_path.display()
         );
-        // A zero or negative worker limit trips `tokens >= cap_tokens` /
-        // `elapsed >= max_wall_s` on the worker's first meter tick, so the
-        // run is killed before it does anything. Zero is not a way to
-        // disable the cap, it is the tightest possible one.
+        // A zero or negative wall-clock limit trips `elapsed >= max_wall_s`
+        // on the worker's first meter tick, so the run is killed before it
+        // does anything. Zero is not a way to disable the limit, it is the
+        // tightest possible one.
         let limit = |field: &str, value: i64| -> anyhow::Result<i64> {
             anyhow::ensure!(
                 value > 0,
@@ -201,15 +197,7 @@ impl Config {
             );
             Ok(value)
         };
-        let hunt_cap_tokens = limit(
-            "hunt.capNewTokens",
-            raw.hunt.cap_new_tokens.unwrap_or(200_000),
-        )?;
         let hunt_max_wall_s = limit("hunt.maxWallS", raw.hunt.max_wall_s.unwrap_or(1800))?;
-        let fix_cap_tokens = limit(
-            "fix.capNewTokens",
-            raw.fix.cap_new_tokens.unwrap_or(150_000),
-        )?;
         let fix_max_wall_s = limit("fix.maxWallS", raw.fix.max_wall_s.unwrap_or(2700))?;
         // staleAfterS is compared as `age_s <= stale_after_s`, so 0 has a
         // defined meaning (only a just-recorded window counts as fresh).
@@ -279,11 +267,9 @@ impl Config {
                 .backend
                 .kind
                 .unwrap_or_else(|| "omp-scavenge".to_owned()),
-            hunt_cap_tokens,
             hunt_max_wall_s,
             hunt_max_findings: raw.hunt.max_findings.unwrap_or(8),
             hunt_rehunt_days: raw.hunt.rehunt_days.unwrap_or(90),
-            fix_cap_tokens,
             fix_max_wall_s,
             scan_interval_days,
             modernization_interval_days,

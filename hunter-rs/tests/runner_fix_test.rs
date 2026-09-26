@@ -99,7 +99,7 @@ async fn leftover_branch_without_a_worktree_does_not_wedge_the_fix() {
     // Declining needs no forge: the run ends at NOT-A-BUG.md, so what is
     // under test is the worktree setup that precedes it.
     let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code");
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend)
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .expect("a leftover branch is reclaimable, not a permanent failure");
 
@@ -119,9 +119,63 @@ async fn clean_repo_runs_the_fix() {
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code");
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend)
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
 
     assert_eq!(summary.outcome.as_deref(), Some("rejected"));
+}
+
+// ---------------------------------------------------------------------------
+// The cap the job is granted
+// ---------------------------------------------------------------------------
+
+/// The granted cap is the backend's headroom, unaltered.
+///
+/// It used to be `min(config cap, headroom)`, the config number being a
+/// hand-picked constant (`fix.capNewTokens`, default 150 000). Such a
+/// constant drifts below what the jobs it governs actually cost and then
+/// kills work the ramp had already found room for, while the ramp's own
+/// headroom — computed from live window state — bounds the same spend
+/// correctly. Two bounds, one of them blind.
+#[tokio::test]
+async fn granted_cap_is_the_backend_headroom_verbatim() {
+    let f = fixture("fix-cap-verbatim").await;
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    // Deliberately above every cap the config used to impose, so a
+    // surviving min() shows up as the config number instead.
+    let backend =
+        ScriptedBackend::writing("NOT-A-BUG.md", "misread the code").granting(Some(777_000));
+    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    let jobs = f.store.list_jobs(10).await.unwrap();
+    assert_eq!(
+        jobs[0].job.cap_tokens,
+        Some(777_000),
+        "the job must run under the headroom the backend granted"
+    );
+}
+
+/// A backend that grants no ceiling leaves the job with no token bound:
+/// NULL in `jobs.cap_tokens`, `maxWallS` the only remaining stop
+/// condition. The old fallback turned "the ramp sees no reason to bound
+/// this" into "bound it at the config cap".
+#[tokio::test]
+async fn backend_without_a_ceiling_leaves_the_job_unbounded() {
+    let f = fixture("fix-cap-none").await;
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code").granting(None);
+    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    let jobs = f.store.list_jobs(10).await.unwrap();
+    assert_eq!(
+        jobs[0].job.cap_tokens, None,
+        "no headroom bound means no token bound, not the config's"
+    );
 }

@@ -9,9 +9,53 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::domain::{FindingJobKind, FindingStatus, FindingType, JobKind, JobState, RepoJobKind};
-use crate::store::{FindingFilter, Store, StoreWriteError, SyncPrData};
-use crate::types::{Finding, Repo};
+use crate::store::{CreatedJob, FindingFilter, Store, StoreWriteError, SyncPrData};
+use crate::types::{Finding, Job, Repo};
 use crate::util::now_ms;
+
+/// Everything a resumed attempt needs and a cold one does not.
+///
+/// A resume is not a seventh job kind: it runs through the executor of
+/// whatever kind was suspended, so it ingests, advances watermarks and
+/// handles PRs exactly as that kind always does. What differs is all in
+/// here — which budget the gate reserves, which row the new job points
+/// back at, which transcript omp is handed, which output path the
+/// continuing worker is still writing to, and the chain's workspace and
+/// pinned commit, reused untouched.
+#[derive(Debug, Clone)]
+pub struct ResumePlan {
+    pub kind: JobKind,
+    pub repo_id: i64,
+    /// Repo name, carried because the events this plan's outcome logs
+    /// fire from `record_job`, which never reads a repo row.
+    pub repo: String,
+    pub finding_id: Option<i64>,
+    /// The suspended attempt being continued.
+    pub predecessor_id: i64,
+    /// The first attempt in the chain. Its id is the one the playbook
+    /// baked into the output path, and a continuing worker is still
+    /// writing there (`Store::resume_origin_job`).
+    pub origin_job_id: i64,
+    /// The predecessor's transcript, handed to omp verbatim. Lives in
+    /// `workspace.session`.
+    pub session_file: PathBuf,
+    /// The chain's workspace. A resume runs in it as it is: nothing is
+    /// fetched, checked out or created.
+    pub workspace: crate::workspace::Workspace,
+    /// The commit the chain's tree was created at (`jobs.pinned_sha`).
+    pub pinned_sha: String,
+    /// The reservation from [`resume_reservation`], standing in for the
+    /// per-kind estimate at the budget gate.
+    pub anticipated: i64,
+    /// The three terms `anticipated` was computed from, kept so the
+    /// event logged at dispatch can show its arithmetic. An operator
+    /// looking at a large reservation needs to see whether it is a large
+    /// context or a chain that has overrun, and re-deriving them at the
+    /// log site would mean re-reading the transcript and the chain.
+    pub ctx: i64,
+    pub typical: i64,
+    pub chain_spent: i64,
+}
 
 /// What `run_cycle` would act on right now, if invoked (scheduler.py
 /// `pick_next` docstring). Enough for the summary preview and for
@@ -30,6 +74,20 @@ pub enum Candidate {
         label: Option<String>,
         budget_override: Option<String>,
     },
+    /// Continue a suspended attempt instead of redoing it.
+    ///
+    /// `label` and `budget_override` are the tier's own: a finding tier
+    /// that continues its finding's suspended attempt still shows that
+    /// finding and still runs under that finding's override, exactly as
+    /// the fresh candidate it replaces would have. The repo-level resume
+    /// tier carries the repo name and no override.
+    Resume {
+        label: Option<String>,
+        budget_override: Option<String>,
+        /// Boxed: a plan carries its workspace's paths and dwarfs the
+        /// other variants.
+        plan: Box<ResumePlan>,
+    },
 }
 
 impl Candidate {
@@ -37,18 +95,22 @@ impl Candidate {
         match self {
             Self::Repo { kind, .. } => (*kind).into(),
             Self::Finding { kind, .. } => (*kind).into(),
+            Self::Resume { plan, .. } => plan.kind,
         }
     }
 
     pub fn repo_id(&self) -> i64 {
         match self {
             Self::Repo { repo_id, .. } | Self::Finding { repo_id, .. } => *repo_id,
+            Self::Resume { plan, .. } => plan.repo_id,
         }
     }
 
     pub fn label(&self) -> Option<&str> {
         match self {
-            Self::Repo { label, .. } | Self::Finding { label, .. } => label.as_deref(),
+            Self::Repo { label, .. } | Self::Finding { label, .. } | Self::Resume { label, .. } => {
+                label.as_deref()
+            }
         }
     }
 
@@ -57,12 +119,16 @@ impl Candidate {
         match self {
             Self::Repo { repo_id, .. } => *repo_id,
             Self::Finding { finding_id, .. } => *finding_id,
+            Self::Resume { plan, .. } => plan.finding_id.unwrap_or(plan.repo_id),
         }
     }
 
     pub fn budget_override(&self) -> Option<&str> {
         match self {
             Self::Finding {
+                budget_override, ..
+            }
+            | Self::Resume {
                 budget_override, ..
             } => budget_override.as_deref(),
             Self::Repo { .. } => None,
@@ -151,18 +217,31 @@ async fn list_pending_harvest(store: &Store) -> sqlx::Result<Vec<Finding>> {
     Ok(rows.into_iter().map(|(_, f)| f).collect())
 }
 
-/// Pure selection — replicates `scheduler.pick_next`'s priority order and
-/// per-kind eligibility conditions. Read-only.
+/// Selection — replicates `scheduler.pick_next`'s priority order and
+/// per-kind eligibility conditions.
 ///
 /// Priority (`scheduler.pick_next`): a budget-overridden finding (any
 /// category) jumps the queue -> flagged PR (oldest-outstanding reason
 /// first) -> oldest merged PR pending follow-up review -> oldest
-/// rechecking -> oldest queued fix -> the most stale-of-rotation job
-/// type for the least-recently-hunted enabled repo (hunt if never
-/// cloned, else whichever of `hunt/test_gap/dep_update/refactor` is
-/// oldest/never-run subject to `cfg.scan_interval_days`; modernization
-/// gated by `cfg.modernization_interval_days`). All types gated for one
-/// repo -> the next-stalest repo is tried. None = nothing to do.
+/// rechecking -> oldest queued fix -> resumable suspended work -> the
+/// most stale-of-rotation job type for the least-recently-hunted enabled
+/// repo (hunt if never cloned, else whichever of
+/// `hunt/test_gap/dep_update/refactor` is oldest/never-run subject to
+/// `cfg.scan_interval_days`; modernization gated by
+/// `cfg.modernization_interval_days`). All types gated for one repo ->
+/// the next-stalest repo is tried. None = nothing to do.
+///
+/// Each finding tier continues a suspended attempt at its own
+/// (finding, kind) instead of starting that work over
+/// ([`finding_pick`]).
+///
+/// Read-only but for retiring suspensions that can never be continued —
+/// a chain past the give-up ceiling, or one whose working directory is
+/// gone — which [`resume_plan`] does as it skips over them. Those writes
+/// are best-effort precisely because this function is also the
+/// `/api/summary` preview, which may hold a read-only handle — the
+/// candidate is skipped either way, and the scheduler's own next cycle
+/// records it.
 pub async fn pick_next(
     store: &Store,
     cfg: &Config,
@@ -199,26 +278,38 @@ pub async fn pick_next(
         (FindingJobKind::Fix, &queued),
     ] {
         if let Some(f) = items.iter().find(|f| override_of(f).is_some()) {
-            return Ok(Some(finding_candidate(kind, f)));
+            return Ok(Some(finding_pick(store, cfg, kind, f).await?));
         }
     }
 
-    // (2)-(5) Normal finding-kind priorities. attention/pending_harvest
-    // are oldest-first; list_findings is id DESC, so last = oldest.
-    if let Some(f) = attention.first() {
-        return Ok(Some(finding_candidate(FindingJobKind::Engage, f)));
-    }
-    if let Some(f) = pending_harvest.first() {
-        return Ok(Some(finding_candidate(FindingJobKind::Harvest, f)));
-    }
-    if let Some(f) = rechecking.last() {
-        return Ok(Some(finding_candidate(FindingJobKind::Recheck, f)));
-    }
-    if let Some(f) = queued.last() {
-        return Ok(Some(finding_candidate(FindingJobKind::Fix, f)));
+    // (2)-(5) Normal finding-kind priorities, in this order.
+    // attention/pending_harvest are oldest-first; list_findings is id
+    // DESC, so last = oldest.
+    for (kind, oldest) in [
+        (FindingJobKind::Engage, attention.first()),
+        (FindingJobKind::Harvest, pending_harvest.first()),
+        (FindingJobKind::Recheck, rechecking.last()),
+        (FindingJobKind::Fix, queued.last()),
+    ] {
+        if let Some(f) = oldest {
+            return Ok(Some(finding_pick(store, cfg, kind, f).await?));
+        }
     }
 
-    // (6) Repo rotation: enabled repos in staleness order — never-hunted
+    // (6) Work already paid for: a suspended attempt whose transcript is
+    // still on disk. This sits below every tier above it because those
+    // are all a human waiting on a pull request — a flagged review, a
+    // merged branch, a recheck they asked for, a fix they queued. A
+    // resume is background work, and it outranks *starting* background
+    // work because continuing costs the context at suspension (median
+    // re-cache ratio 1.00 across 112 production events) where restarting
+    // costs a flat ~37,000-token session floor plus every token already
+    // spent, and advances no watermark to show for it.
+    if let Some(c) = pick_resume(store, cfg, force_id).await? {
+        return Ok(Some(c));
+    }
+
+    // (7) Repo rotation: enabled repos in staleness order — never-hunted
     // first, then oldest last_hunt_at first; ties keep list_repos' name
     // order (Python sorted() and Vec::sort_by_key are both stable).
     let mut repos: Vec<Repo> = store
@@ -289,10 +380,338 @@ pub async fn pick_next(
     Ok(None)
 }
 
+// ---------------------------------------------------------------------------
+// Resume policy
+// ---------------------------------------------------------------------------
+
+/// Floor on the work half of any attempt's reservation.
+///
+/// The work half is whatever an attempt is budgeted beyond the context
+/// it must load first, and it can come out tiny or negative: a chain
+/// that has already outspent the per-kind typical `z` leaves
+/// `z - chain_spent` below zero, and a negative budget for the work
+/// still to do is not a small budget, it is a meaningless one. Floored
+/// here at enough for the worker to do real work after loading, rather
+/// than exactly enough to load and be killed again with nothing to
+/// show, which would turn every resume into another suspension.
+const MIN_PROGRESS_TOKENS: i64 = 25_000;
+
+/// The system prompt and tool schemas a cold session loads before it
+/// reads a single job-specific byte.
+///
+/// The smallest first call measured is 17,257 tokens. Kept below that
+/// so it under-estimates: it feeds the floor arm of a `max()`, where
+/// guessing high would refuse work the window could have funded.
+const START_CONTEXT_FLOOR_TOKENS: i64 = 15_000;
+
+/// The fraction of an attempt's budget that must go to work rather than
+/// to loading context.
+///
+/// Every attempt pays to load its context before it can do anything —
+/// a cold one its system prompt and tools, a resumed one its whole
+/// transcript, re-sent at a measured median ratio of 1.00. That is
+/// overhead; only what is left is work. Under a flat 25,000-token work
+/// floor a resume with a 100,000-token transcript reserved 125,000, and
+/// when the window had just that much room the attempt it admitted
+/// spent 80% of its budget re-sending the transcript and 20% working.
+/// Holding every start to at least this fraction of work makes the same
+/// resume reserve 200,000, so it waits for a window that can fund an
+/// attempt that is at least half work.
+const MIN_START_EFFICIENCY: f64 = 0.5;
+
+/// The least work budget worth paying `ctx` tokens of loading for.
+///
+/// Solves `work / (ctx + work) >= MIN_START_EFFICIENCY` for `work`, and
+/// never below [`MIN_PROGRESS_TOKENS`]: a small context would otherwise
+/// be funded for a few thousand tokens of work, too little to finish
+/// anything.
+fn min_useful(ctx: i64) -> i64 {
+    // One expression rather than a named `eff / (1 - eff)` ratio: at 0.5
+    // that ratio is exactly 1, so multiplying `ctx` by it and dividing
+    // by it agree, and no reservation could show which one the code
+    // does. Spelled out, a wrong operator anywhere here moves the
+    // 100,000-token resume off 200,000.
+    let work = ctx as f64 * MIN_START_EFFICIENCY / (1.0 - MIN_START_EFFICIENCY);
+    MIN_PROGRESS_TOKENS.max(work.ceil() as i64)
+}
+
+/// Multiple of the per-kind typical cost at which a chain is abandoned.
+///
+/// Applied to what the chain spent OUTSIDE its single biggest attempt:
+/// work that has burned three typical runs' worth on top of its one
+/// most expensive try, and is still not finished, is not finishing.
+/// Without a ceiling the chain resumes forever, each link cheap enough
+/// to look reasonable — the exact loop this feature exists to end, only
+/// slower.
+const GIVE_UP_MULTIPLE: i64 = 3;
+
+/// How many attempts one piece of work gets before the chain is
+/// abandoned regardless of what it has cost.
+///
+/// The token arm below cannot bound a chain whose every attempt is
+/// cheap: a suspension that resumes, does a little, and suspends again
+/// runs forever without ever tripping a spend threshold. This arm is
+/// also the one a reader can reason about, because it is expressed in
+/// the unit the question is actually asked in — how many times have we
+/// tried this.
+const MAX_RESUME_ATTEMPTS: i64 = 4;
+
+/// The whole prompt a resumed attempt gets.
+///
+/// Short by necessity, not by preference: the session already contains
+/// the original playbook, the diff range, the suppression list and
+/// everything the worker has done since. Re-sending it would re-send a
+/// prompt the model is already looking at, for full price.
+const RESUME_PROMPT: &str = "Continue the work you were doing in this session. You were interrupted; \
+     pick up where you left off.";
+
+/// What to reserve for a resumed attempt.
+///
+/// `ctx_at_suspension` is what the first call costs: a resumed session
+/// re-establishes its whole context, measured median ratio 1.00 across
+/// 112 production re-cache events. That is the overhead. The work half
+/// is what is left of the per-kind typical estimate after everything
+/// the chain has already spent, but never less than [`min_useful`] of
+/// that context — a 100,000-token transcript reserves at least 200,000,
+/// so the gate admits it only once at least half the attempt can be
+/// work rather than re-sending the transcript.
+fn resume_reservation(ctx_at_suspension: i64, z: i64, chain_spent: i64) -> i64 {
+    ctx_at_suspension + (z - chain_spent).max(min_useful(ctx_at_suspension))
+}
+
+/// What to reserve for an attempt that starts cold.
+///
+/// The per-kind history, but never less than the cheapest cold start
+/// that clears [`MIN_START_EFFICIENCY`]: [`START_CONTEXT_FLOOR_TOKENS`]
+/// of fixed context plus [`min_useful`] of it, 40,000 with these
+/// constants. History knows nothing about that floor and has collapsed
+/// before: mis-metered rows once dragged the estimate to 1,876 tokens,
+/// and the gate then started hunts with about 10,000 tokens of headroom
+/// that died on their second call.
+fn cold_reservation(history: i64) -> i64 {
+    history.max(START_CONTEXT_FLOOR_TOKENS + min_useful(START_CONTEXT_FLOOR_TOKENS))
+}
+
+/// What the budget gate will reserve if `c` runs, for the
+/// `/api/summary` preview: a preview that reserved anything else would
+/// show a budget decision the scheduler is not going to make.
+///
+/// Unlike the gate, a failed history read is an error here rather than
+/// a zero — the preview reports it instead of guessing.
+pub async fn candidate_reservation(
+    store: &Store,
+    cfg: &Config,
+    c: &Candidate,
+) -> anyhow::Result<i64> {
+    Ok(match c {
+        Candidate::Resume { plan, .. } => plan.anticipated,
+        Candidate::Repo { .. } | Candidate::Finding { .. } => {
+            cold_reservation(anticipated_tokens(store, cfg, c.repo_id(), c.job_kind()).await?)
+        }
+    })
+}
+
+/// The resume tier of [`pick_next`]: the newest suspension that is still
+/// worth continuing, or `None`.
+///
+/// Candidates are walked newest-first; [`resume_plan`] decides each one
+/// and retires those that can never be continued, so the walk moves on
+/// to the next in the same cycle — which is what "fall through to
+/// normal selection" means.
+async fn pick_resume(
+    store: &Store,
+    cfg: &Config,
+    force_id: Option<i64>,
+) -> anyhow::Result<Option<Candidate>> {
+    for job in store.list_resumable_jobs().await? {
+        if force_id.is_some_and(|rid| job.repo_id != rid) {
+            continue;
+        }
+        if let Some(plan) = resume_plan(store, cfg, job).await? {
+            return Ok(Some(Candidate::Resume {
+                label: (!plan.repo.is_empty()).then(|| plan.repo.clone()),
+                budget_override: None,
+                plan: Box::new(plan),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// A finding tier's pick: continue the suspended attempt at this same
+/// (finding, kind) when one is resumable, otherwise start the work.
+///
+/// Without this the finding tiers, which outrank the resume tier, never
+/// see the suspension: they start the work fresh — paying the session
+/// floor plus everything the suspended attempt already spent. The
+/// replacement keeps the tier's position, label and budget override;
+/// only the plan differs.
+async fn finding_pick(
+    store: &Store,
+    cfg: &Config,
+    kind: FindingJobKind,
+    f: &Finding,
+) -> anyhow::Result<Candidate> {
+    let fresh = finding_candidate(kind, f);
+    let job_kind = JobKind::from(kind);
+    for job in store.list_resumable_jobs().await? {
+        if job.finding_id != Some(f.id) || job.kind != job_kind {
+            continue;
+        }
+        if let Some(plan) = resume_plan(store, cfg, job).await? {
+            return Ok(Candidate::Resume {
+                label: fresh.label().map(str::to_owned),
+                budget_override: fresh.budget_override().map(str::to_owned),
+                plan: Box::new(plan),
+            });
+        }
+    }
+    Ok(fresh)
+}
+
+/// How to continue one resumable job, or `None` when it cannot be.
+///
+/// Checks the two things the database cannot know. The chain's
+/// workspace must still hold its tree, and the transcript must live in
+/// its session directory — a resumed worker continues a conversation, not
+/// a filesystem, so pointing it at a tree that has since gone would have
+/// it edit files that are not there. A row from before per-chain
+/// workspaces fails this too: its transcript and tree are in the old
+/// layout, and its row has no pinned commit. And the chain must be under
+/// the give-up ceiling.
+///
+/// Failing either is permanent, so the job is retired here rather than
+/// skipped. A skip leaves the row `suspended`: it is offered again every
+/// cycle and never leaves the table. Refusing from inside the executor
+/// would be worse — this tier outranks repo rotation, so the same
+/// hopeless job would be picked every cycle, starving every rotation
+/// kind. Retiring it takes it out of the walk in this same cycle.
+async fn resume_plan(store: &Store, cfg: &Config, job: Job) -> anyhow::Result<Option<ResumePlan>> {
+    // Non-NULL by the query's own filter; a row that lost its path
+    // between the read and here is simply not resumable.
+    let Some(session_file) = job.session_file.as_deref().map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let Some(repo) = store.get_repo_by_id(job.repo_id).await? else {
+        return Ok(None);
+    };
+    let origin_job_id = store.resume_origin_job(job.id).await?;
+    let workspace = crate::workspace::Workspace::for_chain(
+        &cfg.work_root,
+        Path::new(&repo.path),
+        origin_job_id,
+    );
+    let pinned_sha = store.pinned_sha(job.id).await?;
+    let pinned_sha = match pinned_sha {
+        Some(sha) if workspace.tree.is_dir() && session_file.starts_with(&workspace.session) => sha,
+        _ => {
+            // The transcript names files in that tree, so no later cycle
+            // can resume it either.
+            let msg = format!(
+                "resume {} {}: job {} retired, workspace {} is gone",
+                job.kind,
+                repo.name,
+                job.id,
+                workspace.root.display()
+            );
+            // Best-effort, like the give-up retirement below.
+            let _ = store
+                .retire_suspended_job(job.id, JobState::Killed, Some("workdir-gone"), &msg)
+                .await;
+            let _ = store
+                .log_event("resume", &msg, Some(job.id), job.finding_id)
+                .await;
+            return Ok(None);
+        }
+    };
+
+    let z = anticipated_tokens(store, cfg, job.repo_id, job.kind)
+        .await
+        .unwrap_or(0);
+    let chain = store.resume_chain_stats(job.id).await?;
+    let chain_spent = chain.total;
+    // Two independent ways a chain runs out of road, and neither
+    // implies the other: too many tries, or too much spent on the
+    // tries other than the biggest one.
+    //
+    // The biggest attempt is set aside because one enormous attempt
+    // is evidence about the SIZE OF THE JOB, not about the chain
+    // being stuck — judging by it would retire big-but-healthy work
+    // on its first resume. What the chain spent BESIDES that
+    // attempt is the part that says continuing is not getting
+    // anywhere.
+    //
+    // Subtracting rather than multiplying it is forced, not
+    // stylistic: `chain_spent <= attempts * largest`, so any
+    // threshold of the form `k * largest` is unreachable below
+    // `attempts = k + 1` and would be decoration at k = 3.
+    //
+    // Both arms leave a chain of one alone. A first suspension is a
+    // single attempt whose spend is, by definition of a cap kill, at
+    // least its own cap; retiring on that would end the work before
+    // resume had been tried even once, which is the opposite of what
+    // this feature is for.
+    let excess = chain_spent - chain.max_single;
+    let too_many = chain.attempts >= MAX_RESUME_ATTEMPTS;
+    let too_costly = chain.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
+    if too_many || too_costly {
+        let why = if too_many {
+            format!("{} attempts, the limit", chain.attempts)
+        } else {
+            format!("{excess} tok outside its largest attempt > {GIVE_UP_MULTIPLE}x {z} typical")
+        };
+        let msg = format!(
+            "resume {} {}: giving up after {chain_spent} tok across the chain ({why})",
+            job.kind, repo.name
+        );
+        // Best-effort: the summary preview runs this same function
+        // over a read-only handle. Either way the candidate is
+        // skipped, so a failed write only defers the record.
+        let _ = store
+            .retire_suspended_job(job.id, JobState::Failed, Some("give-up"), &msg)
+            .await;
+        let _ = store
+            .log_event("resume", &msg, Some(job.id), job.finding_id)
+            .await;
+        return Ok(None);
+    }
+
+    // An unreadable transcript, or one with no usage record at all,
+    // leaves the first call's cost unknown. `z` is the only other
+    // estimate of this work that exists, so it stands in — better a
+    // per-kind typical than a zero that would reserve nothing and
+    // let the ramp grant a job it cannot afford.
+    let ctx = crate::backends::omp_scavenge::harness::ctx_at_suspension(&session_file).unwrap_or(z);
+    let anticipated = resume_reservation(ctx, z, chain_spent);
+
+    // No "resuming" event here: this function is also the
+    // /api/summary preview, which polls every few seconds, and an
+    // event per poll would bury the log. `run_cycle_inner` logs it
+    // when the cycle actually acts on the candidate.
+
+    Ok(Some(ResumePlan {
+        kind: job.kind,
+        repo_id: job.repo_id,
+        repo: repo.name,
+        finding_id: job.finding_id,
+        predecessor_id: job.id,
+        origin_job_id,
+        session_file,
+        workspace,
+        pinned_sha,
+        anticipated,
+        ctx,
+        typical: z,
+        chain_spent,
+    }))
+}
+
 /// Historical cost estimate for one (repo, kind): warm (finished a
 /// non-denied job of this kind on this repo within `cache_ttl_s`) -> p50 of
 /// the kind's `tokens_new` history, cold -> p90; empty history -> 0
-/// (`scheduler.anticipated_tokens`, exact index formula in BACKEND-CONTRACT.md §1.9).
+/// (`scheduler.anticipated_tokens`, exact index formula in
+/// BACKEND-CONTRACT.md §1.9; the history itself is
+/// `Store::kind_token_history`).
 pub async fn anticipated_tokens(
     store: &Store,
     cfg: &Config,
@@ -322,6 +741,7 @@ use crate::forge::{self, CheckConclusion, GhCheckRun, Mergeable, PrView, ReviewD
 use crate::ingest::{IngestResult, ingest_findings};
 use crate::playbooks;
 use crate::types::RunResult;
+use crate::workspace::{TreeSpec, Workspace};
 use serde::{Deserialize, Serialize};
 
 /// Sync PR results — typed replacement for raw JSON blobs.
@@ -395,13 +815,35 @@ pub struct CycleSummary {
 const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 
 /// Map `RunResult` to job state.
+///
+/// A cap kill that left a transcript behind is a PAUSE, not a failure.
+/// The worker ran out of window headroom mid-thought and the record of
+/// that thought is still on disk, so the work can be continued for the
+/// price of re-caching it — measured median ratio 1.00 across 112
+/// production re-cache events — instead of redone for a flat
+/// ~37,000-token session floor plus everything already paid for. Calling
+/// that outcome `killed` is what let one repo run ten consecutive hunts
+/// over an identical diff range for 1.48M tokens, eight of them finding
+/// nothing: a killed job advances no watermark, so the same work was
+/// re-selected from scratch every cycle.
+///
+/// The session file is load-bearing, not incidental: resuming means
+/// handing omp one exact path, and a cap kill with no transcript has
+/// nothing to hand it.
+///
+/// Every other `killed_reason` stays `Killed` and is never resumed.
+/// Wallclock above all: an unbounded overrun is the runaway signature,
+/// and continuing a runaway only buys it more wall clock.
+///
+/// `resume-unavailable` is `Failed` rather than `Killed` because nothing
+/// was spawned — there was no run to kill, the attempt could not start.
 fn job_state(rr: &RunResult) -> JobState {
-    if rr.killed_reason.is_some() {
-        JobState::Killed
-    } else if rr.exit_code == Some(0) {
-        JobState::Done
-    } else {
-        JobState::Failed
+    match rr.killed_reason.as_deref() {
+        Some("cap") if rr.session_file.is_some() => JobState::Suspended,
+        Some("resume-unavailable") => JobState::Failed,
+        Some(_) => JobState::Killed,
+        None if rr.exit_code == Some(0) => JobState::Done,
+        None => JobState::Failed,
     }
 }
 
@@ -431,11 +873,17 @@ fn job_refused(
 }
 
 /// Record a completed job's outcome (`scheduler._record_job`).
+///
+/// `resume` is the plan this attempt ran under, if it was a resume. It
+/// is here rather than in each executor because every executor funnels
+/// through this one call, and the one outcome that needs it —
+/// `resume-unavailable` — is identical for all six.
 pub async fn record_job(
     store: &Store,
     job_id: i64,
     rr: &RunResult,
     model: Option<&str>,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<JobState> {
     let state = job_state(rr);
     let notes = if state != JobState::Done && !rr.stdout_tail.is_empty() {
@@ -460,6 +908,33 @@ pub async fn record_job(
             now,
         )
         .await?;
+
+    // The transcript this attempt was to continue is gone, so nothing
+    // ran. The predecessor is retired `killed`: leaving it `suspended`
+    // would offer the same missing session every cycle forever.
+    //
+    // Deliberately NOT restarting the work cold in this same cycle. omp
+    // treats an unresolvable `--resume` path as permission to start a
+    // FRESH session, write it at that path and exit 0, which is
+    // indistinguishable downstream from a real continuation — so
+    // "cannot resume" quietly becoming "start cold here" would pay a
+    // full session floor while believing it had continued. The next
+    // cycle picks the work up through normal selection, cold and
+    // knowing it.
+    if let Some(plan) = resume
+        && rr.killed_reason.as_deref() == Some("resume-unavailable")
+    {
+        let msg = format!(
+            "resume {} {}: session gone, predecessor job {} marked killed",
+            plan.kind, plan.repo, plan.predecessor_id
+        );
+        store
+            .retire_suspended_job(plan.predecessor_id, JobState::Killed, None, &msg)
+            .await?;
+        let _ = store
+            .log_event("error", &msg, Some(job_id), plan.finding_id)
+            .await;
+    }
     Ok(state)
 }
 
@@ -504,13 +979,17 @@ fn run_cmd_sync(argv: &[&str], timeout_s: u64) -> (i32, String) {
     crate::util::run_cmd(argv, timeout_s)
 }
 
-/// Clone repo if not yet cloned, then fetch+checkout+pull default branch.
-/// Returns Ok(()) on success, Err with an error summary dict on failure.
+/// Clone the repo if it is not cloned yet, then fetch.
+///
+/// Fetch only — never checkout or pull. The clone is the object store
+/// every chain's worktree is added from, not a working tree anyone runs
+/// in: moving its HEAD would do nothing for the trees, and moving the
+/// trees is exactly what must never happen under a suspended chain.
+/// Returns Ok(()) on success, Err with an error summary on failure.
 async fn sync_repo(
     store: &Store,
     repo_url: &str,
     rpath: &Path,
-    default_branch: &str,
     log_prefix: &str,
     finding_id: Option<i64>,
 ) -> Result<(), String> {
@@ -568,41 +1047,38 @@ async fn sync_repo(
             return Err(format!("clone failed: {tail}"));
         }
     }
-    let rp_str = rpath.to_string_lossy().to_string();
-    for cmd_tail in [
-        vec!["fetch".to_owned(), "origin".to_owned()],
-        vec!["checkout".to_owned(), default_branch.to_owned()],
-        vec!["pull".to_owned(), "--ff-only".to_owned()],
-    ] {
-        let rps = rp_str.clone();
-        let ct = cmd_tail.clone();
-        let (rc, out) = tokio::task::spawn_blocking(move || {
-            let mut argv: Vec<&str> = vec!["git", "-C", &rps];
-            argv.extend(ct.iter().map(std::string::String::as_str));
-            run_cmd_sync(&argv, 600)
-        })
-        .await
-        .unwrap_or((127, "spawn error".to_owned()));
-        if rc != 0 {
-            let tail = crate::util::tail(&out, 300);
-            let cmd_str = format!("git {}", cmd_tail.join(" "));
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!("{log_prefix}: {cmd_str} failed: {tail}"),
-                    None,
-                    finding_id,
-                )
-                .await;
-            return Err(format!("{cmd_str} failed: {tail}"));
-        }
+    let rps = rpath.to_string_lossy().to_string();
+    let (rc, out) = tokio::task::spawn_blocking(move || {
+        run_cmd_sync(&["git", "-C", &rps, "fetch", "origin"], 600)
+    })
+    .await
+    .unwrap_or((127, "spawn error".to_owned()));
+    if rc != 0 {
+        let tail = crate::util::tail(&out, 300);
+        let _ = store
+            .log_event(
+                "error",
+                &format!("{log_prefix}: git fetch origin failed: {tail}"),
+                None,
+                finding_id,
+            )
+            .await;
+        return Err(format!("git fetch origin failed: {tail}"));
     }
     Ok(())
 }
 
-/// Budget gate: check with backend, return (cap, granted) or Err with denied dict.
+/// Budget gate: check with backend, return the grant or a denied summary.
 enum BudgetDecision {
-    Approved(i64),
+    /// The token bound to enforce — `None` for a job the ramp put no
+    /// ceiling on, which then runs under `maxWallS` alone — and the
+    /// anticipated cost the ramp reserved to grant it. The job row records
+    /// the latter so the inflight reservation can read it back while the
+    /// job runs.
+    Approved {
+        cap: Option<i64>,
+        anticipated: i64,
+    },
     Denied(Box<CycleSummary>),
 }
 
@@ -612,14 +1088,33 @@ async fn budget_gate(
     cfg: &Config,
     repo_id: i64,
     kind: JobKind,
-    cfg_cap: i64,
     use_override: bool,
     log_prefix: &str,
     finding_id: Option<i64>,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<BudgetDecision> {
-    let anticipated = anticipated_tokens(store, cfg, repo_id, kind)
-        .await
-        .unwrap_or(0);
+    // A resumed attempt costs its context back plus whatever is left of
+    // the per-kind typical, not the per-kind typical on its own: the
+    // first call re-establishes a transcript that may be far larger than
+    // a cold session's floor. Reserving `z` for it would under-reserve
+    // by exactly the amount that makes resuming worth doing.
+    //
+    // Both reservations are floored so that loading context is at most
+    // half of what an admitted attempt pays for (`MIN_START_EFFICIENCY`).
+    // The floor only decides WHETHER the gate admits the job: the cap a
+    // granted job runs under is the window's headroom computed without
+    // this job's own reservation, so a larger reservation never shrinks
+    // it. What it does is refuse a window too tight to fund the attempt
+    // as mostly work, instead of starting one that spends its budget
+    // loading context.
+    let anticipated = match resume {
+        Some(plan) => plan.anticipated,
+        None => cold_reservation(
+            anticipated_tokens(store, cfg, repo_id, kind)
+                .await
+                .unwrap_or(0),
+        ),
+    };
     let outlook = backend.decide(anticipated).await?;
     let verdict = if use_override {
         &outlook.prioritized
@@ -641,17 +1136,121 @@ async fn budget_gate(
         Verdict::Granted {
             cap_tokens: backend_cap,
             ..
-        } => {
-            let cap = match backend_cap {
-                Some(bc) => cfg_cap.min(*bc),
-                None => cfg_cap,
-            };
-            Ok(BudgetDecision::Approved(cap))
+        } => Ok(BudgetDecision::Approved {
+            // Verbatim: the ramp's headroom IS the budget for this job,
+            // and it is the only token bound. A config constant beside it
+            // could only ever be a second, static guess at the same
+            // quantity — and the one that shipped had drifted below what
+            // the jobs it governed cost, killing them on its own.
+            cap: *backend_cap,
+            anticipated,
+        }),
+    }
+}
+
+/// The chain workspace a job runs in: for a resume, the chain's own,
+/// untouched; for a cold job, a new one — after first releasing the trees
+/// of the chains its `create_job` superseded.
+///
+/// Called after the budget gate and after `create_job`, never before: a
+/// job that is denied or refused has no workspace, so there is nothing to
+/// clean up on those paths. The supersession release has to come first
+/// because a superseded fix chain holds the same branch checked out, and
+/// git refuses one branch in two worktrees.
+///
+/// `Ok(Err(summary))`: the tree could not be made. The job is recorded
+/// `failed` with the reason, and [`crate::workspace::create`] has already
+/// removed whatever it made.
+async fn open_workspace(
+    store: &Store,
+    cfg: &Config,
+    repo: &Repo,
+    created: &CreatedJob,
+    resume: Option<&ResumePlan>,
+    spec: TreeSpec,
+    kind: JobKind,
+    log_prefix: &str,
+    finding_id: Option<i64>,
+) -> anyhow::Result<Result<(Workspace, String), CycleSummary>> {
+    if let Some(plan) = resume {
+        return Ok(Ok((plan.workspace.clone(), plan.pinned_sha.clone())));
+    }
+    let clone = Path::new(&repo.path);
+    for &old in &created.superseded {
+        let origin = store.resume_origin_job(old).await?;
+        let stale = Workspace::for_chain(&cfg.work_root, clone, origin);
+        crate::workspace::release_if_idle(store, &stale).await?;
+    }
+    let ws = Workspace::for_chain(&cfg.work_root, clone, created.id);
+    let made = {
+        let ws = ws.clone();
+        tokio::task::spawn_blocking(move || crate::workspace::create(&ws, &spec)).await?
+    };
+    match made {
+        Ok(sha) => {
+            store.set_pinned_sha(created.id, &sha).await?;
+            Ok(Ok((ws, sha)))
+        }
+        Err(why) => {
+            let note = format!("workspace not created: {why}");
+            store.fail_unstarted_job(created.id, &note).await?;
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("{log_prefix}: job {} {note}", created.id),
+                    Some(created.id),
+                    finding_id,
+                )
+                .await;
+            Ok(Err(CycleSummary {
+                kind: Some(kind),
+                repo: Some(repo.name.clone()),
+                finding_id,
+                job_id: Some(created.id),
+                state: Some(JobState::Failed),
+                failure: Some(note),
+                ..Default::default()
+            }))
         }
     }
 }
 
+/// Release a chain's tree once its job has ended, unless the job table
+/// says the chain is still `running` or `suspended` — a suspension is a
+/// budget pause, and its tree is the state the resume continues.
+///
+/// Best effort: a tree that could not be released is picked up by the
+/// sweep before the next cycle.
+async fn close_workspace(store: &Store, ws: &Workspace) {
+    if let Err(e) = crate::workspace::release_if_idle(store, ws).await {
+        tracing::warn!("releasing {}: {e}", ws.tree.display());
+    }
+}
+
+/// Retire a suspended attempt whose work concluded anyway.
+///
+/// A worker can finish the finding's business before the cap stops it —
+/// leave a verdict file, or commit enough for the scheduler to open the
+/// pull request. The finding then leaves the status the kind acts on, so
+/// no resume could ever continue the chain, yet it would stay `suspended`
+/// and be offered by the resume tier every cycle. Retiring it here makes
+/// the chain terminal, so its tree is released with the job instead of
+/// kept for a resume that cannot come. `killed_reason` is left alone: the
+/// attempt really did stop on `cap`.
+async fn retire_concluded(store: &Store, job: i64, outcome: &str) {
+    let msg =
+        format!("job {job} suspended after its work concluded ({outcome}); nothing to resume");
+    let _ = store
+        .retire_suspended_job(job, JobState::Killed, None, &msg)
+        .await;
+}
+
 /// Run a hunt job (`scheduler.run_hunt`).
+///
+/// `resume` continues a suspended attempt: no sync, the diff range ending
+/// at the chain's pinned commit, the same ingest and the same watermark
+/// rule, but the worker is handed its own transcript and a one-line
+/// "carry on" instead of a fresh playbook.
 #[allow(
     clippy::too_many_lines,
     reason = "linear job pipeline: sync, resolve diff range, gate budget, \
@@ -664,6 +1263,7 @@ pub async fn run_hunt(
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     // Git's empty tree — the implicit parent of all root commits.
     // Using this as diff base includes the root commit itself.
@@ -674,32 +1274,38 @@ pub async fn run_hunt(
     let rpath = PathBuf::from(&repo.path);
     let db = &repo.default_branch;
 
-    sync_repo(store, &repo.url, &rpath, db, &format!("hunt {rname}"), None)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // Get HEAD
-    let rp_str = rpath.to_string_lossy().to_string();
-    let (rc, head) = {
-        let rps = rp_str.clone();
-        tokio::task::spawn_blocking(move || {
-            run_cmd_sync(&["git", "-C", &rps, "rev-parse", "HEAD"], 30)
-        })
-        .await
-        .unwrap_or((127, String::new()))
+    // The commit this chain reviews up to. Cold: the freshly fetched tip
+    // of the default branch, which the chain's tree is created at below.
+    // Resume: the commit the chain's tree was created at, however far the
+    // default branch has moved since — nothing is fetched or checked out
+    // for a resume. Both the diff range and the watermark written on Done
+    // come from this, so the watermark always names the commit the worker
+    // actually reviewed and never marks as hunted a commit that was not in
+    // the range.
+    let head = if let Some(plan) = resume {
+        plan.pinned_sha.clone()
+    } else {
+        sync_repo(store, &repo.url, &rpath, &format!("hunt {rname}"), None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let clone = rpath.clone();
+        let rev = format!("origin/{db}");
+        let tip =
+            tokio::task::spawn_blocking(move || crate::workspace::resolve(&clone, &rev)).await?;
+        let Some(tip) = tip else {
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("hunt {rname}: origin/{db} does not resolve"),
+                    None,
+                    None,
+                )
+                .await;
+            anyhow::bail!("origin/{db} does not resolve");
+        };
+        tip
     };
-    let head = head.trim().to_owned();
-    if rc != 0 || head.is_empty() {
-        let _ = store
-            .log_event(
-                "error",
-                &format!("hunt {rname}: rev-parse HEAD failed"),
-                None,
-                None,
-            )
-            .await;
-        anyhow::bail!("rev-parse HEAD failed");
-    }
+    let rp_str = rpath.to_string_lossy().to_string();
 
     let last = repo
         .last_hunt_sha
@@ -707,7 +1313,12 @@ pub async fn run_hunt(
         .map(std::borrow::ToOwned::to_owned);
     let last_full = repo.last_full_hunt_at;
     let rehunt_interval_ms = cfg.hunt_rehunt_days * 86_400_000;
-    let rehunt_due = last_full.is_some_and(|lf| (now_ms() - lf) > rehunt_interval_ms);
+    // Both of the decisions below answer "should this work START", and
+    // on a resume that question was settled in an earlier cycle. Firing
+    // the periodic full re-hunt here would re-scope work already in
+    // flight, and the no-new-commits skip would abandon a live session.
+    let rehunt_due =
+        resume.is_none() && last_full.is_some_and(|lf| (now_ms() - lf) > rehunt_interval_ms);
     let mut full_rehunt_triggered = false;
     let last = if rehunt_due {
         let _ = store.clear_last_hunt_sha(rid).await;
@@ -727,7 +1338,7 @@ pub async fn run_hunt(
     } else {
         last
     };
-    if last.as_deref() == Some(&head) {
+    if resume.is_none() && last.as_deref() == Some(&head) {
         let _ = store.set_last_hunt(rid, &head).await;
         let _ = store
             .log_event(
@@ -818,34 +1429,64 @@ pub async fn run_hunt(
         }
     };
 
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
         rid,
         RepoJobKind::Hunt.into(),
-        cfg.hunt_cap_tokens,
         false,
         &format!("hunt {rname}"),
         None,
+        resume,
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => return Ok(*d),
     };
 
-    let job = match store
-        .create_job(RepoJobKind::Hunt.into(), rid, None, cap, JobState::Running)
+    let created = match store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            rid,
+            None,
+            cap,
+            JobState::Running,
+            Some(anticipated),
+            resume.map(|r| r.predecessor_id),
+        )
         .await
     {
         Ok(j) => j,
         Err(e) => return job_refused(RepoJobKind::Hunt.into(), Some(rname), None, e),
     };
+    let job = created.id;
+    let (ws, pinned) = match open_workspace(
+        store,
+        cfg,
+        repo,
+        &created,
+        resume,
+        TreeSpec::Detached { at: head.clone() },
+        RepoJobKind::Hunt.into(),
+        &format!("hunt {rname}"),
+        None,
+    )
+    .await?
+    {
+        Ok(opened) => opened,
+        Err(failed) => return Ok(failed),
+    };
+    // A resumed worker is still writing to the path its ORIGINAL prompt
+    // named, so the attempt that ingests has to look there. Using this
+    // job's own id would find nothing, advance no watermark, and put the
+    // same work back in the rotation next cycle.
+    let out_job = resume.map_or(job, |r| r.origin_job_id);
     let out_path = cfg
         .work_root
         .join("out")
-        .join(format!("job{job}.findings.json"));
+        .join(format!("job{out_job}.findings.json"));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
     let suppressions = store
@@ -857,22 +1498,33 @@ pub async fn run_hunt(
         .await
         .unwrap_or_default();
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
-    let prompt = playbooks::build_hunt_prompt(
-        &cfg.root,
-        repo,
-        &diff_range,
-        &scope_note,
-        &suppressions,
-        &known,
-        &out_path,
-        cfg.hunt_max_findings,
-        &repo_notes,
-    )?;
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => playbooks::build_hunt_prompt(
+            &cfg.root,
+            repo,
+            &ws.tree,
+            &diff_range,
+            &scope_note,
+            &suppressions,
+            &known,
+            &out_path,
+            cfg.hunt_max_findings,
+            &repo_notes,
+        )?,
+    };
     let model = cfg.model_for("hunt");
     let rr = backend
-        .run(&rpath, &prompt, cap, cfg.hunt_max_wall_s, JobClass::Hunt)
+        .run(
+            &ws,
+            &prompt,
+            cap,
+            cfg.hunt_max_wall_s,
+            JobClass::Hunt,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await?;
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
 
@@ -914,7 +1566,9 @@ pub async fn run_hunt(
             )
             .await;
         if state == JobState::Done && counts.invalid == 0 {
-            let _ = store.set_last_hunt(rid, &head).await;
+            // The chain's pinned commit, never the clone's current tip:
+            // see where `head` is resolved.
+            let _ = store.set_last_hunt(rid, &pinned).await;
             if full_rehunt_triggered || last_full.is_none() {
                 let _ = store.set_last_full_hunt(rid).await;
             }
@@ -933,6 +1587,7 @@ pub async fn run_hunt(
             )
             .await;
     }
+    close_workspace(store, &ws).await;
     Ok(summary)
 }
 
@@ -990,6 +1645,7 @@ pub async fn run_recheck(
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     #[derive(Debug, Clone)]
     enum RecheckOutcome {
@@ -1050,42 +1706,47 @@ pub async fn run_recheck(
         anyhow::bail!("repo missing");
     };
     let rpath = PathBuf::from(&repo.path);
-    sync_repo(
-        store,
-        &repo.url,
-        &rpath,
-        &repo.default_branch,
-        &format!("recheck #{fid}"),
-        Some(fid),
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Never on a resume: a resumed chain continues in its own tree, and
+    // nothing is fetched for it.
+    if resume.is_none() {
+        sync_repo(
+            store,
+            &repo.url,
+            &rpath,
+            &format!("recheck #{fid}"),
+            Some(fid),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
         repo.id,
         FindingJobKind::Recheck.into(),
-        cfg.hunt_cap_tokens,
         override_mode.is_some(),
         &format!("recheck #{fid}"),
         Some(fid),
+        resume,
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => return Ok(*d),
     };
 
-    let job = match store
+    let created = match store
         .create_job(
             FindingJobKind::Recheck.into(),
             repo.id,
             Some(fid),
             cap,
             JobState::Running,
+            Some(anticipated),
+            resume.map(|r| r.predecessor_id),
         )
         .await
     {
@@ -1099,22 +1760,66 @@ pub async fn run_recheck(
             );
         }
     };
+    let job = created.id;
+    let (ws, _pinned) = match open_workspace(
+        store,
+        cfg,
+        &repo,
+        &created,
+        resume,
+        TreeSpec::Detached {
+            at: format!("origin/{}", repo.default_branch),
+        },
+        FindingJobKind::Recheck.into(),
+        &format!("recheck #{fid}"),
+        Some(fid),
+    )
+    .await?
+    {
+        Ok(opened) => opened,
+        Err(failed) => return Ok(failed),
+    };
     let out_path = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
-    // Remove stale output from a previous crashed attempt — a leftover verdict
-    // file would be read as this attempt's result.
-    let _ = std::fs::remove_file(&out_path);
+    // Only on a cold run: the verdict file is finding-keyed, so on a
+    // resume this path is the one the continuing worker was told to
+    // write, and deleting it would discard a verdict it may already
+    // have produced before the suspension.
+    if resume.is_none() {
+        // Remove stale output from a previous crashed attempt — a
+        // leftover verdict file would be read as this attempt's result.
+        let _ = std::fs::remove_file(&out_path);
+    }
 
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
-    let prompt =
-        playbooks::build_recheck_prompt(&cfg.root, finding, &repo, &out_path, &repo_notes)?;
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => playbooks::build_recheck_prompt(
+            &cfg.root,
+            finding,
+            &repo,
+            &ws.tree,
+            &out_path,
+            &repo_notes,
+        )?,
+    };
     let model = cfg.model_for("hunt");
     let rr = backend
-        .run(&rpath, &prompt, cap, cfg.hunt_max_wall_s, JobClass::Hunt)
+        .run(
+            &ws,
+            &prompt,
+            cap,
+            cfg.hunt_max_wall_s,
+            JobClass::Hunt,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await?;
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
+    // Released here rather than at each return below: everything after
+    // this point reads the verdict under `out/`, never the tree.
+    close_workspace(store, &ws).await;
     let mut summary = CycleSummary {
         kind: Some(FindingJobKind::Recheck.into()),
         finding_id: Some(fid),
@@ -1123,6 +1828,30 @@ pub async fn run_recheck(
         tokens_new: Some(rr.tokens_new),
         ..Default::default()
     };
+    if state == JobState::Suspended {
+        // A suspension is a budget pause, not a failure: the worker ran out
+        // of window headroom mid-work and its tree and transcript are kept
+        // for the resume. Counting it toward the streak would turn three
+        // pauses of one healthy recheck into "stuck" and reset the finding.
+        // It stays rechecking, where the recheck tier continues it.
+        let _ = store
+            .log_event(
+                "recheck",
+                &format!(
+                    "#{fid} suspended; worktree kept at {} for the resume",
+                    ws.tree.display()
+                ),
+                Some(job),
+                Some(fid),
+            )
+            .await;
+        summary.outcome = Some("suspended".into());
+        summary.worktree = Some(ws.tree.to_string_lossy().into_owned());
+        if override_mode == Some("once") {
+            let _ = store.set_budget_override(fid, None).await;
+        }
+        return Ok(summary);
+    }
 
     // Parse verdict file — only read if the worker completed successfully.
     // A stale file from a crashed previous attempt was already deleted above;
@@ -1245,8 +1974,17 @@ pub async fn run_recheck(
 // -- analysis jobs (`scheduler._AnalysisSpec`, `run_test_gap` … `run_modernize`) ------------------------------------
 
 /// Static per-kind wiring for analysis jobs.
-type AnalysisPromptBuilder =
-    fn(&Path, &Repo, &str, &[Finding], &[Finding], &Path, i64, &str) -> anyhow::Result<String>;
+type AnalysisPromptBuilder = fn(
+    &Path,
+    &Repo,
+    &Path,
+    &str,
+    &[Finding],
+    &[Finding],
+    &Path,
+    i64,
+    &str,
+) -> anyhow::Result<String>;
 
 struct AnalysisSpec {
     kind: RepoJobKind,
@@ -1311,6 +2049,7 @@ async fn run_analysis_job(
     repo: &Repo,
     spec: &AnalysisSpec,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let rid = repo.id;
     let rname = &repo.name;
@@ -1328,45 +2067,71 @@ async fn run_analysis_job(
             .await;
         anyhow::bail!("repo not cloned");
     }
-    let db = &repo.default_branch;
-    sync_repo(
-        store,
-        &repo.url,
-        &rpath,
-        db,
-        &format!("{kind} {rname}"),
-        None,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Never on a resume: a resumed chain continues in its own tree, and
+    // nothing is fetched for it.
+    if resume.is_none() {
+        sync_repo(store, &repo.url, &rpath, &format!("{kind} {rname}"), None)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
 
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
         rid,
         JobKind::from(kind),
-        cfg.hunt_cap_tokens,
         false,
         &format!("{kind} {rname}"),
         None,
+        resume,
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
         BudgetDecision::Denied(d) => return Ok(*d),
     };
-    let job = match store
-        .create_job(kind.into(), rid, None, cap, JobState::Running)
+    let created = match store
+        .create_job(
+            kind.into(),
+            rid,
+            None,
+            cap,
+            JobState::Running,
+            Some(anticipated),
+            resume.map(|r| r.predecessor_id),
+        )
         .await
     {
         Ok(j) => j,
         Err(e) => return job_refused(kind.into(), Some(rname), None, e),
     };
+    let job = created.id;
+    let (ws, _pinned) = match open_workspace(
+        store,
+        cfg,
+        repo,
+        &created,
+        resume,
+        TreeSpec::Detached {
+            at: format!("origin/{}", repo.default_branch),
+        },
+        kind.into(),
+        &format!("{kind} {rname}"),
+        None,
+    )
+    .await?
+    {
+        Ok(opened) => opened,
+        Err(failed) => return Ok(failed),
+    };
+    // The continuing worker still writes the path its original prompt
+    // named; see `run_hunt`.
+    let out_job = resume.map_or(job, |r| r.origin_job_id);
     let out_path = cfg
         .work_root
         .join("out")
-        .join(format!("job{job}.{}.json", spec.out_plural));
+        .join(format!("job{out_job}.{}.json", spec.out_plural));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
     let suppressions = store
@@ -1378,21 +2143,32 @@ async fn run_analysis_job(
         .await
         .unwrap_or_default();
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
-    let prompt = (spec.prompt_builder)(
-        &cfg.root,
-        repo,
-        spec.scope_note,
-        &suppressions,
-        &known,
-        &out_path,
-        cfg.hunt_max_findings,
-        &repo_notes,
-    )?;
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => (spec.prompt_builder)(
+            &cfg.root,
+            repo,
+            &ws.tree,
+            spec.scope_note,
+            &suppressions,
+            &known,
+            &out_path,
+            cfg.hunt_max_findings,
+            &repo_notes,
+        )?,
+    };
     let model = cfg.model_for("hunt");
     let rr = backend
-        .run(&rpath, &prompt, cap, cfg.hunt_max_wall_s, JobClass::Hunt)
+        .run(
+            &ws,
+            &prompt,
+            cap,
+            cfg.hunt_max_wall_s,
+            JobClass::Hunt,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await?;
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
     let mut summary = CycleSummary {
@@ -1443,6 +2219,7 @@ async fn run_analysis_job(
             )
             .await;
     }
+    close_workspace(store, &ws).await;
     Ok(summary)
 }
 
@@ -1451,15 +2228,34 @@ pub async fn run_test_gap(
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &TEST_GAP_SPEC, backend).await
+    run_analysis_job(store, cfg, repo, &TEST_GAP_SPEC, backend, resume).await
 }
+/// Dependency scan. Renovate answers it for free when it is installed
+/// and finds something; otherwise an AI worker does.
+#[allow(
+    clippy::too_many_lines,
+    reason = "two alternative bodies for one job kind — the zero-token \
+              Renovate path and the AI fallback — and the choice between \
+              them is a single `match` on what the scan returned"
+)]
 pub async fn run_dep_update(
     store: &Store,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
+    // A resume continues a suspended AI worker, so the Renovate
+    // shortcut below is not an option for it: that path spends no
+    // tokens, creates no job row, and would leave the suspension
+    // uncontinued and still resumable. `run_analysis_job` repeats the
+    // clone check and the sync, so nothing is skipped by going straight
+    // there.
+    if resume.is_some() {
+        return run_analysis_job(store, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
+    }
     let rpath = std::path::PathBuf::from(&repo.path);
     if !rpath.exists() {
         let _ = store
@@ -1473,23 +2269,29 @@ pub async fn run_dep_update(
         anyhow::bail!("repo not cloned");
     }
 
-    // Sync to default branch first
-    sync_repo(
-        store,
-        &repo.url,
-        &rpath,
-        &repo.default_branch,
-        "dep_update",
-        None,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    sync_repo(store, &repo.url, &rpath, "dep_update", None)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Try Renovate (zero tokens) — fall back to AI if unavailable
+    // Try Renovate (zero tokens) — fall back to AI if unavailable. It
+    // reads manifests, and the fetch-only clone's own files are never
+    // updated, so it scans a throwaway tree at the fetched tip instead.
     let candidates = tokio::task::spawn_blocking({
+        let work_root = cfg.work_root.clone();
         let rp = rpath.clone();
         let rn = repo.name.clone();
-        move || crate::dep_scan::scan_repo(&rp, &rn, 120)
+        let rid = repo.id;
+        let tip = format!("origin/{}", repo.default_branch);
+        move || {
+            let scan = match crate::workspace::ScanTree::create(&work_root, &rp, rid, &tip) {
+                Ok(scan) => scan,
+                Err(e) => {
+                    tracing::warn!("dep_update {rn}: {e}");
+                    return None;
+                }
+            };
+            crate::dep_scan::scan_repo(scan.path(), &rn, 120)
+        }
     })
     .await
     .ok()
@@ -1566,7 +2368,7 @@ pub async fn run_dep_update(
                 "dep_update {}: renovate unavailable or empty, falling back to AI",
                 repo.name
             );
-            run_analysis_job(store, cfg, repo, &DEP_UPDATE_SPEC, backend).await
+            run_analysis_job(store, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await
         }
     }
 }
@@ -1575,24 +2377,27 @@ pub async fn run_refactor(
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &REFACTOR_SPEC, backend).await
+    run_analysis_job(store, cfg, repo, &REFACTOR_SPEC, backend, resume).await
 }
 pub async fn run_modernize(
     store: &Store,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &MODERNIZATION_SPEC, backend).await
+    run_analysis_job(store, cfg, repo, &MODERNIZATION_SPEC, backend, resume).await
 }
 pub async fn run_standards(
     store: &Store,
     cfg: &Config,
     repo: &Repo,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
-    run_analysis_job(store, cfg, repo, &STANDARDS_SPEC, backend).await
+    run_analysis_job(store, cfg, repo, &STANDARDS_SPEC, backend, resume).await
 }
 
 fn extract_pr_url(text: &str) -> Option<String> {
@@ -1624,6 +2429,7 @@ pub async fn run_fix(
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let fid = finding.id;
     if finding.status != FindingStatus::Queued {
@@ -1674,144 +2480,63 @@ pub async fn run_fix(
         "improve"
     };
     let branch = format!("{branch_prefix}/{slug}-{fid}");
-    let worktree = cfg.work_root.join("wt").join(format!("f{fid}"));
-    let _ = std::fs::create_dir_all(worktree.parent().unwrap_or(Path::new(".")));
-
-    // Clean up old worktree if exists
-    if worktree.exists() {
-        let rps = rpath.to_string_lossy().to_string();
-        let wts = worktree.to_string_lossy().to_string();
-        let br = branch.clone();
-        tokio::task::spawn_blocking(move || {
-            run_cmd_sync(
-                &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                30,
-            );
-            run_cmd_sync(&["git", "-C", &rps, "branch", "-D", &br], 30);
-        })
-        .await
-        .ok();
-        let _ = store
-            .log_event(
-                "fix",
-                &format!("#{fid}: reclaimed stale worktree from prior attempt"),
-                None,
-                Some(fid),
-            )
-            .await;
-    }
-
-    // Create worktree
-    let db = repo.default_branch.clone();
-    let rps = rpath.to_string_lossy().to_string();
-    let wts = worktree.to_string_lossy().to_string();
-    let br = branch.clone();
-    let db2 = db.clone();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        let add = |start_point: &str| {
-            run_cmd_sync(
-                &[
-                    "git",
-                    "-C",
-                    &rps,
-                    "worktree",
-                    "add",
-                    "-b",
-                    &br,
-                    &wts,
-                    start_point,
-                ],
-                30,
-            )
-        };
-        let (rc, out) = add(&format!("origin/{db2}"));
-        if rc == 0 {
-            return (rc, out);
-        }
-        let (rc, out) = add(&db2);
-        if rc == 0 {
-            return (rc, out);
-        }
-        // A prior attempt can leave the branch behind with its worktree
-        // gone: the branch is only deleted on the path where the worktree
-        // directory still exists. `worktree add -b` then fails with
-        // "a branch named ... already exists" on every later cycle, which
-        // is a retry loop no amount of waiting resolves — observed
-        // 2026-09-15, broken only by restarting the daemon. The branch
-        // belongs to this finding and its work was abandoned when the
-        // attempt failed, so reclaiming the name is safe: a finding whose
-        // branch reached a PR is `pr_open` and never re-enters `fix`.
-        run_cmd_sync(&["git", "-C", &rps, "worktree", "prune"], 30);
-        run_cmd_sync(&["git", "-C", &rps, "branch", "-D", &br], 30);
-        add(&format!("origin/{db2}"))
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
-    if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("fix #{fid}: worktree add failed: {tail}"),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("worktree add failed: {tail}");
-    }
-
-    let drop_worktree = |delete_branch: bool| {
-        let rps = rpath.to_string_lossy().to_string();
-        let wts = worktree.to_string_lossy().to_string();
-        let br = branch.clone();
-        tokio::task::spawn_blocking(move || {
-            run_cmd_sync(
-                &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                30,
-            );
-            if delete_branch {
-                run_cmd_sync(&["git", "-C", &rps, "branch", "-D", &br], 30);
-            }
-        })
-    };
-
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
         repo.id,
         FindingJobKind::Fix.into(),
-        cfg.fix_cap_tokens,
         override_mode.is_some(),
         &format!("fix #{fid}"),
         Some(fid),
+        resume,
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
-        BudgetDecision::Denied(d) => {
-            let _ = drop_worktree(true).await;
-            return Ok(*d);
-        }
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
+        BudgetDecision::Denied(d) => return Ok(*d),
     };
 
-    let job = match store
+    let created = match store
         .create_job(
             FindingJobKind::Fix.into(),
             repo.id,
             Some(fid),
             cap,
             JobState::Running,
+            Some(anticipated),
+            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
-        Err(e) => {
-            let _ = drop_worktree(true).await;
-            return job_refused(FindingJobKind::Fix.into(), Some(&repo.name), Some(fid), e);
-        }
+        Err(e) => return job_refused(FindingJobKind::Fix.into(), Some(&repo.name), Some(fid), e),
     };
+    let job = created.id;
+    // The branch is per finding, so a superseded fix chain of this finding
+    // holds it checked out; `open_workspace` releases that chain's tree
+    // before adding this one.
+    let (ws, _pinned) = match open_workspace(
+        store,
+        cfg,
+        &repo,
+        &created,
+        resume,
+        TreeSpec::Branch {
+            name: branch.clone(),
+            at: format!("origin/{}", repo.default_branch),
+        },
+        FindingJobKind::Fix.into(),
+        &format!("fix #{fid}"),
+        Some(fid),
+    )
+    .await?
+    {
+        Ok(opened) => opened,
+        Err(failed) => return Ok(failed),
+    };
+    let worktree = ws.tree.clone();
 
     // set_in_progress: fixing -> fallback queued
     let _ = store.set_in_progress(fid, FindingStatus::Fixing).await;
@@ -1846,9 +2571,24 @@ pub async fn run_fix(
             anyhow::bail!("{e}");
         }
     };
+    // The session already holds the playbook, the finding and the branch
+    // name; the builders above still run because their failure is a real
+    // configuration fault worth surfacing on either path.
+    let prompt = if resume.is_some() {
+        RESUME_PROMPT.to_owned()
+    } else {
+        prompt
+    };
     let model = cfg.model_for("fix");
     let rr = match backend
-        .run(&worktree, &prompt, cap, cfg.fix_max_wall_s, JobClass::Fix)
+        .run(
+            &ws,
+            &prompt,
+            cap,
+            cfg.fix_max_wall_s,
+            JobClass::Fix,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await
     {
         Ok(r) => r,
@@ -1859,167 +2599,140 @@ pub async fn run_fix(
             anyhow::bail!("{e}");
         }
     };
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
-    let mut summary = CycleSummary {
-        kind: Some(FindingJobKind::Fix.into()),
-        finding_id: Some(fid),
-        job_id: Some(job),
-        state: Some(state),
-        branch: Some(branch.clone()),
-        tokens_new: Some(rr.tokens_new),
-        ..Default::default()
-    };
-
-    // Check for decline/blocked file
-    let decline_name = if is_bug {
-        "NOT-A-BUG.md"
-    } else {
-        "DECLINED.md"
-    };
-    let decline_file = worktree.join(decline_name);
-    let blocked_file = worktree.join("BLOCKED.md");
-    let outcome_file = if decline_file.exists() {
-        Some(decline_file.clone())
-    } else if blocked_file.exists() {
-        Some(blocked_file.clone())
-    } else {
-        None
-    };
-    if let Some(ref ofile) = outcome_file {
-        let raw = std::fs::read_to_string(ofile).unwrap_or_default();
-        let reason: String = raw.chars().take(500).collect();
-        let _ = store
-            .set_finding_verdict(fid, FindingStatus::Rejected, &reason)
-            .await;
-        let _ = store.clear_fix_attempts(fid).await;
-        let first_line: String = reason
-            .lines()
-            .next()
-            .map(|l| l.chars().take(120).collect())
-            .unwrap_or_default();
-        let verb = if ofile == &decline_file {
-            "rejected"
-        } else {
-            "blocked"
+    let summary = 'post: {
+        let mut summary = CycleSummary {
+            kind: Some(FindingJobKind::Fix.into()),
+            finding_id: Some(fid),
+            job_id: Some(job),
+            state: Some(state),
+            branch: Some(branch.clone()),
+            tokens_new: Some(rr.tokens_new),
+            ..Default::default()
         };
-        let _ = store
-            .log_event(
-                "fix",
-                &format!("#{fid} {verb} by worker: {first_line}"),
-                Some(job),
-                Some(fid),
-            )
-            .await;
-        let _ = drop_worktree(true).await;
-        summary.outcome = Some("rejected".into());
-        let _ = store
-            .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-            .await;
-        return Ok(summary);
-    }
 
-    // Check for commits + PR description
-    let db = repo.default_branch.clone();
-    let wts = worktree.to_string_lossy().to_string();
-    let db2 = db.clone();
-    let (rc, commits) = tokio::task::spawn_blocking(move || {
-        let (rc, out) = run_cmd_sync(
-            &[
-                "git",
-                "-C",
-                &wts,
-                "log",
-                &format!("origin/{db2}..HEAD"),
-                "--oneline",
-            ],
-            30,
-        );
-        if rc != 0 {
-            run_cmd_sync(
+        // Check for decline/blocked file
+        let decline_name = if is_bug {
+            "NOT-A-BUG.md"
+        } else {
+            "DECLINED.md"
+        };
+        let decline_file = worktree.join(decline_name);
+        let blocked_file = worktree.join("BLOCKED.md");
+        let outcome_file = if decline_file.exists() {
+            Some(decline_file.clone())
+        } else if blocked_file.exists() {
+            Some(blocked_file.clone())
+        } else {
+            None
+        };
+        if let Some(ref ofile) = outcome_file {
+            let raw = std::fs::read_to_string(ofile).unwrap_or_default();
+            let reason: String = raw.chars().take(500).collect();
+            let _ = store
+                .set_finding_verdict(fid, FindingStatus::Rejected, &reason)
+                .await;
+            let _ = store.clear_fix_attempts(fid).await;
+            let first_line: String = reason
+                .lines()
+                .next()
+                .map(|l| l.chars().take(120).collect())
+                .unwrap_or_default();
+            let verb = if ofile == &decline_file {
+                "rejected"
+            } else {
+                "blocked"
+            };
+            let _ = store
+                .log_event(
+                    "fix",
+                    &format!("#{fid} {verb} by worker: {first_line}"),
+                    Some(job),
+                    Some(fid),
+                )
+                .await;
+            summary.outcome = Some("rejected".into());
+            let _ = store
+                .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
+                .await;
+            break 'post summary;
+        }
+
+        // Check for commits + PR description
+        let db = repo.default_branch.clone();
+        let wts = worktree.to_string_lossy().to_string();
+        let db2 = db.clone();
+        let (rc, commits) = tokio::task::spawn_blocking(move || {
+            let (rc, out) = run_cmd_sync(
                 &[
                     "git",
                     "-C",
                     &wts,
                     "log",
-                    &format!("{db2}..HEAD"),
+                    &format!("origin/{db2}..HEAD"),
                     "--oneline",
                 ],
                 30,
-            )
-        } else {
-            (rc, out)
-        }
-    })
-    .await
-    .unwrap_or((127, String::new()));
-    let commits = commits.trim().to_owned();
-
-    let pr_desc = worktree.join("PR-DESCRIPTION.md");
-    let mut failure: Option<String> = None;
-
-    if rc == 0 && !commits.is_empty() && pr_desc.exists() {
-        let f = forge::forge_for(repo.forge);
-        let push_url = f.ssh_url(&repo.url);
-        let wts = worktree.to_string_lossy().to_string();
-        let pu = push_url.clone();
-        let (prc, pout) = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(&["git", "-C", &wts, "push", "--force", &pu, "HEAD"], 600)
+            );
+            if rc != 0 {
+                run_cmd_sync(
+                    &[
+                        "git",
+                        "-C",
+                        &wts,
+                        "log",
+                        &format!("{db2}..HEAD"),
+                        "--oneline",
+                    ],
+                    30,
+                )
+            } else {
+                (rc, out)
+            }
         })
         .await
-        .unwrap_or((127, "spawn error".to_owned()));
-        if prc == 0 {
-            let owner_slug = f.owner_repo(&repo.url);
-            if let Some((_owner, _slug_name)) = owner_slug {
-                let body = std::fs::read_to_string(&pr_desc).unwrap_or_default();
-                let wts = worktree.to_string_lossy().to_string();
-                let (_trc, title) = tokio::task::spawn_blocking(move || {
-                    run_cmd_sync(&["git", "-C", &wts, "log", "-1", "--format=%s"], 30)
-                })
-                .await
-                .unwrap_or((127, branch.clone()));
-                let title = title.trim();
-                let title = if title.is_empty() { &branch } else { title };
-                match f.create_pr(&rpath, &branch, &db, title, &body) {
-                    Ok(pr_url) => {
-                        let _ = store.set_finding_pr_open(fid, &pr_url).await;
-                        let _ = store.clear_fix_attempts(fid).await;
-                        let _ = store
-                            .log_event(
-                                "ship",
-                                &format!("#{fid} draft PR: {pr_url}"),
-                                Some(job),
-                                Some(fid),
-                            )
-                            .await;
-                        let _ = drop_worktree(false).await;
-                        summary.outcome = Some("pr_open".into());
-                        summary.pr_url = Some(pr_url);
-                        if override_mode == Some("once") {
-                            let _ = store.set_budget_override(fid, None).await;
-                        }
-                        let _ = store
-                            .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-                            .await;
-                        return Ok(summary);
-                    }
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        if err_msg.contains("already exists")
-                            && let Some(pr_url) = extract_pr_url(&err_msg)
-                        {
+        .unwrap_or((127, String::new()));
+        let commits = commits.trim().to_owned();
+
+        let pr_desc = worktree.join("PR-DESCRIPTION.md");
+        let mut failure: Option<String> = None;
+
+        if rc == 0 && !commits.is_empty() && pr_desc.exists() {
+            let f = forge::forge_for(repo.forge);
+            let push_url = f.ssh_url(&repo.url);
+            let wts = worktree.to_string_lossy().to_string();
+            let pu = push_url.clone();
+            let (prc, pout) = tokio::task::spawn_blocking(move || {
+                run_cmd_sync(&["git", "-C", &wts, "push", "--force", &pu, "HEAD"], 600)
+            })
+            .await
+            .unwrap_or((127, "spawn error".to_owned()));
+            if prc == 0 {
+                let owner_slug = f.owner_repo(&repo.url);
+                if let Some((_owner, _slug_name)) = owner_slug {
+                    let body = std::fs::read_to_string(&pr_desc).unwrap_or_default();
+                    let wts = worktree.to_string_lossy().to_string();
+                    let (_trc, title) = tokio::task::spawn_blocking(move || {
+                        run_cmd_sync(&["git", "-C", &wts, "log", "-1", "--format=%s"], 30)
+                    })
+                    .await
+                    .unwrap_or((127, branch.clone()));
+                    let title = title.trim();
+                    let title = if title.is_empty() { &branch } else { title };
+                    match f.create_pr(&rpath, &branch, &db, title, &body) {
+                        Ok(pr_url) => {
                             let _ = store.set_finding_pr_open(fid, &pr_url).await;
                             let _ = store.clear_fix_attempts(fid).await;
                             let _ = store
                                 .log_event(
                                     "ship",
-                                    &format!("#{fid} recovered existing PR: {pr_url}"),
+                                    &format!("#{fid} draft PR: {pr_url}"),
                                     Some(job),
                                     Some(fid),
                                 )
                                 .await;
-                            let _ = drop_worktree(false).await;
                             summary.outcome = Some("pr_open".into());
                             summary.pr_url = Some(pr_url);
                             if override_mode == Some("once") {
@@ -2032,77 +2745,137 @@ pub async fn run_fix(
                                     FindingStatus::Queued,
                                 )
                                 .await;
-                            return Ok(summary);
+                            break 'post summary;
                         }
-                        let head: String = err_msg.chars().take(300).collect();
-                        failure = Some(format!("PR create failed: {head}"));
+                        Err(e) => {
+                            let err_msg = e.to_string();
+                            if err_msg.contains("already exists")
+                                && let Some(pr_url) = extract_pr_url(&err_msg)
+                            {
+                                let _ = store.set_finding_pr_open(fid, &pr_url).await;
+                                let _ = store.clear_fix_attempts(fid).await;
+                                let _ = store
+                                    .log_event(
+                                        "ship",
+                                        &format!("#{fid} recovered existing PR: {pr_url}"),
+                                        Some(job),
+                                        Some(fid),
+                                    )
+                                    .await;
+                                summary.outcome = Some("pr_open".into());
+                                summary.pr_url = Some(pr_url);
+                                if override_mode == Some("once") {
+                                    let _ = store.set_budget_override(fid, None).await;
+                                }
+                                let _ = store
+                                    .finalize_in_progress(
+                                        fid,
+                                        FindingStatus::Fixing,
+                                        FindingStatus::Queued,
+                                    )
+                                    .await;
+                                break 'post summary;
+                            }
+                            let head: String = err_msg.chars().take(300).collect();
+                            failure = Some(format!("PR create failed: {head}"));
+                        }
                     }
+                } else {
+                    failure = Some(format!("unparseable repo url for PR: {:?}", repo.url));
                 }
             } else {
-                failure = Some(format!("unparseable repo url for PR: {:?}", repo.url));
+                let tail = crate::util::tail(&pout, 300);
+                failure = Some(format!("push failed: {tail}"));
             }
-        } else {
-            let tail = crate::util::tail(&pout, 300);
-            failure = Some(format!("push failed: {tail}"));
-        }
-    } else if failure.is_none() {
-        failure = Some(if state == JobState::Done {
-            if commits.is_empty() {
-                "no commits".to_owned()
+        } else if failure.is_none() {
+            failure = Some(if state == JobState::Done {
+                if commits.is_empty() {
+                    "no commits".to_owned()
+                } else {
+                    "no PR-DESCRIPTION.md".to_owned()
+                }
             } else {
-                "no PR-DESCRIPTION.md".to_owned()
-            }
-        } else {
-            format!("worker {state}")
-        });
-    }
+                format!("worker {state}")
+            });
+        }
 
-    // Salvage
-    let failure = failure.unwrap_or_else(|| "unknown failure".to_owned());
-    let streak = store.record_fix_attempt(fid, &failure).await.unwrap_or(1);
-    let tail = crate::util::tail(&rr.stdout_tail, 300);
-    if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
+        // Salvage
+        let failure = failure.unwrap_or_else(|| "unknown failure".to_owned());
+        let tail = crate::util::tail(&rr.stdout_tail, 300);
+        if state == JobState::Suspended {
+            // A suspension is a budget pause, not a failure: the worker ran
+            // out of window headroom mid-work and its tree and transcript are
+            // kept for the resume. Counting it toward the streak would turn
+            // three pauses of one healthy fix into "stuck" and reject the
+            // finding. Back to queued, where the fix tier continues it.
+            let _ = store.set_finding_status(fid, FindingStatus::Queued).await;
+            let _ = store
+                .log_event(
+                    "fix",
+                    &format!(
+                        "#{fid} suspended; worktree kept at {} for the resume. tail: {tail}",
+                        worktree.display()
+                    ),
+                    Some(job),
+                    Some(fid),
+                )
+                .await;
+            summary.outcome = Some("suspended".into());
+            summary.worktree = Some(worktree.to_string_lossy().into_owned());
+        } else {
+            let streak = store.record_fix_attempt(fid, &failure).await.unwrap_or(1);
+            if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
+                let _ = store
+                .set_finding_verdict(
+                    fid,
+                    FindingStatus::Rejected,
+                    &format!(
+                        "stuck: {streak} consecutive fix attempts hit the same failure: {failure}"
+                    ),
+                )
+                .await;
+                let _ = store.clear_fix_attempts(fid).await;
+                let _ = store
+                .log_event(
+                    "fix",
+                    &format!(
+                        "#{fid} gave up after {streak} identical failures ({failure}). tail: {tail}"
+                    ),
+                    Some(job),
+                    Some(fid),
+                )
+                .await;
+                summary.outcome = Some("stuck".into());
+                summary.failure = Some(failure);
+                summary.attempts = Some(streak);
+            } else {
+                let _ = store.set_finding_status(fid, FindingStatus::Queued).await;
+                let _ = store
+                    .log_event(
+                        "fix",
+                        &format!("#{fid} incomplete ({failure}). tail: {tail}"),
+                        Some(job),
+                        Some(fid),
+                    )
+                    .await;
+                summary.outcome = Some("requeued".into());
+                summary.failure = Some(failure);
+            }
+        }
+        if override_mode == Some("once") {
+            let _ = store.set_budget_override(fid, None).await;
+        }
         let _ = store
-            .set_finding_verdict(
-                fid,
-                FindingStatus::Rejected,
-                &format!(
-                    "stuck: {streak} consecutive fix attempts hit the same failure: {failure}"
-                ),
-            )
+            .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
             .await;
-        let _ = store.clear_fix_attempts(fid).await;
-        let _ = store.log_event("fix",
-            &format!("#{fid} gave up after {streak} identical failures ({failure}); worktree kept at {}. tail: {tail}", worktree.display()),
-            Some(job), Some(fid),
-        ).await;
-        let _ = drop_worktree(true).await;
-        summary.outcome = Some("stuck".into());
-        summary.failure = Some(failure);
-        summary.attempts = Some(streak);
-    } else {
-        let _ = store.set_finding_status(fid, FindingStatus::Queued).await;
-        let _ = store
-            .log_event(
-                "fix",
-                &format!(
-                    "#{fid} incomplete ({failure}); worktree kept at {}. tail: {tail}",
-                    worktree.display()
-                ),
-                Some(job),
-                Some(fid),
-            )
-            .await;
-        summary.outcome = Some("requeued".into());
-        summary.failure = Some(failure);
-        summary.worktree = Some(worktree.to_string_lossy().into_owned());
+        summary
+    };
+    if state == JobState::Suspended
+        && let Some(outcome @ ("rejected" | "pr_open")) = summary.outcome.as_deref()
+    {
+        retire_concluded(store, job, outcome).await;
     }
-    if override_mode == Some("once") {
-        let _ = store.set_budget_override(fid, None).await;
-    }
-    let _ = store
-        .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-        .await;
+    close_workspace(store, &ws).await;
     Ok(summary)
 }
 
@@ -2491,6 +3264,7 @@ pub async fn run_engage(
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let fid = finding.id;
     let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
@@ -2566,126 +3340,47 @@ pub async fn run_engage(
     }
 
     let rpath = PathBuf::from(&repo.path);
-    let worktree = cfg.work_root.join("wt").join(format!("e{fid}"));
-    let _ = std::fs::create_dir_all(worktree.parent().unwrap_or(Path::new(".")));
-    if worktree.exists() {
+    // Fetch the PR head into the clone for a cold attempt; the tree is
+    // added from it once the job exists. Never on a resume: the chain
+    // continues in its own tree, at the head it was created at.
+    if resume.is_none() {
         let rps = rpath.to_string_lossy().to_string();
-        let wts = worktree.to_string_lossy().to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(
-                &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                30,
-            );
+        let hr = head_ref.clone();
+        let (rc, out) = tokio::task::spawn_blocking(move || {
+            run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &hr], 600)
         })
-        .await;
-        let _ = store
-            .log_event(
-                "engage",
-                &format!("#{fid}: reclaimed stale worktree from prior attempt"),
-                None,
-                Some(fid),
-            )
-            .await;
+        .await
+        .unwrap_or((127, "spawn error".to_owned()));
+        if rc != 0 {
+            let tail = crate::util::tail(&out, 300);
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!("engage #{fid}: fetch {head_ref} failed: {tail}"),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            anyhow::bail!("fetch failed: {tail}");
+        }
     }
-
-    // Fetch PR branch, create worktree
-    let rps = rpath.to_string_lossy().to_string();
-    let hr = head_ref.clone();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &hr], 600)
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
-    if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("engage #{fid}: fetch {head_ref} failed: {tail}"),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("fetch failed: {tail}");
-    }
-    let rps = rpath.to_string_lossy().to_string();
-    let wts = worktree.to_string_lossy().to_string();
-    let hr = head_ref.clone();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(
-            &[
-                "git",
-                "-C",
-                &rps,
-                "worktree",
-                "add",
-                "--detach",
-                &wts,
-                &format!("origin/{hr}"),
-            ],
-            30,
-        )
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
-    if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("engage #{fid}: worktree add failed: {tail}"),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("worktree add failed: {tail}");
-    }
-    // Checkout branch
-    let wts = worktree.to_string_lossy().to_string();
-    let hr = head_ref.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(
-            &[
-                "git",
-                "-C",
-                &wts,
-                "checkout",
-                "-B",
-                &hr,
-                &format!("origin/{hr}"),
-            ],
-            30,
-        )
-    })
-    .await;
 
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
         repo.id,
         FindingJobKind::Engage.into(),
-        cfg.fix_cap_tokens,
         override_mode.is_some(),
         &format!("engage #{fid}"),
         Some(fid),
+        resume,
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
-        BudgetDecision::Denied(d) => {
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
-            return Ok(*d);
-        }
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
+        BudgetDecision::Denied(d) => return Ok(*d),
     };
 
     let fg = forge::forge_for(repo.forge);
@@ -2700,40 +3395,24 @@ pub async fn run_engage(
                     Some(fid),
                 )
                 .await;
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
             anyhow::bail!("PR/MR view failed");
         }
     };
 
-    let job = match store
+    let created = match store
         .create_job(
             FindingJobKind::Engage.into(),
             repo.id,
             Some(fid),
             cap,
             JobState::Running,
+            Some(anticipated),
+            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => {
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
             return job_refused(
                 FindingJobKind::Engage.into(),
                 Some(&repo.name),
@@ -2742,266 +3421,282 @@ pub async fn run_engage(
             );
         }
     };
+    let job = created.id;
+    let (ws, _pinned) = match open_workspace(
+        store,
+        cfg,
+        &repo,
+        &created,
+        resume,
+        TreeSpec::PrHead {
+            head_ref: head_ref.clone(),
+        },
+        FindingJobKind::Engage.into(),
+        &format!("engage #{fid}"),
+        Some(fid),
+    )
+    .await?
+    {
+        Ok(opened) => opened,
+        Err(failed) => return Ok(failed),
+    };
+    let worktree = ws.tree.clone();
 
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
-    let prompt = playbooks::build_engage_prompt(
-        &cfg.root,
-        finding,
-        &worktree,
-        &head_ref,
-        &repo,
-        &pr,
-        &ps,
-        &repo_notes,
-    )?;
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => playbooks::build_engage_prompt(
+            &cfg.root,
+            finding,
+            &worktree,
+            &head_ref,
+            &repo,
+            &pr,
+            &ps,
+            &repo_notes,
+        )?,
+    };
     let model = cfg.model_for("fix");
     let rr = backend
-        .run(&worktree, &prompt, cap, cfg.fix_max_wall_s, JobClass::Fix)
+        .run(
+            &ws,
+            &prompt,
+            cap,
+            cfg.fix_max_wall_s,
+            JobClass::Fix,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await?;
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
-    let mut summary = CycleSummary {
-        kind: Some(FindingJobKind::Engage.into()),
-        finding_id: Some(fid),
-        job_id: Some(job),
-        state: Some(state),
-        pr_number: Some(pr_number),
-        tokens_new: Some(rr.tokens_new),
-        ..Default::default()
-    };
+    let summary = 'post: {
+        let mut summary = CycleSummary {
+            kind: Some(FindingJobKind::Engage.into()),
+            finding_id: Some(fid),
+            job_id: Some(job),
+            state: Some(state),
+            pr_number: Some(pr_number),
+            tokens_new: Some(rr.tokens_new),
+            ..Default::default()
+        };
 
-    // Check for WITHDRAW.md
-    let withdraw = worktree.join("WITHDRAW.md");
-    if withdraw.exists() {
-        let reason = std::fs::read_to_string(&withdraw).unwrap_or_default();
-        if fg.owner_repo(&repo.url).is_some() {
-            let comment: String = reason.chars().take(800).collect();
-            if let Err(err) = fg.close_pr(&repo.url, pr_number, &comment) {
-                // close_pr posts the withdrawal reason and only then closes,
-                // so a failure here means the PR is still OPEN on the forge.
-                // Recording the verdict anyway would mark it closed locally
-                // and set the finding Rejected -- and sync_prs only revisits
-                // pr_open findings, so nothing would ever reconcile it.
-                //
-                // Leaving the finding untouched is not enough either: it
-                // stays in list_attention, which pick_next ranks second, so
-                // a persistently failing forge would monopolise every cycle
-                // running a fresh worker each time. Unlike fix/recheck/
-                // harvest there is no engage attempt counter to cap that.
-                // So mark THIS attention reason addressed, exactly as a
-                // reply-only engage does: the finding stops being re-picked
-                // until the PR sees genuinely new activity (the attention
-                // fingerprint or head_sha changes), and the error event
-                // below is what surfaces it in the meantime.
-                tracing::warn!(finding = fid, pr = pr_number, error = %err, "close_pr failed");
-                let _ = store
-                    .mark_pr_engaged(
-                        fid,
-                        ps.last_activity_at.unwrap_or_else(now_ms),
-                        now_ms(),
-                        ps.attention_fingerprint.as_deref(),
-                        ps.head_sha.as_deref(),
-                    )
-                    .await;
-                let _ = store
-                    .log_event(
-                        "error",
-                        &format!(
-                            "#{fid} withdrawal aborted: PR #{pr_number} could not be closed \
+        // Check for WITHDRAW.md
+        let withdraw = worktree.join("WITHDRAW.md");
+        if withdraw.exists() {
+            let reason = std::fs::read_to_string(&withdraw).unwrap_or_default();
+            if fg.owner_repo(&repo.url).is_some() {
+                let comment: String = reason.chars().take(800).collect();
+                if let Err(err) = fg.close_pr(&repo.url, pr_number, &comment) {
+                    // close_pr posts the withdrawal reason and only then closes,
+                    // so a failure here means the PR is still OPEN on the forge.
+                    // Recording the verdict anyway would mark it closed locally
+                    // and set the finding Rejected -- and sync_prs only revisits
+                    // pr_open findings, so nothing would ever reconcile it.
+                    //
+                    // Leaving the finding untouched is not enough either: it
+                    // stays in list_attention, which pick_next ranks second, so
+                    // a persistently failing forge would monopolise every cycle
+                    // running a fresh worker each time. Unlike fix/recheck/
+                    // harvest there is no engage attempt counter to cap that.
+                    // So mark THIS attention reason addressed, exactly as a
+                    // reply-only engage does: the finding stops being re-picked
+                    // until the PR sees genuinely new activity (the attention
+                    // fingerprint or head_sha changes), and the error event
+                    // below is what surfaces it in the meantime.
+                    tracing::warn!(finding = fid, pr = pr_number, error = %err, "close_pr failed");
+                    let _ = store
+                        .mark_pr_engaged(
+                            fid,
+                            ps.last_activity_at.unwrap_or_else(now_ms),
+                            now_ms(),
+                            ps.attention_fingerprint.as_deref(),
+                            ps.head_sha.as_deref(),
+                        )
+                        .await;
+                    let _ = store
+                        .log_event(
+                            "error",
+                            &format!(
+                                "#{fid} withdrawal aborted: PR #{pr_number} could not be closed \
                              (retries when the PR next changes)"
-                        ),
-                        Some(job),
-                        Some(fid),
-                    )
-                    .await;
-                let rps = rpath.to_string_lossy().to_string();
-                let wts = worktree.to_string_lossy().to_string();
-                let _ = tokio::task::spawn_blocking(move || {
-                    run_cmd_sync(
-                        &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                        30,
-                    );
-                })
-                .await;
-                summary.outcome = Some("withdraw-failed".into());
-                return Ok(summary);
+                            ),
+                            Some(job),
+                            Some(fid),
+                        )
+                        .await;
+                    summary.outcome = Some("withdraw-failed".into());
+                    break 'post summary;
+                }
             }
+            let reason_short: String = reason.chars().take(500).collect();
+            let _ = store
+                .set_finding_verdict(fid, FindingStatus::Rejected, &reason_short)
+                .await;
+            let _ = store.mark_pr_closed(fid, pr_number, now_ms()).await;
+            let first_line: String = reason
+                .lines()
+                .next()
+                .map(|l| l.chars().take(120).collect())
+                .unwrap_or_default();
+            let _ = store
+                .log_event(
+                    "verdict",
+                    &format!("#{fid} withdrawn by engage worker: {first_line}"),
+                    Some(job),
+                    Some(fid),
+                )
+                .await;
+            summary.ingest = ingest_followups(store, repo.id, &worktree, fid, job, "engage").await;
+            summary.outcome = Some("withdrawn".into());
+            break 'post summary;
         }
-        let reason_short: String = reason.chars().take(500).collect();
-        let _ = store
-            .set_finding_verdict(fid, FindingStatus::Rejected, &reason_short)
-            .await;
-        let _ = store.mark_pr_closed(fid, pr_number, now_ms()).await;
-        let first_line: String = reason
-            .lines()
-            .next()
-            .map(|l| l.chars().take(120).collect())
-            .unwrap_or_default();
-        let _ = store
-            .log_event(
-                "verdict",
-                &format!("#{fid} withdrawn by engage worker: {first_line}"),
-                Some(job),
-                Some(fid),
-            )
-            .await;
-        summary.ingest = ingest_followups(store, repo.id, &worktree, fid, job, "engage").await;
-        let rps = rpath.to_string_lossy().to_string();
-        let wts = worktree.to_string_lossy().to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(
-                &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                30,
-            );
-        })
-        .await;
-        summary.outcome = Some("withdrawn".into());
-        return Ok(summary);
-    }
 
-    // Push + reply
-    let mut failure: Option<String> = if state == JobState::Done {
-        None
-    } else {
-        Some(format!("worker {state}"))
-    };
-    let mut pushed = false;
-    let mut replied = false;
-    if failure.is_none() {
-        let wts = worktree.to_string_lossy().to_string();
-        let hr = head_ref.clone();
-        let (rc, commits) = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(
-                &[
-                    "git",
-                    "-C",
-                    &wts,
-                    "log",
-                    &format!("origin/{hr}..HEAD"),
-                    "--oneline",
-                ],
-                30,
-            )
-        })
-        .await
-        .unwrap_or((127, String::new()));
-        if rc == 0 && !commits.trim().is_empty() {
-            let push_url = fg.ssh_url(&repo.url);
+        // Push + reply
+        let mut failure: Option<String> = if state == JobState::Done {
+            None
+        } else {
+            Some(format!("worker {state}"))
+        };
+        let mut pushed = false;
+        let mut replied = false;
+        if failure.is_none() {
             let wts = worktree.to_string_lossy().to_string();
             let hr = head_ref.clone();
-            let (prc, pout) = tokio::task::spawn_blocking(move || {
+            let (rc, commits) = tokio::task::spawn_blocking(move || {
                 run_cmd_sync(
                     &[
                         "git",
                         "-C",
                         &wts,
-                        "push",
-                        "--force",
-                        &push_url,
-                        &format!("HEAD:{hr}"),
+                        "log",
+                        &format!("origin/{hr}..HEAD"),
+                        "--oneline",
                     ],
-                    600,
+                    30,
                 )
             })
             .await
-            .unwrap_or((127, "spawn error".to_owned()));
-            if prc == 0 {
-                pushed = true;
-            } else {
-                let tail = crate::util::tail(&pout, 300);
-                failure = Some(format!("push failed: {tail}"));
+            .unwrap_or((127, String::new()));
+            if rc == 0 && !commits.trim().is_empty() {
+                let push_url = fg.ssh_url(&repo.url);
+                let wts = worktree.to_string_lossy().to_string();
+                let hr = head_ref.clone();
+                let (prc, pout) = tokio::task::spawn_blocking(move || {
+                    run_cmd_sync(
+                        &[
+                            "git",
+                            "-C",
+                            &wts,
+                            "push",
+                            "--force",
+                            &push_url,
+                            &format!("HEAD:{hr}"),
+                        ],
+                        600,
+                    )
+                })
+                .await
+                .unwrap_or((127, "spawn error".to_owned()));
+                if prc == 0 {
+                    pushed = true;
+                } else {
+                    let tail = crate::util::tail(&pout, 300);
+                    failure = Some(format!("push failed: {tail}"));
+                }
             }
         }
-    }
-    if failure.is_none() {
-        let reply = worktree.join("PR-REPLY.md");
-        if reply.exists() {
-            let body = std::fs::read_to_string(&reply).unwrap_or_default();
-            match fg.comment_pr(&repo.url, pr_number, &body) {
-                Ok(()) => {
-                    replied = true;
-                }
-                Err(e) => {
-                    failure = Some(format!(
-                        "PR comment failed: {}",
-                        crate::util::tail(&e.to_string(), 300)
-                    ));
+        if failure.is_none() {
+            let reply = worktree.join("PR-REPLY.md");
+            if reply.exists() {
+                let body = std::fs::read_to_string(&reply).unwrap_or_default();
+                match fg.comment_pr(&repo.url, pr_number, &body) {
+                    Ok(()) => {
+                        replied = true;
+                    }
+                    Err(e) => {
+                        failure = Some(format!(
+                            "PR comment failed: {}",
+                            crate::util::tail(&e.to_string(), 300)
+                        ));
+                    }
                 }
             }
         }
-    }
 
-    if let Some(ref fail) = failure {
-        if state == JobState::Done {
-            let _ = store.fail_job(job, fail.as_str()).await;
+        if let Some(ref fail) = failure {
+            if state == JobState::Done {
+                let _ = store.fail_job(job, fail.as_str()).await;
+            }
+            let tail = crate::util::tail(&rr.stdout_tail, 300);
+            // Only a suspension keeps its tree; any other outcome ends the
+            // chain and the tree is released below.
+            let kept = if state == JobState::Suspended {
+                format!("; worktree kept at {} for the resume", worktree.display())
+            } else {
+                String::new()
+            };
+            let _ = store
+                .log_event(
+                    "engage",
+                    &format!("#{fid} incomplete ({fail}){kept}. tail: {tail}"),
+                    Some(job),
+                    Some(fid),
+                )
+                .await;
+            summary.outcome = Some("retry".into());
+            summary.failure = Some(fail.clone());
+            if override_mode == Some("once") {
+                let _ = store.set_budget_override(fid, None).await;
+            }
+            break 'post summary;
         }
-        let tail = crate::util::tail(&rr.stdout_tail, 300);
+
+        // Success: update engagement state
+        let engaged_mark = if replied {
+            now_ms() + 3_000
+        } else {
+            ps.last_activity_at.unwrap_or_else(now_ms)
+        };
+        let addressed_fp: Option<&str> = if pushed {
+            None
+        } else {
+            ps.attention_fingerprint.as_deref()
+        };
+        let addressed_sha: Option<&str> = if pushed { None } else { ps.head_sha.as_deref() };
+        let _ = store
+            .mark_pr_engaged(fid, engaged_mark, now_ms(), addressed_fp, addressed_sha)
+            .await;
+        let did: Vec<&str> = [("pushed", pushed), ("replied", replied)]
+            .iter()
+            .filter(|(_, on)| *on)
+            .map(|(b, _)| *b)
+            .collect();
+        let did_str = if did.is_empty() {
+            "no-op".to_owned()
+        } else {
+            did.join(", ")
+        };
         let _ = store
             .log_event(
                 "engage",
-                &format!(
-                    "#{fid} incomplete ({fail}); worktree kept at {}. tail: {tail}",
-                    worktree.display()
-                ),
+                &format!("#{fid} PR #{pr_number} engaged ({did_str})"),
                 Some(job),
                 Some(fid),
             )
             .await;
-        summary.outcome = Some("retry".into());
-        summary.failure = Some(fail.clone());
+        summary.outcome = Some("engaged".into());
         if override_mode == Some("once") {
             let _ = store.set_budget_override(fid, None).await;
         }
-        return Ok(summary);
+        summary
+    };
+    if state == JobState::Suspended
+        && let Some(outcome @ ("withdrawn" | "withdraw-failed")) = summary.outcome.as_deref()
+    {
+        retire_concluded(store, job, outcome).await;
     }
-
-    // Success: update engagement state
-    let engaged_mark = if replied {
-        now_ms() + 3_000
-    } else {
-        ps.last_activity_at.unwrap_or_else(now_ms)
-    };
-    let addressed_fp: Option<&str> = if pushed {
-        None
-    } else {
-        ps.attention_fingerprint.as_deref()
-    };
-    let addressed_sha: Option<&str> = if pushed { None } else { ps.head_sha.as_deref() };
-    let _ = store
-        .mark_pr_engaged(fid, engaged_mark, now_ms(), addressed_fp, addressed_sha)
-        .await;
-    let did: Vec<&str> = [("pushed", pushed), ("replied", replied)]
-        .iter()
-        .filter(|(_, on)| *on)
-        .map(|(b, _)| *b)
-        .collect();
-    let did_str = if did.is_empty() {
-        "no-op".to_owned()
-    } else {
-        did.join(", ")
-    };
-    let _ = store
-        .log_event(
-            "engage",
-            &format!("#{fid} PR #{pr_number} engaged ({did_str})"),
-            Some(job),
-            Some(fid),
-        )
-        .await;
-    let rps = rpath.to_string_lossy().to_string();
-    let wts = worktree.to_string_lossy().to_string();
-    let _ = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(
-            &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-            30,
-        );
-    })
-    .await;
-    summary.outcome = Some("engaged".into());
-    if override_mode == Some("once") {
-        let _ = store.set_budget_override(fid, None).await;
-    }
+    close_workspace(store, &ws).await;
     Ok(summary)
 }
 
@@ -3016,6 +3711,7 @@ pub async fn run_harvest(
     cfg: &Config,
     finding: &Finding,
     backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
 ) -> anyhow::Result<CycleSummary> {
     let fid = finding.id;
     let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
@@ -3067,108 +3763,50 @@ pub async fn run_harvest(
     };
 
     let rpath = PathBuf::from(&repo.path);
-    let worktree = cfg.work_root.join("wt").join(format!("h{fid}"));
-    let _ = std::fs::create_dir_all(worktree.parent().unwrap_or(Path::new(".")));
-    if worktree.exists() {
+    // Fetch the default branch into the clone for a cold attempt; the
+    // tree is added at it once the job exists. Never on a resume: the
+    // chain continues in its own tree.
+    if resume.is_none() {
+        let db = repo.default_branch.clone();
         let rps = rpath.to_string_lossy().to_string();
-        let wts = worktree.to_string_lossy().to_string();
-        let _ = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(
-                &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                30,
-            );
+        let (rc, out) = tokio::task::spawn_blocking(move || {
+            run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &db], 600)
         })
-        .await;
-        let _ = store
-            .log_event(
-                "harvest",
-                &format!("#{fid}: reclaimed stale worktree from prior attempt"),
-                None,
-                Some(fid),
-            )
-            .await;
-    }
-
-    let db = repo.default_branch.clone();
-    let rps = rpath.to_string_lossy().to_string();
-    let db2 = db.clone();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &db2], 600)
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
-    if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("harvest #{fid}: fetch {db} failed: {tail}"),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("fetch failed: {tail}");
-    }
-    let rps = rpath.to_string_lossy().to_string();
-    let wts = worktree.to_string_lossy().to_string();
-    let db2 = db.clone();
-    let (rc, out) = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(
-            &[
-                "git",
-                "-C",
-                &rps,
-                "worktree",
-                "add",
-                "--detach",
-                &wts,
-                &format!("origin/{db2}"),
-            ],
-            30,
-        )
-    })
-    .await
-    .unwrap_or((127, "spawn error".to_owned()));
-    if rc != 0 {
-        let tail = crate::util::tail(&out, 300);
-        let _ = store
-            .log_event(
-                "error",
-                &format!("harvest #{fid}: worktree add failed: {tail}"),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("worktree add failed: {tail}");
+        .await
+        .unwrap_or((127, "spawn error".to_owned()));
+        if rc != 0 {
+            let tail = crate::util::tail(&out, 300);
+            let _ = store
+                .log_event(
+                    "error",
+                    &format!(
+                        "harvest #{fid}: fetch {} failed: {tail}",
+                        repo.default_branch
+                    ),
+                    None,
+                    Some(fid),
+                )
+                .await;
+            anyhow::bail!("fetch failed: {tail}");
+        }
     }
 
     let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
-    let cap = match budget_gate(
+    let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
         repo.id,
         FindingJobKind::Harvest.into(),
-        cfg.fix_cap_tokens,
         override_mode.is_some(),
         &format!("harvest #{fid}"),
         Some(fid),
+        resume,
     )
     .await?
     {
-        BudgetDecision::Approved(c) => c,
-        BudgetDecision::Denied(d) => {
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
-            return Ok(*d);
-        }
+        BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
+        BudgetDecision::Denied(d) => return Ok(*d),
     };
 
     let fg = forge::forge_for(repo.forge);
@@ -3183,40 +3821,24 @@ pub async fn run_harvest(
                     Some(fid),
                 )
                 .await;
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
             anyhow::bail!("PR/MR view failed");
         }
     };
 
-    let job = match store
+    let created = match store
         .create_job(
             FindingJobKind::Harvest.into(),
             repo.id,
             Some(fid),
             cap,
             JobState::Running,
+            Some(anticipated),
+            resume.map(|r| r.predecessor_id),
         )
         .await
     {
         Ok(j) => j,
         Err(e) => {
-            let rps = rpath.to_string_lossy().to_string();
-            let wts = worktree.to_string_lossy().to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-                    30,
-                );
-            })
-            .await;
             return job_refused(
                 FindingJobKind::Harvest.into(),
                 Some(&repo.name),
@@ -3225,36 +3847,60 @@ pub async fn run_harvest(
             );
         }
     };
-    let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
-    let prompt = playbooks::build_harvest_prompt(
-        &cfg.root,
-        finding,
-        &worktree,
-        &repo.default_branch,
+    let job = created.id;
+    let (ws, _pinned) = match open_workspace(
+        store,
+        cfg,
         &repo,
-        &pr,
-        pr_number,
-        &repo_notes,
-    )?;
+        &created,
+        resume,
+        TreeSpec::Detached {
+            at: format!("origin/{}", repo.default_branch),
+        },
+        FindingJobKind::Harvest.into(),
+        &format!("harvest #{fid}"),
+        Some(fid),
+    )
+    .await?
+    {
+        Ok(opened) => opened,
+        Err(failed) => return Ok(failed),
+    };
+    let worktree = ws.tree.clone();
+    let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => playbooks::build_harvest_prompt(
+            &cfg.root,
+            finding,
+            &worktree,
+            &repo.default_branch,
+            &repo,
+            &pr,
+            pr_number,
+            &repo_notes,
+        )?,
+    };
     let model = cfg.model_for("fix");
     let rr = backend
-        .run(&worktree, &prompt, cap, cfg.fix_max_wall_s, JobClass::Fix)
+        .run(
+            &ws,
+            &prompt,
+            cap,
+            cfg.fix_max_wall_s,
+            JobClass::Fix,
+            resume.map(|r| r.session_file.as_path()),
+        )
         .await?;
-    let state = record_job(store, job, &rr, model)
+    let state = record_job(store, job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
 
-    // Ingest follow-ups before dropping worktree
+    // Follow-ups are read from the tree, so before it is released. The
+    // release itself is state-checked: a suspended harvest keeps its tree
+    // for the resume, where this used to drop it after every run.
     let followups = ingest_followups(store, repo.id, &worktree, fid, job, "harvest").await;
-    let rps = rpath.to_string_lossy().to_string();
-    let wts = worktree.to_string_lossy().to_string();
-    let _ = tokio::task::spawn_blocking(move || {
-        run_cmd_sync(
-            &["git", "-C", &rps, "worktree", "remove", "--force", &wts],
-            30,
-        );
-    })
-    .await;
+    close_workspace(store, &ws).await;
 
     let mut summary = CycleSummary {
         kind: Some(FindingJobKind::Harvest.into()),
@@ -3265,6 +3911,30 @@ pub async fn run_harvest(
         ingest: followups,
         ..Default::default()
     };
+    if state == JobState::Suspended {
+        // A suspension is a budget pause, not a failure: the worker ran out
+        // of window headroom mid-work and its tree and transcript are kept
+        // for the resume. Counting it toward the streak would turn three
+        // pauses of one healthy harvest into "stuck" and give the PR up.
+        // It stays unharvested, where the harvest tier continues it.
+        let _ = store
+            .log_event(
+                "harvest",
+                &format!(
+                    "#{fid} suspended; worktree kept at {} for the resume",
+                    worktree.display()
+                ),
+                Some(job),
+                Some(fid),
+            )
+            .await;
+        summary.outcome = Some("suspended".into());
+        summary.worktree = Some(worktree.to_string_lossy().into_owned());
+        if override_mode == Some("once") {
+            let _ = store.set_budget_override(fid, None).await;
+        }
+        return Ok(summary);
+    }
     if state != JobState::Done {
         let failure = format!("worker {state}");
         let streak = store
@@ -3393,10 +4063,10 @@ async fn run_cycle_inner(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("finding {finding_id} not found"))?;
             match kind {
-                FindingJobKind::Engage => run_engage(store, cfg, &finding, backend).await?,
-                FindingJobKind::Harvest => run_harvest(store, cfg, &finding, backend).await?,
-                FindingJobKind::Recheck => run_recheck(store, cfg, &finding, backend).await?,
-                FindingJobKind::Fix => run_fix(store, cfg, &finding, backend).await?,
+                FindingJobKind::Engage => run_engage(store, cfg, &finding, backend, None).await?,
+                FindingJobKind::Harvest => run_harvest(store, cfg, &finding, backend, None).await?,
+                FindingJobKind::Recheck => run_recheck(store, cfg, &finding, backend, None).await?,
+                FindingJobKind::Fix => run_fix(store, cfg, &finding, backend, None).await?,
             }
         }
         Candidate::Repo { kind, repo_id, .. } => {
@@ -3405,12 +4075,91 @@ async fn run_cycle_inner(
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
             match kind {
-                RepoJobKind::Hunt => run_hunt(store, cfg, &repo, backend).await?,
-                RepoJobKind::TestGap => run_test_gap(store, cfg, &repo, backend).await?,
-                RepoJobKind::DepUpdate => run_dep_update(store, cfg, &repo, backend).await?,
-                RepoJobKind::Refactor => run_refactor(store, cfg, &repo, backend).await?,
-                RepoJobKind::Modernization => run_modernize(store, cfg, &repo, backend).await?,
-                RepoJobKind::Standards => run_standards(store, cfg, &repo, backend).await?,
+                RepoJobKind::Hunt => run_hunt(store, cfg, &repo, backend, None).await?,
+                RepoJobKind::TestGap => run_test_gap(store, cfg, &repo, backend, None).await?,
+                RepoJobKind::DepUpdate => run_dep_update(store, cfg, &repo, backend, None).await?,
+                RepoJobKind::Refactor => run_refactor(store, cfg, &repo, backend, None).await?,
+                RepoJobKind::Modernization => {
+                    run_modernize(store, cfg, &repo, backend, None).await?
+                }
+                RepoJobKind::Standards => run_standards(store, cfg, &repo, backend, None).await?,
+            }
+        }
+        // A resume runs through the executor of the kind that was
+        // suspended — so ingest, watermarks and PR handling are that
+        // kind's own, unchanged. Logged here rather than in `pick_next`,
+        // which the summary endpoint also calls on every poll.
+        Candidate::Resume { plan, .. } => {
+            let _ = store
+                .log_event(
+                    "resume",
+                    &format!(
+                        "resume {} {}: job {} -> reserving {} tok \
+                         (ctx {} + max({} - {}, {}))",
+                        plan.kind,
+                        plan.repo,
+                        plan.predecessor_id,
+                        plan.anticipated,
+                        plan.ctx,
+                        plan.typical,
+                        plan.chain_spent,
+                        min_useful(plan.ctx)
+                    ),
+                    Some(plan.predecessor_id),
+                    plan.finding_id,
+                )
+                .await;
+            let resume = Some(plan.as_ref());
+            match plan.kind {
+                JobKind::Repo(kind) => {
+                    let repo = store
+                        .get_repo_by_id(plan.repo_id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("repo {} not found", plan.repo_id))?;
+                    match kind {
+                        RepoJobKind::Hunt => run_hunt(store, cfg, &repo, backend, resume).await?,
+                        RepoJobKind::TestGap => {
+                            run_test_gap(store, cfg, &repo, backend, resume).await?
+                        }
+                        RepoJobKind::DepUpdate => {
+                            run_dep_update(store, cfg, &repo, backend, resume).await?
+                        }
+                        RepoJobKind::Refactor => {
+                            run_refactor(store, cfg, &repo, backend, resume).await?
+                        }
+                        RepoJobKind::Modernization => {
+                            run_modernize(store, cfg, &repo, backend, resume).await?
+                        }
+                        RepoJobKind::Standards => {
+                            run_standards(store, cfg, &repo, backend, resume).await?
+                        }
+                    }
+                }
+                JobKind::Finding(kind) => {
+                    // A finding-kind job always recorded its target, so a
+                    // row without one is corrupt rather than merely odd.
+                    let fid = plan
+                        .finding_id
+                        .ok_or_else(|| anyhow::anyhow!("resume of a {kind} job with no finding"))?;
+                    let finding = store
+                        .get_finding(fid)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("finding {fid} not found"))?;
+                    match kind {
+                        FindingJobKind::Engage => {
+                            run_engage(store, cfg, &finding, backend, resume).await?
+                        }
+                        FindingJobKind::Harvest => {
+                            run_harvest(store, cfg, &finding, backend, resume).await?
+                        }
+                        FindingJobKind::Recheck => {
+                            run_recheck(store, cfg, &finding, backend, resume).await?
+                        }
+                        FindingJobKind::Fix => {
+                            run_fix(store, cfg, &finding, backend, resume).await?
+                        }
+                    }
+                }
             }
         }
     };
@@ -3420,6 +4169,18 @@ async fn run_cycle_inner(
     // kind doesn't monopolise the rotation forever. This is SEPARATE from
     // run_analysis_job's success-gated timestamp (which governs this kind's
     // own retry cadence) — this block ensures OTHER kinds get a turn.
+    //
+    // Suspended is deliberately absent from `failed` below. A cap kill is
+    // a pause, and re-selecting that work is no longer this bump's job:
+    // the resume tier claims it by id at a priority above rotation. Were
+    // it bumped here it would be counted as a turn taken, while the work
+    // itself had not started. A chain that never finishes is retired by
+    // the give-up ceiling, and the still-old timestamp is then the honest
+    // record that this scan has not run.
+    //
+    // `is_analysis()` covers standards here where the Python twin's list
+    // does not, because standards exists only in this daemon — the twin
+    // has no such kind to starve.
     if let Candidate::Repo { kind, repo_id, .. } = &candidate
         && kind.is_analysis()
     {

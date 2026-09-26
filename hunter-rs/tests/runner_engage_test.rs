@@ -15,7 +15,7 @@
 mod support;
 
 use hunter::config::Config;
-use hunter::domain::{FindingStatus, ForgeName};
+use hunter::domain::{FindingStatus, ForgeName, RepoJobKind};
 use hunter::store::{FindingInsert, SyncPrData};
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, fresh_store};
 
@@ -178,7 +178,7 @@ async fn failed_close_does_not_record_the_withdrawal() {
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
-    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend)
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .expect("run_engage should not error, it should decline to record");
 
@@ -216,7 +216,7 @@ async fn successful_close_records_the_withdrawal() {
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
-    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend)
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
 
@@ -254,7 +254,7 @@ async fn failed_close_marks_the_attention_addressed_so_it_stops_being_repicked()
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
-    hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend)
+    hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
 
@@ -304,7 +304,7 @@ async fn a_clone_of_a_different_repository_is_refused() {
     // Never reached: the sync refuses before any worker is spawned, which
     // is itself part of the contract.
     let backend = ScriptedBackend::writing("findings.json", "[]");
-    let err = hunter::scheduler::run_hunt(&store, &cfg, &row, &backend)
+    let err = hunter::scheduler::run_hunt(&store, &cfg, &row, &backend, None)
         .await
         .expect_err("a clone of another repository must not be hunted");
     let msg = err.to_string();
@@ -312,4 +312,65 @@ async fn a_clone_of_a_different_repository_is_refused() {
         msg.contains("but its origin is") && msg.contains("somebody-elses-repo"),
         "the refusal must name both URLs so the operator can see the mismatch: {msg}"
     );
+}
+
+/// A hunt whose repo was deleted between the pick and the job insert
+/// reports which kind and which repo it skipped.
+///
+/// `create_job` refuses a soft-deleted repo, and the executor turns that
+/// into a skipped cycle rather than an error: deleting a repo is operator
+/// traffic, not a crash. The status page and the cycle log render that
+/// summary, so "skipped" without the kind and repo would tell the
+/// operator nothing about what was dropped. The row handed to `run_hunt`
+/// is the one the pick read, taken before the delete, exactly as a cycle
+/// holds it.
+#[tokio::test]
+async fn a_hunt_refused_because_its_repo_was_deleted_names_what_it_skipped() {
+    let dir = TempDir::new("refused-hunt");
+    let repo = GitRepo::with_branch(&dir, BRANCH);
+    let (_db, store) = fresh_store(&dir, "refused").await;
+
+    let repos_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repos_root).unwrap();
+    let rid = store
+        .add_repo(
+            "widget",
+            &repo.origin.to_string_lossy(),
+            &repos_root,
+            &repo.default_branch,
+            ForgeName::Github,
+        )
+        .await
+        .unwrap();
+    std::fs::rename(&repo.work, hunter::store::Store::repo_dir(&repos_root, rid)).unwrap();
+
+    let picked = store.get_repo_by_id(rid).await.unwrap().unwrap();
+    store.soft_delete_repo(rid).await.unwrap();
+
+    let playbooks = dir.subdir("playbooks");
+    std::fs::write(playbooks.join("hunt.md"), "hunt {{WORKTREE}}\n").unwrap();
+    let mut cfg = Config::load(dir.path()).expect("load config");
+    cfg.work_root = dir.subdir("work_root");
+    // Never reached: the job row is refused before any worker is spawned.
+    let backend = ScriptedBackend::writing("findings.json", "[]");
+    let summary = hunter::scheduler::run_hunt(&store, &cfg, &picked, &backend, None)
+        .await
+        .expect("losing the race to a delete is a skipped cycle, not an error");
+
+    assert_eq!(
+        (
+            summary.kind,
+            summary.repo.as_deref(),
+            summary.finding_id,
+            summary.skipped.as_deref(),
+        ),
+        (
+            Some(RepoJobKind::Hunt.into()),
+            Some("widget"),
+            None,
+            Some(format!("repo {rid} is deleted -- cannot start a hunt job").as_str()),
+        ),
+        "a refused job must still name the kind and repo it skipped: {summary:?}"
+    );
+    assert_eq!(summary.job_id, None, "no job row may have been written");
 }

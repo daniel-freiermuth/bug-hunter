@@ -245,9 +245,14 @@ fn finding_json(f: &Finding) -> String {
 
 /// Each build_*_prompt reads the corresponding .md template, builds slots,
 /// and calls `render()`. Signatures use typed structs instead of JSON blobs.
+///
+/// `tree` (`{{REPO_PATH}}`) is the job chain's own worktree, not
+/// `repo.path`: the clone is fetch-only and its working files are never
+/// updated, so a worker told to read it would review stale code.
 pub fn build_hunt_prompt(
     root: &Path,
     repo: &Repo,
+    tree: &Path,
     diff_range: &str,
     scope_note: &str,
     suppressions: &[Finding],
@@ -263,7 +268,7 @@ pub fn build_hunt_prompt(
     );
     let template = read_template(root, "hunt.md")?;
     let mut slots = HashMap::new();
-    slots.insert("REPO_PATH", repo.path.clone());
+    slots.insert("REPO_PATH", tree.display().to_string());
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("DIFF_RANGE", diff_range.to_owned());
     slots.insert("SCOPE_NOTE", scope_note.to_owned());
@@ -413,13 +418,14 @@ pub fn build_recheck_prompt(
     root: &Path,
     finding: &Finding,
     repo: &Repo,
+    tree: &Path,
     out_path: &Path,
     repo_notes: &str,
 ) -> Result<String> {
     let notes = notes_or_default(repo_notes, "(No notes yet)");
     let template = read_template(root, "recheck.md")?;
     let mut slots = HashMap::new();
-    slots.insert("REPO_PATH", repo.path.clone());
+    slots.insert("REPO_PATH", tree.display().to_string());
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("OUT_PATH", out_path.display().to_string());
@@ -433,6 +439,7 @@ fn build_analysis_prompt(
     root: &Path,
     template_name: &str,
     repo: &Repo,
+    tree: &Path,
     scope_note: &str,
     suppressions: &[Finding],
     known: &[Finding],
@@ -445,7 +452,7 @@ fn build_analysis_prompt(
     let notes = notes_or_default(repo_notes, "(No notes yet)");
     let template = read_template(root, template_name)?;
     let mut slots = HashMap::new();
-    slots.insert("REPO_PATH", repo.path.clone());
+    slots.insert("REPO_PATH", tree.display().to_string());
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("SCOPE_NOTE", scope_note.to_owned());
     slots.insert("SUPPRESSIONS", suppressions_block(suppressions));
@@ -459,6 +466,7 @@ fn build_analysis_prompt(
 pub fn build_test_gap_prompt(
     root: &Path,
     repo: &Repo,
+    tree: &Path,
     scope_note: &str,
     suppressions: &[Finding],
     known: &[Finding],
@@ -470,6 +478,7 @@ pub fn build_test_gap_prompt(
         root,
         "test_gap.md",
         repo,
+        tree,
         scope_note,
         suppressions,
         known,
@@ -484,6 +493,7 @@ pub fn build_test_gap_prompt(
 pub fn build_dep_update_prompt(
     root: &Path,
     repo: &Repo,
+    tree: &Path,
     scope_note: &str,
     suppressions: &[Finding],
     known: &[Finding],
@@ -495,6 +505,7 @@ pub fn build_dep_update_prompt(
         root,
         "dep_update.md",
         repo,
+        tree,
         scope_note,
         suppressions,
         known,
@@ -509,6 +520,7 @@ pub fn build_dep_update_prompt(
 pub fn build_refactor_prompt(
     root: &Path,
     repo: &Repo,
+    tree: &Path,
     scope_note: &str,
     suppressions: &[Finding],
     known: &[Finding],
@@ -520,6 +532,7 @@ pub fn build_refactor_prompt(
         root,
         "refactor.md",
         repo,
+        tree,
         scope_note,
         suppressions,
         known,
@@ -534,6 +547,7 @@ pub fn build_refactor_prompt(
 pub fn build_modernization_prompt(
     root: &Path,
     repo: &Repo,
+    tree: &Path,
     scope_note: &str,
     suppressions: &[Finding],
     known: &[Finding],
@@ -545,6 +559,7 @@ pub fn build_modernization_prompt(
         root,
         "modernization.md",
         repo,
+        tree,
         scope_note,
         suppressions,
         known,
@@ -559,6 +574,7 @@ pub fn build_modernization_prompt(
 pub fn build_standards_prompt(
     root: &Path,
     repo: &Repo,
+    tree: &Path,
     scope_note: &str,
     suppressions: &[Finding],
     known: &[Finding],
@@ -584,7 +600,7 @@ pub fn build_standards_prompt(
         );
     }
     let mut slots = HashMap::new();
-    slots.insert("REPO_PATH", repo.path.clone());
+    slots.insert("REPO_PATH", tree.display().to_string());
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("SCOPE_NOTE", scope_note.to_owned());
     slots.insert("SUPPRESSIONS", suppressions_block(suppressions));

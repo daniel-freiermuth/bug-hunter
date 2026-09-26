@@ -278,8 +278,7 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
         match scheduler::pick_next(store, &state.config, None).await {
             Ok(Some(c)) => {
                 let anticipated =
-                    scheduler::anticipated_tokens(store, &state.config, c.repo_id(), c.job_kind())
-                        .await?;
+                    scheduler::candidate_reservation(store, &state.config, &c).await?;
                 let outlook = state.backend.decide(anticipated).await?;
                 let is_prioritized = c.budget_override().is_some();
                 let verdict = if is_prioritized {

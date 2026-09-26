@@ -192,6 +192,21 @@ impl FakeBins {
         EnvGuard { key, previous }
     }
 
+    /// Remove an environment variable for the lifetime of the returned
+    /// guard: for tests about what the daemon does when the operator did
+    /// NOT export something that the test runner itself may have.
+    #[allow(
+        clippy::unused_self,
+        reason = "same as `env`: the receiver forces the caller through \
+                  `acquire` and its process-isolation assertion"
+    )]
+    pub fn unset_env(&self, key: &'static str) -> EnvGuard {
+        let previous = std::env::var(key).ok();
+        // SAFETY: one test per process; restored on drop.
+        unsafe { std::env::remove_var(key) };
+        EnvGuard { key, previous }
+    }
+
     /// Drop the real `PATH`, leaving only the scripted directory.
     ///
     /// `acquire` appends the original `PATH` so unscripted binaries (git)
@@ -302,18 +317,32 @@ fn set_executable(_path: &Path) {}
 
 type RunFn = Box<dyn Fn(&Path) -> RunResult + Send + Sync>;
 
-/// A `Backend` whose `run()` is a closure over the worktree it is handed.
+/// A `Backend` whose `run()` is a closure over the chain's worktree
+/// (`Workspace::tree`) it is handed.
 ///
 /// Use it to stage exactly what a worker would leave behind. `decide()`
-/// always grants, so a test never has to satisfy the budget gate.
+/// always grants, so a test never has to satisfy the budget gate. The
+/// headroom it grants is `None` — no token bound — unless
+/// [`ScriptedBackend::granting`] says otherwise.
 pub struct ScriptedBackend {
     run: RunFn,
+    cap_tokens: Option<i64>,
 }
 
 impl ScriptedBackend {
     /// Run the given closure against the worktree.
     pub fn new(run: impl Fn(&Path) -> RunResult + Send + Sync + 'static) -> Self {
-        Self { run: Box::new(run) }
+        Self {
+            run: Box::new(run),
+            cap_tokens: None,
+        }
+    }
+
+    /// Grant `cap_tokens` as the backend's headroom for every verdict.
+    #[must_use]
+    pub fn granting(mut self, cap_tokens: Option<i64>) -> Self {
+        self.cap_tokens = cap_tokens;
+        self
     }
 
     /// A worker that writes `contents` to `name` in the worktree and exits 0.
@@ -348,7 +377,7 @@ pub fn done() -> RunResult {
 impl Backend for ScriptedBackend {
     async fn decide(&self, _anticipated_tokens: i64) -> anyhow::Result<Outlook> {
         let granted = Verdict::Granted {
-            cap_tokens: None,
+            cap_tokens: self.cap_tokens,
             reason: "test: always granted".to_owned(),
         };
         Ok(Outlook {
@@ -367,13 +396,14 @@ impl Backend for ScriptedBackend {
 
     async fn run(
         &self,
-        cwd: &Path,
+        ws: &hunter::workspace::Workspace,
         _prompt: &str,
-        _cap_tokens: i64,
+        _cap_tokens: Option<i64>,
         _max_wall_s: i64,
         _job_class: JobClass,
+        _resume_from: Option<&Path>,
     ) -> anyhow::Result<RunResult> {
-        Ok((self.run)(cwd))
+        Ok((self.run)(&ws.tree))
     }
 }
 

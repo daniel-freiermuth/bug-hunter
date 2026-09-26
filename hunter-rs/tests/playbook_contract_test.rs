@@ -79,6 +79,7 @@ type ApplyBuilder =
 type AnalysisBuilder = fn(
     &Path,
     &hunter::types::Repo,
+    &Path,
     &str,
     &[Finding],
     &[Finding],
@@ -105,6 +106,7 @@ fn hunt_prompt_renders() {
     let prompt = playbooks::build_hunt_prompt(
         &root(),
         &repo,
+        Path::new("/tmp/tree"),
         "abc123..def456",
         "a scope note",
         &suppressed,
@@ -136,6 +138,7 @@ fn analysis_prompts_render() {
         let prompt = build(
             &root,
             &repo,
+            Path::new("/tmp/tree"),
             "a scope note",
             &suppressed,
             &known,
@@ -197,9 +200,15 @@ fn improvement_and_modernization_apply_prompts_render() {
 fn recheck_prompt_renders() {
     let repo = sample_repo();
     let finding = sample_finding(FindingType::Bug);
-    let prompt =
-        playbooks::build_recheck_prompt(&root(), &finding, &repo, &out_path(), "repo notes")
-            .expect("recheck.md must render");
+    let prompt = playbooks::build_recheck_prompt(
+        &root(),
+        &finding,
+        &repo,
+        Path::new("/tmp/tree"),
+        &out_path(),
+        "repo notes",
+    )
+    .expect("recheck.md must render");
     assert_usable("recheck", &prompt);
 }
 

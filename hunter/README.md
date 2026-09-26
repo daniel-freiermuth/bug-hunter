@@ -120,16 +120,55 @@ what actually runs):
 3. **Harvest** the oldest merged PR still pending follow-up review.
 4. **Recheck** the oldest finding stuck in `rechecking`.
 5. **Fix** the oldest queued finding.
-6. Otherwise, **hunt/test_gap/dep_update/refactor** — whichever is most
+6. **Resume** the newest suspended attempt that can still be continued.
+   A worker killed for running out of window headroom (and only that:
+   never a wallclock overrun, which is the runaway signature) keeps its
+   session and comes back as `suspended` rather than `killed`, and the
+   next cycle hands omp that exact session instead of starting cold.
+   Ranked here because a suspension has already been paid for — it
+   outranks *starting* new background work, never a human waiting on a
+   PR. Restarting costs a flat ~37k-token session floor and then redoes
+   the work; continuing costs re-caching the context the worker was
+   already carrying.
+7. Otherwise, **hunt/test_gap/dep_update/refactor** — whichever is most
    overdue for the least-recently-scanned enabled repo (a never-cloned repo
    always hunts first). **Modernization** joins this rotation too, but only
    once `modernization.intervalDays` (config, default 30) has passed since it last ran for that
    repo — a periodic strategic check, not a tight-loop scan competing for
    every cycle.
 
+Each of 1-5 picks a (finding, kind). When that finding has a suspended
+attempt of that same kind that can still be continued, the tier continues
+it, at the tier's own position, instead of starting the work fresh.
+
 A repeatedly-failing item (same failure reason, consecutive attempts) gives
 up after a bounded streak rather than looping forever — this applies
-uniformly to fix retries, recheck retries, and harvest retries.
+uniformly to fix retries, recheck retries, and harvest retries. A resume
+chain has the same kind of ceiling, on either of two counts: once it has
+made four attempts, or once — after at least one resume — everything it
+spent *besides its single largest attempt* is past three times what that
+kind of job typically costs. Whichever fires, the suspension is marked
+`failed` (reason `give-up`) instead of being continued again. A chain
+that has never been resumed is never retired: one attempt's spend is by
+definition at least its own cap, and the largest attempt is discounted
+because one enormous attempt says the job is big, not that the chain is
+stuck.
+
+Two more things end a suspension, because after either one it can never
+usefully be continued, and a suspension nobody ends stays `suspended`
+forever:
+
+- **Superseded.** Starting the same work fresh — same finding and kind
+  for engage/harvest/recheck/fix, same repo and kind for hunt and the
+  analysis scans — marks the suspended attempt `killed` (reason
+  `superseded`) in the same transaction that creates the fresh job,
+  whichever path started it.
+- **Working directory gone.** The transcript describes files in the
+  clone (hunt, recheck, analysis scans) or the per-finding worktree
+  (fix, engage, harvest). If that directory no longer exists the
+  suspension is marked `killed` (reason `workdir-gone`) when selection
+  reaches it, and selection moves on to the next candidate the same
+  cycle.
 
 ### Budget policy
 
@@ -146,14 +185,34 @@ linear ramps, never letting spend get ahead of either:
   `HEADROOM_MS` in `hunter-rs/src/backends/omp_scavenge/capacity.rs`) so a freshly-opened window is never
   immediately claimed, then ramps 0→1 over what's left. Unspent capacity at
   reset is wasted — there's no rollover.
-- **In-flight accounting**: a running job's *anticipated* cost (not its
-  nominal cap — cold-cache first calls have been observed running
-  2-5x cap_tokens in one atomic, uninterruptible LLM call) is reserved
+- **In-flight accounting**: a running job's *anticipated* cost is reserved
   before the next decision, so concurrent/rapid cycles can't overshoot
-  either ramp.
-- Workers are metered **externally**: the harness tails the worker's live
-  session JSONL and SIGTERMs the process group at the token cap — it never
-  depends on the worker cooperating with its own limit.
+  either ramp. It is an estimate from history, not the job's granted cap:
+  a cold-cache first call arrives as one atomic, uninterruptible LLM call
+  that has been observed spending 2-4x what was reserved for it. The
+  history is the 20 most recent *completed* jobs of that kind, not all of
+  it — a window ages out both rows written under accounting bugs that
+  have since been fixed and repos that have since changed size.
+- **Start efficiency**: loading context is pure overhead, so no attempt
+  starts unless the window can fund at least as much work as the context
+  it must load (`MIN_START_EFFICIENCY` = 0.5; never less than 25k of
+  work). A resume re-sends its whole transcript (measured: re-cache cost
+  equals the context at suspension), so it reserves that context plus
+  the larger of what is left of a typical job and that minimum — a
+  100k-token transcript reserves at least 200k. With a flat 25k on top it
+  would reserve 125k, and an attempt granted 125k spends 80% of it
+  re-sending the transcript and 20% working. A cold start reserves the
+  larger of its history estimate and 40k (a 15k system-prompt floor plus
+  25k of work), which also stops a collapsed estimate from starting jobs
+  that die on their second call. A larger reservation does not shrink
+  the granted cap — the cap is computed without the job's own
+  reservation — it makes the gate refuse until the window can fund both.
+- A granted job's token cap is the ramp's remaining headroom, verbatim —
+  there is no separate configured per-kind cap. Workers are metered
+  **externally**: the harness tails the worker's live session JSONL and
+  SIGTERMs the process group at that cap, never depending on the worker
+  cooperating with its own limit. A grant with no headroom figure carries
+  no token bound, and `maxWallS` alone stops it.
 - Stale or missing usage data → conservative denial, never an optimistic
   guess.
 
@@ -260,8 +319,11 @@ for the schema — most columns carry comments explaining *why*, not just *what*
   missing\_tests, refactor smell\_type, modernization\_class), and retry
   streak tracking (fix/recheck) for the give-up mechanism.
 - **`jobs`** — one row per worker invocation: kind, cap/actual tokens,
-  exit/kill reason, timing. The audit trail for "what did hunter actually
-  spend, and on what."
+  exit/kill reason, timing, and `resumed_from` (the suspended attempt this
+  one continues). States are `queued | running | done | failed | killed |
+  suspended | denied`; `suspended` is a pause with a session file to
+  continue, everything else killed is terminal. The audit trail for "what
+  did hunter actually spend, and on what."
 - **`pr_state`** — one row per finding with an open/merged PR: forge state,
   attention fingerprint + suppression marker (state-based, see § PR
   follow-up loop), harvest tracking.
@@ -282,15 +344,15 @@ for the schema — most columns carry comments explaining *why*, not just *what*
   "workRoot": "data",           // repo clones, worktrees, job output
   "dbPath": "data/hunter.db",
   "ompBin": "omp",
-  "hunt":  { "capNewTokens": 200000, "maxWallS": 1800, "maxFindings": 8 },
-  "fix":   { "capNewTokens": 150000, "maxWallS": 2700 },
+  "hunt":  { "maxWallS": 1800, "maxFindings": 8 },
+  "fix":   { "maxWallS": 2700 },
   "budget": { "deny5hAbove": 0.85, "staleAfterS": 300 },
   "serve": { "port": 8377 },
   "models": { "default": "opus", "smol": "sonnet", "hunt": null, "fix": null }
 }
 ```
 
-- `hunt`/`fix` caps apply to their whole job family (hunt also covers
+- `hunt`/`fix` settings apply to their whole job family (hunt also covers
   test\_gap/dep\_update/refactor/modernization/recheck; fix also covers
   engage/harvest/apply\_\*).
 - `budget.deny5hAbove` / `staleAfterS` — see § Budget policy.

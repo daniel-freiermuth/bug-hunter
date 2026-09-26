@@ -35,8 +35,8 @@ impl JobClass {
 
 /// Granted/Denied verdict (`backend.Granted` / `backend.Denied`).
 ///
-/// - `Granted.cap_tokens`: backend's own spend ceiling; None = no ceiling.
-///   Core still min()s against its config caps — the backend never sees them.
+/// - `Granted.cap_tokens`: the backend's headroom for the job, and the
+///   only token bound it gets; None = no token bound at all.
 /// - `Denied.retry_at`: epoch ms the denial is expected to resolve; None = no
 ///   informed estimate (callers use a generic 30-min backoff).
 /// - reason strings are prose for notes/events/UI — never machine-matched
@@ -79,7 +79,7 @@ pub struct Outlook {
 /// thread-safe). Exact SQL: BACKEND-CONTRACT.md §1.6.
 #[async_trait]
 pub trait SpendLedger: Send + Sync {
-    /// `SUM(cap_tokens)` over running jobs.
+    /// `SUM(COALESCE(estimated_tokens, cap_tokens, 0))` over running jobs.
     async fn running_estimate(&self) -> sqlx::Result<i64>;
     /// `SUM(tokens_new)` of non-running jobs finished strictly after `ts_ms`.
     async fn finished_since(&self, ts_ms: i64) -> sqlx::Result<i64>;
@@ -153,15 +153,21 @@ pub trait Backend: Send + Sync {
     /// (innerHTML'd by the UI every 5 s; byte-parity spec in
     /// BACKEND-CONTRACT.md §2.3).
     async fn status_html(&self) -> anyhow::Result<String>;
-    /// Execute a worker job. `cap_tokens` is the EFFECTIVE cap (already
-    /// min'd by the caller); `job_class` drives model selection.
+    /// Execute a worker job in its chain's workspace: the worker runs in
+    /// `ws.tree` and its transcript goes to `ws.session`. `cap_tokens` is
+    /// the token bound the ramp
+    /// granted, `None` for a job that has none; `job_class` drives model
+    /// selection. `resume_from` is the session file of an earlier attempt
+    /// to continue instead of starting cold — `None` is a cold run, which
+    /// is what every job was before resume existed.
     async fn run(
         &self,
-        cwd: &std::path::Path,
+        ws: &crate::workspace::Workspace,
         prompt: &str,
-        cap_tokens: i64,
+        cap_tokens: Option<i64>,
         max_wall_s: i64,
         job_class: JobClass,
+        resume_from: Option<&std::path::Path>,
     ) -> anyhow::Result<crate::types::RunResult>;
 }
 
@@ -191,11 +197,12 @@ impl Backend for NullBackend {
 
     async fn run(
         &self,
-        _cwd: &std::path::Path,
+        _ws: &crate::workspace::Workspace,
         _prompt: &str,
-        _cap_tokens: i64,
+        _cap_tokens: Option<i64>,
         _max_wall_s: i64,
         _job_class: JobClass,
+        _resume_from: Option<&std::path::Path>,
     ) -> anyhow::Result<crate::types::RunResult> {
         anyhow::bail!("NullBackend cannot run workers")
     }

@@ -217,11 +217,14 @@ async fn findings_are_attributed_to_the_hunt_that_produced_them() {
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
-            1000,
+            Some(1000),
             JobState::Running,
+            None,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
 
     let inserted = hunt_producing_two(&dir, &store, repo_id, job).await;
     assert_eq!(inserted, 2, "fixture: both entries are new");
@@ -245,11 +248,14 @@ async fn a_rediscovery_does_not_steal_attribution() {
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
-            1000,
+            Some(1000),
             JobState::Running,
+            None,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     assert_eq!(hunt_producing_two(&dir, &store, repo_id, first).await, 2);
     let original = produced_by(&store, first).await;
 
@@ -258,11 +264,14 @@ async fn a_rediscovery_does_not_steal_attribution() {
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
-            1000,
+            Some(1000),
             JobState::Running,
+            None,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     assert_eq!(
         hunt_producing_two(&dir, &store, repo_id, second).await,
         0,
@@ -290,11 +299,14 @@ async fn a_job_given_a_finding_produces_nothing() {
             RepoJobKind::Hunt.into(),
             repo_id,
             None,
-            1000,
+            Some(1000),
             JobState::Running,
+            None,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     hunt_producing_two(&dir, &store, repo_id, hunt).await;
     let found = produced_by(&store, hunt).await;
 
@@ -303,11 +315,14 @@ async fn a_job_given_a_finding_produces_nothing() {
             FindingJobKind::Fix.into(),
             repo_id,
             Some(found[0]),
-            1000,
+            Some(1000),
             JobState::Running,
+            None,
+            None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .id;
     let entry = store
         .list_jobs(50)
         .await
