@@ -325,6 +325,20 @@ quota source for one installation.
   default) and `openai-codex` both use the same short/long-window scavenging
   ramps but map to their provider's OMP usage records. It must match the
   provider selected by `models`.
+- `serve` controls who can reach the dashboard (Rust daemon only; the Python
+  rollback always serves loopback). Defaults keep it local:
+  - `serve.host` — address to bind, default `127.0.0.1`. `0.0.0.0` listens
+    on every IPv4 interface.
+  - `serve.allowedHosts` — names accepted in the HTTP `Host` header, beyond
+    the loopback names that are always accepted. List the names clients use,
+    e.g. `["hunter-box", "192.168.1.20"]`. `["*"]` accepts any name and turns
+    off the DNS-rebinding guard.
+
+  The API has **no authentication**: anything that can reach the port can
+  read findings and notes and use every write (delete repos, overrides).
+  Widening `serve.host` makes the dashboard reachable; widening
+  `serve.allowedHosts` decides which names it answers to. Only do either on a
+  network you trust.
 
 ## Development
 

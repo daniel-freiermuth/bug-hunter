@@ -38,6 +38,9 @@ struct RawConfig {
 #[serde(default)]
 struct RawServe {
     port: Option<u16>,
+    host: Option<String>,
+    #[serde(rename = "allowedHosts")]
+    allowed_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -87,6 +90,41 @@ struct RawScan {
     interval_days: Option<f64>,
 }
 
+/// Which `Host` header names the HTTP server answers to.
+///
+/// The check exists for DNS rebinding: a page the operator visits can point
+/// its own hostname at this machine and talk to the port same-origin, and
+/// the one thing that still gives it away is the attacker's name in `Host`.
+/// Loopback names are always accepted -- no attacker's hostname is
+/// `localhost` -- so a list only ever *adds* names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostAllowList {
+    /// Loopback names plus these (lowercased; `Host` names are
+    /// case-insensitive).
+    Names(Vec<String>),
+    /// `serve.allowedHosts: ["*"]` -- any `Host`. Rebinding protection is
+    /// off; only for a listener on a network the operator trusts entirely.
+    Any,
+}
+
+impl Default for HostAllowList {
+    fn default() -> Self {
+        Self::Names(Vec::new())
+    }
+}
+
+impl HostAllowList {
+    /// Whether a `Host` name (port already stripped) is accepted.
+    pub fn allows(&self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        matches!(name.as_str(), "localhost" | "127.0.0.1" | "::1")
+            || match self {
+                Self::Any => true,
+                Self::Names(names) => names.contains(&name),
+            }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     /// The hunter/ project root (Python side) this serve reads from.
@@ -94,6 +132,11 @@ pub struct Config {
     pub work_root: PathBuf,
     pub db_path: PathBuf,
     pub serve_port: u16,
+    /// Address the HTTP server binds (`serve.host`). Loopback unless the
+    /// operator opts in, e.g. `0.0.0.0` for every IPv4 interface.
+    pub serve_host: std::net::IpAddr,
+    /// `Host` names accepted beyond loopback (`serve.allowedHosts`).
+    pub allowed_hosts: HostAllowList,
     /// root/ui — index.html + compiled app.js.
     pub ui_dir: PathBuf,
     // -- backend inputs (BACKEND-CONTRACT.md §3; `types.Config`) ----------
@@ -275,11 +318,54 @@ impl Config {
             }
         };
 
+        let serve_host = match raw.serve.host.as_deref() {
+            None => std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+            Some(h) => h.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "{}: serve.host must be an IP address such as 127.0.0.1 or 0.0.0.0 (got {h:?})",
+                    cfg_path.display()
+                )
+            })?,
+        };
+        let allowed_hosts = match raw.serve.allowed_hosts {
+            None => HostAllowList::default(),
+            Some(names) if names.iter().any(|n| n == "*") => {
+                // "*" means all; next to other names it reads as a mistake,
+                // and guessing which one was meant is how a guard ends up
+                // wider than the operator intended.
+                anyhow::ensure!(
+                    names.len() == 1,
+                    "{}: serve.allowedHosts: \"*\" allows every host and cannot be combined with names",
+                    cfg_path.display()
+                );
+                HostAllowList::Any
+            }
+            Some(names) => {
+                anyhow::ensure!(
+                    names.iter().all(|n| {
+                        let n = n.trim();
+                        !n.is_empty()
+                            && (!n.contains(':') || n.parse::<std::net::Ipv6Addr>().is_ok())
+                    }),
+                    "{}: serve.allowedHosts entries must be host names or IP addresses, without a port (got {names:?})",
+                    cfg_path.display()
+                );
+                HostAllowList::Names(
+                    names
+                        .iter()
+                        .map(|n| n.trim().to_ascii_lowercase())
+                        .collect(),
+                )
+            }
+        };
+
         Ok(Self {
             root: root.to_owned(),
             work_root: resolve(raw.work_root.as_deref().unwrap_or("data")),
             db_path: resolve(raw.db_path.as_deref().unwrap_or("data/hunter.db")),
             serve_port: raw.serve.port.unwrap_or(8377),
+            serve_host,
+            allowed_hosts,
             ui_dir: root.join("ui"),
             omp_bin: raw.omp_bin.unwrap_or_else(|| "omp".to_owned()),
             stale_after_s,

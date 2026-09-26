@@ -33,9 +33,17 @@ fn free_port() -> u16 {
 /// One HTTP/1.1 request with `Connection: close`; `None` if nothing is
 /// listening yet. No client crate: this is the only test that needs one.
 async fn http(port: u16, method: &str, path: &str, body: &str) -> Option<(u16, Value)> {
-    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
-        .await
-        .ok()?;
+    http_at("127.0.0.1", port, method, path, body).await
+}
+
+async fn http_at(
+    ip: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Option<(u16, Value)> {
+    let mut stream = tokio::net::TcpStream::connect((ip, port)).await.ok()?;
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -133,4 +141,59 @@ async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
         .join()
         .expect("run_daemon thread panicked")
         .expect("run_daemon returned an error");
+}
+
+/// `serve.host` is what the daemon binds, not a hard-coded loopback.
+///
+/// Proven without touching a real interface: Linux routes all of
+/// 127.0.0.0/8 to loopback, so a daemon told to bind 127.0.0.2 must answer
+/// there and refuse 127.0.0.1 -- which a hard-coded bind would accept.
+#[tokio::test]
+async fn the_daemon_binds_the_configured_address() {
+    let bins = FakeBins::acquire("daemon-bind");
+    bins.script("omp", "exit 0");
+    let root = TempDir::new("daemon-bind-root");
+    let _home = bins.env("HOME", root.path());
+    let port = free_port();
+    std::fs::write(
+        root.join("config.json"),
+        format!(r#"{{"ompBin": "omp", "serve": {{"host": "127.0.0.2", "port": {port}}}}}"#),
+    )
+    .unwrap();
+    let cfg = Config::load(root.path()).expect("load scratch config");
+    let daemon = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("daemon runtime")
+            .block_on(hunter::daemon::run_daemon(cfg))
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some((200, _)) = http_at("127.0.0.2", port, "GET", "/api/summary", "").await {
+            break;
+        }
+        assert!(!daemon.is_finished(), "run_daemon returned before serving");
+        assert!(Instant::now() < deadline, "no answer on 127.0.0.2:{port}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_err(),
+        "127.0.0.1:{port} answered: the daemon ignored serve.host"
+    );
+
+    nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
+        .expect("send SIGTERM to this test process");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !daemon.is_finished() {
+        assert!(Instant::now() < deadline, "daemon did not stop on SIGTERM");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    daemon
+        .join()
+        .expect("run_daemon thread panicked")
+        .expect("run_daemon failed");
 }

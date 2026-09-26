@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use hunter::config::Config;
+use hunter::config::{Config, HostAllowList};
 
 mod support;
 use support::TempDir;
@@ -204,4 +204,67 @@ fn unknown_llm_provider_is_rejected() {
     let dir = TempDir::new("cfg-provider-invalid");
     let message = err(&dir, r#"{"backend": {"llmProvider": "github-copilot"}}"#);
     assert!(message.contains("backend.llmProvider"), "{message}");
+}
+
+// -- serve.host / serve.allowedHosts ------------------------------------------
+
+/// No config means today's behaviour exactly: loopback bind, loopback names.
+#[test]
+fn the_listener_is_loopback_only_by_default() {
+    let dir = TempDir::new("cfg-serve-default");
+    let cfg = load(&dir, "{}").unwrap();
+    assert_eq!(cfg.serve_host, std::net::IpAddr::from([127, 0, 0, 1]));
+    assert_eq!(cfg.allowed_hosts, HostAllowList::default());
+    assert!(cfg.allowed_hosts.allows("localhost"));
+    assert!(cfg.allowed_hosts.allows("127.0.0.1"));
+    assert!(cfg.allowed_hosts.allows("::1"));
+    assert!(!cfg.allowed_hosts.allows("hunter-box"));
+}
+
+/// Listing names adds them to loopback -- `localhost` keeps working -- and
+/// matching ignores case, as `Host` names do.
+#[test]
+fn allowed_hosts_add_names_to_loopback() {
+    let dir = TempDir::new("cfg-serve-names");
+    let cfg = load(
+        &dir,
+        r#"{"serve": {"host": "0.0.0.0", "allowedHosts": ["Hunter-Box", "192.168.1.20", "fe80::1"]}}"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.serve_host, std::net::IpAddr::from([0, 0, 0, 0]));
+    for ok in [
+        "hunter-box",
+        "HUNTER-BOX",
+        "192.168.1.20",
+        "fe80::1",
+        "localhost",
+    ] {
+        assert!(cfg.allowed_hosts.allows(ok), "{ok} should be accepted");
+    }
+    assert!(!cfg.allowed_hosts.allows("rebound.attacker.example"));
+}
+
+/// `"*"` switches the check off, and only on its own.
+#[test]
+fn a_lone_star_allows_every_host_and_nothing_else_does() {
+    let dir = TempDir::new("cfg-serve-any");
+    let cfg = load(&dir, r#"{"serve": {"allowedHosts": ["*"]}}"#).unwrap();
+    assert_eq!(cfg.allowed_hosts, HostAllowList::Any);
+    assert!(cfg.allowed_hosts.allows("rebound.attacker.example"));
+
+    let e = err(&dir, r#"{"serve": {"allowedHosts": ["*", "hunter-box"]}}"#);
+    assert!(e.contains("cannot be combined"), "{e}");
+}
+
+/// Misconfigurations are refused at load time, naming the field, instead
+/// of producing a guard that is wider or narrower than intended.
+#[test]
+fn bad_serve_settings_are_refused() {
+    let dir = TempDir::new("cfg-serve-bad");
+    let e = err(&dir, r#"{"serve": {"host": "hunter-box"}}"#);
+    assert!(e.contains("serve.host must be an IP address"), "{e}");
+    for bad in [r#"["hunter-box:8377"]"#, r#"[""]"#, r#"["  "]"#] {
+        let e = err(&dir, &format!(r#"{{"serve": {{"allowedHosts": {bad}}}}}"#));
+        assert!(e.contains("serve.allowedHosts entries"), "{bad}: {e}");
+    }
 }
