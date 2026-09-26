@@ -4,7 +4,8 @@
 //! queries, semver classification, and advisory lookup. Falls back
 //! to None when Renovate isn't installed or fails.
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -26,22 +27,92 @@ pub struct DepCandidate {
     pub detail: String,
 }
 
+/// The only variables Renovate's child sees, besides the sanitised `PATH`
+/// and the two logging switches: what a Node process needs to find its
+/// home, a temp dir and a proxy. Everything else -- `GH_TOKEN`, cloud
+/// credentials, whatever the daemon was started with -- stays behind.
+const FORWARDED_ENV: &[&str] = &[
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+];
+
+/// The operator's `renovate`, and the `PATH` to run it with.
+///
+/// Why not `npx renovate`, which is what this used to run: npx resolves a
+/// package from the *current directory's* `node_modules/.bin` first, and the
+/// current directory is the checkout being scanned. A repo that commits
+/// `node_modules/.bin/renovate` therefore had its own program executed by
+/// the daemon, with the daemon's environment. And when no Renovate was
+/// installed at all, npx fetched whatever the registry served as latest.
+///
+/// So: only absolute `PATH` entries are searched (a relative one like
+/// `node_modules/.bin` would resolve against the checkout), any entry or
+/// binary that lives inside the checkout is skipped, and nothing is ever
+/// downloaded -- no installed Renovate means `None`, and the caller falls
+/// back to the model. The same filtered `PATH` is handed to the child, so
+/// Renovate's own `#!/usr/bin/env node` cannot be pointed into the repo
+/// either.
+fn resolve_renovate(repo_path: &Path) -> Option<(PathBuf, OsString)> {
+    let repo = repo_path.canonicalize().ok()?;
+    let inside_repo = |p: &Path| p.canonicalize().is_ok_and(|real| real.starts_with(&repo));
+    let path = std::env::var_os("PATH")?;
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path)
+        .filter(|d| d.is_absolute() && !inside_repo(d))
+        .collect();
+    let binary = dirs
+        .iter()
+        .map(|d| d.join("renovate"))
+        .find(|candidate| is_executable_file(candidate) && !inside_repo(candidate))?;
+    let clean_path = std::env::join_paths(&dirs).ok()?;
+    Some((binary, clean_path))
+}
+
+#[cfg(unix)]
+fn is_executable_file(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(p: &Path) -> bool {
+    p.is_file()
+}
+
 /// Run Renovate in local dry-run mode and return update candidates.
 /// Returns None on failure (not installed, timeout, parse error) —
 /// the caller falls back to the AI-based analysis job.
 pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Vec<DepCandidate>> {
-    let mut cmd = Command::new("npx");
-    cmd.args(["renovate", "--platform=local", "--dry-run=lookup"])
+    let Some((renovate, clean_path)) = resolve_renovate(repo_path) else {
+        tracing::debug!("dep_scan: no installed renovate usable for {repo_name}");
+        return None;
+    };
+    let mut cmd = Command::new(&renovate);
+    cmd.args(["--platform=local", "--dry-run=lookup"])
         .current_dir(repo_path)
+        .env_clear()
+        .env("PATH", clean_path)
         .env("LOG_FORMAT", "json")
-        .env("LOG_LEVEL", "debug")
-        .stdin(Stdio::null())
+        .env("LOG_LEVEL", "debug");
+    for key in FORWARDED_ENV {
+        if let Some(value) = std::env::var_os(key) {
+            cmd.env(key, value);
+        }
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
     {
-        // npx execs node which execs renovate: the timeout below can only
-        // be enforced against the whole tree.
+        // renovate is a node script: the timeout below can only be
+        // enforced against the whole tree.
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
@@ -64,8 +135,8 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // `npx` execs node execs renovate: the direct child can
-                // exit while a descendant still holds the pipes, which
+                // renovate is a node script that spawns helpers: the direct
+                // child can exit while a descendant still holds the pipes, which
                 // would make this read unbounded (see util::run_cmd).
                 kill_tree(&mut child);
                 let output = join_pipes(so, se);

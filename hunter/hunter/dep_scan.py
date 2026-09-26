@@ -1,6 +1,6 @@
 """Static dependency scanner using Renovate's local platform.
 
-Runs `npx renovate --platform=local --dry-run=lookup` against a repo
+Runs an installed `renovate --platform=local --dry-run=lookup` against a repo
 clone and parses the JSON log output into structured update candidates
 compatible with the findings ingest format.
 
@@ -12,14 +12,64 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any
+import os
+from pathlib import Path
+from typing import Any
 
 from .util import run_cmd
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 log = logging.getLogger(__name__)
+
+
+# The only variables Renovate's child sees, besides the sanitised PATH and
+# the two logging switches. Mirrors hunter-rs dep_scan.rs FORWARDED_ENV.
+_FORWARDED_ENV = (
+    "HOME",
+    "TMPDIR",
+    "LANG",
+    "LC_ALL",
+    "http_proxy",
+    "https_proxy",
+    "no_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+)
+
+
+def _resolve_renovate(repo_path: Path) -> tuple[str, str] | None:
+    """The operator's renovate, and the PATH to run it with.
+
+    Not `npx renovate`: npx resolves from the current directory's
+    node_modules/.bin first, and the current directory is the checkout being
+    scanned, so a repo shipping node_modules/.bin/renovate had its own
+    program run as the daemon; with nothing installed, npx downloaded
+    whatever the registry served. Only absolute PATH entries outside the
+    checkout are searched, the same filtered PATH is given to the child (so
+    renovate's `#!/usr/bin/env node` cannot resolve into the repo either),
+    and nothing is ever downloaded. Mirrors hunter-rs dep_scan.rs.
+    """
+    try:
+        repo = repo_path.resolve(strict=True)
+    except OSError:
+        return None
+
+    def inside_repo(p: Path) -> bool:
+        try:
+            return p.resolve(strict=True).is_relative_to(repo)
+        except OSError:
+            return False
+
+    dirs = [
+        Path(d)
+        for d in os.environ.get("PATH", "").split(os.pathsep)
+        if d and Path(d).is_absolute() and not inside_repo(Path(d))
+    ]
+    for d in dirs:
+        candidate = d / "renovate"
+        if candidate.is_file() and os.access(candidate, os.X_OK) and not inside_repo(candidate):
+            return str(candidate), os.pathsep.join(str(x) for x in dirs)
+    return None
 
 
 def scan_repo(repo_path: Path, repo_name: str, timeout: int = 120) -> list[dict[str, Any]] | None:
@@ -31,11 +81,18 @@ def scan_repo(repo_path: Path, repo_name: str, timeout: int = 120) -> list[dict[
 
     Returns [] on failure (Renovate not installed, timeout, parse error).
     """
+    resolved = _resolve_renovate(repo_path)
+    if resolved is None:
+        log.info("dep_scan: no installed renovate usable for %s", repo_name)
+        return None
+    renovate, clean_path = resolved
+    env = {k: os.environ[k] for k in _FORWARDED_ENV if k in os.environ}
+    env |= {"PATH": clean_path, "LOG_FORMAT": "json", "LOG_LEVEL": "debug"}
     rc, output = run_cmd(
-        ["npx", "renovate", "--platform=local", "--dry-run=lookup"],
+        [renovate, "--platform=local", "--dry-run=lookup"],
         cwd=str(repo_path),
         timeout=timeout,
-        env_extra={"LOG_FORMAT": "json", "LOG_LEVEL": "debug"},
+        env=env,
     )
 
     if rc != 0 and not output:
