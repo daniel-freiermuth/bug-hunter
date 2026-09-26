@@ -6,6 +6,13 @@
 //! schema this comment used to describe: it rejects what would blank the
 //! dashboard, and lets everything else through.
 //!
+//! The UI's TypeScript types are generated from these structs by ts-rs
+//! (`#[derive(TS)]`; `#[ts(export)]` on each type the UI fetches, whose
+//! dependencies follow) into `hunter/ui-svelte/src/lib/generated/`.
+//! A serde attribute that changes presence needs its ts-rs twin: ts-rs
+//! ignores `skip_serializing_if` without `default`, so "key absent" also
+//! carries `#[ts(optional)]`.
+//!
 //! Conventions:
 //! - SQLite INTEGER -> i64, REAL -> f64, TEXT -> String; nullable -> Option.
 //! - `enabled` stays i64 (Python serves 0/1 ints, not booleans).
@@ -15,9 +22,10 @@
 
 use crate::domain::{BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState, Severity};
 use serde::Serialize;
+use ts_rs::TS;
 
 /// Budget gate result: allowed or denied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "lowercase")]
 pub enum BudgetState {
     Allowed,
@@ -56,7 +64,7 @@ pub struct Repo {
 /// keys -- `isKeyedList` checks `id` is a number and the components read
 /// `url`, `added_at` and `name` off every entry, so extra keys pass and a
 /// missing one of those four blanks the page (validate.ts:83-96).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 pub struct RepoBrief {
     pub id: i64,
     pub name: String,
@@ -90,7 +98,7 @@ impl From<&Repo> for RepoBrief {
 /// findings row, all 39 columns (38 from migrations/001 + `standard_section`
 /// from migrations/004). `missing_tests` is JSON-encoded TEXT served
 /// as a plain string — do NOT parse it.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 pub struct Finding {
     pub id: i64,
     #[serde(rename = "type")]
@@ -155,26 +163,29 @@ impl Finding {
 
 /// One row of GET /api/findings: the finding columns flattened, plus the
 /// computed/embedded keys.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
 pub struct FindingOut {
     #[serde(flatten)]
     pub finding: Finding,
     /// Absent only in legacy mode (`unified` != "1", server.rs:357); null
     /// when the source column is null.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub category: Option<Option<String>>,
     /// Always present, ascending event-id order, [] when empty.
     pub timeline: Vec<Event>,
     /// Present ONLY for status == "`pr_open`" rows that have a `pr_state` row;
     /// value is `pr_state.needs_attention` (string or null).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub needs_attention: Option<Option<String>>,
 }
 
 /// jobs row (17 columns) + `repo_name` from the JOIN. The two finding_*
 /// keys exist ONLY on /`api/summary.current_job` when the job has a
 /// finding — absent (not null) everywhere else.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 pub struct Job {
     pub id: i64,
     pub kind: JobKind,
@@ -195,8 +206,10 @@ pub struct Job {
     pub finished_at: Option<i64>,
     pub repo_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub finding_summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub finding_fingerprint: Option<String>,
 }
 
@@ -206,7 +219,8 @@ pub struct Job {
 /// on `jobs` — it is a reverse lookup over `findings.found_by_job`, and
 /// only the jobs list needs it. Keeping it out of `Job` leaves the three
 /// other job queries selecting exactly the columns they have.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
 pub struct JobListEntry {
     #[serde(flatten)]
     pub job: Job,
@@ -220,7 +234,8 @@ pub struct JobListEntry {
 }
 
 /// events row.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
 pub struct Event {
     pub id: i64,
     pub at: i64,
@@ -232,7 +247,7 @@ pub struct Event {
 
 /// `pr_state` row, all 18 columns the code creates (the live DB may carry
 /// residual columns — explicit column list excludes them).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 pub struct PrState {
     pub finding_id: i64,
     pub pr_number: Option<i64>,
@@ -255,7 +270,7 @@ pub struct PrState {
 }
 
 /// `scheduler_state` single row (id = 1).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 pub struct SchedulerState {
     pub id: i64,
     pub state: String,
@@ -269,7 +284,8 @@ pub struct SchedulerState {
 // ---------------------------------------------------------------------------
 
 /// GET /api/finding?id=N
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export)]
 pub struct FindingDetail {
     pub jobs: Vec<Job>,
     pub pr_state: Option<PrState>,
@@ -277,7 +293,7 @@ pub struct FindingDetail {
 
 /// /`api/summary.next_candidate` -- the job the scheduler would pick next,
 /// shown in the UI so a human can see what the budget gate is holding back.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 pub struct NextCandidate {
     pub kind: JobKind,
     pub id: i64,
@@ -301,7 +317,7 @@ pub struct NextCandidate {
 /// old arm stops firing and the new name falls through to that empty
 /// card. Only dropping a field an existing arm reads is louder: the
 /// validator rejects the whole summary.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ActivityStatus {
     Running { job: Box<Job> },
@@ -318,7 +334,8 @@ pub enum ActivityStatus {
 /// a component dereferences without `?.`. A violation there blanks the
 /// dashboard; anything else missing or renamed degrades silently, so this
 /// shape is held by the Rust tests, not by the client.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export)]
 pub struct Summary {
     pub backend_status_html: String,
     /// All `FindingStatus` keys, zero-filled.
@@ -340,7 +357,7 @@ pub struct Summary {
 // SUM over zero rows is null, COUNT is 0.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
 pub struct StatsTotals {
     pub jobs: i64,
     pub total_tokens: Option<i64>,
@@ -350,7 +367,7 @@ pub struct StatsTotals {
     pub denied: Option<i64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
 pub struct StatsByKind {
     pub kind: JobKind,
     pub jobs: i64,
@@ -366,7 +383,7 @@ pub struct StatsByKind {
     pub models: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
 pub struct StatsByFinding {
     pub finding_id: i64,
     pub fingerprint: String,
@@ -378,7 +395,8 @@ pub struct StatsByFinding {
     pub total_usage_delta: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export)]
 pub struct Stats {
     pub totals: StatsTotals,
     pub by_kind: Vec<StatsByKind>,

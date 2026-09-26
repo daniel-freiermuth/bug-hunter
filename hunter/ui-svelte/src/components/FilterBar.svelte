@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Finding } from "../lib/types";
+  import type { FindingOut } from "../lib/types";
   import { SEV_RANK } from "../lib/format";
   import { Filter, needsSelector } from "../lib/filter.svelte";
   import MultiSelect from "./MultiSelect.svelte";
@@ -11,11 +11,11 @@
     repoNames = new Map<number, string>(),
     onFilter,
   }: {
-    findings: Finding[];
+    findings: FindingOut[];
     prefix: string;
     showStatus?: boolean;
     repoNames?: Map<number, string>;
-    onFilter: (filtered: Finding[]) => void;
+    onFilter: (filtered: FindingOut[]) => void;
   } = $props();
 
   // -- Extract unique values from the findings list -------------------------

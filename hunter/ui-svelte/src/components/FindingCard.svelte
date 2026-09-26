@@ -1,10 +1,10 @@
 <script lang="ts">
   import { store, post } from "../lib/api.svelte";
-  import type { Finding } from "../lib/types";
+  import type { FindingOut } from "../lib/types";
   import { isHttpUrl, pct, datetime, typeLabel } from "../lib/format";
   import FindingDetail from "./FindingDetail.svelte";
 
-  let { finding, actions = false }: { finding: Finding; actions?: boolean } = $props();
+  let { finding, actions = false }: { finding: FindingOut; actions?: boolean } = $props();
 
   let expanded = $state(false);
   let reasonText = $state("");

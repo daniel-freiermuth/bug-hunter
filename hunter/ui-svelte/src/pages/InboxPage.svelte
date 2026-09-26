@@ -1,13 +1,13 @@
 <script lang="ts">
   import { store } from "../lib/api.svelte";
-  import type { Finding } from "../lib/types";
+  import type { FindingOut } from "../lib/types";
   import FilterBar from "../components/FilterBar.svelte";
   import FindingCard from "../components/FindingCard.svelte";
 
   // Inbox shows only status=new findings
   const inbox = $derived(store.findings.filter((f) => f.status === "new"));
 
-  let displayed = $state<Finding[]>([]);
+  let displayed = $state<FindingOut[]>([]);
   const repoNames = $derived(new Map((store.summary?.repos ?? []).map((r) => [r.id, r.name])));
 </script>
 
@@ -22,7 +22,7 @@
     prefix="f"
     showStatus={false}
     repoNames={repoNames}
-    onFilter={(f: Finding[]) => { displayed = f; }}
+    onFilter={(f: FindingOut[]) => { displayed = f; }}
   />
 
   {#if displayed.length === 0}

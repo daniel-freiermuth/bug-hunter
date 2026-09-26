@@ -10,7 +10,8 @@ TypeScript app that previously lived in `../ui/src/app.ts`.
 | `src/pages/` | One component per nav page: Status, Inbox, Kanban, All Findings, Repos, Stats, Log |
 | `src/components/` | Shared widgets: `FilterBar`, `FindingCard`, `FindingDetail`, `MultiSelect` |
 | `src/lib/api.svelte.ts` | Polling store and the `post()` helper (sets `Content-Type`, which the server's POST gate requires) |
-| `src/lib/types.ts` | Hand-maintained mirror of the server's JSON shapes — see `hunter-rs/API-CONTRACT.md` |
+| `src/lib/generated/` | API types generated from `hunter-rs/src/types.rs` by ts-rs — never edit; regenerate with `just bindings` in `hunter-rs/` |
+| `src/lib/types.ts` | Re-exports the generated types the components import |
 | `src/lib/format.ts` | Timestamp, duration and token formatting |
 
 State uses runes (`$state`, `$derived`, `$effect`). Reactive collections

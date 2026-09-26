@@ -75,7 +75,8 @@ pub struct AppState {
 }
 
 /// Response shape for GET /api/repo/notes.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct RepoNotesResponse {
     pub notes: String,
 }

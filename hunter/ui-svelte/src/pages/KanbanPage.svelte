@@ -1,19 +1,19 @@
 <script lang="ts">
   import { SvelteSet } from "svelte/reactivity";
   import { store, post } from "../lib/api.svelte";
-  import type { Finding } from "../lib/types";
+  import type { FindingOut } from "../lib/types";
   import FilterBar from "../components/FilterBar.svelte";
   import FindingCard from "../components/FindingCard.svelte";
 
   const repoNames = $derived(new Map((store.summary?.repos ?? []).map((r) => [r.id, r.name])));
 
   const COLUMNS = [
-    { key: "rechecking", label: "Rechecking", filter: (f: Finding) => f.status === "rechecking" },
-    { key: "queued", label: "Queued", filter: (f: Finding) => f.status === "queued" },
-    { key: "fixing", label: "Fixing", filter: (f: Finding) => f.status === "fixing" },
-    { key: "pr_review", label: "PR Review", filter: (f: Finding) => f.status === "pr_open" && !!f.needs_attention },
-    { key: "pr_open", label: "PR Open", filter: (f: Finding) => f.status === "pr_open" && !f.needs_attention },
-    { key: "merged", label: "Merged", filter: (f: Finding) => f.status === "merged" },
+    { key: "rechecking", label: "Rechecking", filter: (f: FindingOut) => f.status === "rechecking" },
+    { key: "queued", label: "Queued", filter: (f: FindingOut) => f.status === "queued" },
+    { key: "fixing", label: "Fixing", filter: (f: FindingOut) => f.status === "fixing" },
+    { key: "pr_review", label: "PR Review", filter: (f: FindingOut) => f.status === "pr_open" && !!f.needs_attention },
+    { key: "pr_open", label: "PR Open", filter: (f: FindingOut) => f.status === "pr_open" && !f.needs_attention },
+    { key: "merged", label: "Merged", filter: (f: FindingOut) => f.status === "merged" },
   ];
 
   // All findings in pipeline statuses
@@ -21,7 +21,7 @@
     store.findings.filter((f) => COLUMNS.some((c) => c.filter(f)))
   );
 
-  let filtered = $state<Finding[]>([]);
+  let filtered = $state<FindingOut[]>([]);
 
   // Group filtered findings by column
   const columns = $derived(
@@ -82,7 +82,7 @@
     prefix="k"
     showStatus={false}
     repoNames={repoNames}
-    onFilter={(f: Finding[]) => { filtered = f; }}
+    onFilter={(f: FindingOut[]) => { filtered = f; }}
   />
 
   <div class="board">

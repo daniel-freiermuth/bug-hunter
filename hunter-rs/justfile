@@ -72,3 +72,14 @@ run:
 build:
     cd ../hunter/ui-svelte && npx vite build
     cargo build --release
+
+# Regenerate the UI's API types (`hunter/ui-svelte/src/lib/generated/`).
+#
+# ts-rs writes them from every `#[ts(export)]` test, so any test run
+# refreshes the files that still exist. The rm is what this recipe adds:
+# ts-rs never deletes, so a renamed or removed type would otherwise leave
+# its old file behind for the UI to keep importing. CI runs the same two
+# commands and fails on any difference from what is committed.
+bindings:
+    rm -rf ../hunter/ui-svelte/src/lib/generated
+    cargo test --quiet --lib export_bindings

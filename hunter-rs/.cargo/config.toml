@@ -2,3 +2,9 @@
 # Regenerate it after any schema change:  just dev-db   (see justfile)
 [env]
 DATABASE_URL = { value = "sqlite:dev.db", relative = false }
+
+# ts-rs: `#[ts(export)]` types are written into the Svelte UI on every
+# test run (see `just bindings`). i64 is `number`, not `bigint`: serde_json
+# emits plain JSON numbers and every value here fits in 2^53.
+TS_RS_EXPORT_DIR = { value = "../hunter/ui-svelte/src/lib/generated", relative = true }
+TS_RS_LARGE_INT = "number"
