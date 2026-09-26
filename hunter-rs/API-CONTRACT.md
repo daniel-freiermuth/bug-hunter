@@ -10,7 +10,7 @@ Parity bar: the Svelte UI (`hunter/ui-svelte/src/`) must work unchanged. Nothing
 ## 1. Transport & global behavior
 
 - `ThreadingHTTPServer` subclass `_Server` (server.py:888-897): `allow_reuse_address = True`, `request_queue_size = 64`, `daemon_threads = True` (server.py:915).
-- Binds `("127.0.0.1", port or cfg.serve_port)` — **loopback only** (server.py:903-905). Port already in use (errno 98) -> process exits with an error message (server.py:906-914).
+- Binds `("127.0.0.1", port or cfg.serve_port)` — **loopback only** (server.py:903-905). Port already in use (errno 98) -> process exits with an error message (server.py:906-914). Rust binds `serve.host` instead (default `127.0.0.1`; `daemon::run_daemon`), and answers only `Host` names in `serve.allowedHosts` plus loopback — see API-CONTRACT-WRITES.md §0.1.
 - Handler class attrs (server.py:145-147): `server_version = "hunter/1"`, `protocol_version = "HTTP/1.1"` (keep-alive), `timeout = 15` (idle keep-alive connections closed after 15 s).
 - Every response goes through `_send` (server.py:162-168) which sets exactly these headers:
   - `Content-Type: <ctype>`
@@ -339,7 +339,9 @@ Paths are resolved relative to `PROJECT_ROOT` (the `hunter/` dir containing the 
 
 | config key | Config field | default | used by serve path for |
 |---|---|---|---|
-| `serve.port` | `serve_port` | `8377` (types.py:187,223) | listen port; bind host is hardcoded `127.0.0.1` (server.py:903) |
+| `serve.port` | `serve_port` | `8377` (types.py:187,223) | listen port; Python's bind host is hardcoded `127.0.0.1` (server.py:903) |
+| `serve.host` | — (Rust: `serve_host`) | `127.0.0.1` | Rust only: bind address, an IP (`0.0.0.0` = every IPv4 interface); anything else is a load error |
+| `serve.allowedHosts` | — (Rust: `allowed_hosts`) | `[]` | Rust only: `Host` names accepted beyond loopback (case-insensitive, no port); `["*"]` accepts any name and cannot be combined with names |
 | `workRoot` | `work_root` | `"data"` | `hunter.lock` lockfile (server.py:75), repo clones `repos/repo-<id>` (store.py:105-113), repo notes `notes/repo-<id>.md` (store.py:727) |
 | `dbPath` | `db_path` | `"data/hunter.db"` | SQLite database (store.py:165-166) |
 | — (constant) | `UI_DIR` | `PROJECT_ROOT / "ui"` (types.py:20) | static files + index.html |

@@ -26,7 +26,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tower_http::set_header::SetResponseHeaderLayer;
 
-use crate::config::Config;
+use crate::config::{Config, HostAllowList};
 use crate::domain::{FindingStatus, FindingType, ForgeName, Severity};
 use crate::store::{FindingFilter, RepoUpdate, Store, StoreWriteError};
 use crate::types::{
@@ -130,10 +130,11 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// Reject requests whose `Host` is not a loopback name.
+/// Reject requests whose `Host` is not an accepted name: loopback, plus
+/// whatever `serve.allowedHosts` adds ([`HostAllowList`]).
 ///
-/// The listener already binds 127.0.0.1, so this is not about reachability
-/// from the network — it is about DNS rebinding. A page the operator
+/// By default the listener binds 127.0.0.1, so this is not about
+/// reachability from the network — it is about DNS rebinding. A page the operator
 /// visits can point its own hostname at 127.0.0.1 and then talk to this
 /// port as same-origin, which defeats CORS; the one thing that still
 /// differs is the `Host` header, which carries the attacker's name.
@@ -146,12 +147,12 @@ impl IntoResponse for ApiError {
 /// status and message. An absent `Host` is allowed: only an HTTP/1.0 client
 /// can omit it, and a rebinding attack runs in a browser, which always
 /// sends one.
-fn require_localhost(headers: &HeaderMap) -> Result<(), ApiError> {
+fn require_allowed_host(headers: &HeaderMap, allowed: &HostAllowList) -> Result<(), ApiError> {
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if host.is_empty() || matches!(host_name(host), "localhost" | "127.0.0.1" | "::1") {
+    if host.is_empty() || allowed.allows(host_name(host)) {
         Ok(())
     } else {
         Err(ApiError::Forbidden)
@@ -183,9 +184,13 @@ fn host_name(host: &str) -> &str {
     }
 }
 
-/// [`require_localhost`] for every route, reads included.
-async fn host_guard(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
-    match require_localhost(req.headers()) {
+/// [`require_allowed_host`] for every route, reads included.
+async fn host_guard(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match require_allowed_host(req.headers(), &state.config.allowed_hosts) {
         Ok(()) => next.run(req).await,
         Err(e) => e.into_response(),
     }
@@ -224,7 +229,10 @@ pub fn router(state: AppState) -> Router {
         .fallback(static_files)
         // Host check ahead of every handler and the static files, so a
         // rebound hostname cannot read findings either (contract §0.1).
-        .layer(axum::middleware::from_fn(host_guard))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            host_guard,
+        ))
         // Cache-Control: no-store on EVERY response, static files included
         // (contract §1) — `overriding` so nothing downstream can win.
         .layer(SetResponseHeaderLayer::overriding(

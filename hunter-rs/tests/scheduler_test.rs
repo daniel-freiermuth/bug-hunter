@@ -49,6 +49,8 @@ fn test_config(cache_ttl_s: f64) -> Config {
         work_root: dir.join("data"),
         db_path: dir.join("hunter.db"),
         serve_port: 0,
+        serve_host: std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+        allowed_hosts: hunter::config::HostAllowList::default(),
         ui_dir: dir.join("ui"),
         omp_bin: "omp".to_owned(),
         stale_after_s: 300.0,
