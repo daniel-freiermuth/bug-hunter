@@ -300,6 +300,20 @@ for the schema — most columns carry comments explaining *why*, not just *what*
   default. Anthropic tracks per-model-class weekly limits
   (`anthropic:7d:<class>`), so splitting hunt and fix across model classes
   taps two separate budgets.
+- `serve` controls who can reach the dashboard (Rust daemon only; the Python
+  rollback always serves loopback). Defaults keep it local:
+  - `serve.host` — address to bind, default `127.0.0.1`. `0.0.0.0` listens
+    on every IPv4 interface.
+  - `serve.allowedHosts` — names accepted in the HTTP `Host` header, beyond
+    the loopback names that are always accepted. List the names clients use,
+    e.g. `["hunter-box", "192.168.1.20"]`. `["*"]` accepts any name and turns
+    off the DNS-rebinding guard.
+
+  The API has **no authentication**: anything that can reach the port can
+  read findings and notes and use every write (delete repos, overrides).
+  Widening `serve.host` makes the dashboard reachable; widening
+  `serve.allowedHosts` decides which names it answers to. Only do either on a
+  network you trust.
 
 ## Development
 
