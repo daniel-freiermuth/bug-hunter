@@ -375,17 +375,56 @@ pub async fn pick_next(
 // Resume policy
 // ---------------------------------------------------------------------------
 
-/// Floor on the progress half of a resumed attempt's reservation.
+/// Floor on the work half of any attempt's reservation.
 ///
-/// The reservation is `ctx_at_suspension + max(z - chain_spent, this)`.
-/// A suspension may already have cost more than the per-kind typical
-/// `z`, which makes `z - chain_spent` negative — and a negative budget
-/// for the work still to do is not a small budget, it is a meaningless
-/// one. Floored here at enough for the worker to do real work after
-/// re-caching, rather than exactly enough to re-cache and be killed
-/// again with nothing to show, which would turn every resume into
-/// another suspension.
+/// The work half is whatever an attempt is budgeted beyond the context
+/// it must load first, and it can come out tiny or negative: a chain
+/// that has already outspent the per-kind typical `z` leaves
+/// `z - chain_spent` below zero, and a negative budget for the work
+/// still to do is not a small budget, it is a meaningless one. Floored
+/// here at enough for the worker to do real work after loading, rather
+/// than exactly enough to load and be killed again with nothing to
+/// show, which would turn every resume into another suspension.
 const MIN_PROGRESS_TOKENS: i64 = 25_000;
+
+/// The system prompt and tool schemas a cold session loads before it
+/// reads a single job-specific byte.
+///
+/// The smallest first call measured is 17,257 tokens. Kept below that
+/// so it under-estimates: it feeds the floor arm of a `max()`, where
+/// guessing high would refuse work the window could have funded.
+const START_CONTEXT_FLOOR_TOKENS: i64 = 15_000;
+
+/// The fraction of an attempt's budget that must go to work rather than
+/// to loading context.
+///
+/// Every attempt pays to load its context before it can do anything —
+/// a cold one its system prompt and tools, a resumed one its whole
+/// transcript, re-sent at a measured median ratio of 1.00. That is
+/// overhead; only what is left is work. Under a flat 25,000-token work
+/// floor a resume with a 100,000-token transcript reserved 125,000, and
+/// when the window had just that much room the attempt it admitted
+/// spent 80% of its budget re-sending the transcript and 20% working.
+/// Holding every start to at least this fraction of work makes the same
+/// resume reserve 200,000, so it waits for a window that can fund an
+/// attempt that is at least half work.
+const MIN_START_EFFICIENCY: f64 = 0.5;
+
+/// The least work budget worth paying `ctx` tokens of loading for.
+///
+/// Solves `work / (ctx + work) >= MIN_START_EFFICIENCY` for `work`, and
+/// never below [`MIN_PROGRESS_TOKENS`]: a small context would otherwise
+/// be funded for a few thousand tokens of work, too little to finish
+/// anything.
+fn min_useful(ctx: i64) -> i64 {
+    // One expression rather than a named `eff / (1 - eff)` ratio: at 0.5
+    // that ratio is exactly 1, so multiplying `ctx` by it and dividing
+    // by it agree, and no reservation could show which one the code
+    // does. Spelled out, a wrong operator anywhere here moves the
+    // 100,000-token resume off 200,000.
+    let work = ctx as f64 * MIN_START_EFFICIENCY / (1.0 - MIN_START_EFFICIENCY);
+    MIN_PROGRESS_TOKENS.max(work.ceil() as i64)
+}
 
 /// Multiple of the per-kind typical cost at which a chain is abandoned.
 ///
@@ -421,11 +460,46 @@ const RESUME_PROMPT: &str = "Continue the work you were doing in this session. Y
 ///
 /// `ctx_at_suspension` is what the first call costs: a resumed session
 /// re-establishes its whole context, measured median ratio 1.00 across
-/// 112 production re-cache events. The second term is what is left of
-/// the per-kind typical estimate after everything the chain has already
-/// spent, floored at [`MIN_PROGRESS_TOKENS`].
+/// 112 production re-cache events. That is the overhead. The work half
+/// is what is left of the per-kind typical estimate after everything
+/// the chain has already spent, but never less than [`min_useful`] of
+/// that context — a 100,000-token transcript reserves at least 200,000,
+/// so the gate admits it only once at least half the attempt can be
+/// work rather than re-sending the transcript.
 fn resume_reservation(ctx_at_suspension: i64, z: i64, chain_spent: i64) -> i64 {
-    ctx_at_suspension + (z - chain_spent).max(MIN_PROGRESS_TOKENS)
+    ctx_at_suspension + (z - chain_spent).max(min_useful(ctx_at_suspension))
+}
+
+/// What to reserve for an attempt that starts cold.
+///
+/// The per-kind history, but never less than the cheapest cold start
+/// that clears [`MIN_START_EFFICIENCY`]: [`START_CONTEXT_FLOOR_TOKENS`]
+/// of fixed context plus [`min_useful`] of it, 40,000 with these
+/// constants. History knows nothing about that floor and has collapsed
+/// before: mis-metered rows once dragged the estimate to 1,876 tokens,
+/// and the gate then started hunts with about 10,000 tokens of headroom
+/// that died on their second call.
+fn cold_reservation(history: i64) -> i64 {
+    history.max(START_CONTEXT_FLOOR_TOKENS + min_useful(START_CONTEXT_FLOOR_TOKENS))
+}
+
+/// What the budget gate will reserve if `c` runs, for the
+/// `/api/summary` preview: a preview that reserved anything else would
+/// show a budget decision the scheduler is not going to make.
+///
+/// Unlike the gate, a failed history read is an error here rather than
+/// a zero — the preview reports it instead of guessing.
+pub async fn candidate_reservation(
+    store: &Store,
+    cfg: &Config,
+    c: &Candidate,
+) -> anyhow::Result<i64> {
+    Ok(match c {
+        Candidate::Resume { plan, .. } => plan.anticipated,
+        Candidate::Repo { .. } | Candidate::Finding { .. } => {
+            cold_reservation(anticipated_tokens(store, cfg, c.repo_id(), c.job_kind()).await?)
+        }
+    })
 }
 
 /// Where a job of this kind ran — and where a resumed attempt must run,
@@ -1026,11 +1100,22 @@ async fn budget_gate(
     // first call re-establishes a transcript that may be far larger than
     // a cold session's floor. Reserving `z` for it would under-reserve
     // by exactly the amount that makes resuming worth doing.
+    //
+    // Both reservations are floored so that loading context is at most
+    // half of what an admitted attempt pays for (`MIN_START_EFFICIENCY`).
+    // The floor only decides WHETHER the gate admits the job: the cap a
+    // granted job runs under is the window's headroom computed without
+    // this job's own reservation, so a larger reservation never shrinks
+    // it. What it does is refuse a window too tight to fund the attempt
+    // as mostly work, instead of starting one that spends its budget
+    // loading context.
     let anticipated = match resume {
         Some(plan) => plan.anticipated,
-        None => anticipated_tokens(store, cfg, repo_id, kind)
-            .await
-            .unwrap_or(0),
+        None => cold_reservation(
+            anticipated_tokens(store, cfg, repo_id, kind)
+                .await
+                .unwrap_or(0),
+        ),
     };
     let outlook = backend.decide(anticipated).await?;
     let verdict = if use_override {
@@ -4104,14 +4189,15 @@ async fn run_cycle_inner(
                     "resume",
                     &format!(
                         "resume {} {}: job {} -> reserving {} tok \
-                         (ctx {} + max({} - {}, {MIN_PROGRESS_TOKENS}))",
+                         (ctx {} + max({} - {}, {}))",
                         plan.kind,
                         plan.repo,
                         plan.predecessor_id,
                         plan.anticipated,
                         plan.ctx,
                         plan.typical,
-                        plan.chain_spent
+                        plan.chain_spent,
+                        min_useful(plan.ctx)
                     ),
                     Some(plan.predecessor_id),
                     plan.finding_id,
