@@ -140,9 +140,15 @@ what actually runs):
 A repeatedly-failing item (same failure reason, consecutive attempts) gives
 up after a bounded streak rather than looping forever — this applies
 uniformly to fix retries, recheck retries, and harvest retries. A resume
-chain has the same kind of ceiling: once its attempts have cost three
-times what that kind of job typically costs, the suspension is marked
-`failed` (reason `give-up`) instead of being continued again.
+chain has the same kind of ceiling, on either of two counts: once it has
+made four attempts, or once — after at least one resume — everything it
+spent *besides its single largest attempt* is past three times what that
+kind of job typically costs. Whichever fires, the suspension is marked
+`failed` (reason `give-up`) instead of being continued again. A chain
+that has never been resumed is never retired: one attempt's spend is by
+definition at least its own cap, and the largest attempt is discounted
+because one enormous attempt says the job is big, not that the chain is
+stuck.
 
 ### Budget policy
 
@@ -163,7 +169,10 @@ linear ramps, never letting spend get ahead of either:
   before the next decision, so concurrent/rapid cycles can't overshoot
   either ramp. It is an estimate from history, not the job's granted cap:
   a cold-cache first call arrives as one atomic, uninterruptible LLM call
-  that has been observed spending 2-4x what was reserved for it.
+  that has been observed spending 2-4x what was reserved for it. The
+  history is the 20 most recent *completed* jobs of that kind, not all of
+  it — a window ages out both rows written under accounting bugs that
+  have since been fixed and repos that have since changed size.
 - A granted job's token cap is the ramp's remaining headroom, verbatim —
   there is no separate configured per-kind cap. Workers are metered
   **externally**: the harness tails the worker's live session JSONL and

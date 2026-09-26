@@ -154,6 +154,36 @@ async fn seed_suspension(pool: &SqlitePool, id: i64, session: &Path, tokens: i64
     .unwrap();
 }
 
+/// A chain of linked attempts at one piece of work, oldest first, with
+/// `tokens[i]` as each attempt's own cost. Returns the newest id.
+///
+/// Only the newest is resumable: a predecessor that already has a
+/// successor row is being continued, and `list_resumable_jobs` filters
+/// it out. So this is exactly the shape `pick_resume` sees when it has
+/// to decide whether to continue a chain yet again.
+async fn seed_chain(pool: &SqlitePool, session: &Path, tokens: &[i64]) -> i64 {
+    let mut id = 9_i64;
+    let mut previous: Option<i64> = None;
+    for &t in tokens {
+        id += 1;
+        sqlx::query(
+            "INSERT INTO jobs \
+             (id, kind, repo_id, state, session_file, killed_reason, tokens_new, \
+              resumed_from, started_at, finished_at) \
+             VALUES (?1, 'hunt', 1, 'suspended', ?2, 'cap', ?3, ?4, 1000, 2000)",
+        )
+        .bind(id)
+        .bind(session.to_string_lossy().to_string())
+        .bind(t)
+        .bind(previous)
+        .execute(pool)
+        .await
+        .unwrap();
+        previous = Some(id);
+    }
+    id
+}
+
 async fn job_row(pool: &SqlitePool, id: i64) -> (String, Option<String>, Option<String>) {
     sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
         "SELECT state, killed_reason, notes FROM jobs WHERE id = ?1",
@@ -257,20 +287,23 @@ async fn resume_falls_back_to_the_per_kind_estimate_when_the_transcript_is_unrea
 
 // -- the give-up ceiling -----------------------------------------------------
 
-/// A chain that has cost three times its kind's typical is abandoned,
-/// not resumed again.
+/// A chain that has been tried too many times is abandoned, however
+/// cheap each attempt was.
 ///
-/// Work that expensive and still unfinished is not going to finish, and
-/// without a ceiling the chain resumes forever with every link looking
-/// individually reasonable. Falling through to normal selection is the
-/// other half: the cycle still does something useful.
+/// This is the arm that actually fires in practice. A suspension that
+/// resumes, does a little, and suspends again never trips a spend
+/// threshold, so without a count the chain runs forever with every link
+/// looking individually reasonable. Falling through to normal selection
+/// is the other half: the cycle still does something useful.
 #[tokio::test]
-async fn the_give_up_ceiling_retires_the_chain_and_falls_through() {
+async fn a_chain_out_of_attempts_is_retired_and_the_cycle_falls_through() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
     let session = seed_session(&dir);
-    seed_suspension(&pool, 10, &session, 3 * Z + 1).await;
+    // Four cheap attempts: 40_000 all told, nowhere near 3x the 100_000
+    // typical, so only the attempt count can end this.
+    let newest = seed_chain(&pool, &session, &[10_000; 4]).await;
     let store = rw_store(&path).await;
     let cfg = test_config(dir.path());
 
@@ -286,12 +319,13 @@ async fn the_give_up_ceiling_retires_the_chain_and_falls_through() {
         ),
         "must fall through to normal selection, got {picked:?}"
     );
-    let (state, reason, notes) = job_row(&pool, 10).await;
+    let (state, reason, notes) = job_row(&pool, newest).await;
     assert_eq!(state, JobState::Failed.as_str());
     assert_eq!(reason.as_deref(), Some("give-up"));
+    let notes = notes.unwrap();
     assert!(
-        notes.unwrap().contains("giving up after 300001 tok"),
-        "the record must name what the chain cost"
+        notes.contains("40000 tok") && notes.contains("4 attempts"),
+        "the record must name what the chain cost and how often it was tried, got {notes:?}"
     );
     assert!(
         store.list_resumable_jobs().await.unwrap().is_empty(),
@@ -299,21 +333,102 @@ async fn the_give_up_ceiling_retires_the_chain_and_falls_through() {
     );
 }
 
-/// Exactly at the ceiling is still resumable — "three times the typical
-/// and still not done" is the condition, and a chain that has spent
-/// precisely 3x has not passed it.
+/// A chain whose attempts OTHER than its biggest have outspent the
+/// per-kind typical three times over is abandoned.
+///
+/// The second arm, and the one that catches a chain burning real money
+/// before it has been tried four times.
+#[tokio::test]
+async fn a_chain_that_outspends_the_typical_outside_its_biggest_attempt_is_retired() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    let session = seed_session(&dir);
+    // Two attempts, so the count arm cannot fire: 800_000 spent, of
+    // which 400_000 is outside the larger attempt, against 3x 100_000.
+    let newest = seed_chain(&pool, &session, &[400_000, 400_000]).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+
+    let picked = pick_next(&store, &cfg, None).await.unwrap();
+
+    assert!(
+        matches!(picked, Some(Candidate::Repo { .. })),
+        "must fall through to normal selection, got {picked:?}"
+    );
+    let (state, reason, _) = job_row(&pool, newest).await;
+    assert_eq!(state, JobState::Failed.as_str());
+    assert_eq!(reason.as_deref(), Some("give-up"));
+}
+
+/// A chain of ONE attempt is never retired, however expensive it was.
+///
+/// A first suspension is a single attempt whose spend is, by definition
+/// of a cap kill, at least its own cap — so comparing it against a
+/// multiple of the per-kind typical retires the work before resume has
+/// been tried even once, which is the exact opposite of what this
+/// feature is for. Live symptom: every hunt on one repo recorded
+/// `failed`/`give-up` with 88,697 spent against an 80,493 cap, and no
+/// job was ever resumed at all.
+#[tokio::test]
+async fn a_chain_of_one_attempt_is_never_retired() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    let session = seed_session(&dir);
+    // Fifty times the typical, on a single attempt that has never been
+    // continued. There is nothing here to conclude that continuing does
+    // not work, because continuing has not been tried.
+    seed_suspension(&pool, 10, &session, 50 * Z).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+
+    let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
+
+    assert_eq!(plan.predecessor_id, 10);
+    let (state, _, _) = job_row(&pool, 10).await;
+    assert_eq!(state, JobState::Suspended.as_str());
+}
+
+/// One enormous attempt is evidence about the size of the JOB, not
+/// about the chain being stuck, so the chain is judged on what it spent
+/// besides that attempt.
+///
+/// Without setting it aside, the per-kind typical is the wrong
+/// yardstick for this job and a big-but-healthy piece of work is retired
+/// on its first resume — the whole chain here is over 3x the typical,
+/// and all but 10,000 of it is one attempt.
+#[tokio::test]
+async fn the_biggest_attempt_is_set_aside_before_the_chain_is_judged() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    let session = seed_session(&dir);
+    let newest = seed_chain(&pool, &session, &[500_000, 10_000]).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+
+    let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
+
+    assert_eq!(plan.predecessor_id, newest);
+    assert_eq!(plan.chain_spent, 510_000, "5x the typical, and still fine");
+}
+
+/// Exactly at the ceiling is still resumable: "more than three times the
+/// typical" is the condition, and a chain that has spent precisely 3x
+/// outside its biggest attempt has not passed it.
 #[tokio::test]
 async fn the_give_up_ceiling_is_exclusive() {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
     let session = seed_session(&dir);
-    seed_suspension(&pool, 10, &session, 3 * Z).await;
+    let newest = seed_chain(&pool, &session, &[400_000, 3 * Z]).await;
     let store = rw_store(&path).await;
     let cfg = test_config(dir.path());
 
     let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
-    assert_eq!(plan.predecessor_id, 10);
+    assert_eq!(plan.predecessor_id, newest);
 }
 
 // -- selection order ---------------------------------------------------------

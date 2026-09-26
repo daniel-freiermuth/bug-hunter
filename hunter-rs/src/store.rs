@@ -41,13 +41,30 @@ pub enum StoreWriteError {
     Db(#[from] sqlx::Error),
 }
 
-/// How far [`Store::resume_chain_tokens`] will walk a resume chain.
+/// How far [`Store::resume_chain_stats`] will walk a resume chain.
 ///
 /// Purely a termination guarantee for a graph that should not need one:
 /// far beyond any chain a give-up ceiling would let form, so it never
 /// truncates a real answer, and small enough that a cyclic row from a
 /// hand-repaired database costs a bounded query instead of a hung one.
 const RESUME_CHAIN_MAX_DEPTH: i64 = 64;
+
+/// What a resume chain has cost, across every attempt in it.
+///
+/// The three numbers are read in one walk because they answer one
+/// question — has this work run out of road? — and a ceiling that read
+/// them separately could see three different chains if a successor row
+/// landed between the queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeChainStats {
+    /// Every token the chain has spent.
+    pub total: i64,
+    /// How many attempts the chain contains, this one included.
+    pub attempts: i64,
+    /// The costliest single attempt in it. 0 when nothing in the chain
+    /// has a metered cost yet.
+    pub max_single: i64,
+}
 
 /// Allowed /api/repo update fields, post-coercion (WRITES contract §6).
 #[derive(Debug, Default)]
@@ -1166,17 +1183,22 @@ impl Store {
         .await
     }
 
-    /// Every token the chain containing `job_id` has spent, across all
-    /// its attempts.
+    /// What the chain containing `job_id` has cost, how many attempts
+    /// it took, and what its most expensive attempt cost.
     ///
     /// A resumed attempt is its own row, so `tokens_new` alone answers
-    /// "what did this attempt cost" and never "what has this work cost".
-    /// The second question is the one a give-up ceiling has to ask, so it
-    /// is answered by walking the link.
+    /// "what did this attempt cost" and never "what has this work
+    /// cost". The second question is the one a give-up ceiling has to
+    /// ask, so it is answered by walking the link.
+    ///
+    /// `attempts` and `max_single` ride along because the ceiling
+    /// cannot be applied without them: a chain of one has not been
+    /// continued even once, and one enormous attempt is evidence about
+    /// the job's size rather than about the chain being stuck.
     ///
     /// Walks BOTH ways — to predecessors via `resumed_from` and to
-    /// successors via the rows that name this one — because `job_id` can
-    /// be any link, not just the newest.
+    /// successors via the rows that name this one — because `job_id`
+    /// can be any link, not just the newest.
     ///
     /// The depth cap is the termination guarantee. `UNION` de-duplicates
     /// against rows already produced, but cannot stop a cycle once
@@ -1190,12 +1212,13 @@ impl Store {
     /// chain length worth resuming, so the cap costs a healthy chain
     /// nothing.
     ///
-    /// Carrying `depth` is what forces the final sum to go through `id
+    /// Carrying `depth` is what forces the aggregate to go through `id
     /// IN (SELECT ...)` rather than a join: a node reachable by several
     /// paths appears once per depth, and joining on it would count that
     /// job's tokens once per appearance.
-    pub async fn resume_chain_tokens(&self, job_id: i64) -> sqlx::Result<i64> {
-        sqlx::query_scalar!(
+    pub async fn resume_chain_stats(&self, job_id: i64) -> sqlx::Result<ResumeChainStats> {
+        sqlx::query_as!(
+            ResumeChainStats,
             r#"
             WITH RECURSIVE chain(id, resumed_from, depth) AS (
                 SELECT id, resumed_from, 0 FROM jobs WHERE id = ?1
@@ -1205,7 +1228,9 @@ impl Store {
                 WHERE c.depth < ?2
                   AND (j.id = c.resumed_from OR j.resumed_from = c.id)
             )
-            SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64"
+            SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64",
+                   COUNT(*) AS "attempts!: i64",
+                   COALESCE(MAX(tokens_new), 0) AS "max_single!: i64"
             FROM jobs WHERE id IN (SELECT id FROM chain)
             "#,
             job_id,
@@ -1235,7 +1260,7 @@ impl Store {
     /// written once at INSERT naming a row that already exists, so ids
     /// strictly decrease along the link and the ancestor walk's smallest
     /// id is its root. Depth-capped for the same reason
-    /// [`Self::resume_chain_tokens`] is — a hand-repaired database can
+    /// [`Self::resume_chain_stats`] is — a hand-repaired database can
     /// carry a cycle the write path cannot produce. Falls back to
     /// `job_id` when the row is gone (retention prunes oldest-first, and
     /// `ON DELETE SET NULL` means a pruned root leaves the successor
@@ -1522,7 +1547,8 @@ impl Store {
     }
 
     /// Targeted query for `anticipated_tokens`: this kind's `tokens_new`
-    /// values, sorted ascending, from jobs that actually COMPLETED.
+    /// values, sorted ascending, from the most recent jobs that actually
+    /// COMPLETED.
     ///
     /// A killed job's `tokens_new` is not a measurement of what the work
     /// costs — it is whatever bound killed it, so killed rows cluster at the
@@ -1530,6 +1556,21 @@ impl Store {
     /// failures. Live data: 64 of 259 hunt jobs were killed, and counting
     /// them put the cold p90 at 204,173, within 2% of the 200,000 cap that
     /// did the killing, against 73,724 for the 189 that finished.
+    ///
+    /// `RECENT_COMPLETED_WINDOW` is the other half, and it bounds how far
+    /// back the estimate can be dragged. An estimator that reads all
+    /// history forever is hostage to every accounting bug the ledger has
+    /// ever had, and to repos that have since changed size: 130 of the 189
+    /// completed hunts here are recorded under 3,000 tokens, all of them
+    /// from before the metering repair, when a worker's first call alone
+    /// writes a ~37,000-token prompt cache. Those rows cannot be corrected
+    /// and will never leave the table, so the p50 they produced was 1,876
+    /// against 43,901 over the recent window. A window ages a bad era out
+    /// on its own, which no filter written against one known defect does.
+    ///
+    /// Most recent by `id` DESC, then sorted ascending, because the two
+    /// orderings answer different questions: the first picks WHICH jobs
+    /// count, the second is what makes a percentile index meaningful.
     ///
     /// Below `MIN_COMPLETED_SAMPLES` the unfiltered history comes back
     /// instead, because the alternative is worse than a biased estimate:
@@ -1539,11 +1580,16 @@ impl Store {
     /// anything other than an endpoint.
     pub async fn kind_token_history(&self, kind: &str) -> sqlx::Result<Vec<i64>> {
         const MIN_COMPLETED_SAMPLES: usize = 3;
+        const RECENT_COMPLETED_WINDOW: i64 = 20;
         let done = sqlx::query_scalar!(
-            r#"SELECT tokens_new AS "tokens_new!: i64" FROM jobs
-               WHERE kind = ?1 AND state = 'done' AND tokens_new IS NOT NULL
+            r#"SELECT tokens_new AS "tokens_new!: i64" FROM (
+                   SELECT id, tokens_new FROM jobs
+                   WHERE kind = ?1 AND state = 'done' AND tokens_new IS NOT NULL
+                   ORDER BY id DESC LIMIT ?2
+               )
                ORDER BY tokens_new ASC"#,
-            kind
+            kind,
+            RECENT_COMPLETED_WINDOW
         )
         .fetch_all(&self.pool)
         .await?;

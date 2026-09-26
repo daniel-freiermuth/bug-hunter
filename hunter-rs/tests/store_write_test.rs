@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use hunter::backend::SpendLedger;
 use hunter::domain::{ForgeName, JobState, RepoJobKind};
-use hunter::store::{RepoUpdate, Store, StoreWriteError};
+use hunter::store::{RepoUpdate, ResumeChainStats, Store, StoreWriteError};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
 use support::TempDir;
@@ -1046,11 +1046,17 @@ async fn resumable_jobs_skip_a_suspension_that_already_has_a_successor() {
     );
 }
 
-/// Three attempts at one piece of work cost what all three cost, and the
-/// answer is the same whichever link you ask from — the scheduler holds
+/// Three attempts at one piece of work cost what all three cost, are
+/// counted as three, and report the biggest of the three — and the
+/// answer is the same whichever link you ask from: the scheduler holds
 /// the newest, a UI would hold whichever row it rendered.
+///
+/// All three numbers matter to the caller. The give-up ceiling retires
+/// on attempt COUNT as well as on spend, and it sets the largest single
+/// attempt aside before judging the rest, so a stats struct that got any
+/// one of them wrong would retire the wrong chains silently.
 #[tokio::test]
-async fn resume_chain_tokens_sums_every_attempt_from_any_link() {
+async fn resume_chain_stats_measure_every_attempt_from_any_link() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
@@ -1077,8 +1083,12 @@ async fn resume_chain_tokens_sums_every_attempt_from_any_link() {
 
     for link in &chain {
         assert_eq!(
-            store.resume_chain_tokens(*link).await.unwrap(),
-            240_000,
+            store.resume_chain_stats(*link).await.unwrap(),
+            ResumeChainStats {
+                total: 240_000,
+                attempts: 3,
+                max_single: 120_000,
+            },
             "asked from job {link}"
         );
     }
@@ -1097,7 +1107,14 @@ async fn resume_chain_tokens_sums_every_attempt_from_any_link() {
         .await
         .unwrap();
     set_tokens(&pool, loner, 7_000).await;
-    assert_eq!(store.resume_chain_tokens(loner).await.unwrap(), 7_000);
+    assert_eq!(
+        store.resume_chain_stats(loner).await.unwrap(),
+        ResumeChainStats {
+            total: 7_000,
+            attempts: 1,
+            max_single: 7_000,
+        }
+    );
 }
 
 /// A cyclic link makes the walk terminate anyway.
@@ -1116,7 +1133,7 @@ async fn resume_chain_tokens_sums_every_attempt_from_any_link() {
 /// report, instead of one nextest kills at its own timeout two minutes
 /// later.
 #[tokio::test]
-async fn resume_chain_tokens_terminates_on_a_cyclic_link() {
+async fn resume_chain_stats_terminate_on_a_cyclic_link() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
@@ -1147,13 +1164,21 @@ async fn resume_chain_tokens_terminates_on_a_cyclic_link() {
         .await
         .unwrap();
 
-    let total = tokio::time::timeout(
+    let stats = tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        store.resume_chain_tokens(chain[0]),
+        store.resume_chain_stats(chain[0]),
     )
     .await
     .expect("the walk must terminate on a cycle, not run until the harness kills it")
     .unwrap();
 
-    assert_eq!(total, 240_000, "every attempt counted exactly once");
+    assert_eq!(
+        stats,
+        ResumeChainStats {
+            total: 240_000,
+            attempts: 3,
+            max_single: 120_000,
+        },
+        "every attempt counted exactly once"
+    );
 }

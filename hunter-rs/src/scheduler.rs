@@ -375,11 +375,24 @@ const MIN_PROGRESS_TOKENS: i64 = 25_000;
 
 /// Multiple of the per-kind typical cost at which a chain is abandoned.
 ///
-/// Work that has cost three times what its kind typically costs and is
-/// still not finished is not going to finish. Without a ceiling the
-/// chain resumes forever, each link cheap enough to look reasonable —
-/// the exact loop this feature exists to end, only slower.
+/// Applied to what the chain spent OUTSIDE its single biggest attempt:
+/// work that has burned three typical runs' worth on top of its one
+/// most expensive try, and is still not finished, is not finishing.
+/// Without a ceiling the chain resumes forever, each link cheap enough
+/// to look reasonable — the exact loop this feature exists to end, only
+/// slower.
 const GIVE_UP_MULTIPLE: i64 = 3;
+
+/// How many attempts one piece of work gets before the chain is
+/// abandoned regardless of what it has cost.
+///
+/// The token arm below cannot bound a chain whose every attempt is
+/// cheap: a suspension that resumes, does a little, and suspends again
+/// runs forever without ever tripping a spend threshold. This arm is
+/// also the one a reader can reason about, because it is expressed in
+/// the unit the question is actually asked in — how many times have we
+/// tried this.
+const MAX_RESUME_ATTEMPTS: i64 = 4;
 
 /// The whole prompt a resumed attempt gets.
 ///
@@ -458,11 +471,42 @@ async fn pick_resume(
         let z = anticipated_tokens(store, cfg, job.repo_id, job.kind)
             .await
             .unwrap_or(0);
-        let chain_spent = store.resume_chain_tokens(job.id).await?;
-        if chain_spent > GIVE_UP_MULTIPLE * z {
+        let chain = store.resume_chain_stats(job.id).await?;
+        let chain_spent = chain.total;
+        // Two independent ways a chain runs out of road, and neither
+        // implies the other: too many tries, or too much spent on the
+        // tries other than the biggest one.
+        //
+        // The biggest attempt is set aside because one enormous attempt
+        // is evidence about the SIZE OF THE JOB, not about the chain
+        // being stuck — judging by it would retire big-but-healthy work
+        // on its first resume. What the chain spent BESIDES that
+        // attempt is the part that says continuing is not getting
+        // anywhere.
+        //
+        // Subtracting rather than multiplying it is forced, not
+        // stylistic: `chain_spent <= attempts * largest`, so any
+        // threshold of the form `k * largest` is unreachable below
+        // `attempts = k + 1` and would be decoration at k = 3.
+        //
+        // Both arms leave a chain of one alone. A first suspension is a
+        // single attempt whose spend is, by definition of a cap kill, at
+        // least its own cap; retiring on that would end the work before
+        // resume had been tried even once, which is the opposite of what
+        // this feature is for.
+        let excess = chain_spent - chain.max_single;
+        let too_many = chain.attempts >= MAX_RESUME_ATTEMPTS;
+        let too_costly = chain.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
+        if too_many || too_costly {
+            let why = if too_many {
+                format!("{} attempts, the limit", chain.attempts)
+            } else {
+                format!(
+                    "{excess} tok outside its largest attempt > {GIVE_UP_MULTIPLE}x {z} typical"
+                )
+            };
             let msg = format!(
-                "resume {} {}: giving up after {chain_spent} tok across the chain \
-                 (> {GIVE_UP_MULTIPLE}x {z} typical)",
+                "resume {} {}: giving up after {chain_spent} tok across the chain ({why})",
                 job.kind, repo.name
             );
             // Best-effort: the summary preview runs this same function

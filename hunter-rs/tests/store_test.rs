@@ -397,3 +397,37 @@ async fn kind_token_history_filters_at_exactly_three_completed() {
     let history = store.kind_token_history("hunt").await.unwrap();
     assert_eq!(history, vec![1_000, 2_000, 3_000]);
 }
+
+/// The estimate is built from the most recent completed jobs only, so a
+/// mis-metered era cannot hold it down forever.
+///
+/// The five cheap rows here are what the live table actually holds: 130
+/// of 189 completed hunts recorded under 3,000 tokens, from before the
+/// metering repair, when a single worker call writes a ~37,000-token
+/// prompt cache. Those rows are wrong, cannot be recomputed, and will
+/// never leave the table — an estimator that reads all history is
+/// hostage to them, and to every repo that has since changed size. They
+/// dragged the hunt p50 to 1,876 against 43,901 over the recent window,
+/// and an estimate that small makes the cap kill every hunt it funds.
+///
+/// Asserted as the whole window rather than a percentile: what the
+/// percentile picks is `anticipated_tokens`' business, and the property
+/// this query owns is which rows it is allowed to pick from.
+#[tokio::test]
+async fn kind_token_history_reads_only_the_most_recent_completed_jobs() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_bare_repo(&pool).await;
+    // Oldest first: ids ascend with insertion, so these five are the
+    // ones the window must drop.
+    seed_hunt_jobs(&pool, "done", &[1, 2, 3, 4, 5]).await;
+    let recent: Vec<i64> = (0..20).map(|i| 50_000 + i * 1_000).collect();
+    seed_hunt_jobs(&pool, "done", &recent).await;
+    let store = open_store(pool, &path).await;
+
+    let history = store.kind_token_history("hunt").await.unwrap();
+
+    assert_eq!(
+        history, recent,
+        "exactly the 20 newest completed hunts, ascending for the percentile index"
+    );
+}
