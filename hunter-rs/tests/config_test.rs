@@ -177,3 +177,42 @@ fn ordinary_cadences_load() {
     assert_eq!(cfg.modernization_interval_days, 30);
     assert_eq!(cfg.standards_interval_days, 14);
 }
+
+#[test]
+fn llm_provider_defaults_to_anthropic_and_accepts_codex() {
+    let default_dir = TempDir::new("cfg-provider-default");
+    let default = Config::load(default_dir.path()).expect("default configuration");
+    assert_eq!(
+        default.llm_provider,
+        hunter::backends::omp_scavenge::LlmProvider::Anthropic
+    );
+
+    let explicit_dir = TempDir::new("cfg-provider-anthropic");
+    let explicit = load(
+        &explicit_dir,
+        r#"{"backend": {"llmProvider": "anthropic"}}"#,
+    )
+    .expect("explicit Anthropic provider configuration");
+    assert_eq!(
+        explicit.llm_provider,
+        hunter::backends::omp_scavenge::LlmProvider::Anthropic
+    );
+
+    let codex_dir = TempDir::new("cfg-provider-codex");
+    let codex = load(
+        &codex_dir,
+        r#"{"backend": {"llmProvider": "openai-codex"}}"#,
+    )
+    .expect("Codex provider configuration");
+    assert_eq!(
+        codex.llm_provider,
+        hunter::backends::omp_scavenge::LlmProvider::OpenAiCodex
+    );
+}
+
+#[test]
+fn unknown_llm_provider_is_rejected() {
+    let dir = TempDir::new("cfg-provider-invalid");
+    let message = err(&dir, r#"{"backend": {"llmProvider": "github-copilot"}}"#);
+    assert!(message.contains("backend.llmProvider"), "{message}");
+}

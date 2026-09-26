@@ -24,7 +24,7 @@
 use std::collections::BTreeMap;
 
 use hunter::backends::omp_scavenge::capacity::WindowState;
-use hunter::backends::omp_scavenge::{StatusInputs, render_status};
+use hunter::backends::omp_scavenge::{LlmProvider, StatusInputs, render_status};
 
 /// Fixed instant so `resets_at` offsets below read as durations.
 const NOW: i64 = 1_800_000_000_000;
@@ -48,6 +48,7 @@ fn window(
 }
 
 struct Case {
+    provider: LlmProvider,
     windows: Vec<WindowState>,
     unaccounted_5h: f64,
     unaccounted_7d: f64,
@@ -57,6 +58,7 @@ struct Case {
 impl Case {
     fn new(windows: Vec<WindowState>) -> Self {
         Self {
+            provider: LlmProvider::Anthropic,
             windows,
             unaccounted_5h: 0.0,
             unaccounted_7d: 0.0,
@@ -73,6 +75,7 @@ impl Case {
         }
         render_status(&StatusInputs {
             now_ms: NOW,
+            provider: self.provider,
             windows: map,
             unaccounted_5h: self.unaccounted_5h,
             unaccounted_7d: self.unaccounted_7d,
@@ -98,6 +101,31 @@ fn fresh_both_windows() {
         ])
         .render()
     );
+}
+
+/// Codex's windows take the same two bars under the same labels: the
+/// primary window is the 5h dimension, the secondary the 7d one with its
+/// weekly ramp marker, whatever omp calls them.
+#[test]
+fn codex_primary_and_secondary_windows() {
+    let mut case = Case::new(vec![
+        window(
+            "openai-codex:primary",
+            Some(0.32),
+            "ok",
+            Some(2 * HOUR),
+            45.0,
+        ),
+        window(
+            "openai-codex:secondary",
+            Some(0.43),
+            "warning",
+            Some(64 * HOUR),
+            90.0,
+        ),
+    ]);
+    case.provider = LlmProvider::OpenAiCodex;
+    insta::assert_snapshot!(case.render());
 }
 
 /// In-flight spend the probe cannot see yet: adds the `+N% in flight`

@@ -3,7 +3,10 @@
 //! `read_windows` takes the agent.db path explicitly (tests point it at a
 //! fixture).
 
+use super::provider::LlmProvider;
+use sqlx::Row;
 use std::collections::BTreeMap;
+
 use std::path::Path;
 
 /// THE tunable: human headroom at 5h-window start (`capacity.HEADROOM_MS`).
@@ -34,11 +37,11 @@ pub fn default_agent_db() -> std::path::PathBuf {
     home.join(".omp/agent/agent.db")
 }
 
-/// Read newest `usage_history` row per anthropic:% `limit_id`; roll expired
-/// account-wide cycles forward (used=0, status=ok, `recorded_at=cycle`
-/// start), DROP expired per-model-class rows. Missing file or ANY sqlite
-/// error -> empty map. `BTreeMap`: deny-reason precedence needs ascending
-/// `limit_id` order.
+/// Read the newest `usage_history` row per `limit_id` of the provider; roll
+/// expired short/long cycles forward (used=0, status=ok, `recorded_at=cycle`
+/// start), DROP any other expired row (Anthropic's per-model-class limits).
+/// Missing file or ANY sqlite error -> empty map. `BTreeMap`: deny-reason
+/// precedence needs ascending `limit_id` order.
 ///
 /// An empty map is indistinguishable from "no window data" downstream:
 /// `decide` denies until fresh and `keep_fresh` probes forever. A genuine
@@ -46,6 +49,14 @@ pub fn default_agent_db() -> std::path::PathBuf {
 /// logged here. A missing file or a row-less table is not a failure and
 /// stays silent.
 pub fn read_windows(agent_db: &Path, now_ms: i64) -> BTreeMap<String, WindowState> {
+    read_windows_for(agent_db, LlmProvider::Anthropic, now_ms)
+}
+
+pub fn read_windows_for(
+    agent_db: &Path,
+    provider: LlmProvider,
+    now_ms: i64,
+) -> BTreeMap<String, WindowState> {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::error!(
             agent_db = %agent_db.display(),
@@ -53,7 +64,7 @@ pub fn read_windows(agent_db: &Path, now_ms: i64) -> BTreeMap<String, WindowStat
         );
         return BTreeMap::new();
     };
-    match handle.block_on(read_windows_async(agent_db, now_ms)) {
+    match handle.block_on(read_windows_async(agent_db, provider, now_ms)) {
         Ok(windows) => windows,
         Err(err) => {
             tracing::error!(
@@ -71,11 +82,10 @@ pub fn read_windows(agent_db: &Path, now_ms: i64) -> BTreeMap<String, WindowStat
 /// cycles, drops expired per-model-class rows.
 async fn read_windows_async(
     agent_db: &Path,
+    provider: LlmProvider,
     now_ms: i64,
 ) -> Result<BTreeMap<String, WindowState>, Box<dyn std::error::Error + Send + Sync>> {
-    use sqlx::Row;
     use sqlx::sqlite::SqliteConnectOptions;
-
     if !agent_db.exists() {
         return Ok(BTreeMap::new());
     }
@@ -85,16 +95,19 @@ async fn read_windows_async(
         .read_only(true);
     let pool = sqlx::SqlitePool::connect_with(opts).await?;
 
-    // Runtime query: reads external omp agent.db whose schema isn't available at compile time.
+    // Every limit of the provider, not just its short and long window:
+    // Anthropic's per-model-class weekly limits gate spending too.
+    let limits = provider.windows();
     let rows = sqlx::query(
         "SELECT limit_id, used_fraction, status, resets_at, recorded_at \
          FROM ( \
            SELECT limit_id, used_fraction, status, resets_at, recorded_at, \
                   ROW_NUMBER() OVER (PARTITION BY limit_id ORDER BY recorded_at DESC) AS rn \
            FROM usage_history \
-           WHERE limit_id LIKE 'anthropic:%' \
+           WHERE provider = ? \
          ) WHERE rn = 1",
     )
+    .bind(provider.name())
     .fetch_all(&pool)
     .await?;
 
@@ -124,11 +137,12 @@ async fn read_windows_async(
             // Truthy resets_at (> 0) that has expired (<= now_ms).
             // Some(0) is falsy like Python's `not resets_at`.
             Some(r) if r > 0 && r <= now_ms => {
-                // Determine period for account-wide lids; per-model-class → drop.
-                let period = match limit_id.as_str() {
-                    "anthropic:5h" => FIVE_H_MS,
-                    "anthropic:7d" => WEEK_MS,
-                    _ => continue, // per-model-class / unrecognized → drop
+                let period = if limit_id == limits.short.limit_id {
+                    limits.short.period_ms
+                } else if limit_id == limits.long.limit_id {
+                    limits.long.period_ms
+                } else {
+                    continue;
                 };
                 // Roll forward: advance resets_at by period until > now,
                 // recording each step as the current cycle's start.
@@ -216,16 +230,4 @@ pub fn retry_at_5h(resets_at: Option<i64>, effective_used: f64) -> Option<f64> {
             Some(raw.min(r as f64))
         }
     }
-}
-
-/// status == "exhausted" clamps to exactly 1.0 (hard-stop signal; raw
-/// value unreliable); else `used_fraction` (call sites guarantee Some) +
-/// inflight reservation.
-pub fn effective_used(w: &WindowState, inflight_reservation: f64) -> f64 {
-    let used = if w.status.as_deref() == Some("exhausted") {
-        1.0
-    } else {
-        w.used_fraction.unwrap_or(0.0)
-    };
-    used + inflight_reservation
 }

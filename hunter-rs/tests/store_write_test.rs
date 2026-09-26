@@ -557,6 +557,52 @@ async fn estimate_capacity_returns_max_spend_per_completed_cycle() {
     assert_eq!(store.estimate_capacity("anthropic:7d").await.unwrap(), None);
 }
 
+/// Codex windows calibrate like Anthropic's, each over its own period: a
+/// job 3h before the reset counts toward the 5h primary window, one two
+/// days before only toward the weekly secondary.
+#[tokio::test]
+async fn estimate_capacity_calibrates_codex_windows_over_their_periods() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let hour = 3_600_000;
+    let (o, r) = (now - 200_000, now - 100_000); // one completed cycle each
+    sqlx::query!(
+        "INSERT INTO window_log \
+         (observed_at, limit_id, used_fraction, status, resets_at, source_age_s) \
+         VALUES (?, 'openai-codex:primary', 0.9, 'ok', ?, 1), \
+                (?, 'openai-codex:secondary', 0.4, 'ok', ?, 1)",
+        o,
+        r,
+        o,
+        r,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    insert_job(&pool, "done", None, Some(700_000), Some(r - 3 * hour)).await;
+    insert_job(&pool, "done", None, Some(300_000), Some(r - 48 * hour)).await;
+    let store = rw_store(&path).await;
+
+    assert_eq!(
+        store
+            .estimate_capacity("openai-codex:primary")
+            .await
+            .unwrap(),
+        Some(700_000.0)
+    );
+    assert_eq!(
+        store
+            .estimate_capacity("openai-codex:secondary")
+            .await
+            .unwrap(),
+        Some(1_000_000.0)
+    );
+}
+
 #[tokio::test]
 async fn estimate_capacity_zero_spend_returns_none() {
     let (_dir, path, pool) = fresh_db().await;

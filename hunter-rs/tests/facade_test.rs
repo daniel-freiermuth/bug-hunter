@@ -50,6 +50,7 @@ fn cfg_with(stale_after_s: f64, omp_bin: &str) -> Config {
         model_hunt: None,
         model_fix: None,
         backend_type: "omp-scavenge".to_owned(),
+        llm_provider: hunter::backends::omp_scavenge::LlmProvider::Anthropic,
         hunt_cap_tokens: 200_000,
         hunt_max_wall_s: 1800,
         hunt_max_findings: 8,
@@ -662,6 +663,9 @@ async fn test_no_5h_window_7d_over_deny() {
 }
 
 /// Item 19: expired model-class window ignored.
+///
+/// Fully used on purpose: an expired window's 7d ramp is 1.0, so at 0.99
+/// it would pass the ramp anyway and the expiry skip would go untested.
 #[tokio::test]
 async fn test_expired_model_class_window_ignored() {
     let now = now_ms();
@@ -672,7 +676,7 @@ async fn test_expired_model_class_window_ignored() {
         "anthropic:7d:abandoned-model".to_owned(),
         WindowState {
             limit_id: "anthropic:7d:abandoned-model".to_owned(),
-            used_fraction: Some(0.99),
+            used_fraction: Some(1.0),
             status: Some("ok".to_owned()),
             resets_at: Some(expired_resets),
             recorded_at: now - 26 * 24 * HOUR_MS,
@@ -681,7 +685,26 @@ async fn test_expired_model_class_window_ignored() {
     );
     let b = make_backend(FakeLedger::new(0, 0));
     let o = b.decide_with_windows(&w, 0).await.unwrap();
-    assert!(is_granted(&o.normal));
+    assert!(is_granted(&o.normal), "{:?}", o.normal);
+}
+
+/// `resets_at = 0` means "reset unknown", not "expired": the window still
+/// gates, against a ramp of 1.0, so reaching it exactly denies.
+#[tokio::test]
+async fn test_7d_window_with_unknown_reset_denies_once_full() {
+    let mut w = BTreeMap::new();
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 1.0, "ok", 0, 60.0),
+    );
+    let b = make_backend(FakeLedger::new(0, 0));
+    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    assert!(is_denied(&o.normal), "{:?}", o.normal);
+    assert!(
+        reason(&o.normal).starts_with("anthropic:7d:"),
+        "{:?}",
+        o.normal
+    );
 }
 
 /// Item 20: active model-class window still gates.
@@ -859,13 +882,16 @@ async fn make_agent_db(rows: &[(&str, Option<f64>, &str, Option<i64>, i64)]) -> 
     .unwrap();
 
     for &(lid, uf, status, resets, recorded) in rows {
+        // omp files each limit under the provider that prefixes its id.
+        let provider = lid.split(':').next().unwrap();
         sqlx::query(
             "INSERT INTO usage_history \
              (recorded_at, provider, account_key, limit_id, label, \
               used_fraction, status, resets_at) \
-             VALUES (?, 'anthropic', 'acct', ?, ?, ?, ?, ?)",
+             VALUES (?, ?, 'acct', ?, ?, ?, ?, ?)",
         )
         .bind(recorded)
+        .bind(provider)
         .bind(lid)
         .bind(lid)
         .bind(uf)
@@ -1266,39 +1292,6 @@ async fn test_prio_exhausted_not_waived() {
     );
 }
 
-// ============================================================
-// effective_used tests
-// ============================================================
-
-#[test]
-fn test_effective_used_exhausted() {
-    use hunter::backends::omp_scavenge::capacity::effective_used;
-    let w = WindowState {
-        limit_id: "anthropic:5h".to_owned(),
-        used_fraction: Some(0.5),
-        status: Some("exhausted".to_owned()),
-        resets_at: Some(99999),
-        recorded_at: 1000,
-        age_s: 10.0,
-    };
-    // Exhausted: used clamped to 1.0, plus reservation.
-    assert!((effective_used(&w, 0.1) - 1.1).abs() < 1e-9);
-}
-
-#[test]
-fn test_effective_used_normal() {
-    use hunter::backends::omp_scavenge::capacity::effective_used;
-    let w = WindowState {
-        limit_id: "anthropic:5h".to_owned(),
-        used_fraction: Some(0.3),
-        status: Some("ok".to_owned()),
-        resets_at: Some(99999),
-        recorded_at: 1000,
-        age_s: 10.0,
-    };
-    assert!((effective_used(&w, 0.05) - 0.35).abs() < 1e-9);
-}
-
 /// The 7d token cap uses the 7d capacity estimate when one exists.
 ///
 /// An earlier revision of BACKEND-CONTRACT.md asserted the opposite —
@@ -1571,4 +1564,501 @@ async fn test_7d_prio_override_cap_excludes_the_anticipated_job() {
         "prio cap {cap} should be (1.0 − used .60) × 10M = 4000000; counting \
          the anticipated 200k against the job gives 3800000 instead"
     );
+}
+
+/// Codex uses the shared two-window scavenging policy with its own OMP
+/// limit IDs; its warning status retains the reported fraction.
+#[tokio::test]
+async fn codex_high_short_window_usage_denies() {
+    let mut config = cfg();
+    config.llm_provider = hunter::backends::omp_scavenge::LlmProvider::OpenAiCodex;
+    let backend = make_backend_with(FakeLedger::new(0, 0), config, FakeProber::new(0));
+    let now = now_ms();
+    let mut windows = BTreeMap::new();
+    windows.insert(
+        "openai-codex:primary".to_owned(),
+        ws("openai-codex:primary", 0.94, "warning", now + HOUR_MS, 60.0),
+    );
+    windows.insert(
+        "openai-codex:secondary".to_owned(),
+        ws(
+            "openai-codex:secondary",
+            0.15,
+            "ok",
+            now + WEEK_MS / 2,
+            60.0,
+        ),
+    );
+
+    let outlook = backend.decide_with_windows(&windows, 0).await.unwrap();
+    assert!(is_denied(&outlook.normal));
+    assert!(reason(&outlook.normal).contains("5h"));
+}
+
+/// The long-window pass reads Codex's own weekly limit, not the
+/// Anthropic `:7d` substring: `openai-codex:secondary` over its ramp
+/// denies even while the short window has room.
+#[tokio::test]
+async fn codex_long_window_over_its_ramp_denies() {
+    let mut config = cfg();
+    config.llm_provider = hunter::backends::omp_scavenge::LlmProvider::OpenAiCodex;
+    let backend = make_backend_with(FakeLedger::new(0, 0), config, FakeProber::new(0));
+    let now = now_ms();
+    let mut windows = BTreeMap::new();
+    windows.insert(
+        "openai-codex:primary".to_owned(),
+        ws("openai-codex:primary", 0.05, "ok", now + HOUR_MS, 60.0),
+    );
+    // Halfway through the week (ramp .50) at .80 used.
+    windows.insert(
+        "openai-codex:secondary".to_owned(),
+        ws(
+            "openai-codex:secondary",
+            0.80,
+            "ok",
+            now + WEEK_MS / 2,
+            60.0,
+        ),
+    );
+
+    let outlook = backend.decide_with_windows(&windows, 0).await.unwrap();
+    assert!(is_denied(&outlook.normal), "{:?}", outlook.normal);
+    assert!(
+        reason(&outlook.normal).starts_with("openai-codex:secondary:"),
+        "{:?}",
+        outlook.normal
+    );
+}
+
+// ============================================================
+// Running jobs: their reservation is charged against every cap
+// ============================================================
+//
+// The anticipated job is excluded from the cap (tests above); jobs that
+// are ALREADY running are not, and every test above runs with none, so
+// the `budget_*` term was never anything but zero there.
+
+/// 5h capacity 1M, used .69, ramp .90, one running job reserving 100k
+/// (.10): the grant is what is left of the ramp, (.90 − .69 − .10) × 1M.
+#[tokio::test]
+async fn test_running_jobs_shrink_the_5h_cap() {
+    let now = now_ms();
+    let mut w = BTreeMap::new();
+    w.insert(
+        "anthropic:5h".to_owned(),
+        ws(
+            "anthropic:5h",
+            0.69,
+            "ok",
+            now + (0.45 * HOUR_MS as f64) as i64,
+            60.0,
+        ),
+    );
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 0.10, "ok", now + WEEK_MS / 2, 60.0),
+    );
+    let mut ledger = FakeLedger::new(100_000, 0);
+    ledger
+        .capacity
+        .insert("anthropic:5h".to_owned(), 1_000_000.0);
+
+    let o = make_backend(ledger)
+        .decide_with_windows(&w, 0)
+        .await
+        .unwrap();
+
+    let cap = cap_tokens(&o.normal).expect("a granted cap");
+    assert!((cap - 110_000).abs() <= 100, "cap {cap}, want 110000");
+}
+
+/// 7d capacity 10M, used .30, ramp .50, running 1M (.10), no 5h window:
+/// the grant is (.50 − .30 − .10) × 10M.
+#[tokio::test]
+async fn test_running_jobs_shrink_the_7d_cap() {
+    let now = now_ms();
+    let mut w = BTreeMap::new();
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 0.30, "ok", now + WEEK_MS / 2, 60.0),
+    );
+    let mut ledger = FakeLedger::new(1_000_000, 0);
+    ledger
+        .capacity
+        .insert("anthropic:7d".to_owned(), 10_000_000.0);
+
+    let o = make_backend(ledger)
+        .decide_with_windows(&w, 0)
+        .await
+        .unwrap();
+
+    let cap = cap_tokens(&o.normal).expect("a granted cap");
+    assert!((cap - 1_000_000).abs() <= 100, "cap {cap}, want 1000000");
+}
+
+/// 5h capacity 1M, used .55, ramp .50, running 100k (.10): denied, and
+/// the prio override may spend up to the hard limit less what is running,
+/// (1.0 − .55 − .10) × 1M.
+#[tokio::test]
+async fn test_running_jobs_shrink_the_5h_prio_override_cap() {
+    let now = now_ms();
+    let mut w = BTreeMap::new();
+    w.insert(
+        "anthropic:5h".to_owned(),
+        ws(
+            "anthropic:5h",
+            0.55,
+            "ok",
+            now + (2.25 * HOUR_MS as f64) as i64,
+            60.0,
+        ),
+    );
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 0.01, "ok", now + WEEK_MS / 2, 60.0),
+    );
+    let mut ledger = FakeLedger::new(100_000, 0);
+    ledger
+        .capacity
+        .insert("anthropic:5h".to_owned(), 1_000_000.0);
+
+    let o = make_backend(ledger)
+        .decide_with_windows(&w, 0)
+        .await
+        .unwrap();
+
+    assert!(is_denied(&o.normal), "{:?}", o.normal);
+    let cap = cap_tokens(&o.prioritized).expect("a prio override cap");
+    assert!((cap - 350_000).abs() <= 2, "cap {cap}, want 350000");
+}
+
+/// 7d capacity 10M, used .60, ramp .50, running 1M (.10): the override
+/// cap is (1.0 − .60 − .10) × 10M. The 5h window has room to spare.
+#[tokio::test]
+async fn test_running_jobs_shrink_the_7d_prio_override_cap() {
+    let o = seven_day_override(0.60).await;
+    assert!(is_denied(&o.normal), "{:?}", o.normal);
+    let cap = cap_tokens(&o.prioritized).expect("a prio override cap");
+    assert!((cap - 3_000_000).abs() <= 2, "cap {cap}, want 3000000");
+}
+
+/// Same, at .95 used: running work already fills the rest of the week, so
+/// there is nothing for prio to hand out and it is denied, not granted a
+/// zero-token cap.
+#[tokio::test]
+async fn test_7d_prio_override_denied_when_running_jobs_fill_the_window() {
+    let o = seven_day_override(0.95).await;
+    assert!(is_denied(&o.normal), "{:?}", o.normal);
+    assert!(is_denied(&o.prioritized), "{:?}", o.prioritized);
+}
+
+async fn seven_day_override(used_7d: f64) -> hunter::backend::Outlook {
+    let now = now_ms();
+    let mut w = BTreeMap::new();
+    w.insert(
+        "anthropic:5h".to_owned(),
+        ws(
+            "anthropic:5h",
+            0.05,
+            "ok",
+            now + (0.5 * HOUR_MS as f64) as i64,
+            60.0,
+        ),
+    );
+    w.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", used_7d, "ok", now + WEEK_MS / 2, 60.0),
+    );
+    let mut ledger = FakeLedger::new(1_000_000, 0);
+    ledger
+        .capacity
+        .insert("anthropic:5h".to_owned(), 100_000_000.0);
+    ledger
+        .capacity
+        .insert("anthropic:7d".to_owned(), 10_000_000.0);
+    make_backend(ledger)
+        .decide_with_windows(&w, 0)
+        .await
+        .unwrap()
+}
+
+// ============================================================
+// keep_fresh observations and calibration, against a real ledger
+// ============================================================
+
+/// What one `keep_fresh` wrote to a real `Store`: calibration samples as
+/// `(limit_id, used_fraction_delta, hunter_tokens)` and its window
+/// observations as `(limit_id, used_fraction)`, both by `limit_id`.
+#[derive(Debug)]
+struct Observed {
+    samples: Vec<(String, f64, i64)>,
+    logged: Vec<(String, Option<f64>)>,
+}
+
+/// `agent_rows` is what omp reports now; `earlier` the observations
+/// already logged, as `(limit_id, used_fraction, resets_at, observed_at)`;
+/// `spend` hunter's finished jobs as `(tokens_new, finished_at)`.
+async fn keep_fresh_against_ledger(
+    agent_rows: &[(&str, Option<f64>, &str, Option<i64>, i64)],
+    earlier: &[(&str, f64, i64, i64)],
+    spend: &[(i64, i64)],
+) -> Observed {
+    let (_agent_dir, agent_db) = make_agent_db(agent_rows).await;
+    let dir = TempDir::new("facade-ledger");
+    let (path, pool) = support::fresh_pool(&dir, "hunter").await;
+    sqlx::raw_sql(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+         VALUES (1, 'alpha', 'https://example.com/alpha.git', '/tmp/alpha', 'github', 'main', 1, 1000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    for &(lid, used, resets, observed_at) in earlier {
+        sqlx::query(
+            "INSERT INTO window_log (observed_at, limit_id, used_fraction, status, resets_at) \
+             VALUES (?, ?, ?, 'ok', ?)",
+        )
+        .bind(observed_at)
+        .bind(lid)
+        .bind(used)
+        .bind(resets)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    for &(tokens, finished_at) in spend {
+        sqlx::query(
+            "INSERT INTO jobs (kind, repo_id, state, tokens_new, started_at, finished_at) \
+             VALUES ('hunt', 1, 'done', ?, ?, ?)",
+        )
+        .bind(tokens)
+        .bind(finished_at - 60_000)
+        .bind(finished_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let store = hunter::store::Store::connect(&path).await.unwrap();
+    let b = OmpScavengeBackend {
+        cfg: cfg(),
+        ledger: Arc::new(store),
+        agent_db,
+        prober: Arc::new(FakeProber::new(0)),
+    };
+    let started = now_ms();
+    b.keep_fresh().await.unwrap();
+
+    let samples = sqlx::query_as(
+        "SELECT limit_id, used_fraction_delta, hunter_tokens \
+         FROM calibration_samples ORDER BY limit_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let logged = sqlx::query_as(
+        "SELECT limit_id, used_fraction FROM window_log \
+         WHERE observed_at >= ? ORDER BY limit_id",
+    )
+    .bind(started)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    Observed { samples, logged }
+}
+
+/// Every window is logged; the short and long window grew since the
+/// last observation in the same cycle while hunter spent 60k, so each
+/// gets a calibration sample of its own growth. The per-model-class
+/// window grew too, but has no period to calibrate against.
+#[tokio::test]
+async fn keep_fresh_logs_every_window_and_calibrates_short_and_long() {
+    let now = now_ms();
+    let (r5, r7) = (now + 2 * HOUR_MS, now + 72 * HOUR_MS);
+    let observed = keep_fresh_against_ledger(
+        &[
+            ("anthropic:5h", Some(0.40), "ok", Some(r5), now - 60_000),
+            ("anthropic:7d", Some(0.30), "ok", Some(r7), now - 60_000),
+            (
+                "anthropic:7d:fable",
+                Some(0.50),
+                "ok",
+                Some(r7),
+                now - 60_000,
+            ),
+        ],
+        &[
+            ("anthropic:5h", 0.25, r5, now - HOUR_MS),
+            ("anthropic:7d", 0.28, r7, now - HOUR_MS),
+            ("anthropic:7d:fable", 0.45, r7, now - HOUR_MS),
+        ],
+        &[(60_000, now - HOUR_MS / 2)],
+    )
+    .await;
+
+    assert_eq!(
+        observed.logged,
+        vec![
+            ("anthropic:5h".to_owned(), Some(0.40)),
+            ("anthropic:7d".to_owned(), Some(0.30)),
+            ("anthropic:7d:fable".to_owned(), Some(0.50)),
+        ]
+    );
+    let samples: Vec<(&str, i64)> = observed
+        .samples
+        .iter()
+        .map(|(lid, _, tokens)| (lid.as_str(), *tokens))
+        .collect();
+    assert_eq!(
+        samples,
+        [("anthropic:5h", 60_000), ("anthropic:7d", 60_000)]
+    );
+    assert!((observed.samples[0].1 - 0.15).abs() < 1e-9, "{observed:?}");
+    assert!((observed.samples[1].1 - 0.02).abs() < 1e-9, "{observed:?}");
+}
+
+/// A sample needs all three: growth since the baseline, a baseline no
+/// older than the window's period, and hunter tokens spent in between.
+/// Each case below lacks exactly one, against the positive case above.
+#[tokio::test]
+async fn calibration_needs_growth_a_recent_baseline_and_hunter_spend() {
+    let now = now_ms();
+    let r5 = now + 2 * HOUR_MS;
+    let current = [("anthropic:5h", Some(0.40), "ok", Some(r5), now - 60_000)];
+    let spent = [(60_000, now - HOUR_MS / 2)];
+
+    let no_growth = keep_fresh_against_ledger(
+        &current,
+        &[("anthropic:5h", 0.40, r5, now - HOUR_MS)],
+        &spent,
+    )
+    .await;
+    assert_eq!(no_growth.samples, [], "usage did not grow");
+
+    let stale_baseline = keep_fresh_against_ledger(
+        &current,
+        &[("anthropic:5h", 0.25, r5, now - 6 * HOUR_MS)],
+        &spent,
+    )
+    .await;
+    assert_eq!(stale_baseline.samples, [], "baseline older than 5h");
+
+    let no_spend =
+        keep_fresh_against_ledger(&current, &[("anthropic:5h", 0.25, r5, now - HOUR_MS)], &[])
+            .await;
+    assert_eq!(no_spend.samples, [], "hunter spent nothing");
+}
+
+// ============================================================
+// run: the usage-delta sandwich
+// ============================================================
+
+/// `usage_delta` is how far the long window moved while the worker ran.
+/// The fake worker stands in for omp's usage mirror catching up: it swaps
+/// a later agent.db in. It writes no session ledger, so the run itself is
+/// flagged unmetered; that is `run_worker`'s business, not this test's.
+#[tokio::test]
+async fn run_reports_how_far_the_long_window_moved_during_the_job() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let now = now_ms();
+    let resets = now + WEEK_MS / 2;
+    let (_before_dir, agent_db) =
+        make_agent_db(&[("anthropic:7d", Some(0.30), "ok", Some(resets), now - 60_000)]).await;
+    let (_after_dir, after_db) =
+        make_agent_db(&[("anthropic:7d", Some(0.42), "ok", Some(resets), now - 1_000)]).await;
+    let dir = TempDir::new("facade-run");
+    let omp = dir.join("omp");
+    std::fs::write(
+        &omp,
+        format!(
+            "#!/bin/sh\ncp '{}' '{}'\n",
+            after_db.display(),
+            agent_db.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&omp, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut config = cfg_with(1800.0, omp.to_str().unwrap());
+    config.work_root = dir.subdir("work-root");
+    config.poll_s = 0.02;
+    let b = OmpScavengeBackend {
+        cfg: config,
+        ledger: Arc::new(FakeLedger::new(0, 0)),
+        agent_db,
+        prober: Arc::new(FakeProber::new(0)),
+    };
+
+    let rr = b
+        .run(
+            &dir.subdir("worktree"),
+            "prompt",
+            1_000_000,
+            30,
+            hunter::backend::JobClass::Hunt,
+        )
+        .await
+        .unwrap();
+
+    let delta = rr.usage_delta.expect("both snapshots saw a 7d window");
+    assert!(
+        (delta - 0.12).abs() < 1e-9,
+        "usage_delta {delta}, want 0.12"
+    );
+}
+
+// ============================================================
+// status_html
+// ============================================================
+
+/// The status bars come from the configured provider's rows only: a Codex
+/// daemon sharing an agent.db with Anthropic usage shows its own two
+/// windows, labelled by role.
+#[tokio::test]
+async fn codex_status_html_shows_only_codex_windows() {
+    let now = now_ms();
+    let (_dir, agent_db) = make_agent_db(&[
+        (
+            "anthropic:5h",
+            Some(0.50),
+            "ok",
+            Some(now + HOUR_MS),
+            now - 60_000,
+        ),
+        (
+            "openai-codex:primary",
+            Some(0.94),
+            "warning",
+            Some(now + HOUR_MS),
+            now - 60_000,
+        ),
+        (
+            "openai-codex:secondary",
+            Some(0.15),
+            "ok",
+            Some(now + WEEK_MS / 2),
+            now - 60_000,
+        ),
+    ])
+    .await;
+    let mut config = cfg();
+    config.llm_provider = hunter::backends::omp_scavenge::LlmProvider::OpenAiCodex;
+    let b = OmpScavengeBackend {
+        cfg: config,
+        ledger: Arc::new(FakeLedger::new(0, 0)),
+        agent_db,
+        prober: Arc::new(FakeProber::new(0)),
+    };
+
+    let html = b.status_html().await.unwrap();
+
+    assert_eq!(
+        html.matches(r#"<div class="scv-win">"#).count(),
+        2,
+        "{html}"
+    );
+    assert!(html.contains("<b>5h window</b><span>94% used"), "{html}");
+    assert!(html.contains("<b>7d window</b><span>15% used"), "{html}");
+    assert!(!html.contains("50% used"), "Anthropic row leaked: {html}");
 }

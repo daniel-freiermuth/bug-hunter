@@ -333,7 +333,7 @@ Tables the read-only API touches: `findings`, `repos`, `jobs`, `events`, `pr_sta
 
 ---
 
-## 12. Config the serve path needs (`hunter/config.json`, loaded by `Config.load`, types.py:200-230)
+## 12. Config the serve path needs (local `hunter/config.json`, loaded by `Config.load`, types.py:200-230)
 
 Paths are resolved relative to `PROJECT_ROOT` (the `hunter/` dir containing the package) when not absolute (types.py:203-207).
 
@@ -344,7 +344,7 @@ Paths are resolved relative to `PROJECT_ROOT` (the `hunter/` dir containing the 
 | `dbPath` | `db_path` | `"data/hunter.db"` | SQLite database (store.py:165-166) |
 | — (constant) | `UI_DIR` | `PROJECT_ROOT / "ui"` (types.py:20) | static files + index.html |
 
-Actual config.json in this repo: `workRoot=data`, `dbPath=data/hunter.db`, `serve.port=8377` (hunter/config.json). Other keys (hunt/fix caps, models, budget) feed the scheduler/backend, which `/api/summary` reaches only through `scheduler.pick_next` / `backend.decide()` / `backend.status()` — for round 1 those can stay behind a trait boundary.
+`hunter/config.anthropic.example.json` and `hunter/config.openai-codex.example.json` are tracked templates; copy the provider-matched one to ignored `hunter/config.json`. The templates bind compatible models to their `backend.llmProvider`. Other keys (hunt/fix caps, models, budget) feed the scheduler/backend, which `/api/summary` reaches only through `scheduler.pick_next` / `backend.decide()` / `backend.status()` — for round 1 those can stay behind a trait boundary.
 
 ---
 

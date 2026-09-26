@@ -1,0 +1,11 @@
+{
+  "workRoot": "data",
+  "dbPath": "data/hunter.db",
+  "ompBin": "omp",
+  "hunt": { "capNewTokens": 200000, "maxWallS": 1800, "maxFindings": 8 },
+  "fix": { "capNewTokens": 150000, "maxWallS": 2700 },
+  "budget": { "deny5hAbove": 0.85, "staleAfterS": 300 },
+  "serve": { "port": 8377 },
+  "models": { "default": "gpt-5.6-terra", "smol": "gpt-5.6-sol", "hunt": null, "fix": null },
+  "backend": { "type": "omp-scavenge", "llmProvider": "openai-codex" }
+}
