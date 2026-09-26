@@ -80,6 +80,8 @@ async fn test_state() -> TestState {
         work_root: dir.join("data"),
         db_path: dir.join("hunter.db"),
         serve_port: 0,
+        serve_host: std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+        allowed_hosts: hunter::config::HostAllowList::default(),
         ui_dir: dir.join("ui"),
         // Backend inputs (round 2) — inert under NullBackend.
         omp_bin: "omp".into(),
@@ -366,5 +368,66 @@ async fn the_scratch_dir_is_removed_with_the_state() {
         !root.exists(),
         "{} outlived its test and leaks into the temp dir",
         root.display()
+    );
+}
+
+async fn status_for_host(state: &AppState, host: &str) -> StatusCode {
+    router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/findings")
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+fn with_allowed(state: &AppState, allowed: hunter::config::HostAllowList) -> AppState {
+    let mut config = (*state.config).clone();
+    config.allowed_hosts = allowed;
+    AppState {
+        config: std::sync::Arc::new(config),
+        ..state.clone()
+    }
+}
+
+/// A name in `serve.allowedHosts` is served -- with or without a port, in
+/// any case -- loopback still is, and everything else is still refused.
+#[tokio::test]
+async fn allowed_hosts_extend_the_host_check() {
+    let state = test_state().await;
+    let state = with_allowed(
+        &state,
+        hunter::config::HostAllowList::Names(vec!["hunter-box".to_owned()]),
+    );
+    for host in [
+        "hunter-box",
+        "hunter-box:8377",
+        "HUNTER-BOX:8377",
+        "localhost:8377",
+    ] {
+        assert_eq!(
+            status_for_host(&state, host).await,
+            StatusCode::OK,
+            "{host}"
+        );
+    }
+    assert_eq!(
+        status_for_host(&state, "rebound.attacker.example").await,
+        StatusCode::FORBIDDEN
+    );
+}
+
+/// `"*"` is the explicit opt-out: any `Host` is served.
+#[tokio::test]
+async fn allow_any_host_serves_every_name() {
+    let state = test_state().await;
+    let state = with_allowed(&state, hunter::config::HostAllowList::Any);
+    assert_eq!(
+        status_for_host(&state, "rebound.attacker.example:8377").await,
+        StatusCode::OK
     );
 }

@@ -122,6 +122,8 @@ async fn test_state() -> TestState {
         work_root: dir.join("data"),
         db_path: dir.join("hunter.db"),
         serve_port: 0,
+        serve_host: std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+        allowed_hosts: hunter::config::HostAllowList::default(),
         ui_dir: dir.join("ui"),
         omp_bin: "omp".into(),
         stale_after_s: 300.0,
