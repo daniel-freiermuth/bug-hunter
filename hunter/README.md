@@ -310,11 +310,13 @@ frontend lives in `ui-svelte/`; Vite writes the bundle into the generated
 does alongside the release binary. Frontend checks: `npx eslint src/`,
 `npm run check`, `npx vitest run` in `ui-svelte/`.
 
-Conventions: strict TypeScript on the frontend with hand-rolled structural
-validation at the network boundary (`ui-svelte/src/lib/validate.ts`, which
-checks exactly what the components dereference unconditionally), so a
-shape drift between daemon and UI fails loudly instead of silently
-rendering garbage.
+Conventions: strict TypeScript on the frontend, with the API types generated
+from `hunter-rs/src/types.rs` by ts-rs into `ui-svelte/src/lib/generated/`
+(`just bindings` in `hunter-rs/`; CI fails when they are stale) and
+hand-rolled structural validation at the network boundary
+(`ui-svelte/src/lib/validate.ts`, which checks exactly what the components
+dereference unconditionally), so a shape drift between daemon and UI fails
+loudly instead of silently rendering garbage.
 
 ## Running as a service
 

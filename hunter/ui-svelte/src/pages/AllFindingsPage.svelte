@@ -1,12 +1,12 @@
 <script lang="ts">
   import { store } from "../lib/api.svelte";
-  import type { Finding } from "../lib/types";
+  import type { FindingOut } from "../lib/types";
   import FilterBar from "../components/FilterBar.svelte";
   import FindingCard from "../components/FindingCard.svelte";
 
   let { focusId = null }: { focusId?: number | null } = $props();
 
-  let displayed = $state<Finding[]>([]);
+  let displayed = $state<FindingOut[]>([]);
   let filterBar: { clearFilters: () => void } | undefined = $state();
   const repoNames = $derived(new Map((store.summary?.repos ?? []).map((r) => [r.id, r.name])));
 
@@ -51,7 +51,7 @@
     prefix="a"
     showStatus={true}
     repoNames={repoNames}
-    onFilter={(f: Finding[]) => { displayed = f; }}
+    onFilter={(f: FindingOut[]) => { displayed = f; }}
   />
 
   {#if displayed.length === 0}

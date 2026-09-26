@@ -21,7 +21,7 @@
 // unconditionally, and a `{#each}` key is rendered unconditionally even
 // when nothing dereferences it.
 
-import type { Event, Finding, FindingDetail, Job, Stats, Summary } from "./types";
+import type { Event, FindingDetail, FindingOut, JobListEntry, Stats, Summary } from "./types";
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -144,12 +144,12 @@ export function isFindingDetail(v: unknown): v is FindingDetail {
  * them by `finding.id`, and the kanban lists are filtered subsets, so
  * distinctness across the whole body is what they all need.
  */
-export function isFindingList(v: unknown): v is Finding[] {
+export function isFindingList(v: unknown): v is FindingOut[] {
   return isKeyedList(v, "id", "number") && v.every(hasKeyableTimeline);
 }
 
 /** `/api/jobs`. `LogPage` keys the job table by `job.id`. */
-export function isJobList(v: unknown): v is Job[] {
+export function isJobList(v: unknown): v is JobListEntry[] {
   return isKeyedList(v, "id", "number") && v.every(hasDistinctProducedIds);
 }
 
