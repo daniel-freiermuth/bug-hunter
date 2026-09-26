@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 
 use hunter::backend::{Backend, JobClass, Outlook, Verdict};
 use hunter::config::Config;
-use hunter::domain::{FindingStatus, JobState, RepoJobKind};
+use hunter::domain::{FindingJobKind, FindingStatus, JobKind, JobState, RepoJobKind};
 use hunter::scheduler::{
     Candidate, ResumePlan, pick_next, record_job, run_fix, run_harvest, run_hunt, run_recheck,
 };
@@ -44,8 +44,9 @@ async fn fresh_db() -> (TempDir, PathBuf, SqlitePool) {
     (dir, path, pool)
 }
 
-/// Read-write Store: `pick_resume` retires a chain that blew the give-up
-/// ceiling, so the selection path under test writes.
+/// Read-write Store: selection retires a suspension it can never
+/// continue (past the give-up ceiling, or its working directory gone), so
+/// the selection path under test writes.
 async fn rw_store(path: &Path) -> Store {
     Store::connect(path).await.unwrap()
 }
@@ -136,6 +137,72 @@ fn seed_session(dir: &TempDir) -> PathBuf {
     )
     .unwrap();
     path
+}
+
+/// Finding `id` on repo 1 whose pull request is open but asks for
+/// nothing: no tier has work for it.
+async fn seed_quiet_finding(pool: &SqlitePool, id: i64) {
+    sqlx::query(
+        "INSERT INTO findings \
+         (id, type, repo_id, fingerprint, severity, confidence, summary, status, \
+          created_at, updated_at) \
+         VALUES (?1, 'bug', 1, 'fp' || ?1, 'high', 0.9, 'bug ' || ?1, 'pr_open', \
+                 1000, 1000)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Finding `id` on repo 1, its pull request open and flagged for
+/// attention: the engage tier's work.
+async fn seed_flagged_finding(pool: &SqlitePool, id: i64) {
+    seed_quiet_finding(pool, id).await;
+    sqlx::query(
+        "INSERT INTO pr_state \
+         (finding_id, pr_number, state, needs_attention, attention_since, synced_at) \
+         VALUES (?1, 1, 'OPEN', 'review_comments', 1000, 5000)",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A suspended finding-kind job on repo 1, with a transcript.
+async fn seed_finding_suspension(
+    pool: &SqlitePool,
+    id: i64,
+    kind: &str,
+    finding_id: i64,
+    session: &Path,
+) {
+    sqlx::query(
+        "INSERT INTO jobs \
+         (id, kind, repo_id, finding_id, state, session_file, killed_reason, tokens_new, \
+          started_at, finished_at) \
+         VALUES (?1, ?2, 1, ?3, 'suspended', ?4, 'cap', 40000, 1000, 2000)",
+    )
+    .bind(id)
+    .bind(kind)
+    .bind(finding_id)
+    .bind(session.to_string_lossy().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The `resume` events logged against job `id`, oldest first.
+async fn resume_events(pool: &SqlitePool, id: i64) -> Vec<(String, Option<i64>)> {
+    sqlx::query_as::<_, (String, Option<i64>)>(
+        "SELECT message, finding_id FROM events WHERE kind = 'resume' AND job_id = ?1 \
+         ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
 }
 
 /// One suspended hunt on repo 1, with a transcript and a measured cost.
@@ -473,15 +540,17 @@ async fn a_queued_fix_outranks_a_resume_which_outranks_rotation() {
     assert_eq!(plan.predecessor_id, 10);
 }
 
-/// A suspension whose working directory is gone is skipped, not offered.
+/// A suspension whose working directory is gone is retired, not merely
+/// skipped, and never offered.
 ///
-/// A resumed worker continues a conversation, not a filesystem: pointing
-/// it at a tree that has since been reclaimed would have it edit files
-/// that no longer exist. Skipping at selection rather than refusing from
-/// inside the executor is what keeps it from being offered again every
-/// cycle — and since this tier outranks rotation, that would starve it.
+/// A resumed worker continues a conversation, not a filesystem: its
+/// transcript refers to files in that directory, so no later cycle can
+/// continue it either. Skipping it left the row `suspended` forever —
+/// never resumed, never retired. Retiring at selection, in the same
+/// walk, still keeps it from being offered again, which matters because
+/// this tier outranks rotation.
 #[tokio::test]
-async fn a_suspension_whose_working_directory_is_gone_is_skipped() {
+async fn a_suspension_whose_working_directory_is_gone_is_retired() {
     let (dir, path, pool) = fresh_db().await;
     let clone = seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
@@ -503,6 +572,243 @@ async fn a_suspension_whose_working_directory_is_gone_is_skipped() {
         ),
         "an uncloned repo is a hunt candidate, never a resume, got {picked:?}"
     );
+    let (state, reason, notes) = job_row(&pool, 10).await;
+    assert_eq!(state, JobState::Killed.as_str());
+    assert_eq!(reason.as_deref(), Some("workdir-gone"));
+    let msg = format!(
+        "resume hunt alpha: job 10 retired, working directory {} is gone",
+        clone.display()
+    );
+    assert_eq!(notes.as_deref(), Some(msg.as_str()));
+    assert_eq!(resume_events(&pool, 10).await, vec![(msg, None)]);
+}
+
+/// A flagged pull request whose engage was cap-killed continues that
+/// engage instead of starting a fresh one.
+///
+/// The finding tiers outrank the resume tier, so they are the ones that
+/// must notice. Live: engage job 4358 suspended with a valid transcript;
+/// nine minutes later the attention tier picked the same finding and
+/// started a fresh engage for 92,294 tokens where resuming would have
+/// re-cached about 75,000 — and the fresh attempt's worktree handling
+/// removed the directory the suspended transcript refers to.
+///
+/// Two newer suspensions sit in front of the right one — an engage for
+/// another finding and a fix for this one — so matching on either half
+/// of (finding, kind) alone picks the wrong job.
+#[tokio::test]
+async fn a_flagged_pr_resumes_its_suspended_engage_instead_of_starting_fresh() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    let cfg = test_config(dir.path());
+    let session = seed_session(&dir);
+    seed_flagged_finding(&pool, 5).await;
+    seed_quiet_finding(&pool, 6).await;
+    seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
+    seed_finding_suspension(&pool, 21, "engage", 6, &session).await;
+    seed_finding_suspension(&pool, 22, "fix", 5, &session).await;
+    for wt in ["e5", "e6", "f5"] {
+        std::fs::create_dir_all(cfg.work_root.join("wt").join(wt)).unwrap();
+    }
+    let store = rw_store(&path).await;
+
+    let picked = pick_next(&store, &cfg, None).await.unwrap();
+
+    let Some(Candidate::Resume { label, plan, .. }) = picked else {
+        panic!("expected a resume of the suspended engage, got {picked:?}");
+    };
+    assert_eq!(plan.predecessor_id, 20);
+    assert_eq!(plan.kind, JobKind::from(FindingJobKind::Engage));
+    assert_eq!(plan.finding_id, Some(5));
+    assert_eq!(
+        label.as_deref(),
+        Some("bug 5"),
+        "the tier keeps its own label"
+    );
+}
+
+/// A budget-overridden finding with a suspended attempt resumes it and
+/// keeps the override.
+///
+/// The override tier jumps the queue, so it must continue rather than
+/// restart just like the tiers below it — and the resume still carries
+/// the override, or the summary preview judges it by the normal budget
+/// while the executor runs it under the prioritized one.
+#[tokio::test]
+async fn an_overridden_finding_resumes_its_suspended_attempt_under_the_override() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    let cfg = test_config(dir.path());
+    let session = seed_session(&dir);
+    seed_flagged_finding(&pool, 5).await;
+    sqlx::query("UPDATE findings SET budget_override = 'once' WHERE id = 5")
+        .execute(&pool)
+        .await
+        .unwrap();
+    seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
+    std::fs::create_dir_all(cfg.work_root.join("wt").join("e5")).unwrap();
+    let store = rw_store(&path).await;
+
+    let picked = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+
+    assert_eq!(picked.budget_override(), Some("once"));
+    assert_eq!(resume_plan_of(Some(picked)).predecessor_id, 20);
+}
+
+/// The same flagged pull request, but the suspended engage's worktree
+/// is gone: that suspension is retired and the tier starts fresh.
+///
+/// This is job 4358 after the fresh engage removed its worktree. It can
+/// never be resumed, so retiring it on the first cycle that sees it is
+/// the only way it leaves `suspended`.
+#[tokio::test]
+async fn a_flagged_pr_whose_suspended_engage_lost_its_worktree_starts_fresh() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    let cfg = test_config(dir.path());
+    let session = seed_session(&dir);
+    seed_flagged_finding(&pool, 5).await;
+    seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
+    let store = rw_store(&path).await;
+
+    let picked = pick_next(&store, &cfg, None).await.unwrap();
+
+    assert!(
+        matches!(
+            picked,
+            Some(Candidate::Finding {
+                kind: FindingJobKind::Engage,
+                finding_id: 5,
+                ..
+            })
+        ),
+        "a suspension that cannot be continued must not block the fresh engage, got {picked:?}"
+    );
+    let (state, reason, _) = job_row(&pool, 20).await;
+    assert_eq!(state, JobState::Killed.as_str());
+    assert_eq!(reason.as_deref(), Some("workdir-gone"));
+    let wt = cfg.work_root.join("wt").join("e5");
+    assert_eq!(
+        resume_events(&pool, 20).await,
+        vec![(
+            format!(
+                "resume engage alpha: job 20 retired, working directory {} is gone",
+                wt.display()
+            ),
+            Some(5)
+        )]
+    );
+}
+
+// -- fresh work supersedes a suspension --------------------------------------
+
+/// Starting a finding's work fresh retires that finding's suspended
+/// attempt at the same kind.
+///
+/// Whatever path started it, the fresh attempt now owns the work, and
+/// its worktree handling reclaims the directory the old transcript
+/// refers to. A suspension left behind is never resumed and never
+/// retired: it stays `suspended` forever. Other findings and other
+/// kinds are different work and are left alone.
+#[tokio::test]
+async fn fresh_work_on_a_finding_supersedes_its_suspended_attempt() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    let session = seed_session(&dir);
+    seed_flagged_finding(&pool, 5).await;
+    seed_quiet_finding(&pool, 6).await;
+    seed_finding_suspension(&pool, 20, "engage", 5, &session).await;
+    seed_finding_suspension(&pool, 21, "engage", 6, &session).await;
+    seed_finding_suspension(&pool, 22, "fix", 5, &session).await;
+    let store = rw_store(&path).await;
+
+    let fresh = store
+        .create_job(
+            FindingJobKind::Engage.into(),
+            1,
+            Some(5),
+            None,
+            JobState::Running,
+            Some(40_000),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (state, reason, notes) = job_row(&pool, 20).await;
+    assert_eq!(state, JobState::Killed.as_str());
+    assert_eq!(reason.as_deref(), Some("superseded"));
+    let msg = format!("resume engage alpha: job 20 superseded by fresh job {fresh}");
+    assert_eq!(notes.as_deref(), Some(msg.as_str()));
+    assert_eq!(resume_events(&pool, 20).await, vec![(msg, Some(5))]);
+    for other in [21, 22] {
+        assert_eq!(
+            job_row(&pool, other).await.0,
+            JobState::Suspended.as_str(),
+            "job {other} is different work and must stay resumable"
+        );
+    }
+}
+
+/// Starting a repo-level kind fresh retires that repo's suspended
+/// attempt at the same kind, and nothing else.
+#[tokio::test]
+async fn fresh_work_on_a_repo_supersedes_its_suspended_attempt() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at) \
+         VALUES (2, 'beta', 'https://example.com/beta.git', '/nowhere', 'github', 'main', 1, \
+                 1000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let session = seed_session(&dir);
+    seed_suspension(&pool, 10, &session, 40_000).await;
+    for (id, kind, repo) in [(11, "test_gap", 1), (12, "hunt", 2)] {
+        sqlx::query(
+            "INSERT INTO jobs \
+             (id, kind, repo_id, state, session_file, killed_reason, tokens_new, \
+              started_at, finished_at) \
+             VALUES (?1, ?2, ?3, 'suspended', ?4, 'cap', 40000, 1000, 2000)",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(repo)
+        .bind(session.to_string_lossy().to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let store = rw_store(&path).await;
+
+    let fresh = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            1,
+            None,
+            None,
+            JobState::Running,
+            Some(40_000),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (state, reason, notes) = job_row(&pool, 10).await;
+    assert_eq!(state, JobState::Killed.as_str());
+    assert_eq!(reason.as_deref(), Some("superseded"));
+    let msg = format!("resume hunt alpha: job 10 superseded by fresh job {fresh}");
+    assert_eq!(notes.as_deref(), Some(msg.as_str()));
+    assert_eq!(resume_events(&pool, 10).await, vec![(msg, None)]);
+    for other in [11, 12] {
+        assert_eq!(
+            job_row(&pool, other).await.0,
+            JobState::Suspended.as_str(),
+            "job {other} is different work and must stay resumable"
+        );
+    }
 }
 
 /// A cycle forced onto one repo resumes that repo's suspension and no

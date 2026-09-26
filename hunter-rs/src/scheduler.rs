@@ -10,7 +10,7 @@ use std::path::Path;
 use crate::config::Config;
 use crate::domain::{FindingJobKind, FindingStatus, FindingType, JobKind, JobState, RepoJobKind};
 use crate::store::{FindingFilter, Store, StoreWriteError, SyncPrData};
-use crate::types::{Finding, Repo};
+use crate::types::{Finding, Job, Repo};
 use crate::util::now_ms;
 
 /// Everything a resumed attempt needs and a cold one does not.
@@ -68,8 +68,15 @@ pub enum Candidate {
         budget_override: Option<String>,
     },
     /// Continue a suspended attempt instead of redoing it.
+    ///
+    /// `label` and `budget_override` are the tier's own: a finding tier
+    /// that continues its finding's suspended attempt still shows that
+    /// finding and still runs under that finding's override, exactly as
+    /// the fresh candidate it replaces would have. The repo-level resume
+    /// tier carries the repo name and no override.
     Resume {
         label: Option<String>,
+        budget_override: Option<String>,
         plan: ResumePlan,
     },
 }
@@ -111,8 +118,11 @@ impl Candidate {
         match self {
             Self::Finding {
                 budget_override, ..
+            }
+            | Self::Resume {
+                budget_override, ..
             } => budget_override.as_deref(),
-            Self::Repo { .. } | Self::Resume { .. } => None,
+            Self::Repo { .. } => None,
         }
     }
 }
@@ -212,9 +222,14 @@ async fn list_pending_harvest(store: &Store) -> sqlx::Result<Vec<Finding>> {
 /// `cfg.modernization_interval_days`). All types gated for one repo ->
 /// the next-stalest repo is tried. None = nothing to do.
 ///
-/// Read-only but for one write: retiring a chain that has blown the
-/// give-up ceiling, which [`pick_resume`] does as it skips over it. That
-/// write is best-effort precisely because this function is also the
+/// Each finding tier continues a suspended attempt at its own
+/// (finding, kind) instead of starting that work over
+/// ([`finding_pick`]).
+///
+/// Read-only but for retiring suspensions that can never be continued —
+/// a chain past the give-up ceiling, or one whose working directory is
+/// gone — which [`resume_plan`] does as it skips over them. Those writes
+/// are best-effort precisely because this function is also the
 /// `/api/summary` preview, which may hold a read-only handle — the
 /// candidate is skipped either way, and the scheduler's own next cycle
 /// records it.
@@ -254,23 +269,22 @@ pub async fn pick_next(
         (FindingJobKind::Fix, &queued),
     ] {
         if let Some(f) = items.iter().find(|f| override_of(f).is_some()) {
-            return Ok(Some(finding_candidate(kind, f)));
+            return Ok(Some(finding_pick(store, cfg, kind, f).await?));
         }
     }
 
-    // (2)-(5) Normal finding-kind priorities. attention/pending_harvest
-    // are oldest-first; list_findings is id DESC, so last = oldest.
-    if let Some(f) = attention.first() {
-        return Ok(Some(finding_candidate(FindingJobKind::Engage, f)));
-    }
-    if let Some(f) = pending_harvest.first() {
-        return Ok(Some(finding_candidate(FindingJobKind::Harvest, f)));
-    }
-    if let Some(f) = rechecking.last() {
-        return Ok(Some(finding_candidate(FindingJobKind::Recheck, f)));
-    }
-    if let Some(f) = queued.last() {
-        return Ok(Some(finding_candidate(FindingJobKind::Fix, f)));
+    // (2)-(5) Normal finding-kind priorities, in this order.
+    // attention/pending_harvest are oldest-first; list_findings is id
+    // DESC, so last = oldest.
+    for (kind, oldest) in [
+        (FindingJobKind::Engage, attention.first()),
+        (FindingJobKind::Harvest, pending_harvest.first()),
+        (FindingJobKind::Recheck, rechecking.last()),
+        (FindingJobKind::Fix, queued.last()),
+    ] {
+        if let Some(f) = oldest {
+            return Ok(Some(finding_pick(store, cfg, kind, f).await?));
+        }
     }
 
     // (6) Work already paid for: a suspended attempt whose transcript is
@@ -434,19 +448,10 @@ fn job_cwd(cfg: &Config, kind: JobKind, repo_path: &str, finding_id: Option<i64>
 /// The resume tier of [`pick_next`]: the newest suspension that is still
 /// worth continuing, or `None`.
 ///
-/// Candidates are walked newest-first and each is checked against two
-/// things the database cannot know. The working directory must still
-/// exist — a resumed worker continues a conversation, not a filesystem,
-/// so pointing it at a worktree that has since been reclaimed would have
-/// it edit files that are gone. And the chain must be under the give-up
-/// ceiling; one that is not is retired here and skipped, which is what
-/// "fall through to normal selection" means.
-///
-/// Skipping rather than refusing from inside the executor is deliberate.
-/// A refusal would leave the row `suspended`, so the next cycle would
-/// offer it again, and the one after that — and because this tier
-/// outranks repo rotation, that is not a cheap no-op but permanent
-/// starvation of every rotation kind.
+/// Candidates are walked newest-first; [`resume_plan`] decides each one
+/// and retires those that can never be continued, so the walk moves on
+/// to the next in the same cycle — which is what "fall through to
+/// normal selection" means.
 async fn pick_resume(
     store: &Store,
     cfg: &Config,
@@ -456,104 +461,171 @@ async fn pick_resume(
         if force_id.is_some_and(|rid| job.repo_id != rid) {
             continue;
         }
-        // Non-NULL by the query's own filter; a row that lost its path
-        // between the read and here is simply not resumable.
-        let Some(session_file) = job.session_file.as_deref().map(PathBuf::from) else {
-            continue;
-        };
-        let Some(repo) = store.get_repo_by_id(job.repo_id).await? else {
-            continue;
-        };
-        if !job_cwd(cfg, job.kind, &repo.path, job.finding_id).exists() {
-            continue;
+        if let Some(plan) = resume_plan(store, cfg, job).await? {
+            return Ok(Some(Candidate::Resume {
+                label: (!plan.repo.is_empty()).then(|| plan.repo.clone()),
+                budget_override: None,
+                plan,
+            }));
         }
-
-        let z = anticipated_tokens(store, cfg, job.repo_id, job.kind)
-            .await
-            .unwrap_or(0);
-        let chain = store.resume_chain_stats(job.id).await?;
-        let chain_spent = chain.total;
-        // Two independent ways a chain runs out of road, and neither
-        // implies the other: too many tries, or too much spent on the
-        // tries other than the biggest one.
-        //
-        // The biggest attempt is set aside because one enormous attempt
-        // is evidence about the SIZE OF THE JOB, not about the chain
-        // being stuck — judging by it would retire big-but-healthy work
-        // on its first resume. What the chain spent BESIDES that
-        // attempt is the part that says continuing is not getting
-        // anywhere.
-        //
-        // Subtracting rather than multiplying it is forced, not
-        // stylistic: `chain_spent <= attempts * largest`, so any
-        // threshold of the form `k * largest` is unreachable below
-        // `attempts = k + 1` and would be decoration at k = 3.
-        //
-        // Both arms leave a chain of one alone. A first suspension is a
-        // single attempt whose spend is, by definition of a cap kill, at
-        // least its own cap; retiring on that would end the work before
-        // resume had been tried even once, which is the opposite of what
-        // this feature is for.
-        let excess = chain_spent - chain.max_single;
-        let too_many = chain.attempts >= MAX_RESUME_ATTEMPTS;
-        let too_costly = chain.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
-        if too_many || too_costly {
-            let why = if too_many {
-                format!("{} attempts, the limit", chain.attempts)
-            } else {
-                format!(
-                    "{excess} tok outside its largest attempt > {GIVE_UP_MULTIPLE}x {z} typical"
-                )
-            };
-            let msg = format!(
-                "resume {} {}: giving up after {chain_spent} tok across the chain ({why})",
-                job.kind, repo.name
-            );
-            // Best-effort: the summary preview runs this same function
-            // over a read-only handle. Either way the candidate is
-            // skipped, so a failed write only defers the record.
-            let _ = store
-                .retire_suspended_job(job.id, JobState::Failed, Some("give-up"), &msg)
-                .await;
-            let _ = store
-                .log_event("resume", &msg, Some(job.id), job.finding_id)
-                .await;
-            continue;
-        }
-
-        // An unreadable transcript, or one with no usage record at all,
-        // leaves the first call's cost unknown. `z` is the only other
-        // estimate of this work that exists, so it stands in — better a
-        // per-kind typical than a zero that would reserve nothing and
-        // let the ramp grant a job it cannot afford.
-        let ctx =
-            crate::backends::omp_scavenge::harness::ctx_at_suspension(&session_file).unwrap_or(z);
-        let anticipated = resume_reservation(ctx, z, chain_spent);
-        let origin_job_id = store.resume_origin_job(job.id).await?;
-
-        // No "resuming" event here: this function is also the
-        // /api/summary preview, which polls every few seconds, and an
-        // event per poll would bury the log. `run_cycle_inner` logs it
-        // when the cycle actually acts on the candidate.
-
-        return Ok(Some(Candidate::Resume {
-            label: (!repo.name.is_empty()).then(|| repo.name.clone()),
-            plan: ResumePlan {
-                kind: job.kind,
-                repo_id: job.repo_id,
-                repo: repo.name,
-                finding_id: job.finding_id,
-                predecessor_id: job.id,
-                origin_job_id,
-                session_file,
-                anticipated,
-                ctx,
-                typical: z,
-                chain_spent,
-            },
-        }));
     }
     Ok(None)
+}
+
+/// A finding tier's pick: continue the suspended attempt at this same
+/// (finding, kind) when one is resumable, otherwise start the work.
+///
+/// Without this the finding tiers, which outrank the resume tier, never
+/// see the suspension: they start the work fresh — paying the session
+/// floor plus everything the suspended attempt already spent — and the
+/// fresh attempt's worktree handling reclaims the directory the
+/// suspended transcript refers to. The replacement keeps the tier's
+/// position, label and budget override; only the plan differs.
+async fn finding_pick(
+    store: &Store,
+    cfg: &Config,
+    kind: FindingJobKind,
+    f: &Finding,
+) -> anyhow::Result<Candidate> {
+    let fresh = finding_candidate(kind, f);
+    let job_kind = JobKind::from(kind);
+    for job in store.list_resumable_jobs().await? {
+        if job.finding_id != Some(f.id) || job.kind != job_kind {
+            continue;
+        }
+        if let Some(plan) = resume_plan(store, cfg, job).await? {
+            return Ok(Candidate::Resume {
+                label: fresh.label().map(str::to_owned),
+                budget_override: fresh.budget_override().map(str::to_owned),
+                plan,
+            });
+        }
+    }
+    Ok(fresh)
+}
+
+/// How to continue one resumable job, or `None` when it cannot be.
+///
+/// Checks the two things the database cannot know. The working
+/// directory must still exist — a resumed worker continues a
+/// conversation, not a filesystem, so pointing it at a worktree that has
+/// since been reclaimed would have it edit files that are gone. And the
+/// chain must be under the give-up ceiling.
+///
+/// Failing either is permanent, so the job is retired here rather than
+/// skipped. A skip leaves the row `suspended`: it is offered again every
+/// cycle and never leaves the table. Refusing from inside the executor
+/// would be worse — this tier outranks repo rotation, so the same
+/// hopeless job would be picked every cycle, starving every rotation
+/// kind. Retiring it takes it out of the walk in this same cycle.
+async fn resume_plan(store: &Store, cfg: &Config, job: Job) -> anyhow::Result<Option<ResumePlan>> {
+    // Non-NULL by the query's own filter; a row that lost its path
+    // between the read and here is simply not resumable.
+    let Some(session_file) = job.session_file.as_deref().map(PathBuf::from) else {
+        return Ok(None);
+    };
+    let Some(repo) = store.get_repo_by_id(job.repo_id).await? else {
+        return Ok(None);
+    };
+    let cwd = job_cwd(cfg, job.kind, &repo.path, job.finding_id);
+    if !cwd.exists() {
+        // The transcript names files in that directory, so no later
+        // cycle can resume it either.
+        let msg = format!(
+            "resume {} {}: job {} retired, working directory {} is gone",
+            job.kind,
+            repo.name,
+            job.id,
+            cwd.display()
+        );
+        // Best-effort, like the give-up retirement below.
+        let _ = store
+            .retire_suspended_job(job.id, JobState::Killed, Some("workdir-gone"), &msg)
+            .await;
+        let _ = store
+            .log_event("resume", &msg, Some(job.id), job.finding_id)
+            .await;
+        return Ok(None);
+    }
+
+    let z = anticipated_tokens(store, cfg, job.repo_id, job.kind)
+        .await
+        .unwrap_or(0);
+    let chain = store.resume_chain_stats(job.id).await?;
+    let chain_spent = chain.total;
+    // Two independent ways a chain runs out of road, and neither
+    // implies the other: too many tries, or too much spent on the
+    // tries other than the biggest one.
+    //
+    // The biggest attempt is set aside because one enormous attempt
+    // is evidence about the SIZE OF THE JOB, not about the chain
+    // being stuck — judging by it would retire big-but-healthy work
+    // on its first resume. What the chain spent BESIDES that
+    // attempt is the part that says continuing is not getting
+    // anywhere.
+    //
+    // Subtracting rather than multiplying it is forced, not
+    // stylistic: `chain_spent <= attempts * largest`, so any
+    // threshold of the form `k * largest` is unreachable below
+    // `attempts = k + 1` and would be decoration at k = 3.
+    //
+    // Both arms leave a chain of one alone. A first suspension is a
+    // single attempt whose spend is, by definition of a cap kill, at
+    // least its own cap; retiring on that would end the work before
+    // resume had been tried even once, which is the opposite of what
+    // this feature is for.
+    let excess = chain_spent - chain.max_single;
+    let too_many = chain.attempts >= MAX_RESUME_ATTEMPTS;
+    let too_costly = chain.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
+    if too_many || too_costly {
+        let why = if too_many {
+            format!("{} attempts, the limit", chain.attempts)
+        } else {
+            format!("{excess} tok outside its largest attempt > {GIVE_UP_MULTIPLE}x {z} typical")
+        };
+        let msg = format!(
+            "resume {} {}: giving up after {chain_spent} tok across the chain ({why})",
+            job.kind, repo.name
+        );
+        // Best-effort: the summary preview runs this same function
+        // over a read-only handle. Either way the candidate is
+        // skipped, so a failed write only defers the record.
+        let _ = store
+            .retire_suspended_job(job.id, JobState::Failed, Some("give-up"), &msg)
+            .await;
+        let _ = store
+            .log_event("resume", &msg, Some(job.id), job.finding_id)
+            .await;
+        return Ok(None);
+    }
+
+    // An unreadable transcript, or one with no usage record at all,
+    // leaves the first call's cost unknown. `z` is the only other
+    // estimate of this work that exists, so it stands in — better a
+    // per-kind typical than a zero that would reserve nothing and
+    // let the ramp grant a job it cannot afford.
+    let ctx = crate::backends::omp_scavenge::harness::ctx_at_suspension(&session_file).unwrap_or(z);
+    let anticipated = resume_reservation(ctx, z, chain_spent);
+    let origin_job_id = store.resume_origin_job(job.id).await?;
+
+    // No "resuming" event here: this function is also the
+    // /api/summary preview, which polls every few seconds, and an
+    // event per poll would bury the log. `run_cycle_inner` logs it
+    // when the cycle actually acts on the candidate.
+
+    Ok(Some(ResumePlan {
+        kind: job.kind,
+        repo_id: job.repo_id,
+        repo: repo.name,
+        finding_id: job.finding_id,
+        predecessor_id: job.id,
+        origin_job_id,
+        session_file,
+        anticipated,
+        ctx,
+        typical: z,
+        chain_spent,
+    }))
 }
 
 /// Historical cost estimate for one (repo, kind): warm (finished a
@@ -2156,7 +2228,7 @@ pub async fn run_fix(
     // would `worktree remove --force` the exact tree the worker believes
     // it is sitting in, and the `add` would then hand it a clean
     // checkout of the default branch with all of its work gone.
-    // `pick_resume` has already established that the directory is there,
+    // `resume_plan` has already established that the directory is there,
     // which is what makes skipping both steps safe.
     if resume.is_none() {
         // Clean up old worktree if exists
@@ -3101,7 +3173,7 @@ pub async fn run_engage(
     // Only a cold attempt builds the worktree. A resume continues a
     // session that believes it is inside this directory, so reclaiming
     // it would delete exactly the tree the worker is working in.
-    // `pick_resume` has already established the directory is there.
+    // `resume_plan` has already established the directory is there.
     if resume.is_none() {
         if worktree.exists() {
             let rps = rpath.to_string_lossy().to_string();
@@ -3631,7 +3703,7 @@ pub async fn run_harvest(
     // Only a cold attempt builds the worktree. A resume continues a
     // session that believes it is inside this directory, so reclaiming
     // it would delete exactly the tree the worker is working in.
-    // `pick_resume` has already established the directory is there.
+    // `resume_plan` has already established the directory is there.
     if resume.is_none() {
         if worktree.exists() {
             let rps = rpath.to_string_lossy().to_string();

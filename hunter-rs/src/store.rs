@@ -11,9 +11,11 @@
 //!   together owns its transaction internally -- `add_repo` (the insert and
 //!   the id-derived clone path), `soft_delete_repo` (the findings/jobs
 //!   refusal checks and the flag, under `BEGIN IMMEDIATE` so the checks
-//!   cannot go stale before the write), and `sync_pr_open` (the PR upsert
-//!   and the dependent `attention_since` update). Those transactions close
-//!   real races; do not unwind them to make a method look like the others.
+//!   cannot go stale before the write), `sync_pr_open` (the PR upsert and
+//!   the dependent `attention_since` update), and `create_job` (the insert
+//!   and the retirement of the suspension it supersedes, with that
+//!   retirement's event). Those transactions close real races; do not
+//!   unwind them to make a method look like the others.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -187,6 +189,52 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+}
+
+/// INSERT one event row on `ex` — the pool, or an open transaction when
+/// the event must land with the change it records.
+async fn insert_event<'e, E: sqlx::SqliteExecutor<'e>>(
+    ex: E,
+    kind: &str,
+    message: &str,
+    job_id: Option<i64>,
+    finding_id: Option<i64>,
+) -> sqlx::Result<()> {
+    let at = now_ms();
+    sqlx::query!(
+        "INSERT INTO events (at, kind, message, job_id, finding_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        at,
+        kind,
+        message,
+        job_id,
+        finding_id
+    )
+    .execute(ex)
+    .await?;
+    Ok(())
+}
+
+/// Move one job to a terminal `state` on `ex`; see
+/// [`Store::retire_suspended_job`] for why `killed_reason` is optional.
+async fn retire_job<'e, E: sqlx::SqliteExecutor<'e>>(
+    ex: E,
+    job_id: i64,
+    state: JobState,
+    killed_reason: Option<&str>,
+    notes: &str,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        "UPDATE jobs SET state = ?1, killed_reason = COALESCE(?2, killed_reason), \
+         notes = ?3 WHERE id = ?4",
+        state,
+        killed_reason,
+        notes,
+        job_id
+    )
+    .execute(ex)
+    .await?;
+    Ok(())
 }
 
 impl Store {
@@ -690,19 +738,7 @@ impl Store {
         job_id: Option<i64>,
         finding_id: Option<i64>,
     ) -> sqlx::Result<()> {
-        let at = now_ms();
-        sqlx::query!(
-            "INSERT INTO events (at, kind, message, job_id, finding_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            at,
-            kind,
-            message,
-            job_id,
-            finding_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        insert_event(&self.pool, kind, message, job_id, finding_id).await
     }
 
     /// Append to [`Store::notes_path`] (creating dir +
@@ -1287,13 +1323,15 @@ impl Store {
 
     /// Take a suspended attempt out of the resumable pool for good.
     ///
-    /// The two ways a suspension ends without being continued: the
-    /// scheduler's give-up ceiling retires it `failed` with
-    /// `killed_reason = "give-up"`, and a resume that found the
-    /// transcript gone retires it `killed`. Both are terminal states, so
+    /// The ways a suspension ends without being continued: the
+    /// scheduler's give-up ceiling retires it `failed` / `give-up`; a
+    /// suspension whose working directory is gone is retired `killed` /
+    /// `workdir-gone`; fresh work at the same key retires it `killed` /
+    /// `superseded` ([`Self::create_job`]); and a resume that found the
+    /// transcript gone retires it `killed`. All are terminal states, so
     /// [`Self::list_resumable_jobs`] stops offering the row.
     ///
-    /// `killed_reason` is `Option` so the second case can leave the
+    /// `killed_reason` is `Option` so the last case can leave the
     /// original reason alone: that attempt really was killed for `cap`,
     /// and overwriting that with the successor's problem would lose the
     /// only record of why the work stopped. `notes` carries the new fact
@@ -1305,17 +1343,7 @@ impl Store {
         killed_reason: Option<&str>,
         notes: &str,
     ) -> sqlx::Result<()> {
-        sqlx::query!(
-            "UPDATE jobs SET state = ?1, killed_reason = COALESCE(?2, killed_reason), \
-             notes = ?3 WHERE id = ?4",
-            state,
-            killed_reason,
-            notes,
-            job_id
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+        retire_job(&self.pool, job_id, state, killed_reason, notes).await
     }
 
     // -- events / scheduler ----------------------------------------------------
@@ -1395,6 +1423,17 @@ impl Store {
     /// `None` for work starting fresh. It is written here and never
     /// updated, so a row can only ever point at an id that already
     /// existed — which is what keeps the chain acyclic.
+    ///
+    /// Fresh work supersedes a suspension of the same work: a suspended
+    /// job with no successor, of this kind and for this finding (finding
+    /// kinds) or this repo (hunt and the analysis kinds), is retired
+    /// `killed` / `superseded` in the same transaction. Whatever path
+    /// started the work over, the fresh attempt now owns it — and for a
+    /// finding kind its worktree handling reclaims the directory the old
+    /// transcript refers to — so the suspension can never be resumed.
+    /// Left `suspended`, it would stay in the table forever. Doing it
+    /// here rather than in selection is what covers every path that
+    /// creates a job.
     pub async fn create_job(
         &self,
         kind: JobKind,
@@ -1406,6 +1445,9 @@ impl Store {
         resumed_from: Option<i64>,
     ) -> Result<i64, StoreWriteError> {
         let now = now_ms();
+        // IMMEDIATE so the supersession below reads the suspensions under
+        // the same write lock that inserts their replacement.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
@@ -1421,14 +1463,51 @@ impl Store {
             estimated_tokens,
             resumed_from
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 0 {
             return Err(StoreWriteError::Refused(format!(
                 "repo {repo_id} is deleted -- cannot start a {kind} job"
             )));
         }
-        Ok(result.last_insert_rowid())
+        let id = result.last_insert_rowid();
+
+        if resumed_from.is_none() {
+            let suspended = JobState::Suspended;
+            let by_finding = kind.is_finding();
+            let superseded = sqlx::query!(
+                r#"
+                SELECT j.id AS "id!", r.name AS "repo_name!"
+                FROM jobs j
+                JOIN repos r ON r.id = j.repo_id
+                WHERE j.state = ?1
+                  AND j.kind = ?2
+                  AND j.id != ?3
+                  AND CASE WHEN ?4 THEN j.finding_id = ?5 ELSE j.repo_id = ?6 END
+                  AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
+                ORDER BY j.id
+                "#,
+                suspended,
+                kind,
+                id,
+                by_finding,
+                finding_id,
+                repo_id
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+            for old in superseded {
+                let msg = format!(
+                    "resume {kind} {}: job {} superseded by fresh job {id}",
+                    old.repo_name, old.id
+                );
+                retire_job(&mut *tx, old.id, JobState::Killed, Some("superseded"), &msg).await?;
+                insert_event(&mut *tx, "resume", &msg, Some(old.id), finding_id).await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(id)
     }
 
     /// Record a completed job (all outcome fields set at once).

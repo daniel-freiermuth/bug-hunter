@@ -137,6 +137,10 @@ what actually runs):
    repo — a periodic strategic check, not a tight-loop scan competing for
    every cycle.
 
+Each of 1-5 picks a (finding, kind). When that finding has a suspended
+attempt of that same kind that can still be continued, the tier continues
+it, at the tier's own position, instead of starting the work fresh.
+
 A repeatedly-failing item (same failure reason, consecutive attempts) gives
 up after a bounded streak rather than looping forever — this applies
 uniformly to fix retries, recheck retries, and harvest retries. A resume
@@ -149,6 +153,22 @@ that has never been resumed is never retired: one attempt's spend is by
 definition at least its own cap, and the largest attempt is discounted
 because one enormous attempt says the job is big, not that the chain is
 stuck.
+
+Two more things end a suspension, because after either one it can never
+usefully be continued, and a suspension nobody ends stays `suspended`
+forever:
+
+- **Superseded.** Starting the same work fresh — same finding and kind
+  for engage/harvest/recheck/fix, same repo and kind for hunt and the
+  analysis scans — marks the suspended attempt `killed` (reason
+  `superseded`) in the same transaction that creates the fresh job,
+  whichever path started it.
+- **Working directory gone.** The transcript describes files in the
+  clone (hunt, recheck, analysis scans) or the per-finding worktree
+  (fix, engage, harvest). If that directory no longer exists the
+  suspension is marked `killed` (reason `workdir-gone`) when selection
+  reaches it, and selection moves on to the next candidate the same
+  cycle.
 
 ### Budget policy
 
