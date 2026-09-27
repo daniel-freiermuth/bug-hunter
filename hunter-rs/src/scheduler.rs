@@ -8,7 +8,9 @@
 use std::path::Path;
 
 use crate::config::Config;
-use crate::domain::{FindingJobKind, FindingStatus, FindingType, JobKind, JobState, RepoJobKind};
+use crate::domain::{
+    ClosureClass, FindingJobKind, FindingStatus, FindingType, JobKind, JobState, RepoJobKind,
+};
 use crate::store::{CreatedJob, FindingFilter, Store, StoreWriteError, SyncPrData};
 use crate::types::{Finding, Job, Repo};
 use crate::util::now_ms;
@@ -201,28 +203,13 @@ async fn list_attention(store: &Store) -> sqlx::Result<Vec<Finding>> {
     Ok(rows.into_iter().map(|(_, f)| f).collect())
 }
 
-/// store.py `list_pending_harvest`: merged findings whose `pr_state` row has
-/// `harvested_at` IS NULL, ORDER BY `synced_at` ascending (oldest merge
-/// first). The JOIN requires the `pr_state` row to exist.
-async fn list_pending_harvest(store: &Store) -> sqlx::Result<Vec<Finding>> {
-    let mut rows: Vec<(Option<i64>, Finding)> = Vec::new();
-    for f in findings_with_status(store, FindingStatus::Merged).await? {
-        if let Some(ps) = store.get_pr_state(f.id).await?
-            && ps.harvested_at.is_none()
-        {
-            rows.push((ps.synced_at, f));
-        }
-    }
-    rows.sort_by_key(|(key, _)| *key);
-    Ok(rows.into_iter().map(|(_, f)| f).collect())
-}
-
 /// Selection — replicates `scheduler.pick_next`'s priority order and
 /// per-kind eligibility conditions.
 ///
 /// Priority (`scheduler.pick_next`): a budget-overridden finding (any
 /// category) jumps the queue -> flagged PR (oldest-outstanding reason
-/// first) -> oldest merged PR pending follow-up review -> oldest
+/// first) -> oldest merged or closed PR pending its harvest
+/// ([`Store::list_pending_harvest`]) -> oldest
 /// rechecking -> oldest queued fix -> resumable suspended work -> the
 /// most stale-of-rotation job type for the least-recently-hunted enabled
 /// repo (hunt if never cloned, else whichever of
@@ -249,7 +236,7 @@ pub async fn pick_next(
 ) -> anyhow::Result<Option<Candidate>> {
     let mut rechecking = findings_with_status(store, FindingStatus::Rechecking).await?;
     let mut attention = list_attention(store).await?;
-    let mut pending_harvest = list_pending_harvest(store).await?;
+    let mut pending_harvest = store.list_pending_harvest().await?;
     let mut queued = findings_with_status(store, FindingStatus::Queued).await?;
 
     let force_id: Option<i64> = if let Some(name) = force_repo {
@@ -3736,6 +3723,13 @@ pub async fn run_engage(
 }
 
 /// Run harvest job (`scheduler.run_harvest`).
+///
+/// One job kind for both ends of a PR's life. A merged PR is reviewed for
+/// follow-up work (`harvest.md`); a PR closed without merging is also
+/// classified — why it closed decides the finding's status — and reviewed
+/// for what it left open (`harvest-closed.md`). Which one runs is the PR's
+/// own state in `pr_state`, the record that says how the PR ended; the
+/// finding's status says what was decided about the finding since.
 #[allow(
     clippy::too_many_lines,
     reason = "linear job pipeline: sync, gate budget, run the worker, \
@@ -3859,6 +3853,46 @@ pub async fn run_harvest(
             anyhow::bail!("PR/MR view failed");
         }
     };
+    let closed = ps.state.as_deref() == Some("CLOSED");
+    // A closed PR's changes are on no branch the tree can be made from, so
+    // the worker gets them as a diff, fetched the way the view is. A resume
+    // needs neither: its transcript already holds the prompt.
+    let pr_diff = if closed && resume.is_none() {
+        match fg.pr_diff(&repo.url, pr_number) {
+            Ok(d) => d,
+            Err(e) => {
+                // No job exists yet, so nothing else records this attempt:
+                // left alone, a PR whose diff never loads stays unharvested,
+                // and as the oldest pending one it is picked again on every
+                // cycle, starving the tier. The streak key leaves out the
+                // error text so repeats of one outage count as identical.
+                let streak = store
+                    .record_harvest_attempt(fid, "pr diff failed")
+                    .await
+                    .unwrap_or(1);
+                if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
+                    let _ = store.mark_pr_harvested(fid, now_ms()).await;
+                    let _ = store.clear_harvest_attempts(fid).await;
+                    let _ = store.log_event("error",
+                        &format!("harvest #{fid}: gave up after {streak} identical failures (PR/MR diff failed: {e}) -- not reviewed, will not retry"),
+                        None, Some(fid),
+                    ).await;
+                } else {
+                    let _ = store
+                        .log_event(
+                            "error",
+                            &format!("harvest #{fid}: PR/MR diff failed: {e}, will retry"),
+                            None,
+                            Some(fid),
+                        )
+                        .await;
+                }
+                anyhow::bail!("PR/MR diff failed");
+            }
+        }
+    } else {
+        String::new()
+    };
 
     let created = match store
         .create_job(
@@ -3905,6 +3939,17 @@ pub async fn run_harvest(
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
     let prompt = match resume {
         Some(_) => RESUME_PROMPT.to_owned(),
+        None if closed => playbooks::build_harvest_closed_prompt(
+            &cfg.root,
+            finding,
+            &worktree,
+            &repo,
+            &pr,
+            pr_number,
+            &pr_diff,
+            playbooks::ClosedTree::DefaultBranch,
+            &repo_notes,
+        )?,
         None => playbooks::build_harvest_prompt(
             &cfg.root,
             finding,
@@ -3931,10 +3976,12 @@ pub async fn run_harvest(
         .await
         .unwrap_or(JobState::Failed);
 
-    // Follow-ups are read from the tree, so before it is released. The
-    // release itself is state-checked: a suspended harvest keeps its tree
-    // for the resume, where this used to drop it after every run.
+    // Follow-ups and the closure verdict are read from the tree, so before
+    // it is released. The release itself is state-checked: a suspended
+    // harvest keeps its tree for the resume, where this used to drop it
+    // after every run.
     let followups = ingest_followups(store, repo.id, &worktree, fid, job, "harvest").await;
+    let closure = closed.then(|| read_close_reason(&worktree));
     close_workspace(store, &ws).await;
 
     let mut summary = CycleSummary {
@@ -3970,17 +4017,33 @@ pub async fn run_harvest(
         }
         return Ok(summary);
     }
-    if state != JobState::Done {
-        let failure = format!("worker {state}");
-        let streak = store
-            .record_harvest_attempt(fid, &failure)
-            .await
-            .unwrap_or(1);
+    // A closed PR's review must say why it closed. Without that the
+    // finding would sit `closed` for good, so a missing or unusable
+    // CLOSE-REASON.json is a failed harvest like a failed worker, and runs
+    // into the same streak limit.
+    let failure = if state == JobState::Done {
+        match &closure {
+            Some(Err(why)) => Some(why.clone()),
+            _ => None,
+        }
+    } else {
+        Some(CloseFailure {
+            streak_key: format!("worker {state}"),
+            detail: format!("worker {state}"),
+        })
+    };
+    if let Some(failure) = failure {
+        let key = &failure.streak_key;
+        let detail = &failure.detail;
+        let streak = store.record_harvest_attempt(fid, key).await.unwrap_or(1);
         if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
+            // Given up on, the finding keeps whatever status it has:
+            // `closed`, never suppressed, for a closed PR nobody could
+            // classify.
             let _ = store.mark_pr_harvested(fid, now_ms()).await;
             let _ = store.clear_harvest_attempts(fid).await;
             let _ = store.log_event("error",
-                &format!("harvest #{fid}: gave up after {streak} identical failures ({failure}) -- not reviewed, will not retry"),
+                &format!("harvest #{fid}: gave up after {streak} identical failures ({detail}) -- not reviewed, will not retry"),
                 Some(job), Some(fid),
             ).await;
             summary.outcome = Some("stuck".into());
@@ -3988,25 +4051,83 @@ pub async fn run_harvest(
             let _ = store
                 .log_event(
                     "error",
-                    &format!("harvest #{fid}: worker {state}, will retry"),
+                    &format!("harvest #{fid}: {detail}, will retry"),
                     Some(job),
                     Some(fid),
                 )
                 .await;
             summary.outcome = Some("retry".into());
         }
+        summary.failure = Some(detail.clone());
         if override_mode == Some("once") {
             let _ = store.set_budget_override(fid, None).await;
         }
         return Ok(summary);
     }
 
-    let _ = store.mark_pr_harvested(fid, now_ms()).await;
+    // A merged PR's harvest changes no status, so the stamp alone records
+    // it. A closed PR's classification and stamp land together through
+    // `record_closed_harvest`: see there for why neither may land alone,
+    // and why a verdict a human set in the meantime is kept.
+    let reviewed = if let Some(Ok(verdict)) = &closure {
+        let status = verdict.class.status();
+        match store
+            .record_closed_harvest(fid, status, &verdict.reason, now_ms())
+            .await
+        {
+            Err(e) => {
+                // Nothing landed, so the finding is still `closed` and
+                // pending and the next cycle harvests it again. No streak
+                // entry: the worker did its job, and a database that
+                // refused the write is not a reason to give its PR up.
+                let _ = store
+                    .log_event(
+                        "error",
+                        &format!(
+                            "harvest #{fid}: could not record the classification ({e}), will retry"
+                        ),
+                        Some(job),
+                        Some(fid),
+                    )
+                    .await;
+                summary.outcome = Some("retry".into());
+                summary.failure = Some(format!("recording the classification failed: {e}"));
+                if override_mode == Some("once") {
+                    let _ = store.set_budget_override(fid, None).await;
+                }
+                return Ok(summary);
+            }
+            Ok(true) => {
+                summary.verdict = Some(status.as_str().to_owned());
+                summary.reason = Some(verdict.reason.clone());
+                format!(
+                    "closed as {}, finding now {status}; reviewed for follow-ups",
+                    verdict.class
+                )
+            }
+            Ok(false) => {
+                let kept = store
+                    .get_finding(fid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map_or_else(|| "unknown".to_owned(), |f| f.status.as_str().to_owned());
+                format!(
+                    "kept the human's verdict {kept}; closure classified as {}; \
+                     reviewed for follow-ups",
+                    verdict.class
+                )
+            }
+        }
+    } else {
+        let _ = store.mark_pr_harvested(fid, now_ms()).await;
+        "reviewed for follow-ups".to_owned()
+    };
     let _ = store.clear_harvest_attempts(fid).await;
     let _ = store
         .log_event(
             "harvest",
-            &format!("#{fid} PR #{pr_number} reviewed for follow-ups"),
+            &format!("#{fid} PR #{pr_number} {reviewed}"),
             Some(job),
             Some(fid),
         )
@@ -4016,6 +4137,87 @@ pub async fn run_harvest(
         let _ = store.set_budget_override(fid, None).await;
     }
     Ok(summary)
+}
+
+/// A closed PR's review that cannot be used.
+#[derive(Debug, Clone)]
+struct CloseFailure {
+    /// What the identical-failure streak compares. Stable per kind of
+    /// failure on purpose: a worker that writes a different invented
+    /// classification each time is failing the same way every time, and
+    /// keying on the bad value would reset the streak and never give up.
+    streak_key: String,
+    /// What the event says.
+    detail: String,
+}
+
+/// A closed PR's review, as the finding will record it.
+#[derive(Debug, Clone)]
+struct CloseVerdict {
+    class: ClosureClass,
+    /// `verdict_reason`: `"<classification>: <reason>"`, plus the evidence.
+    reason: String,
+}
+
+/// `CLOSE-REASON.json` as `harvest-closed.md` asks for it.
+#[derive(Deserialize)]
+struct CloseReasonFile {
+    classification: String,
+    reason: String,
+    #[serde(default)]
+    evidence: Option<String>,
+}
+
+/// Read and check the closed-PR harvest's verdict file.
+fn read_close_reason(worktree: &Path) -> Result<CloseVerdict, CloseFailure> {
+    use std::fmt::Write as _;
+    let fail = |key: &str, detail: String| CloseFailure {
+        streak_key: key.to_owned(),
+        detail,
+    };
+    let path = worktree.join("CLOSE-REASON.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Err(fail(
+            "no CLOSE-REASON.json",
+            "worker left no CLOSE-REASON.json".to_owned(),
+        ));
+    };
+    let file: CloseReasonFile = serde_json::from_str(&text).map_err(|e| {
+        fail(
+            "invalid CLOSE-REASON.json",
+            format!("CLOSE-REASON.json unreadable: {e}"),
+        )
+    })?;
+    let class: ClosureClass = file
+        .classification
+        .trim()
+        .to_ascii_lowercase()
+        .parse()
+        .map_err(|e| {
+            fail(
+                "invalid CLOSE-REASON.json",
+                format!("CLOSE-REASON.json: {e}"),
+            )
+        })?;
+    let reason = file.reason.trim();
+    if reason.is_empty() {
+        return Err(fail(
+            "invalid CLOSE-REASON.json",
+            "CLOSE-REASON.json: empty reason".to_owned(),
+        ));
+    }
+    let mut full = format!("{class}: {reason}");
+    if let Some(evidence) = file.evidence.as_deref().map(str::trim)
+        && !evidence.is_empty()
+    {
+        let _ = write!(full, " (evidence: {evidence})");
+    }
+    // The same bound an engage withdrawal's reason gets: this text is
+    // injected into every later scan's suppression list when it suppresses.
+    Ok(CloseVerdict {
+        class,
+        reason: full.chars().take(500).collect(),
+    })
 }
 
 /// Run one cycle: sync PRs, `pick_next`, dispatch to the appropriate runner (`scheduler.run_cycle`).

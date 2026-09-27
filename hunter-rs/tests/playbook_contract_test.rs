@@ -308,6 +308,35 @@ fn harvest_prompt_renders() {
     assert_usable("harvest", &prompt);
 }
 
+/// Rendered for both trees the closed-PR harvest runs in: the builder
+/// writes a different `{{WORKTREE_STATE}}` for each, and both reach a
+/// worker.
+#[test]
+fn harvest_closed_prompt_renders() {
+    let repo = sample_repo();
+    let finding = sample_finding(FindingType::Bug);
+    for tree in [
+        playbooks::ClosedTree::DefaultBranch,
+        playbooks::ClosedTree::PrHead,
+    ] {
+        let prompt = playbooks::build_harvest_closed_prompt(
+            &root(),
+            &finding,
+            Path::new("/tmp/worktree"),
+            &repo,
+            &sample_pr_view(),
+            7,
+            "diff --git a/x b/x\n",
+            tree,
+            "repo notes",
+        )
+        .expect(
+            "harvest-closed.md must render with the slots build_harvest_closed_prompt supplies",
+        );
+        assert_usable("harvest-closed", &prompt);
+    }
+}
+
 /// The harvest playbooks are the ones whose workers INVENT findings
 /// of any type, and `ingest` rejects an entry that omits (or misshapes) a
 /// required field for its type — the follow-up is dropped, not queued,
@@ -366,8 +395,8 @@ fn followup_playbooks_name_every_required_field_they_ask_workers_to_emit() {
         }
     }
     assert!(
-        checked >= 1,
-        "expected harvest to offer FOLLOW-UPS.json, found {checked}"
+        checked >= 2,
+        "expected harvest and harvest-closed to offer FOLLOW-UPS.json, found {checked}"
     );
 }
 
@@ -395,6 +424,7 @@ fn every_playbook_is_covered_by_this_test() {
         "recheck",
         "engage",
         "harvest",
+        "harvest-closed",
     ]
     .iter()
     .map(|s| (*s).to_owned())

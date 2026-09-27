@@ -1,0 +1,768 @@
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+//! `run_harvest` on a PR closed without merging: why it closed, and what
+//! it left open.
+//!
+//! A closure used to reject its finding on sight. Of the first 16 closed
+//! PRs, 15 were engage withdrawals (14 "superseded/obsolete") and one was
+//! closed by a human, so that suppressed valid findings. The closed PR now
+//! waits `closed` for this review, which classifies the closure into the
+//! finding's status and files the follow-ups, exactly as the merged
+//! harvest files its own.
+//!
+//! Same scaffolding as `runner_engage_test`: a real repo with a bare
+//! origin, a scripted `gh`, and a backend staging the worker's files.
+
+mod support;
+
+use hunter::config::Config;
+use hunter::domain::{FindingJobKind, FindingStatus, ForgeName};
+use hunter::scheduler::{Candidate, pick_next, run_harvest};
+use hunter::store::{FindingInsert, Store};
+use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, fresh_store};
+
+const REPO_URL: &str = "https://github.com/acme/widget";
+const PR_URL: &str = "https://github.com/acme/widget/pull/7";
+
+/// `gh pr view` of the closed PR, as `view_pr_engage` reads it.
+const PR_VIEW_JSON: &str = r#"{"state":"CLOSED","title":"fix the widget","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"fix/widget","headRefOid":"deadbeef"}"#;
+
+/// `gh pr diff` of the closed PR.
+const PR_DIFF: &str = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old_widget()\n+new_widget()\n";
+
+/// One valid follow-up, so a follow-up that is missing was skipped
+/// rather than rejected by ingest.
+const FOLLOW_UP: &str = r#"[{"type":"bug","fingerprint":"widget:src/lib.rs:left-open","file":"src/lib.rs","bug_class":"logic","severity":"medium","confidence":0.8,"summary":"left open","detail":"src/lib.rs:1 still has it","evidence_plan":"failing test","introduced_by":"left open by closed PR #7"}]"#;
+
+struct Fixture {
+    cfg: Config,
+    store: Store,
+    db: std::path::PathBuf,
+    fid: i64,
+    /// Last: fields drop in declaration order, and the directory must
+    /// outlive the Store's pool.
+    _dir: TempDir,
+}
+
+impl Fixture {
+    /// A raw read-only look at the database, for columns the Store API has
+    /// no reader for.
+    async fn scalar(&self, sql: &'static str) -> Option<i64> {
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
+        )
+        .await
+        .unwrap();
+        let row: Option<(Option<i64>,)> = sqlx::query_as(sql).fetch_optional(&pool).await.unwrap();
+        row.and_then(|r| r.0)
+    }
+}
+
+/// A repo with a finding whose PR #7 closed without merging, unharvested,
+/// the finding at `status` — `closed` as sync and a withdrawal leave it
+/// (and as migration 016 leaves the closures from before this review).
+async fn fixture(label: &str, status: FindingStatus) -> Fixture {
+    let dir = TempDir::new(label);
+    let repo = GitRepo::with_branch(&dir, "fix/widget");
+    let (db, store) = fresh_store(&dir, "harvest").await;
+    let repos_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repos_root).unwrap();
+    let rid = store
+        .add_repo(
+            "widget",
+            REPO_URL,
+            &repos_root,
+            &repo.default_branch,
+            ForgeName::Github,
+        )
+        .await
+        .unwrap();
+    std::fs::rename(&repo.work, Store::repo_dir(&repos_root, rid)).unwrap();
+    let (fid, _) = store
+        .upsert_finding(
+            rid,
+            &FindingInsert {
+                fingerprint: "widget:src/lib.rs:old-widget".to_owned(),
+                file: "src/lib.rs".to_owned(),
+                severity: "medium".to_owned(),
+                confidence: 0.9,
+                summary: "old widget is wrong".to_owned(),
+                ..Default::default()
+            },
+            "bug",
+            None,
+        )
+        .await
+        .unwrap();
+    store.set_finding_pr_open(fid, PR_URL).await.unwrap();
+    store
+        .set_finding_verdict(fid, status, "PR closed without merge")
+        .await
+        .unwrap();
+    store.mark_pr_closed(fid, 7, 1).await.unwrap();
+
+    // Hermetic stubs naming the slots this suite asserts on; the contract
+    // test renders the real playbooks.
+    let playbooks = dir.subdir("playbooks");
+    std::fs::write(
+        playbooks.join("harvest-closed.md"),
+        "closed: the worktree at {{WORKTREE}} is {{WORKTREE_STATE}}.\n{{PR_DIFF}}\n",
+    )
+    .unwrap();
+    std::fs::write(playbooks.join("harvest.md"), "merged {{WORKTREE}}\n").unwrap();
+    let mut cfg = Config::load(dir.path()).expect("load config");
+    cfg.work_root = dir.subdir("work_root");
+    Fixture {
+        cfg,
+        store,
+        db,
+        fid,
+        _dir: dir,
+    }
+}
+
+/// `gh` answering `pr diff` with `diff` and every other call with the view.
+fn gh(bins: &FakeBins, diff_command: &str) {
+    bins.script(
+        "gh",
+        &format!(
+            "if [ \"$2\" = diff ]; then\n{diff_command}\nexit 0\nfi\ncat <<'__FAKE_EOF__'\n{PR_VIEW_JSON}\n__FAKE_EOF__\nexit 0"
+        ),
+    );
+}
+
+fn gh_default(bins: &FakeBins) {
+    gh(
+        bins,
+        &format!("cat <<'__FAKE_EOF__'\n{PR_DIFF}__FAKE_EOF__"),
+    );
+}
+
+fn close_reason(classification: &str) -> String {
+    serde_json::json!({
+        "classification": classification,
+        "reason": "landed in #9",
+        "evidence": "abc1234",
+    })
+    .to_string()
+}
+
+/// A worker that leaves `CLOSE-REASON.json` with `body`.
+fn classifying(body: String) -> ScriptedBackend {
+    ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("CLOSE-REASON.json"), &body).unwrap();
+        support::done()
+    })
+}
+
+/// A closed, unharvested PR whose finding is `closed` is picked for its
+/// harvest. A harvested one is not picked again.
+#[tokio::test]
+async fn a_closed_unharvested_pr_is_picked_once() {
+    let f = fixture("harvest-pick", FindingStatus::Closed).await;
+
+    let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+    match picked {
+        Some(Candidate::Finding {
+            kind: FindingJobKind::Harvest,
+            finding_id,
+            ..
+        }) => assert_eq!(finding_id, f.fid),
+        other => panic!("expected the closed PR's harvest, got {other:?}"),
+    }
+
+    f.store.mark_pr_harvested(f.fid, 2).await.unwrap();
+    let after = pick_next(&f.store, &f.cfg, None).await.unwrap();
+    assert!(
+        !matches!(
+            after,
+            Some(Candidate::Finding {
+                kind: FindingJobKind::Harvest,
+                ..
+            })
+        ),
+        "a harvested PR must not be picked again: {after:?}"
+    );
+}
+
+/// A closure harvested as `abandoned` sends the finding back to `new`, and
+/// its re-fix ships as a new PR into the same `pr_state` row. When that PR
+/// merges it is due its own harvest: the closed PR's stamp must not carry
+/// over and hide it from the queue.
+#[tokio::test]
+async fn a_refix_of_an_abandoned_pr_is_harvested_when_it_merges() {
+    let bins = FakeBins::acquire("harvest-refix");
+    gh_default(&bins);
+    let f = fixture("harvest-refix", FindingStatus::Closed).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = run_harvest(
+        &f.store,
+        &f.cfg,
+        &finding,
+        &classifying(close_reason("abandoned")),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.outcome.as_deref(), Some("harvested"), "{summary:?}");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::New);
+
+    // The re-fix ships as PR #8, which then merges (as `sync_prs` records it).
+    f.store
+        .set_finding_pr_open(f.fid, "https://github.com/acme/widget/pull/8")
+        .await
+        .unwrap();
+    f.store
+        .set_finding_status(f.fid, FindingStatus::Merged)
+        .await
+        .unwrap();
+    f.store.mark_pr_merged(f.fid, 8, 3).await.unwrap();
+
+    let pending: Vec<i64> = f
+        .store
+        .list_pending_harvest()
+        .await
+        .unwrap()
+        .iter()
+        .map(|p| p.id)
+        .collect();
+    assert_eq!(pending, [f.fid], "merged PR #8 awaits its own harvest");
+}
+
+/// Each classification lands as its status, with the reason and the
+/// evidence as the verdict. Only `wrong` and `unwanted` suppress.
+#[tokio::test]
+async fn each_classification_lands_as_its_status() {
+    let bins = FakeBins::acquire("harvest-classes");
+    gh_default(&bins);
+    let table = [
+        ("superseded", FindingStatus::Superseded),
+        ("duplicate", FindingStatus::Superseded),
+        ("obsolete", FindingStatus::Superseded),
+        ("wrong", FindingStatus::Rejected),
+        ("unwanted", FindingStatus::Wontfix),
+        ("abandoned", FindingStatus::New),
+    ];
+    for (class, expected) in table {
+        let f = fixture(&format!("harvest-class-{class}"), FindingStatus::Closed).await;
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+        let summary = run_harvest(
+            &f.store,
+            &f.cfg,
+            &finding,
+            &classifying(close_reason(class)),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            summary.outcome.as_deref(),
+            Some("harvested"),
+            "{class}: {summary:?}"
+        );
+        let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(after.status, expected, "{class}");
+        assert_eq!(
+            after.verdict_reason.as_deref(),
+            Some(format!("{class}: landed in #9 (evidence: abc1234)").as_str()),
+            "{class}"
+        );
+        let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+        assert!(
+            ps.harvested_at.is_some(),
+            "{class}: must be marked harvested"
+        );
+    }
+}
+
+/// A `wrong` the current code proves, with no maintainer having said so,
+/// has no quote to give: the playbook tells the worker to leave it empty
+/// or out rather than invent one, so either form must land the verdict.
+#[tokio::test]
+async fn a_wrong_without_a_maintainer_quote_lands() {
+    let bins = FakeBins::acquire("harvest-wrong-unquoted");
+    gh_default(&bins);
+    let bodies = [
+        r#"{"classification":"wrong","reason":"there is no bug","evidence":"src/lib.rs:1"}"#,
+        r#"{"classification":"wrong","reason":"there is no bug","evidence":"src/lib.rs:1","maintainer_quote":""}"#,
+    ];
+    for (n, body) in bodies.into_iter().enumerate() {
+        let f = fixture(
+            &format!("harvest-wrong-unquoted-{n}"),
+            FindingStatus::Closed,
+        )
+        .await;
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+        let summary = run_harvest(
+            &f.store,
+            &f.cfg,
+            &finding,
+            &classifying(body.to_owned()),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(summary.outcome.as_deref(), Some("harvested"), "{body}");
+        let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(after.status, FindingStatus::Rejected, "{body}");
+        assert_eq!(
+            after.verdict_reason.as_deref(),
+            Some("wrong: there is no bug (evidence: src/lib.rs:1)"),
+            "{body}"
+        );
+    }
+}
+
+/// Follow-ups of a closed PR are filed like the merged harvest's: by the
+/// harvest job, against the finding whose PR it reviewed.
+#[tokio::test]
+async fn follow_ups_are_filed_with_their_provenance() {
+    let bins = FakeBins::acquire("harvest-followups");
+    gh_default(&bins);
+    let f = fixture("harvest-followups", FindingStatus::Closed).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("CLOSE-REASON.json"), close_reason("superseded")).unwrap();
+        std::fs::write(tree.join("FOLLOW-UPS.json"), FOLLOW_UP).unwrap();
+        support::done()
+    });
+
+    let summary = run_harvest(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    let job = summary.job_id.unwrap();
+    assert_eq!(
+        summary.ingest.as_ref().map(|i| i.inserted),
+        Some(1),
+        "{summary:?}"
+    );
+    let found_by = f
+        .scalar(
+            "SELECT found_by_job FROM findings WHERE fingerprint = 'widget:src/lib.rs:left-open'",
+        )
+        .await;
+    assert_eq!(
+        found_by,
+        Some(job),
+        "the follow-up must name the harvest job"
+    );
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "harvest"
+            && e.finding_id == Some(f.fid)
+            && e.job_id == Some(job)
+            && e.message.contains("+1 follow-up")),
+        "the filing must be logged against the reviewed finding: {events:?}"
+    );
+}
+
+/// A review that does not say why the PR closed is a failed harvest: it
+/// counts toward the identical-failure streak, and at the limit the PR is
+/// given up on with the finding left `closed` — never suppressed.
+#[tokio::test]
+async fn an_invalid_close_reason_counts_toward_the_streak() {
+    let bins = FakeBins::acquire("harvest-invalid");
+    gh_default(&bins);
+    let f = fixture("harvest-invalid", FindingStatus::Closed).await;
+
+    let mut outcomes = Vec::new();
+    for attempt in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = run_harvest(
+            &f.store,
+            &f.cfg,
+            &finding,
+            &classifying(close_reason("maybe")),
+            None,
+        )
+        .await
+        .unwrap();
+        let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+        if attempt < 3 {
+            assert_eq!(ps.harvest_attempts, attempt, "{summary:?}");
+            assert_eq!(ps.harvested_at, None, "retried, not given up: {summary:?}");
+        } else {
+            assert!(
+                ps.harvested_at.is_some(),
+                "given up at the limit: {summary:?}"
+            );
+        }
+        outcomes.push(summary.outcome);
+    }
+
+    assert_eq!(
+        outcomes,
+        [
+            Some("retry".into()),
+            Some("retry".into()),
+            Some("stuck".into())
+        ]
+    );
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Closed);
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "error" && e.message.contains("gave up after 3")),
+        "{events:?}"
+    );
+}
+
+/// A classification the database refuses to record leaves the finding
+/// `closed` and pending for the next cycle. It is not the worker's
+/// failure, so it records no attempt toward the streak; once the database
+/// takes writes again, the next run lands the classification.
+#[tokio::test]
+async fn a_classification_that_cannot_be_recorded_is_retried() {
+    let bins = FakeBins::acquire("harvest-record-fails");
+    gh_default(&bins);
+    let f = fixture("harvest-record-fails", FindingStatus::Closed).await;
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER no_harvest_stamp BEFORE UPDATE OF harvested_at ON pr_state \
+         BEGIN SELECT RAISE(ABORT, 'injected harvested_at failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = run_harvest(
+        &f.store,
+        &f.cfg,
+        &finding,
+        &classifying(close_reason("superseded")),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    let pending = f.store.list_pending_harvest().await.unwrap();
+    assert_eq!(
+        (
+            after.status,
+            ps.harvested_at,
+            pending.iter().any(|p| p.id == f.fid)
+        ),
+        (FindingStatus::Closed, None, true),
+        "(status, harvested_at, pending): nothing landed and the finding waits for the next cycle"
+    );
+    assert_eq!(
+        after.verdict_reason.as_deref(),
+        Some("PR closed without merge")
+    );
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    assert_eq!(ps.harvest_attempts, 0, "not counted toward the streak");
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "error"
+            && e.finding_id == Some(f.fid)
+            && e.message.contains("injected harvested_at failure")),
+        "{events:?}"
+    );
+
+    sqlx::query("DROP TRIGGER no_harvest_stamp")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = run_harvest(
+        &f.store,
+        &f.cfg,
+        &finding,
+        &classifying(close_reason("superseded")),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(summary.outcome.as_deref(), Some("harvested"), "{summary:?}");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Superseded);
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert!(ps.harvested_at.is_some());
+}
+
+/// The retry path of an unrecordable classification still spends a
+/// `once` override, as every other end of an attempt does, and keeps an
+/// `exempt` one, which lasts until a human clears it.
+#[tokio::test]
+async fn a_classification_that_cannot_be_recorded_spends_only_a_once_override() {
+    let bins = FakeBins::acquire("harvest-record-fails-override");
+    gh_default(&bins);
+    for (mode, left) in [("once", None), ("exempt", Some("exempt"))] {
+        let f = fixture(
+            &format!("harvest-record-fails-{mode}"),
+            FindingStatus::Closed,
+        )
+        .await;
+        f.store
+            .set_budget_override(f.fid, Some(mode))
+            .await
+            .unwrap();
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db),
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER no_harvest_stamp BEFORE UPDATE OF harvested_at ON pr_state \
+             BEGIN SELECT RAISE(ABORT, 'injected harvested_at failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = run_harvest(
+            &f.store,
+            &f.cfg,
+            &finding,
+            &classifying(close_reason("superseded")),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            summary.outcome.as_deref(),
+            Some("retry"),
+            "{mode}: {summary:?}"
+        );
+        let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(after.budget_override.as_deref(), left, "{mode} override");
+    }
+}
+
+/// A verdict a human sets while the harvest worker runs is kept: the
+/// classification only replaces `closed`. The PR was still reviewed, so
+/// the harvest stamp lands and it is not picked again, and an event says
+/// which verdict was kept over which classification.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_verdict_set_while_the_harvest_ran_is_kept() {
+    let bins = FakeBins::acquire("harvest-human-meanwhile");
+    gh_default(&bins);
+    let f = fixture("harvest-human-meanwhile", FindingStatus::Closed).await;
+    let (db, fid) = (f.db.clone(), f.fid);
+    let backend = ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("CLOSE-REASON.json"), close_reason("superseded")).unwrap();
+        // The human's verdict, through the API's own write, mid-run.
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                Store::connect(&db)
+                    .await
+                    .unwrap()
+                    .set_finding_verdict(fid, FindingStatus::Wontfix, "not worth it")
+                    .await
+                    .unwrap();
+            });
+        });
+        support::done()
+    });
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = run_harvest(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("harvested"), "{summary:?}");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Wontfix);
+    assert_eq!(after.verdict_reason.as_deref(), Some("not worth it"));
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert!(ps.harvested_at.is_some(), "the PR was reviewed");
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.finding_id == Some(f.fid)
+            && e.message
+                .contains("kept the human's verdict wontfix; closure classified as superseded")),
+        "{events:?}"
+    );
+}
+
+/// A closed PR whose diff will not load fails before any job exists, so
+/// the attempt must still count toward the streak: otherwise the PR stays
+/// pending for good and, as the oldest one, is picked on every cycle. The
+/// error text differs per attempt, as a real outage's does, and the
+/// streak must accumulate regardless.
+#[tokio::test]
+async fn a_failing_pr_diff_counts_toward_the_streak() {
+    let bins = FakeBins::acquire("harvest-diff-fails");
+    gh(&bins, "echo \"HTTP 502 at $(date +%s%N)\" >&2\nexit 1");
+    let f = fixture("harvest-diff-fails", FindingStatus::Closed).await;
+    let never_runs = ScriptedBackend::new(|_| panic!("no worker without the PR's diff"));
+
+    for attempt in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let err = run_harvest(&f.store, &f.cfg, &finding, &never_runs, None)
+            .await
+            .expect_err("a failed diff fails the harvest");
+        assert!(err.to_string().contains("diff failed"), "{err}");
+
+        let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+        let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+        let still_pending = matches!(
+            picked,
+            Some(Candidate::Finding {
+                kind: FindingJobKind::Harvest,
+                finding_id,
+                ..
+            }) if finding_id == f.fid
+        );
+        if attempt < 3 {
+            assert_eq!(ps.harvest_attempts, attempt, "attempt {attempt}");
+            assert_eq!(ps.harvested_at, None, "retried, not given up");
+            assert!(still_pending, "attempt {attempt}: {picked:?}");
+        } else {
+            assert!(ps.harvested_at.is_some(), "given up at the limit");
+            assert!(
+                !still_pending,
+                "a given-up PR must not be picked: {picked:?}"
+            );
+        }
+    }
+
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Closed);
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "error" && e.message.contains("gave up after 3")),
+        "{events:?}"
+    );
+}
+
+/// The cold review runs in a tree at the default branch, which does not
+/// hold the PR's changes: the prompt must say so and carry the diff.
+#[tokio::test]
+async fn the_prompt_carries_the_diff_and_what_the_tree_holds() {
+    let bins = FakeBins::acquire("harvest-prompt");
+    gh_default(&bins);
+    let f = fixture("harvest-prompt", FindingStatus::Closed).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = classifying(close_reason("superseded"));
+
+    run_harvest(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 1);
+    let prompt = &runs[0].prompt;
+    assert!(prompt.contains(PR_DIFF), "{prompt}");
+    assert!(
+        prompt.contains("checked out at main's HEAD, which does NOT contain this PR's changes"),
+        "{prompt}"
+    );
+    assert_eq!(runs[0].resume_from, None);
+}
+
+/// A diff past the cap is cut, and says it was: a worker must not take a
+/// truncated diff for the whole PR.
+#[tokio::test]
+async fn a_huge_diff_is_cut_with_a_marker() {
+    let bins = FakeBins::acquire("harvest-huge-diff");
+    // 60,000 lines of "+x\n": 180,000 characters.
+    gh(&bins, "yes '+x' | head -n 60000");
+    let f = fixture("harvest-huge-diff", FindingStatus::Closed).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = classifying(close_reason("superseded"));
+
+    run_harvest(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    let prompt = &backend.runs()[0].prompt;
+    assert!(
+        prompt.contains("[diff truncated here: 140000 more characters not shown]"),
+        "{}",
+        &prompt[prompt.len().saturating_sub(300)..]
+    );
+    assert!(prompt.len() < 41_000, "{} bytes", prompt.len());
+}
+
+/// A closed PR whose finding a human moved on after the closure — back to
+/// `queued` for another fix, or settled as `wontfix` — is not harvested:
+/// the harvest's classification would overwrite that decision. Only
+/// `closed` (the steady state) is picked.
+#[tokio::test]
+async fn a_closed_pr_whose_finding_a_human_moved_on_is_not_picked() {
+    for status in [FindingStatus::Wontfix, FindingStatus::Queued] {
+        let f = fixture(&format!("harvest-moved-on-{status}"), status).await;
+        let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+        assert!(
+            !matches!(
+                picked,
+                Some(Candidate::Finding {
+                    kind: FindingJobKind::Harvest,
+                    ..
+                })
+            ),
+            "{status}: must not be harvested: {picked:?}"
+        );
+    }
+}
+
+/// A human who rejects the finding after its PR closed has decided it: the
+/// harvest must not pick it up and overwrite that verdict with its own
+/// classification. Every closure before this review also left `rejected`,
+/// so the two cannot be told apart by status; migration 016 moved those to
+/// `closed` once, and only `closed` is picked from then on.
+#[tokio::test]
+async fn a_finding_rejected_after_its_pr_closed_is_not_picked() {
+    let f = fixture("harvest-rejected-later", FindingStatus::Closed).await;
+    f.store
+        .set_finding_verdict(f.fid, FindingStatus::Rejected, "wrong after all")
+        .await
+        .unwrap();
+
+    let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+    assert!(
+        !matches!(
+            picked,
+            Some(Candidate::Finding {
+                kind: FindingJobKind::Harvest,
+                ..
+            })
+        ),
+        "a human's rejection must not be harvested: {picked:?}"
+    );
+}
+
+/// A diff that carries its own ``` and ```` lines (a markdown file) stays
+/// one block: the fence is longer than any backtick run in it, so the
+/// block closes only after the whole diff.
+#[tokio::test]
+async fn a_diff_containing_fences_stays_one_block() {
+    const MD_DIFF: &str =
+        "diff --git a/README.md b/README.md\n+```rust\n+let x = 1;\n+```\n+````\n+nested\n+````\n";
+    let bins = FakeBins::acquire("harvest-fenced-diff");
+    gh(
+        &bins,
+        &format!("cat <<'__FAKE_EOF__'\n{MD_DIFF}__FAKE_EOF__"),
+    );
+    let f = fixture("harvest-fenced-diff", FindingStatus::Closed).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = classifying(close_reason("superseded"));
+
+    run_harvest(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    let prompt = &backend.runs()[0].prompt;
+    assert!(
+        prompt.contains(&format!("\n`````diff\n{MD_DIFF}`````\n")),
+        "{prompt}"
+    );
+}

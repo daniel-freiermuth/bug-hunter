@@ -17,7 +17,7 @@
 mod support;
 
 use hunter::domain::ForgeName;
-use hunter::forge::{Mergeable, PrState, ReviewDecision, forge_for};
+use hunter::forge::{MAX_DIFF_PAGES, Mergeable, PrState, ReviewDecision, forge_for};
 use support::{FakeBins, TempDir};
 
 const GH_REPO: &str = "https://github.com/acme/widget";
@@ -791,5 +791,170 @@ fn gitlab_view_fetches_the_newest_notes_and_restores_order() {
             "api",
             "projects/group%2Fwidget/merge_requests/7/notes?sort=desc&per_page=100",
         ]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// pr_diff: what a closed PR proposed
+// ---------------------------------------------------------------------------
+
+/// A closed PR's changes are on no branch its harvest's tree is made from,
+/// so this diff is all the worker sees of them. It must be the plain diff
+/// (no colour codes, whatever `gh` guesses about the terminal), and a
+/// failed fetch must be an error rather than an empty diff that reads as
+/// "this PR changed nothing".
+#[test]
+fn github_pr_diff_is_uncoloured_and_errors_on_a_non_zero_exit() {
+    let bins = FakeBins::acquire("forge-gh-diff");
+    bins.ok("gh", "diff --git a/x b/x");
+    let gh = forge_for(ForgeName::Github);
+
+    let diff = gh.pr_diff(GH_REPO, PR).expect("diff");
+    assert!(diff.starts_with("diff --git a/x b/x"), "{diff:?}");
+    let calls = bins.calls_to("gh");
+    let call = &calls[0];
+    assert_eq!(&call[1..4], ["pr", "diff", "7"], "{call:?}");
+    assert_eq!(value_after(call, "-R"), Some("acme/widget"), "{call:?}");
+    assert_eq!(value_after(call, "--color"), Some("never"), "{call:?}");
+
+    bins.fail("gh", 1, "could not resolve to a PullRequest");
+    let err = gh.pr_diff(GH_REPO, PR).expect_err("rc!=0 must fail");
+    assert!(err.to_string().contains("rc=1"), "got: {err}");
+}
+
+/// GitLab returns an MR's diff per file, without the file headers; the
+/// worker needs a unified diff it can read as one, with created and
+/// deleted files marked the way git marks them.
+#[test]
+fn gitlab_pr_diff_rebuilds_the_unified_diff() {
+    let bins = FakeBins::acquire("forge-gl-diff");
+    bins.ok(
+        "glab",
+        r#"[{"old_path":"src/a.rs","new_path":"src/a.rs","new_file":false,"deleted_file":false,"diff":"@@ -1 +1 @@\n-a\n+b\n"},
+            {"old_path":"src/new.rs","new_path":"src/new.rs","new_file":true,"deleted_file":false,"diff":"@@ -0,0 +1 @@\n+n"}]"#,
+    );
+    let gl = forge_for(ForgeName::Gitlab);
+
+    let diff = gl.pr_diff(GL_NESTED, PR).expect("diff");
+
+    assert_eq!(
+        diff,
+        "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-a\n+b\n\
+         diff --git a/src/new.rs b/src/new.rs\n--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1 @@\n+n\n"
+    );
+    assert!(
+        position_containing(
+            &bins.calls(),
+            "glab",
+            "projects/group%2Fsub%2Fwidget/merge_requests/7/diffs"
+        )
+        .is_some(),
+        "{:?}",
+        bins.calls()
+    );
+}
+
+/// GitLab withholds the hunks of an oversized (`too_large`) or collapsed
+/// file and sends an empty `diff`, on a page short enough to end the walk
+/// as complete. Each such file keeps its header and says its diff was
+/// omitted, so the worker never reads it as a file the PR left alone.
+#[test]
+fn gitlab_pr_diff_marks_files_whose_diff_gitlab_omitted() {
+    let bins = FakeBins::acquire("forge-gl-diff-omitted");
+    bins.ok(
+        "glab",
+        r#"[{"old_path":"src/a.rs","new_path":"src/a.rs","diff":"@@ -1 +1 @@\n-a\n+b\n"},
+            {"old_path":"big.json","new_path":"big.json","diff":"","too_large":true,"collapsed":false},
+            {"old_path":"gen.rs","new_path":"gen.rs","diff":"","too_large":false,"collapsed":true}]"#,
+    );
+
+    let diff = forge_for(ForgeName::Gitlab)
+        .pr_diff(GL_REPO, PR)
+        .expect("diff");
+
+    assert_eq!(
+        diff,
+        "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-a\n+b\n\
+         diff --git a/big.json b/big.json\n--- a/big.json\n+++ b/big.json\n\
+         [diff omitted by GitLab: file too large]\n\
+         diff --git a/gen.rs b/gen.rs\n--- a/gen.rs\n+++ b/gen.rs\n\
+         [diff omitted by GitLab: collapsed]\n"
+    );
+}
+
+/// GitLab pages an MR's diffs at 100 files. A 101-file MR must come back
+/// whole: its last file lives on the second page, and a diff missing it
+/// reads as a smaller change than the PR proposed. Like GitLab, the fake
+/// serves the first page to a request naming none; the short second page
+/// ends the walk, and any other request fails the fake.
+#[test]
+fn gitlab_pr_diff_walks_every_page() {
+    let bins = FakeBins::acquire("forge-gl-diff-pages");
+    let page1 = format!(
+        "[{}]",
+        (0..100).map(gl_diff_file).collect::<Vec<_>>().join(",")
+    );
+    let page2 = format!("[{}]", gl_diff_file(100));
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$*\" in\n  *'&page=1'|*'per_page=100') cat <<'__P1_EOF__'\n{page1}\n__P1_EOF__\n  exit 0 ;;\n  *'&page=2') cat <<'__P2_EOF__'\n{page2}\n__P2_EOF__\n  exit 0 ;;\nesac\necho \"unexpected request: $*\" >&2\nexit 1"
+        ),
+    );
+    let gl = forge_for(ForgeName::Gitlab);
+
+    let diff = gl.pr_diff(GL_REPO, PR).expect("diff");
+
+    for n in [0, 99, 100] {
+        assert!(
+            diff.contains(&format!("diff --git a/f{n}.rs b/f{n}.rs\n")),
+            "file {n} missing from the rebuilt diff"
+        );
+    }
+    assert_eq!(diff.matches("diff --git ").count(), 101);
+    assert_eq!(bins.calls_to("glab").len(), 2, "{:?}", bins.calls());
+}
+
+/// One file of a GitLab MR's `diffs` response.
+fn gl_diff_file(n: usize) -> String {
+    format!(
+        r#"{{"old_path":"f{n}.rs","new_path":"f{n}.rs","new_file":false,"deleted_file":false,"diff":"@@ -1 +1 @@\n-{n}\n+{n}!\n"}}"#
+    )
+}
+
+/// The walk is bounded: against a server that ignores `page` and always
+/// answers a full page, it stops after [`MAX_DIFF_PAGES`] requests and the
+/// diff says it was cut, so the worker never takes it for the whole MR.
+/// The fake refuses any request past the cap, so an unbounded walk fails
+/// fast instead of hanging.
+#[test]
+fn gitlab_pr_diff_stops_at_the_page_cap_and_says_so() {
+    let bins = FakeBins::acquire("forge-gl-diff-cap");
+    let dir = TempDir::new("forge-gl-diff-cap-count");
+    let counter = dir.path().join("calls");
+    let full = format!(
+        "[{}]",
+        (0..100).map(gl_diff_file).collect::<Vec<_>>().join(",")
+    );
+    bins.script(
+        "glab",
+        &format!(
+            "n=$(cat '{counter}' 2>/dev/null || echo 0)\nn=$((n + 1))\necho \"$n\" > '{counter}'\nif [ \"$n\" -gt {MAX_DIFF_PAGES} ]; then\n  echo \"fake glab: request $n is past the {MAX_DIFF_PAGES}-page cap\" >&2\n  exit 1\nfi\ncat <<'__PAGE_EOF__'\n{full}\n__PAGE_EOF__\nexit 0",
+            counter = counter.display()
+        ),
+    );
+
+    let diff = forge_for(ForgeName::Gitlab)
+        .pr_diff(GL_REPO, PR)
+        .expect("the walk must stop at the cap without error");
+
+    assert_eq!(bins.calls_to("glab").len(), MAX_DIFF_PAGES);
+    let shown = 100 * MAX_DIFF_PAGES;
+    assert!(
+        diff.ends_with(&format!(
+            "[diff truncated: MR has more than {shown} changed files; only the first {shown} are shown]\n"
+        )),
+        "no truncation marker at the end: {:?}",
+        &diff[diff.len().saturating_sub(200)..]
     );
 }

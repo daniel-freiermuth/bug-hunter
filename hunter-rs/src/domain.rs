@@ -98,6 +98,76 @@ impl std::fmt::Display for FindingStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Why a pull request closed without merging
+// ---------------------------------------------------------------------------
+
+/// The closed-PR harvest's verdict on why a PR closed unmerged
+/// (`CLOSE-REASON.json`'s `classification`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClosureClass {
+    Superseded,
+    Duplicate,
+    Obsolete,
+    Wrong,
+    Unwanted,
+    Abandoned,
+}
+
+impl ClosureClass {
+    pub const ALL: [Self; 6] = [
+        Self::Superseded,
+        Self::Duplicate,
+        Self::Obsolete,
+        Self::Wrong,
+        Self::Unwanted,
+        Self::Abandoned,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Superseded => "superseded",
+            Self::Duplicate => "duplicate",
+            Self::Obsolete => "obsolete",
+            Self::Wrong => "wrong",
+            Self::Unwanted => "unwanted",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    /// The status the finding takes once its PR's closure is classified.
+    ///
+    /// Only `wrong` and `unwanted` suppress, because only they say
+    /// something about the finding: its premise failed, or the maintainers
+    /// do not want that kind of change. Work that landed another way, or
+    /// whose code is gone, says the finding was right. `abandoned` says
+    /// nothing at all, so the finding goes back to triage.
+    pub fn status(self) -> FindingStatus {
+        match self {
+            Self::Superseded | Self::Duplicate | Self::Obsolete => FindingStatus::Superseded,
+            Self::Wrong => FindingStatus::Rejected,
+            Self::Unwanted => FindingStatus::Wontfix,
+            Self::Abandoned => FindingStatus::New,
+        }
+    }
+}
+
+impl std::fmt::Display for ClosureClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ClosureClass {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|c| c.as_str() == s)
+            .ok_or_else(|| format!("unknown classification {s:?}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Job state
 // ---------------------------------------------------------------------------
 

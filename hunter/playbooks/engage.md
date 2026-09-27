@@ -59,8 +59,8 @@ Title: {{PR_TITLE}}
    genuinely wrong to do here, give a NEW, more specific technical reason
    than before AND a concrete next step (e.g. "this belongs in a dedicated
    formatting PR instead of this dependency bump" — say so plainly in
-   PR-REPLY.md; the review that runs once this PR merges reads the
-   discussion and files it). A
+   PR-REPLY.md; the review that runs once this PR merges or closes reads
+   the discussion and files it). A
    verbatim-repeated decline reads as the human's instruction being
    ignored, not as a considered response — never do that.
 3. Merge conflict -> bring {{BRANCH}} up to date with
@@ -71,9 +71,10 @@ Title: {{PR_TITLE}}
    {{DEFAULT_BRANCH}} already ships (something else landed the same or a
    related change first), withdraw (see Deliverables) and name what
    superseded you: the commit or PR, verified with real commands, not
-   memory. Do NOT propose follow-ups here. The PR's finding then waits as
-   `closed` with your withdrawal reason as its only record, so make the
-   reason precise.
+   memory. Do NOT propose follow-ups here. Once the PR is closed, a
+   separate review establishes why it closed and what the superseding
+   change left open, and files that; your withdrawal reason is its
+   starting point, so make it precise.
 4. Failing checks -> reproduce locally where possible, fix minimally,
    commit. If the failure is unrelated flake, say so in PR-REPLY.md instead.
 
