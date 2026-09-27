@@ -8,9 +8,9 @@ name: Mutants
 # Advisory: it reports surviving mutants and never fails the run. See the
 # job comment below for why, and for what has to happen before it gates.
 
+# PR-only: the scope is the PR's diff against its base branch, which a
+# push event does not have (github.base_ref is empty there).
 on:
-  push:
-    branches: [main]
   pull_request:
 
 # Deliberately NOT sharing CI's concurrency group: a mutation run takes
@@ -53,7 +53,6 @@ jobs:
     # Until then a rotating shard would fail different runs for different
     # reasons, which trains people to ignore it.
     name: Mutation coverage of the diff (advisory)
-    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     # Above the step timeout below. A job timeout cancels the run and
     # marks it failed, which continue-on-error cannot absorb, so the job
