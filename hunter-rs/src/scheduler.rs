@@ -3133,10 +3133,36 @@ pub async fn sync_prs(store: &Store, _cfg: &Config) -> SyncResult {
                 continue;
             }
             forge::PrState::Closed => {
-                let _ = store.set_finding_verdict(fid, FindingStatus::Rejected,
-                    "PR closed without merge -- treat this bug class/location as human-rejected",
-                ).await;
-                let _ = store.mark_pr_closed(fid, pr_number, now_ms()).await;
+                // Not a rejection: a closure alone does not say whether the
+                // finding was wrong, and suppression is permanent and silent.
+                // Of the first 16 closed PRs only one was closed by a human.
+                // The finding waits here until its harvest classifies why.
+                // Record the closure first, and only then leave pr_open:
+                // sync_prs only revisits pr_open findings, so a finding set
+                // Closed while pr_state still reads OPEN would never be
+                // looked at again. Kept pr_open, the next sync retries both.
+                if let Err(err) = store.mark_pr_closed(fid, pr_number, now_ms()).await {
+                    let _ = store
+                        .log_event(
+                            "error",
+                            &format!(
+                                "sync #{fid}: PR closed but not recorded: {err} \
+                                 (the next sync retries)"
+                            ),
+                            None,
+                            Some(fid),
+                        )
+                        .await;
+                    summary.errors += 1;
+                    continue;
+                }
+                let _ = store
+                    .set_finding_verdict(
+                        fid,
+                        FindingStatus::Closed,
+                        "PR closed without merge; awaiting harvest",
+                    )
+                    .await;
                 let _ = store
                     .log_event(
                         "verdict",
@@ -3495,7 +3521,7 @@ pub async fn run_engage(
                     // close_pr posts the withdrawal reason and only then closes,
                     // so a failure here means the PR is still OPEN on the forge.
                     // Recording the verdict anyway would mark it closed locally
-                    // and set the finding Rejected -- and sync_prs only revisits
+                    // and set the finding Closed -- and sync_prs only revisits
                     // pr_open findings, so nothing would ever reconcile it.
                     //
                     // Leaving the finding untouched is not enough either: it
@@ -3533,9 +3559,15 @@ pub async fn run_engage(
                     break 'post summary;
                 }
             }
+            // Closed, not Rejected: 14 of the first 15 engage withdrawals
+            // were "superseded/obsolete", i.e. the finding was right and its
+            // work landed elsewhere. Suppressing those told every later scan
+            // to stop reporting valid bugs. The harvest classifies the
+            // closure and also owns the follow-ups, which is why this no
+            // longer ingests a FOLLOW-UPS.json.
             let reason_short: String = reason.chars().take(500).collect();
             let _ = store
-                .set_finding_verdict(fid, FindingStatus::Rejected, &reason_short)
+                .set_finding_verdict(fid, FindingStatus::Closed, &reason_short)
                 .await;
             let _ = store.mark_pr_closed(fid, pr_number, now_ms()).await;
             let first_line: String = reason
@@ -3551,7 +3583,6 @@ pub async fn run_engage(
                     Some(fid),
                 )
                 .await;
-            summary.ingest = ingest_followups(store, repo.id, &worktree, fid, job, "engage").await;
             summary.outcome = Some("withdrawn".into());
             break 'post summary;
         }
