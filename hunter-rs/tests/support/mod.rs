@@ -316,7 +316,7 @@ fn set_executable(_path: &Path) {}
 // A backend that simulates a worker
 // ---------------------------------------------------------------------------
 
-type RunFn = Box<dyn Fn(&Path) -> RunResult + Send + Sync>;
+type RunFn = Box<dyn Fn(&Path, Option<&Path>) -> RunResult + Send + Sync>;
 
 /// What one `run()` of a [`ScriptedBackend`] was handed.
 #[derive(Debug, Clone)]
@@ -332,23 +332,40 @@ pub struct Run {
 /// Use it to stage exactly what a worker would leave behind. `decide()`
 /// always grants, so a test never has to satisfy the budget gate. The
 /// headroom it grants is `None` — no token bound — unless
-/// [`ScriptedBackend::granting`] says otherwise. Every run is recorded
-/// ([`ScriptedBackend::runs`]), so a test can assert on the prompt and the
-/// transcript a worker was given.
+/// [`ScriptedBackend::granting`] says otherwise, or a window too small for
+/// large reservations ([`ScriptedBackend::denying_above`]). Every run is
+/// recorded ([`ScriptedBackend::runs`]), so a test can assert on the prompt
+/// and the transcript a worker was given.
 pub struct ScriptedBackend {
     run: RunFn,
     cap_tokens: Option<i64>,
+    deny_above: Option<i64>,
     runs: Mutex<Vec<Run>>,
 }
 
 impl ScriptedBackend {
     /// Run the given closure against the worktree.
     pub fn new(run: impl Fn(&Path) -> RunResult + Send + Sync + 'static) -> Self {
+        Self::staged(move |tree, _| run(tree))
+    }
+
+    /// Run the given closure against the worktree and the transcript the
+    /// run was asked to continue, if any.
+    pub fn staged(run: impl Fn(&Path, Option<&Path>) -> RunResult + Send + Sync + 'static) -> Self {
         Self {
             run: Box::new(run),
             cap_tokens: None,
+            deny_above: None,
             runs: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Deny every reservation above `tokens`: a window with room for some
+    /// jobs and not others.
+    #[must_use]
+    pub fn denying_above(mut self, tokens: i64) -> Self {
+        self.deny_above = Some(tokens);
+        self
     }
 
     /// Grant `cap_tokens` as the backend's headroom for every verdict.
@@ -393,14 +410,24 @@ pub fn done() -> RunResult {
 
 #[async_trait::async_trait]
 impl Backend for ScriptedBackend {
-    async fn decide(&self, _anticipated_tokens: i64) -> anyhow::Result<Outlook> {
-        let granted = Verdict::Granted {
-            cap_tokens: self.cap_tokens,
-            reason: "test: always granted".to_owned(),
+    async fn decide(&self, anticipated_tokens: i64) -> anyhow::Result<Outlook> {
+        let verdict = if self
+            .deny_above
+            .is_some_and(|limit| anticipated_tokens > limit)
+        {
+            Verdict::Denied {
+                reason: format!("test: {anticipated_tokens} tok does not fit"),
+                retry_at: None,
+            }
+        } else {
+            Verdict::Granted {
+                cap_tokens: self.cap_tokens,
+                reason: "test: always granted".to_owned(),
+            }
         };
         Ok(Outlook {
-            normal: granted.clone(),
-            prioritized: granted,
+            normal: verdict.clone(),
+            prioritized: verdict,
         })
     }
 
@@ -426,7 +453,7 @@ impl Backend for ScriptedBackend {
             prompt: prompt.to_owned(),
             resume_from: resume_from.map(Path::to_path_buf),
         });
-        Ok((self.run)(&ws.tree))
+        Ok((self.run)(&ws.tree, resume_from))
     }
 }
 

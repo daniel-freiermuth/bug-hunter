@@ -95,7 +95,9 @@ new ──recheck──> new / wontfix / rejected
   every cycle: merged → `merged`; closed unmerged → `closed`; new
   comments/reviews, `CHANGES_REQUESTED`, merge conflicts, or failing checks
   flag it `needs_attention` for an **engage** worker, which may also
-  withdraw the PR (→ `closed`).
+  withdraw the PR (→ `closed`); the same worker session then carries on
+  into the closed-PR harvest below when the window has room, else the
+  harvest runs cold later.
 - **`closed`** — the PR closed without merging. Deliberately NOT a
   rejection: of the first 16 closed PRs, 15 were engage withdrawals (14 of
   them superseded or obsolete) and one was closed by a human, so a closure

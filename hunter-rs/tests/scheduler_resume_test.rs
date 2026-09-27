@@ -1070,6 +1070,7 @@ async fn resume_unavailable_fails_the_attempt_and_retires_the_predecessor() {
         ctx: CTX,
         typical: Z,
         chain_spent: 40_000,
+        handoff: false,
     };
     // What the harness returns when it refuses to hand omp a path it
     // cannot resolve: nothing spawned, no exit code, no transcript.
