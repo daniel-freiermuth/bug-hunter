@@ -11,6 +11,7 @@
 
 use std::path::PathBuf;
 
+use hunter::backends::omp_scavenge::LlmProvider;
 use hunter::backends::omp_scavenge::capacity::*;
 
 mod support;
@@ -224,9 +225,10 @@ async fn make_agent_db(
 async fn test_read_windows_no_db_returns_empty() {
     let db = PathBuf::from("/nonexistent/agent.db");
     let now = now_ms();
-    let windows = tokio::task::spawn_blocking(move || read_windows(&db, now))
-        .await
-        .unwrap();
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+            .await
+            .unwrap();
     assert!(windows.is_empty());
 }
 
@@ -236,9 +238,10 @@ async fn test_read_windows_empty_table_returns_empty() {
     let db_path = make_agent_db(&dir, &[]).await;
     let now = now_ms();
     let db = db_path.clone();
-    let windows = tokio::task::spawn_blocking(move || read_windows(&db, now))
-        .await
-        .unwrap();
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+            .await
+            .unwrap();
     assert!(windows.is_empty());
 }
 
@@ -259,9 +262,10 @@ async fn test_read_windows_keeps_active_window() {
     )
     .await;
     let db = db_path.clone();
-    let windows = tokio::task::spawn_blocking(move || read_windows(&db, now))
-        .await
-        .unwrap();
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+            .await
+            .unwrap();
     assert!(windows.contains_key("anthropic:7d"));
     let w = &windows["anthropic:7d"];
     assert!((w.used_fraction.unwrap() - 0.3).abs() < 1e-9);
@@ -293,11 +297,38 @@ async fn test_read_windows_drops_expired_model_class() {
     )
     .await;
     let db = db_path.clone();
-    let windows = tokio::task::spawn_blocking(move || read_windows(&db, now))
-        .await
-        .unwrap();
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+            .await
+            .unwrap();
     let keys: Vec<&String> = windows.keys().collect();
     assert_eq!(keys, vec!["anthropic:7d"]);
+}
+
+/// An ACTIVE per-model-class row is read like the account-wide ones.
+/// `decide` gates on every `:7d` window it is handed, so a reader that
+/// fetched only `anthropic:5h` and `anthropic:7d` would silently stop
+/// enforcing the per-model weekly limit.
+#[tokio::test]
+async fn test_read_windows_keeps_active_model_class() {
+    let now = now_ms();
+    let dir = TempDir::new("cap-model-class-active");
+    let resets = Some(now + WEEK_MS / 2);
+    let db_path = make_agent_db(
+        &dir,
+        &[
+            ("anthropic:7d", Some(0.3), "ok", resets, now - 60_000),
+            ("anthropic:7d:fable", Some(0.96), "ok", resets, now - 60_000),
+        ],
+    )
+    .await;
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db_path, LlmProvider::Anthropic, now))
+            .await
+            .unwrap();
+    let keys: Vec<&String> = windows.keys().collect();
+    assert_eq!(keys, vec!["anthropic:7d", "anthropic:7d:fable"]);
+    assert_eq!(windows["anthropic:7d:fable"].used_fraction, Some(0.96));
 }
 
 /// §4 item 24: expired 5h window rolled forward.
@@ -320,9 +351,10 @@ async fn test_read_windows_rolls_forward_expired_5h() {
     )
     .await;
     let db = db_path.clone();
-    let windows = tokio::task::spawn_blocking(move || read_windows(&db, now))
-        .await
-        .unwrap();
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+            .await
+            .unwrap();
     let w = &windows["anthropic:5h"];
     assert!((w.used_fraction.unwrap() - 0.0).abs() < 1e-9);
     assert_eq!(w.status.as_deref(), Some("ok"));
@@ -358,9 +390,10 @@ async fn test_read_windows_rolls_forward_expired_7d() {
     )
     .await;
     let db = db_path.clone();
-    let windows = tokio::task::spawn_blocking(move || read_windows(&db, now))
-        .await
-        .unwrap();
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+            .await
+            .unwrap();
     let w = &windows["anthropic:7d"];
     assert!((w.used_fraction.unwrap() - 0.0).abs() < 1e-9);
     assert_eq!(w.resets_at, Some(old_resets + WEEK_MS));
@@ -386,9 +419,10 @@ async fn test_read_windows_rolls_forward_multiple_missed_cycles() {
     )
     .await;
     let db = db_path.clone();
-    let windows = tokio::task::spawn_blocking(move || read_windows(&db, now))
-        .await
-        .unwrap();
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+            .await
+            .unwrap();
     let w = &windows["anthropic:5h"];
     assert!(w.resets_at.unwrap() > now, "resets should be in the future");
     assert!(
@@ -409,9 +443,10 @@ async fn test_read_windows_null_resets_kept() {
     )
     .await;
     let db = db_path.clone();
-    let windows = tokio::task::spawn_blocking(move || read_windows(&db, now))
-        .await
-        .unwrap();
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+            .await
+            .unwrap();
     let w = &windows["anthropic:5h"];
     assert_eq!(w.resets_at, None);
     assert!((w.used_fraction.unwrap() - 0.10).abs() < 1e-9);
@@ -428,9 +463,10 @@ async fn test_read_windows_zero_resets_kept() {
     )
     .await;
     let db = db_path.clone();
-    let windows = tokio::task::spawn_blocking(move || read_windows(&db, now))
-        .await
-        .unwrap();
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::Anthropic, now))
+            .await
+            .unwrap();
     let w = &windows["anthropic:5h"];
     assert_eq!(w.resets_at, Some(0));
     assert!((w.used_fraction.unwrap() - 0.10).abs() < 1e-9);
@@ -531,10 +567,11 @@ async fn test_read_windows_unreadable_db_is_logged() {
     std::fs::write(&db_path, b"this is not a sqlite database").unwrap();
     let now = now_ms();
     let db = db_path.clone();
-    let (windows, logs) =
-        tokio::task::spawn_blocking(move || capture_logs(|| read_windows(&db, now)))
-            .await
-            .unwrap();
+    let (windows, logs) = tokio::task::spawn_blocking(move || {
+        capture_logs(|| read_windows(&db, LlmProvider::Anthropic, now))
+    })
+    .await
+    .unwrap();
     assert!(windows.is_empty(), "fallback must stay an empty map");
     assert!(
         logs.contains("reading omp usage windows failed"),
@@ -549,7 +586,7 @@ async fn test_read_windows_unreadable_db_is_logged() {
 #[test]
 fn test_read_windows_without_runtime_is_logged() {
     let db = PathBuf::from("/nonexistent/agent.db");
-    let (windows, logs) = capture_logs(|| read_windows(&db, now_ms()));
+    let (windows, logs) = capture_logs(|| read_windows(&db, LlmProvider::Anthropic, now_ms()));
     assert!(windows.is_empty());
     assert!(
         logs.contains("outside a Tokio runtime"),
@@ -567,8 +604,8 @@ async fn test_read_windows_empty_sources_log_nothing() {
     let now = now_ms();
     let ((), logs) = tokio::task::spawn_blocking(move || {
         capture_logs(|| {
-            read_windows(&missing, now);
-            read_windows(&empty_db, now);
+            read_windows(&missing, LlmProvider::Anthropic, now);
+            read_windows(&empty_db, LlmProvider::Anthropic, now);
         })
     })
     .await
@@ -626,10 +663,11 @@ async fn test_read_windows_undecodable_row_degrades() {
     insert_undecodable_row(&db_path).await;
 
     let db = db_path.clone();
-    let (windows, logs) =
-        tokio::task::spawn_blocking(move || capture_logs(|| read_windows(&db, now)))
-            .await
-            .expect("an undecodable row must not unwind the blocking task");
+    let (windows, logs) = tokio::task::spawn_blocking(move || {
+        capture_logs(|| read_windows(&db, LlmProvider::Anthropic, now))
+    })
+    .await
+    .expect("an undecodable row must not unwind the blocking task");
 
     assert!(
         windows.is_empty(),

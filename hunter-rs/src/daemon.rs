@@ -248,13 +248,12 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         },
     };
 
-    let port = cfg.serve_port;
-    let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from((
-        std::net::Ipv4Addr::LOCALHOST,
-        port,
-    )))
-    .await?;
-    tracing::info!("daemon started: ui http://127.0.0.1:{port}/ -- scheduler loop live");
+    // Loopback unless `serve.host` opts in to more. Widening the listener
+    // does not widen who is served: the `Host` check still admits only
+    // loopback names and `serve.allowedHosts` (`server::host_guard`).
+    let addr = std::net::SocketAddr::new(cfg.serve_host, cfg.serve_port);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    tracing::info!("daemon started: ui http://{addr}/ -- scheduler loop live");
 
     // One shutdown source for the whole daemon, created before the loop.
     // A signal future built inside the loop's select! cannot replay a

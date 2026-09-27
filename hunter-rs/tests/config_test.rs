@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use hunter::config::Config;
+use hunter::config::{Config, HostAllowList};
 
 mod support;
 use support::TempDir;
@@ -176,4 +176,113 @@ fn ordinary_cadences_load() {
     assert!((cfg.scan_interval_days - 0.5).abs() < f64::EPSILON);
     assert_eq!(cfg.modernization_interval_days, 30);
     assert_eq!(cfg.standards_interval_days, 14);
+}
+
+// -- serve.host / serve.allowedHosts ------------------------------------------
+
+/// No config means today's behaviour exactly: loopback bind, loopback names.
+#[test]
+fn the_listener_is_loopback_only_by_default() {
+    let dir = TempDir::new("cfg-serve-default");
+    let cfg = load(&dir, "{}").unwrap();
+    assert_eq!(cfg.serve_host, std::net::IpAddr::from([127, 0, 0, 1]));
+    assert_eq!(cfg.allowed_hosts, HostAllowList::default());
+    assert!(cfg.allowed_hosts.allows("localhost"));
+    assert!(cfg.allowed_hosts.allows("127.0.0.1"));
+    assert!(cfg.allowed_hosts.allows("::1"));
+    assert!(!cfg.allowed_hosts.allows("hunter-box"));
+}
+
+/// Listing names adds them to loopback -- `localhost` keeps working -- and
+/// matching ignores case, as `Host` names do. An IPv6 entry matches the
+/// canonical form a browser sends, however it was written.
+#[test]
+fn allowed_hosts_add_names_to_loopback() {
+    let dir = TempDir::new("cfg-serve-names");
+    let cfg = load(
+        &dir,
+        r#"{"serve": {"host": "0.0.0.0", "allowedHosts": ["Hunter-Box", "192.168.1.20", "FE80:0:0:0:0:0:0:0001"]}}"#,
+    )
+    .unwrap();
+    assert_eq!(cfg.serve_host, std::net::IpAddr::from([0, 0, 0, 0]));
+    for ok in [
+        "hunter-box",
+        "HUNTER-BOX",
+        "192.168.1.20",
+        "fe80::1",
+        "localhost",
+    ] {
+        assert!(cfg.allowed_hosts.allows(ok), "{ok} should be accepted");
+    }
+    assert!(!cfg.allowed_hosts.allows("rebound.attacker.example"));
+}
+
+/// `"*"` switches the check off, and only on its own.
+#[test]
+fn a_lone_star_allows_every_host_and_nothing_else_does() {
+    let dir = TempDir::new("cfg-serve-any");
+    let cfg = load(&dir, r#"{"serve": {"allowedHosts": ["*"]}}"#).unwrap();
+    assert_eq!(cfg.allowed_hosts, HostAllowList::Any);
+    assert!(cfg.allowed_hosts.allows("rebound.attacker.example"));
+
+    // Padding does not disguise the wildcard as a name.
+    for combined in [r#"["*", "hunter-box"]"#, r#"[" * ", "hunter-box"]"#] {
+        let e = err(
+            &dir,
+            &format!(r#"{{"serve": {{"allowedHosts": {combined}}}}}"#),
+        );
+        assert!(e.contains("cannot be combined"), "{combined}: {e}");
+    }
+}
+
+/// Misconfigurations are refused at load time, naming the field, instead
+/// of producing a guard that is wider or narrower than intended.
+#[test]
+fn bad_serve_settings_are_refused() {
+    let dir = TempDir::new("cfg-serve-bad");
+    let e = err(&dir, r#"{"serve": {"host": "hunter-box"}}"#);
+    assert!(e.contains("serve.host must be an IP address"), "{e}");
+    for bad in [r#"["hunter-box:8377"]"#, r#"[""]"#, r#"["  "]"#] {
+        let e = err(&dir, &format!(r#"{{"serve": {{"allowedHosts": {bad}}}}}"#));
+        assert!(e.contains("serve.allowedHosts entries"), "{bad}: {e}");
+    }
+}
+
+#[test]
+fn llm_provider_defaults_to_anthropic_and_accepts_codex() {
+    let default_dir = TempDir::new("cfg-provider-default");
+    let default = Config::load(default_dir.path()).expect("default configuration");
+    assert_eq!(
+        default.llm_provider,
+        hunter::backends::omp_scavenge::LlmProvider::Anthropic
+    );
+
+    let explicit_dir = TempDir::new("cfg-provider-anthropic");
+    let explicit = load(
+        &explicit_dir,
+        r#"{"backend": {"llmProvider": "anthropic"}}"#,
+    )
+    .expect("explicit Anthropic provider configuration");
+    assert_eq!(
+        explicit.llm_provider,
+        hunter::backends::omp_scavenge::LlmProvider::Anthropic
+    );
+
+    let codex_dir = TempDir::new("cfg-provider-codex");
+    let codex = load(
+        &codex_dir,
+        r#"{"backend": {"llmProvider": "openai-codex"}}"#,
+    )
+    .expect("Codex provider configuration");
+    assert_eq!(
+        codex.llm_provider,
+        hunter::backends::omp_scavenge::LlmProvider::OpenAiCodex
+    );
+}
+
+#[test]
+fn unknown_llm_provider_is_rejected() {
+    let dir = TempDir::new("cfg-provider-invalid");
+    let message = err(&dir, r#"{"backend": {"llmProvider": "github-copilot"}}"#);
+    assert!(message.contains("backend.llmProvider"), "{message}");
 }

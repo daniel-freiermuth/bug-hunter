@@ -38,6 +38,7 @@ around), `git`, and the `gh` CLI (or `glab` for GitLab repos)
 authenticated for whatever repos you register.
 
 ```sh
+cp hunter/config.anthropic.example.json hunter/config.json  # or config.openai-codex.example.json
 (cd hunter/ui-svelte && npm ci)           # once per checkout, and after a dependency change
 cd hunter-rs
 just build                                # UI bundle (ui-svelte/ -> hunter/ui/) + release binary
@@ -275,20 +276,19 @@ for the schema — most columns carry comments explaining *why*, not just *what*
 
 ## Configuration
 
-`config.json`:
+Copy the provider-matched template to the ignored `config.json`:
 
-```jsonc
-{
-  "workRoot": "data",           // repo clones, worktrees, job output
-  "dbPath": "data/hunter.db",
-  "ompBin": "omp",
-  "hunt":  { "capNewTokens": 200000, "maxWallS": 1800, "maxFindings": 8 },
-  "fix":   { "capNewTokens": 150000, "maxWallS": 2700 },
-  "budget": { "deny5hAbove": 0.85, "staleAfterS": 300 },
-  "serve": { "port": 8377 },
-  "models": { "default": "opus", "smol": "sonnet", "hunt": null, "fix": null }
-}
+```sh
+# Anthropic
+cp config.anthropic.example.json config.json
+
+# OpenAI Codex
+cp config.openai-codex.example.json config.json
 ```
+
+The templates share operational settings but pair the provider with compatible
+worker models. Do not commit `config.json`; it selects the credentials and
+quota source for one installation.
 
 - `hunt`/`fix` caps apply to their whole job family (hunt also covers
   test\_gap/dep\_update/refactor/modernization/recheck; fix also covers
@@ -296,10 +296,25 @@ for the schema — most columns carry comments explaining *why*, not just *what*
 - `budget.deny5hAbove` / `staleAfterS` — see § Budget policy.
 - `models` — fuzzy names, anything omp's `--model` flag accepts. `default`
   applies to all workers; `smol` is for lightweight helper tasks; `hunt`/
-  `fix` override per job family; `null` inherits omp's own configured
-  default. Anthropic tracks per-model-class weekly limits
-  (`anthropic:7d:<class>`), so splitting hunt and fix across model classes
-  taps two separate budgets.
+  `fix` override per job family; `null` inherits `default`.
+- `backend.llmProvider` selects the OMP quota source. `anthropic` (the
+  default) and `openai-codex` both use the same short/long-window scavenging
+  ramps but map to their provider's OMP usage records. It must match the
+  provider selected by `models`.
+- `serve` controls who can reach the dashboard (Rust daemon only; the Python
+  rollback always serves loopback). Defaults keep it local:
+  - `serve.host` — address to bind, default `127.0.0.1`. `0.0.0.0` listens
+    on every IPv4 interface.
+  - `serve.allowedHosts` — names accepted in the HTTP `Host` header, beyond
+    the loopback names that are always accepted. List the names clients use,
+    e.g. `["hunter-box", "192.168.1.20"]`. `["*"]` accepts any name and turns
+    off the DNS-rebinding guard.
+
+  The API has **no authentication**: anything that can reach the port can
+  read findings and notes and use every write (delete repos, overrides).
+  Widening `serve.host` makes the dashboard reachable; widening
+  `serve.allowedHosts` decides which names it answers to. Only do either on a
+  network you trust.
 
 ## Development
 
