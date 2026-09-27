@@ -644,6 +644,56 @@ async fn a_failing_pr_diff_counts_toward_the_streak() {
     );
 }
 
+/// The same for a PR whose view will not load, which comes before the
+/// diff and is shared with the merged harvest: a merged PR is the case
+/// here, as the view is all it fetches.
+#[tokio::test]
+async fn a_failing_pr_view_counts_toward_the_streak() {
+    let bins = FakeBins::acquire("harvest-view-fails");
+    bins.script("gh", "echo \"HTTP 502 at $(date +%s%N)\" >&2\nexit 1");
+    let f = fixture("harvest-view-fails", FindingStatus::Merged).await;
+    f.store.mark_pr_merged(f.fid, 7, 2).await.unwrap();
+    let never_runs = ScriptedBackend::new(|_| panic!("no worker without the PR's view"));
+
+    for attempt in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let err = run_harvest(&f.store, &f.cfg, &finding, &never_runs, None)
+            .await
+            .expect_err("a failed view fails the harvest");
+        assert!(err.to_string().contains("view failed"), "{err}");
+
+        let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+        let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+        let still_pending = matches!(
+            picked,
+            Some(Candidate::Finding {
+                kind: FindingJobKind::Harvest,
+                finding_id,
+                ..
+            }) if finding_id == f.fid
+        );
+        if attempt < 3 {
+            assert_eq!(ps.harvest_attempts, attempt, "attempt {attempt}");
+            assert_eq!(ps.harvested_at, None, "retried, not given up");
+            assert!(still_pending, "attempt {attempt}: {picked:?}");
+        } else {
+            assert!(ps.harvested_at.is_some(), "given up at the limit");
+            assert!(
+                !still_pending,
+                "a given-up PR must not be picked: {picked:?}"
+            );
+        }
+    }
+
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "error" && e.message.contains("gave up after 3")),
+        "{events:?}"
+    );
+}
+
 /// The cold review runs in a tree at the default branch, which does not
 /// hold the PR's changes: the prompt must say so and carry the diff.
 #[tokio::test]

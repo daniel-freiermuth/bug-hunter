@@ -858,6 +858,43 @@ async fn an_unrecorded_closed_verdict_starts_no_harvest_and_waits_for_the_sync()
     assert_left_for_the_cold_harvest(&f, &runs[0].tree).await;
 }
 
+/// The same for the closed PR's view, which the harvest fetches before
+/// the diff. The engage's own view (the first) succeeds; the handoff's
+/// (the second) fails.
+#[tokio::test]
+async fn a_handoff_whose_view_fails_counts_no_harvest_attempt() {
+    let f = fixture("handoff-view-fails").await;
+    let bins = FakeBins::acquire("handoff-view-fails");
+    bins.script(
+        "gh",
+        &format!(
+            "if [ \"$2\" = view ]; then\nviews=\"$(dirname \"$0\")/views\"\necho x >> \"$views\"\nif [ \"$(wc -l < \"$views\")\" -gt 1 ]; then\necho 'HTTP 502' >&2\nexit 1\nfi\nfi\ncat <<'__FAKE_EOF__'\n{PR_VIEW_JSON}\n__FAKE_EOF__\nexit 0"
+        ),
+    );
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = withdraw_then_classify(true);
+
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
+    let runs = backend.runs();
+    assert_eq!(
+        runs.len(),
+        1,
+        "no harvest worker without the view: {runs:?}"
+    );
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "error" && e.message.contains("PR/MR view failed")),
+        "the handoff reached the harvest's view: {events:?}"
+    );
+    assert_left_for_the_cold_harvest(&f, &runs[0].tree).await;
+}
+
 /// The forge accepted the close but `pr_state` could not record it. The
 /// harvest reads its playbook off `pr_state`, so continuing into it now
 /// would review the closed PR as a merged one and mark it harvested with
