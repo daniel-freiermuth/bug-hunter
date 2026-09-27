@@ -2421,6 +2421,66 @@ fn extract_pr_url(text: &str) -> Option<String> {
     None
 }
 
+/// Settle a fix attempt that failed: back to `queued` for the retry, or
+/// rejected as stuck once `fingerprint` has ended
+/// `MAX_CONSECUTIVE_SAME_FAILURE` attempts in a row. `failure` is what the
+/// verdict and the log report; `fingerprint` is what the streak compares,
+/// and differs from it only where `failure` embeds per-attempt detail.
+/// `tail` is the worker's output, empty when no worker ran.
+async fn settle_failed_fix(
+    store: &Store,
+    fid: i64,
+    job: i64,
+    fingerprint: &str,
+    failure: &str,
+    tail: &str,
+    summary: &mut CycleSummary,
+) {
+    let tail = if tail.is_empty() {
+        String::new()
+    } else {
+        format!(". tail: {tail}")
+    };
+    let streak = store
+        .record_fix_attempt(fid, fingerprint)
+        .await
+        .unwrap_or(1);
+    if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
+        let _ = store
+            .set_finding_verdict(
+                fid,
+                FindingStatus::Rejected,
+                &format!(
+                    "stuck: {streak} consecutive fix attempts hit the same failure: {failure}"
+                ),
+            )
+            .await;
+        let _ = store.clear_fix_attempts(fid).await;
+        let _ = store
+            .log_event(
+                "fix",
+                &format!("#{fid} gave up after {streak} identical failures ({failure}){tail}"),
+                Some(job),
+                Some(fid),
+            )
+            .await;
+        summary.outcome = Some("stuck".into());
+        summary.attempts = Some(streak);
+    } else {
+        let _ = store.set_finding_status(fid, FindingStatus::Queued).await;
+        let _ = store
+            .log_event(
+                "fix",
+                &format!("#{fid} incomplete ({failure}){tail}"),
+                Some(job),
+                Some(fid),
+            )
+            .await;
+        summary.outcome = Some("requeued".into());
+    }
+    summary.failure = Some(failure.to_owned());
+}
+
 /// Run a fix job (`scheduler.run_fix`).
 #[allow(
     clippy::too_many_lines,
@@ -2538,7 +2598,26 @@ pub async fn run_fix(
     .await?
     {
         Ok(opened) => opened,
-        Err(failed) => return Ok(failed),
+        // A failed attempt like any other, so it counts toward the stuck
+        // streak: left `queued` with nothing recorded, the oldest-first
+        // pick would re-select this finding every cycle and no other
+        // queued fix would ever run. The fingerprint is fixed because the
+        // reason can name this job's own tree path, which differs on
+        // every attempt and would reset the streak each time.
+        Err(mut failed) => {
+            let failure = failed.failure.clone().unwrap_or_default();
+            settle_failed_fix(
+                store,
+                fid,
+                job,
+                "workspace not created",
+                &failure,
+                "",
+                &mut failed,
+            )
+            .await;
+            return Ok(failed);
+        }
     };
     let worktree = ws.tree.clone();
 
@@ -2827,44 +2906,7 @@ pub async fn run_fix(
             summary.outcome = Some("suspended".into());
             summary.worktree = Some(worktree.to_string_lossy().into_owned());
         } else {
-            let streak = store.record_fix_attempt(fid, &failure).await.unwrap_or(1);
-            if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
-                let _ = store
-                .set_finding_verdict(
-                    fid,
-                    FindingStatus::Rejected,
-                    &format!(
-                        "stuck: {streak} consecutive fix attempts hit the same failure: {failure}"
-                    ),
-                )
-                .await;
-                let _ = store.clear_fix_attempts(fid).await;
-                let _ = store
-                .log_event(
-                    "fix",
-                    &format!(
-                        "#{fid} gave up after {streak} identical failures ({failure}). tail: {tail}"
-                    ),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-                summary.outcome = Some("stuck".into());
-                summary.failure = Some(failure);
-                summary.attempts = Some(streak);
-            } else {
-                let _ = store.set_finding_status(fid, FindingStatus::Queued).await;
-                let _ = store
-                    .log_event(
-                        "fix",
-                        &format!("#{fid} incomplete ({failure}). tail: {tail}"),
-                        Some(job),
-                        Some(fid),
-                    )
-                    .await;
-                summary.outcome = Some("requeued".into());
-                summary.failure = Some(failure);
-            }
+            settle_failed_fix(store, fid, job, &failure, &failure, tail, &mut summary).await;
         }
         if override_mode == Some("once") {
             let _ = store.set_budget_override(fid, None).await;
