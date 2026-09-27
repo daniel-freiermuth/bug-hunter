@@ -12,10 +12,11 @@
 //!   the id-derived clone path), `soft_delete_repo` (the findings/jobs
 //!   refusal checks and the flag, under `BEGIN IMMEDIATE` so the checks
 //!   cannot go stale before the write), `sync_pr_open` (the PR upsert and
-//!   the dependent `attention_since` update), and `create_job` (the insert
+//!   the dependent `attention_since` update), `create_job` (the insert
 //!   and the retirement of the suspension it supersedes, with that
-//!   retirement's event). Those transactions close real races; do not
-//!   unwind them to make a method look like the others.
+//!   retirement's event), and `record_closed_harvest` (a closed PR's
+//!   classification and its harvest stamp). Those transactions close real
+//!   races; do not unwind them to make a method look like the others.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -2069,6 +2070,19 @@ impl Store {
     }
 
     /// Mark a PR as merged (UPSERT).
+    ///
+    /// `pr_state` holds one row per finding, not per PR, and a finding can
+    /// ship more than one PR: a closure harvested as `abandoned` sends it
+    /// back to `new`, and its next fix opens a fresh PR on the same row.
+    /// The harvest bookkeeping (`harvested_at`, `harvest_attempts`,
+    /// `last_harvest_failure`) describes the PR it was recorded for, so a
+    /// different `pr_number` clears it; otherwise the new PR inherits the
+    /// old one's stamp and `list_pending_harvest` never selects it. The
+    /// same number keeps it, so re-syncing a PR never un-harvests it. A
+    /// stored NULL is an unknown number, not another PR (`set_pr_number`
+    /// fills it in for the PR already being worked), hence `<>` and not
+    /// `IS NOT`. Every `pr_state` upsert repeats these three CASEs:
+    /// `query!` takes one literal, so the SQL cannot be shared.
     pub async fn mark_pr_merged(
         &self,
         finding_id: i64,
@@ -2080,7 +2094,13 @@ impl Store {
              VALUES (?1, ?2, 'MERGED', NULL, ?3) \
              ON CONFLICT(finding_id) DO UPDATE SET \
              pr_number = excluded.pr_number, state = 'MERGED', \
-             needs_attention = NULL, synced_at = excluded.synced_at",
+             needs_attention = NULL, synced_at = excluded.synced_at, \
+             harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN NULL ELSE pr_state.harvested_at END, \
+             harvest_attempts = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN 0 ELSE pr_state.harvest_attempts END, \
+             last_harvest_failure = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN NULL ELSE pr_state.last_harvest_failure END",
             finding_id,
             pr_number,
             synced_at
@@ -2090,7 +2110,8 @@ impl Store {
         Ok(())
     }
 
-    /// Mark a PR as closed (UPSERT).
+    /// Mark a PR as closed (UPSERT). A new `pr_number` clears the harvest
+    /// bookkeeping, as in [`Self::mark_pr_merged`].
     pub async fn mark_pr_closed(
         &self,
         finding_id: i64,
@@ -2102,7 +2123,13 @@ impl Store {
              VALUES (?1, ?2, 'CLOSED', NULL, ?3) \
              ON CONFLICT(finding_id) DO UPDATE SET \
              pr_number = excluded.pr_number, state = 'CLOSED', \
-             needs_attention = NULL, synced_at = excluded.synced_at",
+             needs_attention = NULL, synced_at = excluded.synced_at, \
+             harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN NULL ELSE pr_state.harvested_at END, \
+             harvest_attempts = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN 0 ELSE pr_state.harvest_attempts END, \
+             last_harvest_failure = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN NULL ELSE pr_state.last_harvest_failure END",
             finding_id,
             pr_number,
             synced_at
@@ -2115,7 +2142,8 @@ impl Store {
     /// Full sync of an open PR.  The main UPSERT sets all always-present
     /// columns; two conditional queries handle `attention_since` and
     /// clearing addressed state — three compile-time checked queries
-    /// instead of one dynamic one.
+    /// instead of one dynamic one. A new `pr_number` clears the harvest
+    /// bookkeeping, as in [`Self::mark_pr_merged`].
     ///
     /// All three share one transaction because the conditional UPDATEs are
     /// decided from the state the UPSERT writes: `attention_since` is only
@@ -2144,7 +2172,13 @@ impl Store {
              last_engaged_activity_at = excluded.last_engaged_activity_at, \
              needs_attention = excluded.needs_attention, \
              attention_fingerprint = excluded.attention_fingerprint, \
-             synced_at = excluded.synced_at",
+             synced_at = excluded.synced_at, \
+             harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN NULL ELSE pr_state.harvested_at END, \
+             harvest_attempts = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN 0 ELSE pr_state.harvest_attempts END, \
+             last_harvest_failure = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN NULL ELSE pr_state.last_harvest_failure END",
             finding_id,
             d.pr_number,
             d.state,
@@ -2222,11 +2256,69 @@ impl Store {
         Ok(())
     }
 
+    /// Record a closed PR's harvest: the finding's classification and the
+    /// harvest stamp, in one transaction.
+    ///
+    /// Both or neither, because each write alone takes the finding out of
+    /// `list_pending_harvest` in a different way. The verdict moves it off
+    /// `closed` and the stamp sets `harvested_at`; with only the verdict
+    /// landed, the row matches neither arm of the queue (not `merged`, no
+    /// longer `closed`) while its harvest never completed, so it would be
+    /// dropped for good instead of retried. `BEGIN IMMEDIATE` like the
+    /// other write transactions here.
+    ///
+    /// The classification only replaces `closed`, the status that means
+    /// "awaiting this harvest". A human may have set another verdict
+    /// while the worker ran, or set one before it started (a `merged`
+    /// verdict puts the finding back in the queue's merged arm, and the
+    /// harvest still reviews the closure it finds in `pr_state`); either
+    /// way the human's decision stands. The stamp lands regardless, since
+    /// the PR was reviewed. Returns whether the classification applied.
+    pub async fn record_closed_harvest(
+        &self,
+        finding_id: i64,
+        status: FindingStatus,
+        reason: &str,
+        harvested_at: i64,
+    ) -> sqlx::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = now_ms();
+        let classified = sqlx::query!(
+            "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND status = 'closed'",
+            status,
+            reason,
+            now,
+            finding_id
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        sqlx::query!(
+            "UPDATE pr_state SET harvested_at = ?1 WHERE finding_id = ?2",
+            harvested_at,
+            finding_id
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(classified)
+    }
+
     /// Self-heal a missing `pr_number` (UPSERT — row may not exist yet).
+    /// A new `pr_number` clears the harvest bookkeeping, as in
+    /// [`Self::mark_pr_merged`]; filling in a NULL one does not.
     pub async fn set_pr_number(&self, finding_id: i64, pr_number: i64) -> sqlx::Result<()> {
         sqlx::query!(
             "INSERT INTO pr_state (finding_id, pr_number) VALUES (?1, ?2) \
-             ON CONFLICT(finding_id) DO UPDATE SET pr_number = excluded.pr_number",
+             ON CONFLICT(finding_id) DO UPDATE SET pr_number = excluded.pr_number, \
+             harvested_at = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN NULL ELSE pr_state.harvested_at END, \
+             harvest_attempts = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN 0 ELSE pr_state.harvest_attempts END, \
+             last_harvest_failure = CASE WHEN pr_state.pr_number <> excluded.pr_number \
+                 THEN NULL ELSE pr_state.last_harvest_failure END",
             finding_id,
             pr_number
         )
@@ -2262,16 +2354,29 @@ impl Store {
         .await
     }
 
-    /// Merged findings pending harvest review.
+    /// Findings whose pull request awaits its one-time harvest: merged, or
+    /// closed without merging, and not harvested yet. Oldest sync first
+    /// (NULL first), then id DESC — the order the merged-only selection had
+    /// when it walked `list_findings` and sorted stably by `synced_at`.
+    ///
+    /// A closed PR qualifies only while its finding is `closed`, which the
+    /// verdict API cannot set, so the status means exactly "awaiting this
+    /// harvest". Any other status is a human's decision taken after the PR
+    /// closed (re-queued, re-triaged, settled, or `rejected` outright),
+    /// which the harvest's classification must not overwrite. Closures
+    /// from before the closed-PR harvest, which left their finding
+    /// `rejected`, were moved to `closed` once by migration 016.
     pub async fn list_pending_harvest(&self) -> sqlx::Result<Vec<Finding>> {
         let merged = FindingStatus::Merged;
+        let closed = FindingStatus::Closed;
         sqlx::query_as!(
             Finding,
             r#"
-            SELECT f.id, f.type AS "kind: FindingType", f.repo_id, f.fingerprint, f.file, f.symbol, f.line,
-                   f.severity AS "severity: Severity", f.confidence, f.summary, f.detail, f.status AS "status: FindingStatus", f.pr_url,
-                   f.created_at, f.updated_at, f.bug_class AS "bug_class: BugClass", f.evidence_plan,
-                   f.introduced_by, f.rung_achieved, f.verdict_reason,
+            SELECT f.id, f.type AS "kind: FindingType", f.repo_id, f.fingerprint, f.file,
+                   f.symbol, f.line, f.severity AS "severity: Severity", f.confidence,
+                   f.summary, f.detail, f.status AS "status: FindingStatus", f.pr_url,
+                   f.created_at, f.updated_at, f.bug_class AS "bug_class: BugClass",
+                   f.evidence_plan, f.introduced_by, f.rung_achieved, f.verdict_reason,
                    f.budget_override, f.fix_attempts, f.last_fix_failure,
                    f.recheck_attempts, f.last_recheck_failure, f.ecosystem, f.package,
                    f.current_version, f.latest_version, f.update_type,
@@ -2280,10 +2385,12 @@ impl Store {
                    f.proposed_approach, f.standard_section
             FROM findings f
             JOIN pr_state p ON p.finding_id = f.id
-            WHERE f.status = ?1 AND p.harvested_at IS NULL
-            ORDER BY p.synced_at ASC
+            WHERE p.harvested_at IS NULL
+              AND (f.status = ?1 OR (p.state = 'CLOSED' AND f.status = ?2))
+            ORDER BY p.synced_at ASC, f.id DESC
             "#,
-            merged
+            merged,
+            closed
         )
         .fetch_all(&self.pool)
         .await

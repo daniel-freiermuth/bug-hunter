@@ -9,8 +9,8 @@ funded by spare Claude-subscription capacity. Register a repo; hunter finds
 bugs, test gaps, outdated dependencies, mechanical refactors, and
 modernization opportunities using headless `omp -p` workers; you triage
 findings in a local web UI; fix workers ship draft PRs and follow up on
-review feedback autonomously; a harvest pass reviews each merged PR's full
-lifetime for genuine deferred follow-up work. Runs as a daemon that idles at
+review feedback autonomously; a harvest pass reviews each merged or closed
+PR's full lifetime for genuine deferred follow-up work. Runs as a daemon that idles at
 zero token cost and only spends against a budget it never overshoots.
 
 ## Contents
@@ -99,8 +99,14 @@ new ──recheck──> new / wontfix / rejected
 - **`closed`** — the PR closed without merging. Deliberately NOT a
   rejection: of the first 16 closed PRs, 15 were engage withdrawals (14 of
   them superseded or obsolete) and one was closed by a human, so a closure
-  on its own says little about whether the finding was wrong. `superseded`
-  records that the work landed another way; neither is suppressed.
+  on its own says little about whether the finding was wrong. A one-time
+  **closed-PR harvest** reads the PR's diff, discussion and the current
+  code, classifies the closure (`CLOSE-REASON.json`) and files what it
+  left open (`FOLLOW-UPS.json`): superseded / duplicate / obsolete →
+  `superseded` (valid, not suppressed), wrong → `rejected`, unwanted →
+  `wontfix`, abandoned → `new`. A review that cannot classify it counts
+  toward the harvest's failure streak; given up on, the finding stays
+  `closed`.
 - **`merged`** → queued for a one-time **harvest** pass reviewing the PR's
   complete lifetime (not just its open-time snapshot) for genuine deferred
   follow-up work, filed as new findings via `FOLLOW-UPS.json`.
@@ -123,7 +129,12 @@ what actually runs):
 1. Any finding with an active **budget override** (any category) — human
    escape hatch, jumps the whole queue.
 2. **Engage** the flagged PR with the oldest-outstanding attention reason.
-3. **Harvest** the oldest merged PR still pending follow-up review.
+3. **Harvest** the oldest merged or closed PR still pending its review
+   (a closed PR qualifies only while its finding is `closed`, which no
+   verdict can set; a finding a human moved on after the closure, even to
+   `rejected`, is left alone. Closures from before the closed-PR harvest,
+   which left their finding `rejected`, were moved to `closed` once by
+   migration 016).
 4. **Recheck** the oldest finding stuck in `rechecking`.
 5. **Fix** the oldest queued finding.
 6. **Resume** the newest suspended attempt that can still be continued.

@@ -14,7 +14,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use hunter::backend::SpendLedger;
-use hunter::domain::{ForgeName, JobState, RepoJobKind};
+use hunter::domain::{FindingStatus, ForgeName, JobState, RepoJobKind};
 use hunter::store::{RepoUpdate, ResumeChainStats, Store, StoreWriteError};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -900,6 +900,241 @@ async fn sync_pr_open_rolls_back_the_upsert_when_a_later_statement_fails() {
             synced_at: Some(5000),
         }
     );
+}
+
+/// A closed PR's classification and its harvest stamp land together or
+/// not at all. The classification alone moves the finding off `closed`
+/// while `harvested_at` stays NULL, which `list_pending_harvest` matches
+/// on neither arm: the harvest would never complete and never be retried.
+/// The failure is injected into the second write, the stamp.
+#[tokio::test]
+async fn record_closed_harvest_keeps_the_finding_pending_when_the_stamp_fails() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    store
+        .set_finding_verdict(1, FindingStatus::Closed, "PR closed without merge")
+        .await
+        .unwrap();
+    store.mark_pr_closed(1, 7, 1000).await.unwrap();
+    let pending_ids = |pending: Vec<hunter::types::Finding>| -> Vec<i64> {
+        pending.iter().map(|f| f.id).collect()
+    };
+    assert_eq!(
+        pending_ids(store.list_pending_harvest().await.unwrap()),
+        [1]
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER no_harvest_stamp BEFORE UPDATE OF harvested_at ON pr_state \
+         BEGIN SELECT RAISE(ABORT, 'injected harvested_at failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = store
+        .record_closed_harvest(1, FindingStatus::Superseded, "superseded: by #9", 5000)
+        .await
+        .expect_err("the injected failure must surface to the caller");
+    assert!(
+        err.to_string().contains("injected harvested_at failure"),
+        "failed on the injected trigger, not something else: {err}"
+    );
+
+    let after = store.get_finding(1).await.unwrap().unwrap();
+    assert_eq!(
+        after.status,
+        FindingStatus::Closed,
+        "the verdict rolled back"
+    );
+    assert_eq!(
+        after.verdict_reason.as_deref(),
+        Some("PR closed without merge")
+    );
+    assert_eq!(
+        pending_ids(store.list_pending_harvest().await.unwrap()),
+        [1],
+        "still pending, so the next cycle retries it"
+    );
+
+    // Without the injected failure both writes land, so the assertions
+    // above measure atomicity, not a method that writes nothing.
+    sqlx::query("DROP TRIGGER no_harvest_stamp")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let classified = store
+        .record_closed_harvest(1, FindingStatus::Superseded, "superseded: by #9", 5000)
+        .await
+        .unwrap();
+    assert!(classified);
+    let after = store.get_finding(1).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Superseded);
+    assert_eq!(after.verdict_reason.as_deref(), Some("superseded: by #9"));
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!(ps.harvested_at, Some(5000));
+    assert!(store.list_pending_harvest().await.unwrap().is_empty());
+}
+
+/// A human's verdict outranks the harvest's classification. A finding
+/// moved off `closed` before the harvest records (here to `wontfix`, as
+/// if set while the worker ran) keeps that verdict; the harvest stamp
+/// still lands, since the PR was reviewed, and the caller is told the
+/// classification did not apply.
+#[tokio::test]
+async fn record_closed_harvest_keeps_a_verdict_a_human_set_meanwhile() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    store
+        .set_finding_verdict(1, FindingStatus::Closed, "PR closed without merge")
+        .await
+        .unwrap();
+    store.mark_pr_closed(1, 7, 1000).await.unwrap();
+    store
+        .set_finding_verdict(1, FindingStatus::Wontfix, "not worth it")
+        .await
+        .unwrap();
+
+    let classified = store
+        .record_closed_harvest(1, FindingStatus::Superseded, "superseded: by #9", 5000)
+        .await
+        .unwrap();
+
+    assert!(
+        !classified,
+        "the classification must report it did not apply"
+    );
+    let after = store.get_finding(1).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Wontfix);
+    assert_eq!(after.verdict_reason.as_deref(), Some("not worth it"));
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!(ps.harvested_at, Some(5000));
+}
+
+/// The `pr_state` upserts, each writing `pr_number` for finding 1.
+#[derive(Debug, Clone, Copy)]
+enum PrUpsert {
+    SyncOpen,
+    MarkClosed,
+    MarkMerged,
+    SetNumber,
+}
+
+impl PrUpsert {
+    const ALL: [Self; 4] = [
+        Self::SyncOpen,
+        Self::MarkClosed,
+        Self::MarkMerged,
+        Self::SetNumber,
+    ];
+
+    async fn run(self, store: &Store, pr_number: i64) {
+        match self {
+            Self::SyncOpen => store
+                .sync_pr_open(
+                    1,
+                    &hunter::store::SyncPrData {
+                        pr_number,
+                        ..sync_pr_data("fp", "new_comments", 6000, false)
+                    },
+                )
+                .await
+                .unwrap(),
+            Self::MarkClosed => store.mark_pr_closed(1, pr_number, 6000).await.unwrap(),
+            Self::MarkMerged => store.mark_pr_merged(1, pr_number, 6000).await.unwrap(),
+            Self::SetNumber => store.set_pr_number(1, pr_number).await.unwrap(),
+        }
+    }
+}
+
+/// Seed finding 1's `pr_state` row for `pr_number`, harvested at 4000 and
+/// two attempts into a failure streak.
+async fn seed_harvested_pr(pool: &SqlitePool, pr_number: Option<i64>) {
+    sqlx::query(
+        "INSERT INTO pr_state (finding_id, pr_number, state, harvested_at, \
+         harvest_attempts, last_harvest_failure) VALUES (1, ?1, 'CLOSED', 4000, 2, 'gh: 502')",
+    )
+    .bind(pr_number)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Finding 1's (`harvested_at`, `harvest_attempts`, `last_harvest_failure`).
+async fn harvest_bookkeeping(pool: &SqlitePool) -> (Option<i64>, i64, Option<String>) {
+    sqlx::query_as(
+        "SELECT harvested_at, harvest_attempts, last_harvest_failure \
+         FROM pr_state WHERE finding_id = 1",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// `pr_state` is one row per finding, so a finding re-fixed after its PR
+/// closed writes its new PR into the old PR's row. The harvest stamp and
+/// failure streak belong to the old PR: carried over, the stamp keeps the
+/// new PR out of `list_pending_harvest` for good.
+#[tokio::test]
+async fn a_new_pr_number_clears_the_old_prs_harvest_bookkeeping() {
+    for upsert in PrUpsert::ALL {
+        let (_dir, path, pool) = fresh_db().await;
+        seed_repo_and_findings(&pool).await;
+        seed_harvested_pr(&pool, Some(5)).await;
+        let store = rw_store(&path).await;
+
+        upsert.run(&store, 6).await;
+
+        assert_eq!(
+            harvest_bookkeeping(&pool).await,
+            (None, 0, None),
+            "{upsert:?}: PR #6 must start unharvested"
+        );
+    }
+}
+
+/// Every sync rewrites the row with the PR's own number, so the same
+/// number must leave the bookkeeping alone: clearing it would harvest the
+/// same PR again on every sync, and reset its give-up streak.
+#[tokio::test]
+async fn the_same_pr_number_keeps_its_harvest_bookkeeping() {
+    for upsert in PrUpsert::ALL {
+        let (_dir, path, pool) = fresh_db().await;
+        seed_repo_and_findings(&pool).await;
+        seed_harvested_pr(&pool, Some(5)).await;
+        let store = rw_store(&path).await;
+
+        upsert.run(&store, 5).await;
+
+        assert_eq!(
+            harvest_bookkeeping(&pool).await,
+            (Some(4000), 2, Some("gh: 502".into())),
+            "{upsert:?}: PR #5 keeps its stamp and streak"
+        );
+    }
+}
+
+/// A NULL `pr_number` is an unknown number, and `run_harvest` fills it in
+/// from the finding's `pr_url` for the PR it is harvesting: the same PR,
+/// whose failure streak must survive the self-heal.
+#[tokio::test]
+async fn filling_in_a_missing_pr_number_keeps_the_harvest_bookkeeping() {
+    for upsert in PrUpsert::ALL {
+        let (_dir, path, pool) = fresh_db().await;
+        seed_repo_and_findings(&pool).await;
+        seed_harvested_pr(&pool, None).await;
+        let store = rw_store(&path).await;
+
+        upsert.run(&store, 5).await;
+
+        assert_eq!(
+            harvest_bookkeeping(&pool).await,
+            (Some(4000), 2, Some("gh: 502".into())),
+            "{upsert:?}: filling in the number is not a new PR"
+        );
+    }
 }
 
 // -- 11. resume chains ------------------------------------------------------

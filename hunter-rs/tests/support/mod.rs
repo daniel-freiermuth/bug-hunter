@@ -24,6 +24,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use hunter::backend::JobClass;
@@ -317,16 +318,27 @@ fn set_executable(_path: &Path) {}
 
 type RunFn = Box<dyn Fn(&Path) -> RunResult + Send + Sync>;
 
+/// What one `run()` of a [`ScriptedBackend`] was handed.
+#[derive(Debug, Clone)]
+pub struct Run {
+    pub tree: PathBuf,
+    pub prompt: String,
+    pub resume_from: Option<PathBuf>,
+}
+
 /// A `Backend` whose `run()` is a closure over the chain's worktree
 /// (`Workspace::tree`) it is handed.
 ///
 /// Use it to stage exactly what a worker would leave behind. `decide()`
 /// always grants, so a test never has to satisfy the budget gate. The
 /// headroom it grants is `None` — no token bound — unless
-/// [`ScriptedBackend::granting`] says otherwise.
+/// [`ScriptedBackend::granting`] says otherwise. Every run is recorded
+/// ([`ScriptedBackend::runs`]), so a test can assert on the prompt and the
+/// transcript a worker was given.
 pub struct ScriptedBackend {
     run: RunFn,
     cap_tokens: Option<i64>,
+    runs: Mutex<Vec<Run>>,
 }
 
 impl ScriptedBackend {
@@ -335,6 +347,7 @@ impl ScriptedBackend {
         Self {
             run: Box::new(run),
             cap_tokens: None,
+            runs: Mutex::new(Vec::new()),
         }
     }
 
@@ -356,6 +369,11 @@ impl ScriptedBackend {
     /// A worker that does nothing and exits 0.
     pub fn noop() -> Self {
         Self::new(|_| done())
+    }
+
+    /// Every run so far, oldest first.
+    pub fn runs(&self) -> Vec<Run> {
+        self.runs.lock().unwrap().clone()
     }
 }
 
@@ -397,12 +415,17 @@ impl Backend for ScriptedBackend {
     async fn run(
         &self,
         ws: &hunter::workspace::Workspace,
-        _prompt: &str,
+        prompt: &str,
         _cap_tokens: Option<i64>,
         _max_wall_s: i64,
         _job_class: JobClass,
-        _resume_from: Option<&Path>,
+        resume_from: Option<&Path>,
     ) -> anyhow::Result<RunResult> {
+        self.runs.lock().unwrap().push(Run {
+            tree: ws.tree.clone(),
+            prompt: prompt.to_owned(),
+            resume_from: resume_from.map(Path::to_path_buf),
+        });
         Ok((self.run)(&ws.tree))
     }
 }

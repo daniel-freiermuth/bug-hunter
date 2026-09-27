@@ -193,6 +193,33 @@ struct GlMergeRequest {
     pipeline: Option<GlPipeline>,
 }
 
+/// One file of `merge_requests/:iid/diffs`: GitLab returns the hunks
+/// without the file headers, which [`gitlab_unified_diff`] puts back.
+#[derive(Debug, Clone, Default, Deserialize)]
+// The bools are GitLab's own independent per-file flags, deserialized
+// as sent; folding them into an enum would invent states the API lacks.
+#[allow(clippy::struct_excessive_bools)]
+struct GlFileDiff {
+    #[serde(default)]
+    old_path: String,
+    #[serde(default)]
+    new_path: String,
+    #[serde(default)]
+    new_file: bool,
+    #[serde(default)]
+    deleted_file: bool,
+    #[serde(default)]
+    diff: String,
+    /// GitLab withholds the hunks of a file over its diff size limits
+    /// (`too_large`) or past its per-MR display limits (`collapsed`) and
+    /// sends an empty `diff` for it; without these the file reads as
+    /// changing nothing.
+    #[serde(default)]
+    too_large: bool,
+    #[serde(default)]
+    collapsed: bool,
+}
+
 /// PR view data returned by `view_pr_sync` and `view_pr_engage`.
 #[derive(Debug, Clone, Default)]
 pub struct PrView {
@@ -229,6 +256,10 @@ pub trait Forge: Send + Sync {
     fn view_pr_sync(&self, url: &str, pr_number: i64) -> anyhow::Result<PrView>;
     /// Heavier PR view for engage (includes comments/reviews).
     fn view_pr_engage(&self, url: &str, pr_number: i64) -> anyhow::Result<PrView>;
+    /// The PR/MR's unified diff: what it proposed. A closed PR's changes
+    /// never reach the default branch, so this is the only place a worker
+    /// reviewing it can read them.
+    fn pr_diff(&self, url: &str, pr_number: i64) -> anyhow::Result<String>;
     /// Post a comment on a PR/MR.
     fn comment_pr(&self, url: &str, pr_number: i64, body: &str) -> anyhow::Result<()>;
     /// Close a PR/MR with a comment explaining why.
@@ -395,6 +426,58 @@ fn gh_pr_view(slug: &str, pr_number: i64, fields: &str) -> anyhow::Result<PrView
         reviews: serde_json::from_value(v.get("reviews").cloned().unwrap_or_default())
             .unwrap_or_default(),
     })
+}
+
+/// Most pages of an MR's diff that `pr_diff` reads from GitLab: 1,000
+/// files. The harvest prompt keeps only the first
+/// [`crate::playbooks::PR_DIFF_CAP_CHARS`] characters of the diff, which
+/// far fewer files already fill, so fetching past this buys the worker
+/// nothing — and a server that ignored `page` would otherwise be asked
+/// forever.
+pub const MAX_DIFF_PAGES: usize = 10;
+
+/// Rebuild a unified diff from GitLab's per-file entries.
+fn gitlab_unified_diff(files: &[GlFileDiff]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    for f in files {
+        let old = if f.new_file {
+            "/dev/null".to_owned()
+        } else {
+            format!("a/{}", f.old_path)
+        };
+        let new = if f.deleted_file {
+            "/dev/null".to_owned()
+        } else {
+            format!("b/{}", f.new_path)
+        };
+        let _ = write!(
+            out,
+            "diff --git a/{} b/{}\n--- {old}\n+++ {new}\n",
+            f.old_path, f.new_path
+        );
+        // An empty `diff` under either flag is GitLab withholding the hunks,
+        // not a file that changed nothing: say so, so the worker never
+        // judges the PR by a diff that silently lost part of what it did.
+        let omitted = if !f.diff.is_empty() {
+            None
+        } else if f.too_large {
+            Some("file too large")
+        } else if f.collapsed {
+            Some("collapsed")
+        } else {
+            None
+        };
+        if let Some(why) = omitted {
+            let _ = writeln!(out, "[diff omitted by GitLab: {why}]");
+            continue;
+        }
+        out.push_str(&f.diff);
+        if !f.diff.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +724,22 @@ impl Forge for GitHubForge {
         )
     }
 
+    fn pr_diff(&self, url: &str, pr_number: i64) -> anyhow::Result<String> {
+        let (owner, repo) = self
+            .owner_repo(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+        let slug = format!("{owner}/{repo}");
+        let num = pr_number.to_string();
+        let (rc, out) = run_cmd(
+            &["gh", "pr", "diff", &num, "-R", &slug, "--color", "never"],
+            60,
+        );
+        if rc != 0 {
+            anyhow::bail!("gh pr diff failed (rc={rc}): {out}");
+        }
+        Ok(out)
+    }
+
     fn comment_pr(&self, url: &str, pr_number: i64, body: &str) -> anyhow::Result<()> {
         let (owner, repo) = self
             .owner_repo(url)
@@ -807,6 +906,46 @@ impl Forge for GitLabForge {
             comments,
             reviews,
         })
+    }
+
+    fn pr_diff(&self, url: &str, pr_number: i64) -> anyhow::Result<String> {
+        // The endpoint is paginated and GitLab caps `per_page` at 100, so
+        // one request silently truncates any MR touching more files than
+        // that; the harvest would then judge a closed PR by part of what
+        // it proposed. Walk the pages until one comes back short.
+        const PER_PAGE: usize = 100;
+        use std::fmt::Write as _;
+        let (_, path) = gitlab_host_path(url)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
+        let enc = path.replace('/', "%2F");
+        let mut files: Vec<GlFileDiff> = Vec::new();
+        let mut complete = false;
+        for page in 1..=MAX_DIFF_PAGES {
+            let api_path = format!(
+                "projects/{enc}/merge_requests/{pr_number}/diffs?per_page={PER_PAGE}&page={page}"
+            );
+            let (rc, out) = gitlab_api(url, &api_path, None, &[]);
+            if rc != 0 {
+                anyhow::bail!("glab api {api_path} failed (rc={rc}): {out}");
+            }
+            let batch: Vec<GlFileDiff> = serde_json::from_str(out.trim())?;
+            complete = batch.len() < PER_PAGE;
+            files.extend(batch);
+            if complete {
+                break;
+            }
+        }
+        let mut diff = gitlab_unified_diff(&files);
+        if !complete {
+            // Stopped at the cap with pages possibly left: say so, or the
+            // worker reads part of the MR as all of it.
+            let shown = PER_PAGE * MAX_DIFF_PAGES;
+            let _ = writeln!(
+                diff,
+                "[diff truncated: MR has more than {shown} changed files; only the first {shown} are shown]"
+            );
+        }
+        Ok(diff)
     }
     fn comment_pr(&self, url: &str, pr_number: i64, body: &str) -> anyhow::Result<()> {
         let (_, path) = gitlab_host_path(url)
