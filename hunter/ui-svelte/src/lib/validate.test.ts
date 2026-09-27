@@ -242,6 +242,20 @@ describe("isJobList produced_finding_ids", () => {
   });
 });
 
+// FindingCard renders `{#each followUps as fid (fid)}`.
+describe("isFindingList follow_ups", () => {
+  it("accepts absent, empty and distinct id lists", () => {
+    expect(isFindingList([{ id: 1 }])).toBe(true);
+    expect(isFindingList([{ id: 1, follow_ups: [] }])).toBe(true);
+    expect(isFindingList([{ id: 1, follow_ups: [4, 5] }])).toBe(true);
+  });
+
+  it("rejects a repeated id and a non-array", () => {
+    expect(isFindingList([{ id: 1, follow_ups: [4, 4] }])).toBe(false);
+    expect(isFindingList([{ id: 1, follow_ups: 4 }])).toBe(false);
+  });
+});
+
 describe("isSummary repos entries", () => {
   it("accepts an empty list and a list of records", () => {
     expect(isSummary({ ...summary, repos: [] })).toBe(true);

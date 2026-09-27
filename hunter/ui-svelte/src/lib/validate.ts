@@ -118,15 +118,18 @@ function hasKeyableTimeline(finding: Record<string, unknown>): boolean {
   return isKeyedList(finding.timeline, "id", "number");
 }
 
-/** `LogPage` keys a job's produced-finding links by the id itself. */
-function hasDistinctProducedIds(job: Record<string, unknown>): boolean {
-  const produced = job.produced_finding_ids;
+/**
+ * An id list rendered with `{#each ids as id (id)}`: `LogPage`'s
+ * produced-finding links, `FindingCard`'s follow-up links.
+ */
+function hasDistinctIds(row: Record<string, unknown>, key: string): boolean {
+  const ids = row[key];
   // Absent rather than empty when the daemon predates the field, which
-  // `LogPage` already reads as `[]`.
-  if (produced === undefined || produced === null) return true;
-  // `.slice()` is called on it unconditionally once it is non-empty.
-  if (!Array.isArray(produced)) return false;
-  return new Set(produced).size === produced.length;
+  // both readers already treat as `[]`.
+  if (ids === undefined || ids === null) return true;
+  // `.slice()`/`.length` are read unconditionally once it is present.
+  if (!Array.isArray(ids)) return false;
+  return new Set(ids).size === ids.length;
 }
 
 /** `FindingDetail` reads `detail.jobs.length` and keys each row by `job.id`. */
@@ -145,12 +148,15 @@ export function isFindingDetail(v: unknown): v is FindingDetail {
  * distinctness across the whole body is what they all need.
  */
 export function isFindingList(v: unknown): v is FindingOut[] {
-  return isKeyedList(v, "id", "number") && v.every(hasKeyableTimeline);
+  return (
+    isKeyedList(v, "id", "number") &&
+    v.every((f) => hasKeyableTimeline(f) && hasDistinctIds(f, "follow_ups"))
+  );
 }
 
 /** `/api/jobs`. `LogPage` keys the job table by `job.id`. */
 export function isJobList(v: unknown): v is JobListEntry[] {
-  return isKeyedList(v, "id", "number") && v.every(hasDistinctProducedIds);
+  return isKeyedList(v, "id", "number") && v.every((j) => hasDistinctIds(j, "produced_finding_ids"));
 }
 
 /** `/api/events`. `LogPage` keys the event table by `ev.id`. */

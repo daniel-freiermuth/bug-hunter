@@ -180,6 +180,12 @@ pub struct FindingOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub needs_attention: Option<Option<String>>,
+    /// The finding whose engage/harvest job filed this one as a follow-up;
+    /// null for everything a hunt or analysis job found. Always present.
+    pub follow_up_of: Option<i64>,
+    /// Findings filed as follow-ups by jobs working on this one, ascending
+    /// id. Always present, [] when none.
+    pub follow_ups: Vec<i64>,
 }
 
 /// jobs row (17 columns) + `repo_name` from the JOIN. The two finding_*
@@ -226,10 +232,11 @@ pub struct JobListEntry {
     pub job: Job,
     /// Findings this job brought into existence.
     ///
-    /// Empty for every job that works on a finding it was handed
-    /// (`finding_id`); non-empty for the ingesting jobs, chiefly hunts,
-    /// which have no `finding_id` of their own. Always present, so a
-    /// client never distinguishes "produced nothing" from "not reported".
+    /// Non-empty chiefly for the ingesting jobs (hunts, analysis), which
+    /// have no `finding_id` of their own, and for engage/harvest jobs that
+    /// filed `FOLLOW-UPS.json` — those carry both: the finding they worked
+    /// on and the follow-ups it produced. Always present, so a client
+    /// never distinguishes "produced nothing" from "not reported".
     pub produced_finding_ids: Vec<i64>,
 }
 

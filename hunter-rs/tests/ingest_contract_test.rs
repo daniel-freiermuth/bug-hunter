@@ -289,8 +289,8 @@ async fn a_rediscovery_does_not_steal_attribution() {
     );
 }
 
-/// A job handed a finding produces none: `finding_id` and
-/// `produced_finding_ids` are opposite directions and never both set.
+/// A job handed a finding does not claim that finding as produced:
+/// `finding_id` is its input, `produced_finding_ids` only its output.
 #[tokio::test]
 async fn a_job_given_a_finding_produces_nothing() {
     let (dir, store, repo_id) = provenance_fixture().await;
@@ -332,6 +332,76 @@ async fn a_job_given_a_finding_produces_nothing() {
         .unwrap();
     assert!(entry.produced_finding_ids.is_empty());
     assert_eq!(entry.job.finding_id, Some(found[0]));
+}
+
+/// A follow-up filed by an engage job links back to the finding the job
+/// was engaging, from either end; a hunt's findings have no source.
+///
+/// The link is the only way from a withdrawn PR's finding to the findings
+/// that replace it: they get new fingerprints, and the withdrawal comment
+/// is truncated before it can name them.
+#[tokio::test]
+async fn follow_ups_link_to_the_finding_their_job_worked_on() {
+    let (dir, store, repo_id) = provenance_fixture().await;
+    let hunt = store
+        .create_job(
+            RepoJobKind::Hunt.into(),
+            repo_id,
+            None,
+            Some(1000),
+            JobState::Running,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .id;
+    hunt_producing_two(&dir, &store, repo_id, hunt).await;
+    let found = produced_by(&store, hunt).await;
+    let (source, bystander) = (found[0], found[1]);
+
+    let engage = store
+        .create_job(
+            FindingJobKind::Engage.into(),
+            repo_id,
+            Some(source),
+            Some(1000),
+            JobState::Running,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .id;
+    let entries = serde_json::json!([{
+        "fingerprint": "widget:src/c.rs:h:3", "type": "bug", "file": "src/c.rs",
+        "bug_class": "boundary", "severity": "medium", "confidence": 0.7, "summary": "follow-up"
+    }]);
+    let path = dir.join("FOLLOW-UPS.json");
+    std::fs::write(&path, serde_json::to_string(&entries).unwrap()).unwrap();
+    let counts = hunter::ingest::ingest_findings(
+        &store,
+        repo_id,
+        Path::new(&path),
+        None,
+        Some(engage),
+        Some(source),
+    )
+    .await;
+    assert_eq!(counts.inserted, 1, "fixture: the follow-up is new");
+    let follow_up = produced_by(&store, engage).await[0];
+
+    let pair = vec![(source, follow_up)];
+    assert_eq!(store.follow_up_pairs(&[source]).await.unwrap(), pair);
+    assert_eq!(store.follow_up_pairs(&[follow_up]).await.unwrap(), pair);
+    assert!(
+        store
+            .follow_up_pairs(&[bystander])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a hunt's finding is nobody's follow-up and has none"
+    );
 }
 
 /// A confidence that parses but is not a number a worker meant is refused

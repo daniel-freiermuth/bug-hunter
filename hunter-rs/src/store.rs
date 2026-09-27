@@ -989,6 +989,39 @@ impl Store {
         Ok(grouped)
     }
 
+    /// `(source, follow_up)` pairs touching `ids` on either side: findings
+    /// filed by a job that was working on another finding (engage and
+    /// harvest `FOLLOW-UPS.json`), paired with that finding.
+    ///
+    /// Derived rather than stored: the follow-up's `found_by_job` names the
+    /// job, and the job's `finding_id` names the source. Ingesting jobs
+    /// (hunts, analysis) have no `finding_id`, so their findings have no
+    /// source and never appear here. Scoped to `ids` for the same reason as
+    /// [`Self::events_by_finding`]; ordered by follow-up id so each source
+    /// lists its follow-ups oldest first.
+    pub async fn follow_up_pairs(&self, ids: &[i64]) -> sqlx::Result<Vec<(i64, i64)>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids_json = serde_json::to_string(ids).unwrap_or_else(|_| "[]".to_owned());
+        let rows = sqlx::query!(
+            r#"
+            SELECT j.finding_id AS "source!: i64", f.id AS "follow_up!: i64"
+            FROM findings f
+            JOIN jobs j ON j.id = f.found_by_job
+            WHERE f.found_by_job IS NOT NULL
+              AND j.finding_id IS NOT NULL
+              AND (f.id IN (SELECT value FROM json_each(?1))
+                   OR j.finding_id IN (SELECT value FROM json_each(?1)))
+            ORDER BY f.id
+            "#,
+            ids_json
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.source, r.follow_up)).collect())
+    }
+
     pub async fn get_pr_state(&self, finding_id: i64) -> sqlx::Result<Option<PrState>> {
         sqlx::query_as!(
             PrState,

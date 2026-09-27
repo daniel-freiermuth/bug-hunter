@@ -14,9 +14,10 @@ export type JobListEntry = {
 /**
  * Findings this job brought into existence.
  *
- * Empty for every job that works on a finding it was handed
- * (`finding_id`); non-empty for the ingesting jobs, chiefly hunts,
- * which have no `finding_id` of their own. Always present, so a
- * client never distinguishes "produced nothing" from "not reported".
+ * Non-empty chiefly for the ingesting jobs (hunts, analysis), which
+ * have no `finding_id` of their own, and for engage/harvest jobs that
+ * filed `FOLLOW-UPS.json` — those carry both: the finding they worked
+ * on and the follow-ups it produced. Always present, so a client
+ * never distinguishes "produced nothing" from "not reported".
  */
 produced_finding_ids: Array<number>, id: number, kind: JobKind, repo_id: number, finding_id: number | null, state: JobState, pid: number | null, session_file: string | null, cap_tokens: number | null, tokens_new: number | null, calls: number | null, exit_code: number | null, killed_reason: string | null, notes: string | null, model: string | null, usage_delta: number | null, started_at: number | null, finished_at: number | null, repo_name: string, finding_summary?: string, finding_fingerprint?: string, };

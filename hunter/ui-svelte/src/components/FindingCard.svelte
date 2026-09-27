@@ -7,6 +7,8 @@
   let { finding, actions = false }: { finding: FindingOut; actions?: boolean } = $props();
 
   let expanded = $state(false);
+  // Absent when talking to a daemon that predates the field.
+  let followUps = $derived(finding.follow_ups ?? []);
   let reasonText = $state("");
   let showReasonPrompt = $state<string | null>(null); // "rejected" | "wontfix" | null
   let busy = $state(false);
@@ -115,8 +117,9 @@
 </script>
 
 <div class="card {sevClass(finding.severity)}" id="finding-{finding.id}">
-  <!-- Header row: type pill + severity dot/text + confidence + category + status pill (right) -->
+  <!-- Header row: id + type pill + severity dot/text + confidence + category + status pill (right) -->
   <div class="card-header">
+    <span class="fid">F#{finding.id}</span>
     <span class="type-pill" title={finding.type}>{typeLabel(finding.type)}</span>
     <span class="sev-indicator {sevClass(finding.severity)}">
       <span class="sev-dot"></span>
@@ -168,6 +171,25 @@
       </span>
     {/if}
   </div>
+
+  <!-- Lineage: an engage/harvest job that files FOLLOW-UPS.json leaves the
+       new findings under new fingerprints, so this is the only path between
+       a withdrawn finding and what replaced it. -->
+  {#if finding.follow_up_of != null || followUps.length > 0}
+    <div class="lineage">
+      {#if finding.follow_up_of != null}
+        <span>follow-up of <a href="#findings:{finding.follow_up_of}">F#{finding.follow_up_of}</a></span>
+      {/if}
+      {#if followUps.length > 0}
+        <span>
+          follow-ups:
+          {#each followUps as fid (fid)}
+            <a href="#findings:{fid}">F#{fid}</a>
+          {/each}
+        </span>
+      {/if}
+    </div>
+  {/if}
 
   <!-- Timeline (collapsible) -->
   {#if finding.timeline && finding.timeline.length > 0}
@@ -350,6 +372,12 @@
     color: var(--text-dim);
     font-size: 0.6875rem;
   }
+  .fid {
+    color: var(--text-dim);
+    font-size: 0.6875rem;
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    user-select: all;
+  }
 
   .cat-label {
     font-size: 0.6875rem;
@@ -447,6 +475,23 @@
   .file-loc {
     flex-shrink: 0;
     color: rgba(136, 136, 136, 0.7);
+  }
+  .lineage {
+    margin-top: 0.25rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    font-size: 0.6875rem;
+    color: var(--text-dim);
+  }
+  .lineage a {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
+    color: var(--accent);
+    text-decoration: none;
+    margin-left: 0.25rem;
+  }
+  .lineage a:hover {
+    text-decoration: underline;
   }
 
   /* ── Timeline ───────────────────────────────────────────────── */
