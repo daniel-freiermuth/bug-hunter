@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! The UI has to be able to render every finding type the daemon emits.
+//! The UI has to be able to render every finding type and status the daemon emits.
 //!
 //! `FindingType` is serialized onto the wire and the Svelte UI switches on
 //! those strings to pick a label and an icon. Nothing connects the two, so
@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use hunter::domain::{FindingJobKind, FindingType, RepoJobKind};
+use hunter::domain::{FindingJobKind, FindingStatus, FindingType, RepoJobKind};
 use ts_rs::TS;
 
 fn format_ts() -> String {
@@ -92,4 +92,35 @@ fn the_generated_job_kinds_are_the_wire_strings() {
         .map(|s| format!("\"{s}\""))
         .collect();
     assert_eq!(generated, wire);
+}
+
+/// Every finding status gets its own badge colour.
+///
+/// Same failure as the types above, for statuses: a status the switch does
+/// not name renders with the neutral fallback, indistinguishable from any
+/// other unknown value. `closed` and `superseded` were added for closed
+/// PRs, which are mostly superseded work rather than rejections, and a
+/// badge that shows them like nothing in particular hides exactly that.
+#[test]
+fn the_ui_badges_every_finding_status() {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../hunter/ui-svelte/src/components/FindingCard.svelte");
+    let src =
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("cannot read {}: {e}", p.display()));
+    let start = src
+        .find("function statusBadgeClass(")
+        .expect("FindingCard.svelte must define statusBadgeClass");
+    let body = &src[start..];
+    let body = &body[..body[1..]
+        .find("\n  function ")
+        .map_or(body.len(), |i| i + 1)];
+    let missing: Vec<&str> = FindingStatus::ALL
+        .iter()
+        .map(|s| s.as_str())
+        .filter(|s| !body.contains(&format!("case \"{s}\":")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "statusBadgeClass in FindingCard.svelte has no case for {missing:?}"
+    );
 }

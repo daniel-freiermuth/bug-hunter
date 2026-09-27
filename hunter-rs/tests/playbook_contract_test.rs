@@ -308,15 +308,16 @@ fn harvest_prompt_renders() {
     assert_usable("harvest", &prompt);
 }
 
-/// `harvest` and `engage` are the playbooks whose workers INVENT findings
+/// The harvest playbooks are the ones whose workers INVENT findings
 /// of any type, and `ingest` rejects an entry that omits (or misshapes) a
 /// required field for its type — the follow-up is dropped, not queued,
 /// and only a truncated `ingest:` error event survives. Seven such losses
 /// are on record: four `test_gap` entries without a usable `missing_tests`
 /// (2026-09-12, 2026-09-22) and three `bug` entries with no `bug_class`
 /// (2026-09-18, 2026-09-22), each because the playbook spelled out the
-/// shapes for some types and not others — engage did not spell out any,
-/// it pointed at a "same schema as `apply_improvement.md`" that does not
+/// shapes for some types and not others — engage (which offered them on
+/// withdrawal until the harvest took that over) did not spell out any, it
+/// pointed at a "same schema as `apply_improvement.md`" that does not
 /// exist. The instructions and the validator have to agree field by field.
 ///
 /// Scope is derived, not listed: every playbook that offers
@@ -365,8 +366,8 @@ fn followup_playbooks_name_every_required_field_they_ask_workers_to_emit() {
         }
     }
     assert!(
-        checked >= 2,
-        "expected harvest and engage to offer FOLLOW-UPS.json, found {checked}"
+        checked >= 1,
+        "expected harvest to offer FOLLOW-UPS.json, found {checked}"
     );
 }
 

@@ -79,7 +79,7 @@ async fn status_counts_zero_fills_all_statuses() {
     let store = open_store(pool, &path).await;
 
     let counts = store.status_counts().await.unwrap();
-    // All 9 enum statuses present even when unobserved.
+    // Every enum status present even when unobserved.
     assert_eq!(counts.len(), FindingStatus::ALL.len());
     for status in FindingStatus::ALL.map(hunter::domain::FindingStatus::as_str) {
         assert!(counts.contains_key(status), "missing status key {status}");
@@ -93,6 +93,10 @@ async fn status_counts_zero_fills_all_statuses() {
     assert_eq!(counts["rejected"], 0);
     assert_eq!(counts["wontfix"], 0);
     assert_eq!(counts["note"], 0);
+    // The two a closed PR passes through: a dashboard that drops them
+    // hides every finding waiting on, or settled by, its harvest.
+    assert_eq!(counts["closed"], 0);
+    assert_eq!(counts["superseded"], 0);
 }
 
 #[tokio::test]

@@ -24,19 +24,32 @@ pub enum FindingStatus {
     Fixing,
     PrOpen,
     Merged,
+    /// The PR was closed without merging and has not been harvested yet.
+    /// Deliberately not suppressed: a closure says nothing on its own about
+    /// whether the finding was wrong. Of the first 16 closed PRs, 15 were
+    /// withdrawn by engage (14 of those as superseded or obsolete) and only
+    /// one was closed by a human, so treating every closure as a rejection
+    /// silenced mostly valid findings. The closed-PR harvest decides.
+    Closed,
+    /// The finding was valid, but its work landed another way (another
+    /// commit or PR), duplicated one, or its code is gone. Not suppressed:
+    /// the same defect showing up again elsewhere is still worth reporting.
+    Superseded,
     Rejected,
     Wontfix,
     Note,
 }
 
 impl FindingStatus {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::New,
         Self::Rechecking,
         Self::Queued,
         Self::Fixing,
         Self::PrOpen,
         Self::Merged,
+        Self::Closed,
+        Self::Superseded,
         Self::Rejected,
         Self::Wontfix,
         Self::Note,
@@ -50,6 +63,8 @@ impl FindingStatus {
             Self::Fixing => "fixing",
             Self::PrOpen => "pr_open",
             Self::Merged => "merged",
+            Self::Closed => "closed",
+            Self::Superseded => "superseded",
             Self::Rejected => "rejected",
             Self::Wontfix => "wontfix",
             Self::Note => "note",
@@ -69,7 +84,8 @@ impl FindingStatus {
         matches!(self, Self::Rejected | Self::Wontfix)
     }
 
-    /// Suppressed statuses (feed the suppression corpus).
+    /// Suppressed statuses (feed the suppression corpus). `Closed` and
+    /// `Superseded` are left out on purpose: see their variants.
     pub fn is_suppressed(self) -> bool {
         matches!(self, Self::Rejected | Self::Wontfix)
     }

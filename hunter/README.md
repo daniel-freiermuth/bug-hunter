@@ -73,7 +73,7 @@ place the distinction usually matters day to day.
 new ──recheck──> new / wontfix / rejected
  │
  ├─ queue for fix ─> queued ─> fixing ─> pr_open ─┬─> merged
- │                      ↑           │              └─> rejected (closed unmerged)
+ │                      ↑           │              └─> closed (closed unmerged)
  │                      └───────────┘ (requeued on a
  │                        recoverable failure, up to
  │                        a bounded same-reason streak
@@ -92,10 +92,15 @@ new ──recheck──> new / wontfix / rejected
   `queued` on ANY exit path, including an unhandled exception or a process
   kill.
 - **`pr_open`** — tracked via `sync_prs` (free — `gh pr view`, no worker)
-  every cycle: merged → `merged`; closed unmerged → `rejected` (feeds the
-  suppression corpus below); new comments/reviews, `CHANGES_REQUESTED`,
-  merge conflicts, or failing checks flag it `needs_attention` for an
-  **engage** worker.
+  every cycle: merged → `merged`; closed unmerged → `closed`; new
+  comments/reviews, `CHANGES_REQUESTED`, merge conflicts, or failing checks
+  flag it `needs_attention` for an **engage** worker, which may also
+  withdraw the PR (→ `closed`).
+- **`closed`** — the PR closed without merging. Deliberately NOT a
+  rejection: of the first 16 closed PRs, 15 were engage withdrawals (14 of
+  them superseded or obsolete) and one was closed by a human, so a closure
+  on its own says little about whether the finding was wrong. `superseded`
+  records that the work landed another way; neither is suppressed.
 - **`merged`** → queued for a one-time **harvest** pass reviewing the PR's
   complete lifetime (not just its open-time snapshot) for genuine deferred
   follow-up work, filed as new findings via `FOLLOW-UPS.json`.

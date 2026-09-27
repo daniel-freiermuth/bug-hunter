@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! `run_engage` — the withdrawal path.
+//! `run_engage` — the withdrawal path — and what a PR closing does to its
+//! finding.
 //!
 //! This is the runner layer, which had no tests until a review found a P1
 //! here: `close_pr` was changed to propagate a failed withdrawal comment,
@@ -7,6 +8,11 @@
 //! PR open on the forge, closed in the database, and the finding rejected
 //! — and `sync_prs` only revisits `pr_open` findings, so nothing would
 //! ever reconcile it.
+//!
+//! A closed PR, whether a worker withdrew it or a human closed it, leaves
+//! its finding `closed` for the harvest to classify, never `rejected`:
+//! 15 of the first 16 closures were engage withdrawals, 14 of them
+//! "superseded/obsolete", and rejecting those suppressed valid findings.
 //!
 //! Worth reading as a template for the other runners: `support` gives you
 //! a git repo with a real origin, a scripted `gh`, and a backend that
@@ -25,6 +31,13 @@ const REPO_URL: &str = "https://github.com/acme/widget";
 
 /// Minimal `gh pr view --json` payload that `view_pr_engage` can parse.
 const PR_VIEW_JSON: &str = r#"{"state":"OPEN","mergeable":"MERGEABLE","title":"a fix","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
+
+/// The same PR as `sync_prs` sees it once a human has closed it.
+const PR_CLOSED_JSON: &str = r#"{"state":"CLOSED","mergeable":"UNKNOWN","reviewDecision":"","comments":[],"reviews":[],"statusCheckRollup":[],"updatedAt":"2026-01-02T03:04:05Z","headRefName":"fix/some-bug","headRefOid":"deadbeef"}"#;
+
+/// One valid follow-up entry, so a follow-up that is not filed is known
+/// to have been skipped rather than rejected by ingest.
+const FOLLOW_UP: &str = r#"[{"type":"bug","fingerprint":"widget:src/lib.rs:left-open","file":"src/lib.rs","bug_class":"logic","severity":"medium","confidence":0.8,"summary":"left open","detail":"src/lib.rs:1 still has it","evidence_plan":"failing test"}]"#;
 
 struct Fixture {
     db: std::path::PathBuf,
@@ -207,7 +220,9 @@ async fn failed_close_does_not_record_the_withdrawal() {
 }
 
 /// The happy path, so the test above is known to be asserting on a
-/// difference rather than on a runner that always declines.
+/// difference rather than on a runner that always declines. A withdrawal
+/// closes the PR and leaves the finding `closed`, awaiting its harvest,
+/// with the worker's reason; it does not suppress it.
 #[tokio::test]
 async fn successful_close_records_the_withdrawal() {
     let f = fixture("engage-close-ok").await;
@@ -215,7 +230,7 @@ async fn successful_close_records_the_withdrawal() {
     bins.ok("gh", PR_VIEW_JSON);
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let backend = ScriptedBackend::writing("WITHDRAW.md", "not worth pursuing");
+    let backend = ScriptedBackend::writing("WITHDRAW.md", "superseded by #9");
     let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
@@ -228,7 +243,122 @@ async fn successful_close_records_the_withdrawal() {
     );
 
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    assert_eq!(after.status, FindingStatus::Rejected);
+    assert_eq!(after.status, FindingStatus::Closed);
+    assert_eq!(after.verdict_reason.as_deref(), Some("superseded by #9"));
+    assert_eq!(f.pr_state().await.as_deref(), Some("CLOSED"));
+    let suppressed = f.store.suppressions(after.repo_id, "bug").await.unwrap();
+    assert!(
+        suppressed.is_empty(),
+        "a withdrawn finding must not feed the suppression corpus: {suppressed:?}"
+    );
+}
+
+/// A withdrawal files no follow-ups: the harvest of the closed PR owns
+/// them now. Ingesting the withdrawing worker's `FOLLOW-UPS.json` as well
+/// would file the same work twice, under two different provenances.
+#[tokio::test]
+async fn a_withdrawal_files_no_follow_ups() {
+    let f = fixture("engage-withdraw-no-followups").await;
+    let bins = FakeBins::acquire("engage-withdraw-no-followups");
+    bins.ok("gh", PR_VIEW_JSON);
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("WITHDRAW.md"), "superseded by #9").unwrap();
+        std::fs::write(tree.join("FOLLOW-UPS.json"), FOLLOW_UP).unwrap();
+        support::done()
+    });
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
+    assert!(summary.ingest.is_none(), "{summary:?}");
+    let all = f
+        .store
+        .list_findings(&hunter::store::FindingFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        all.iter().map(|x| x.id).collect::<Vec<_>>(),
+        vec![f.fid],
+        "no follow-up may be filed by the withdrawal"
+    );
+}
+
+/// A PR closed on the forge (here: by a human) leaves its finding
+/// `closed`, awaiting the harvest, and out of the suppression corpus.
+/// Rejecting it on sight is what silenced valid findings: a closure alone
+/// does not say whether the finding was wrong.
+#[tokio::test]
+async fn a_pr_closed_on_the_forge_waits_for_its_harvest() {
+    let f = fixture("sync-closed").await;
+    let bins = FakeBins::acquire("sync-closed");
+    bins.ok("gh", PR_CLOSED_JSON);
+
+    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+
+    assert_eq!(result.closed, 1, "{result:?}");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Closed);
+    assert_eq!(
+        after.verdict_reason.as_deref(),
+        Some("PR closed without merge; awaiting harvest")
+    );
+    assert_eq!(f.pr_state().await.as_deref(), Some("CLOSED"));
+    let suppressed = f.store.suppressions(after.repo_id, "bug").await.unwrap();
+    assert!(
+        suppressed.is_empty(),
+        "a closed PR's finding must not feed the suppression corpus: {suppressed:?}"
+    );
+}
+
+/// A closed PR whose closure cannot be recorded keeps its finding
+/// `pr_open`. `sync_prs` only revisits `pr_open` findings, so setting it
+/// `closed` over a `pr_state` still reading OPEN would strand it; left
+/// `pr_open`, the next sync records both.
+#[tokio::test]
+async fn a_closure_that_cannot_be_recorded_is_retried_by_the_next_sync() {
+    let f = fixture("sync-closed-unrecorded").await;
+    let bins = FakeBins::acquire("sync-closed-unrecorded");
+    bins.ok("gh", PR_CLOSED_JSON);
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER no_close BEFORE UPDATE OF state ON pr_state \
+         WHEN NEW.state = 'CLOSED' \
+         BEGIN SELECT RAISE(ABORT, 'injected mark_pr_closed failure'); END",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+
+    assert_eq!(result.closed, 0, "{result:?}");
+    assert_eq!(result.errors, 1, "{result:?}");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::PrOpen);
+    assert_ne!(f.pr_state().await.as_deref(), Some("CLOSED"));
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "error"
+            && e.finding_id == Some(f.fid)
+            && e.message.contains("PR closed but not recorded")),
+        "{events:?}"
+    );
+
+    sqlx::query("DROP TRIGGER no_close")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+
+    assert_eq!(result.closed, 1, "{result:?}");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Closed);
     assert_eq!(f.pr_state().await.as_deref(), Some("CLOSED"));
 }
 

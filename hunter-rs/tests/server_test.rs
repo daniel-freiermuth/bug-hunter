@@ -167,6 +167,8 @@ async fn summary_has_every_top_level_key() {
         "fixing",
         "pr_open",
         "merged",
+        "closed",
+        "superseded",
         "rejected",
         "wontfix",
         "note",
