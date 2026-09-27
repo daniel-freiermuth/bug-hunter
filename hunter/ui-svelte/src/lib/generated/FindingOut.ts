@@ -23,4 +23,14 @@ timeline: Array<Event>,
  * Present ONLY for status == "`pr_open`" rows that have a `pr_state` row;
  * value is `pr_state.needs_attention` (string or null).
  */
-needs_attention?: string | null, id: number, type: FindingType, repo_id: number, fingerprint: string, file: string | null, symbol: string | null, line: number | null, severity: Severity, confidence: number, summary: string, detail: string | null, status: FindingStatus, pr_url: string | null, created_at: number, updated_at: number, bug_class: BugClass | null, evidence_plan: string | null, introduced_by: string | null, rung_achieved: number | null, verdict_reason: string | null, budget_override: string | null, fix_attempts: number, last_fix_failure: string | null, recheck_attempts: number, last_recheck_failure: string | null, ecosystem: string | null, package: string | null, current_version: string | null, latest_version: string | null, update_type: string | null, security_advisory: string | null, missing_tests: string | null, test_file: string | null, smell_type: string | null, suggested_refactor: string | null, modernization_class: string | null, current_approach: string | null, proposed_approach: string | null, standard_section: string | null, };
+needs_attention?: string | null, 
+/**
+ * The finding whose engage/harvest job filed this one as a follow-up;
+ * null for everything a hunt or analysis job found. Always present.
+ */
+follow_up_of: number | null, 
+/**
+ * Findings filed as follow-ups by jobs working on this one, ascending
+ * id. Always present, [] when none.
+ */
+follow_ups: Array<number>, id: number, type: FindingType, repo_id: number, fingerprint: string, file: string | null, symbol: string | null, line: number | null, severity: Severity, confidence: number, summary: string, detail: string | null, status: FindingStatus, pr_url: string | null, created_at: number, updated_at: number, bug_class: BugClass | null, evidence_plan: string | null, introduced_by: string | null, rung_achieved: number | null, verdict_reason: string | null, budget_override: string | null, fix_attempts: number, last_fix_failure: string | null, recheck_attempts: number, last_recheck_failure: string | null, ecosystem: string | null, package: string | null, current_version: string | null, latest_version: string | null, update_type: string | null, security_advisory: string | null, missing_tests: string | null, test_file: string | null, smell_type: string | null, suggested_refactor: string | null, modernization_class: string | null, current_approach: string | null, proposed_approach: string | null, standard_section: string | null, };

@@ -149,15 +149,17 @@
                   <td class="cell-kind">{job.kind}</td>
                   <td class="cell-small">{job.repo_name}</td>
                   <td class="cell-links">
-                    <!-- Two different relationships, deliberately shown in
-                         one column: the finding a job was given to work
-                         on, or the findings a hunt turned up. A job never
-                         has both. -->
+                    <!-- Two relationships in one column: the finding a job
+                         was given to work on, then the findings it filed.
+                         Hunts only file; engage/harvest jobs can do both
+                         (FOLLOW-UPS.json), shown as "F#2010 → F#3474". -->
                     {#if job.finding_id != null}
                       <a href="#findings:{job.finding_id}" class="finding-link">
                         F#{job.finding_id}
                       </a>
-                    {:else if produced(job).length > 0}
+                    {/if}
+                    {#if produced(job).length > 0}
+                      {#if job.finding_id != null}<span class="dim">→</span>{/if}
                       {#each produced(job).slice(0, MAX_PRODUCED_LINKS) as fid (fid)}
                         <a href="#findings:{fid}" class="finding-link">F#{fid}</a>
                       {/each}
@@ -166,7 +168,8 @@
                           +{produced(job).length - MAX_PRODUCED_LINKS}
                         </span>
                       {/if}
-                    {:else}
+                    {/if}
+                    {#if job.finding_id == null && produced(job).length === 0}
                       <span class="dim">–</span>
                     {/if}
                   </td>

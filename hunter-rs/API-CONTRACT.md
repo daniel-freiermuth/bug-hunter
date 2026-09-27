@@ -143,12 +143,13 @@ Store: `list_findings` (store.py:863-911): `SELECT * FROM findings [WHERE status
 Handler then embeds per-row (server.py:369-381):
 - `timeline`: **always added**, array of event rows for that finding, ascending id order. Store: `events_by_finding(fids)` (store.py:1375-1389): `SELECT * FROM events WHERE finding_id IN (…) ORDER BY id`, grouped by `finding_id`. Empty array when no events.
 - `needs_attention`: added **only** for rows with `status == "pr_open"` that have a `pr_state` row (`get_pr_state`, store.py:1085-1087); value is `pr_state.needs_attention` (string or null). Key **absent** for all other rows.
+- `follow_up_of` / `follow_ups` (**Rust only**): **always added**. The finding whose engage/harvest job filed this one via `FOLLOW-UPS.json` (int or null), and the findings jobs on this one filed that way (array, ascending id, `[]` when none). Derived as `findings.found_by_job -> jobs.finding_id` (`Store::follow_up_pairs`), so findings ingested before migration 011 have neither.
 
 ### Row columns (findings table verbatim; schema.sql:28-91 + migrations, see section 11)
 
 `id:int, type:str, repo_id:int, fingerprint:str, file:str|null (in practice "" default at insert, store.py:810), symbol:str|null, line:int|null, severity:str ("high"|"medium"|"low"), confidence:float, summary:str, detail:str|null, status:str, pr_url:str|null, created_at:int, updated_at:int, bug_class:str|null, evidence_plan:str|null, introduced_by:str|null, rung_achieved:int|null, verdict_reason:str|null, budget_override:str|null ("once"|"exempt"|null), fix_attempts:int, last_fix_failure:str|null, recheck_attempts:int, last_recheck_failure:str|null, ecosystem:str|null, package:str|null, current_version:str|null, latest_version:str|null, update_type:str|null, security_advisory:str|null, missing_tests:str|null (JSON-encoded array stored as TEXT — served as a string, NEVER json.loads'd), test_file:str|null, smell_type:str|null, suggested_refactor:str|null, modernization_class:str|null, current_approach:str|null, proposed_approach:str|null, standard_section:str|null` + computed `category`, `timeline`, conditional `needs_attention`.
 
-The table also carries `found_by_job` (migration 011, §11), and no findings response does: Rust names its columns and never selects it, and Python's `SELECT *` reads are filtered through `_public_finding`, which pops it (store.py:854-857, applied at :861 and :910). That provenance is served the other way round, as `produced_finding_ids` on `/api/jobs` (§6).
+The table also carries `found_by_job` (migration 011, §11), and no findings response does: Rust names its columns and never selects it, and Python's `SELECT *` reads are filtered through `_public_finding`, which pops it (store.py:854-857, applied at :861 and :910). That provenance is served the other way round, as `produced_finding_ids` on `/api/jobs` (§6), and folded into `follow_up_of`/`follow_ups` above.
 
 ---
 
