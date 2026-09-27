@@ -17,7 +17,8 @@ mod support;
 
 use std::path::Path;
 
-use hunter::dep_scan::scan_repo;
+use hunter::dep_scan::{github_token, scan_repo};
+use hunter::domain::ForgeName;
 use support::{FakeBins, TempDir};
 
 const REPO: &str = "acme/widget";
@@ -58,7 +59,7 @@ fn success_with_candidates_parses_them() {
     let work = TempDir::new("depscan-ok-repo");
     bins.ok("renovate", &format!("{CHATTER}\n{UPDATE_LINE}"));
 
-    let got = scan_repo(work.path(), REPO, 30).expect("renovate succeeded, so Some");
+    let got = scan_repo(work.path(), REPO, None, 30).expect("renovate succeeded, so Some");
 
     assert_renovate_invoked(&bins);
     assert_eq!(got.len(), 1, "one dep, one update: {got:?}");
@@ -87,13 +88,46 @@ fn success_with_no_updates_is_empty_not_none() {
     let work = TempDir::new("depscan-empty-repo");
     bins.ok("renovate", &format!("{CHATTER}\n{NO_UPDATE_LINE}"));
 
-    let got = scan_repo(work.path(), REPO, 30);
+    let got = scan_repo(work.path(), REPO, None, 30);
 
     assert_renovate_invoked(&bins);
     assert!(
         matches!(&got, Some(v) if v.is_empty()),
         "up-to-date repo must be Some(empty), not a model fallback: {got:?}"
     );
+}
+
+/// Scan a repo whose Renovate run printed `line` and exited 0.
+fn scan_printing(label: &str, line: &str) -> Option<Vec<hunter::dep_scan::DepCandidate>> {
+    let bins = FakeBins::acquire(label);
+    let work = TempDir::new(label);
+    bins.ok("renovate", &format!("{CHATTER}\n{line}"));
+    let got = scan_repo(work.path(), REPO, None, 30);
+    assert_renovate_invoked(&bins);
+    got
+}
+
+/// Renovate exits 0 and reports `{}` for a repo it finds no dependency in
+/// (observed with 44.96.2). That is not "everything is current":
+/// Renovate has no answer, so the caller must fall back to the model.
+#[test]
+fn no_dependencies_found_is_unavailable() {
+    let got = scan_printing(
+        "depscan-no-deps",
+        r#"{"name":"renovate","level":20,"msg":"packageFiles with updates","config":{}}"#,
+    );
+    assert!(got.is_none(), "{got:?}");
+}
+
+/// Deps Renovate could not look up carry a `skipReason`; a repo made only
+/// of those has had nothing checked.
+#[test]
+fn only_skipped_dependencies_is_unavailable() {
+    let got = scan_printing(
+        "depscan-all-skipped",
+        r#"{"name":"renovate","level":20,"msg":"packageFiles with updates","config":{"github-actions":[{"packageFile":".github/workflows/ci.yml","deps":[{"depName":"actions/checkout","currentValue":"v4","datasource":"github-tags","skipReason":"github-token-required","updates":[]}]}]}}"#,
+    );
+    assert!(got.is_none(), "{got:?}");
 }
 
 /// The subtle one: a failed lookup that still printed a parseable
@@ -114,7 +148,7 @@ fn failure_with_output_is_unavailable() {
         ),
     );
 
-    let got = scan_repo(work.path(), REPO, 30);
+    let got = scan_repo(work.path(), REPO, None, 30);
 
     assert_renovate_invoked(&bins);
     assert!(
@@ -131,7 +165,7 @@ fn failure_without_output_is_unavailable() {
     let work = TempDir::new("depscan-fail-quiet-repo");
     bins.script("renovate", "exit 3");
 
-    let got = scan_repo(work.path(), REPO, 30);
+    let got = scan_repo(work.path(), REPO, None, 30);
 
     assert_renovate_invoked(&bins);
     assert!(got.is_none(), "silent failure is unavailable too: {got:?}");
@@ -147,7 +181,7 @@ fn missing_binary_is_unavailable() {
     bins.isolate();
     let work = TempDir::new("depscan-missing-repo");
 
-    let got = scan_repo(work.path(), REPO, 30);
+    let got = scan_repo(work.path(), REPO, None, 30);
 
     assert!(got.is_none(), "no renovate means fall back to the model");
     assert!(
@@ -166,7 +200,7 @@ fn unspawnable_scan_is_unavailable() {
     bins.ok("renovate", UPDATE_LINE);
     let missing = work.join("no-such-checkout");
 
-    let got = scan_repo(&missing, REPO, 30);
+    let got = scan_repo(&missing, REPO, None, 30);
 
     assert!(got.is_none(), "spawn failure is unavailable: {got:?}");
 }
@@ -189,7 +223,7 @@ fn malformed_lines_do_not_discard_good_ones() {
         ),
     );
 
-    let got = scan_repo(work.path(), REPO, 30).expect("renovate succeeded, so Some");
+    let got = scan_repo(work.path(), REPO, None, 30).expect("renovate succeeded, so Some");
 
     assert_renovate_invoked(&bins);
     let packages: Vec<&str> = got.iter().map(|c| c.package.as_str()).collect();
@@ -216,10 +250,13 @@ fn renovate_runs_inside_the_repo_checkout() {
     let marker = work.join("cwd.txt");
     bins.script(
         "renovate",
-        &format!("pwd > '{}'\nexit 0", marker.to_string_lossy()),
+        &format!(
+            "pwd > '{}'\necho '{NO_UPDATE_LINE}'",
+            marker.to_string_lossy()
+        ),
     );
 
-    let got = scan_repo(&checkout, REPO, 30);
+    let got = scan_repo(&checkout, REPO, None, 30);
 
     assert!(got.is_some(), "clean exit is Some: {got:?}");
     let recorded = std::fs::read_to_string(&marker).expect("fake renovate recorded its cwd");
@@ -250,7 +287,7 @@ fn single_candidate(
     let bins = FakeBins::acquire(label);
     let work = TempDir::new(label);
     bins.ok("renovate", &update_line(update_type, vulnerability));
-    let got = scan_repo(work.path(), REPO, 30).expect("renovate succeeded");
+    let got = scan_repo(work.path(), REPO, None, 30).expect("renovate succeeded");
     assert_eq!(got.len(), 1, "expected one candidate: {got:?}");
     got.into_iter().next().unwrap_or_else(|| unreachable!())
 }
@@ -348,7 +385,7 @@ fn a_renovate_shipped_by_the_scanned_repo_never_runs() {
     let hostile = format!("node_modules/.bin:{}:{installed}", repo_bin.display());
     let _path = bins.env("PATH", Path::new(&hostile));
 
-    let got = scan_repo(work.path(), REPO, 30);
+    let got = scan_repo(work.path(), REPO, None, 30);
 
     assert!(
         !marker.exists(),
@@ -376,7 +413,7 @@ fn a_repo_shipped_renovate_is_not_a_fallback() {
     }
     let _path = bins.env("PATH", &repo_bin);
 
-    let got = scan_repo(work.path(), REPO, 30);
+    let got = scan_repo(work.path(), REPO, None, 30);
 
     assert!(!marker.exists(), "the repo's renovate ran");
     assert!(
@@ -399,7 +436,7 @@ fn renovate_does_not_inherit_the_daemons_secrets() {
     let _token = bins.env("GH_TOKEN", Path::new("s3cret-token"));
     let _home = bins.env("HOME", work.path());
 
-    let got = scan_repo(work.path(), REPO, 30);
+    let got = scan_repo(work.path(), REPO, None, 30);
 
     assert!(got.is_some(), "{got:?}");
     let env = std::fs::read_to_string(&seen).unwrap();
@@ -442,11 +479,109 @@ fn renovates_own_path_lookups_cannot_reach_the_checkout() {
     let hostile = format!("node_modules/.bin:{installed}");
     let _path = bins.env("PATH", Path::new(&hostile));
 
-    let got = scan_repo(work.path(), REPO, 30);
+    let got = scan_repo(work.path(), REPO, None, 30);
 
     assert!(got.is_some(), "{got:?}");
     assert!(
         !marker.exists(),
         "renovate's child PATH resolved into the checkout and ran the repo's node"
     );
+}
+
+/// The token handed to `scan_repo` is the one Renovate's github.com lookups
+/// read. Without it every Action and GitHub-tagged dep is skipped as
+/// `github-token-required` while the run still exits 0.
+#[test]
+fn the_github_token_reaches_renovate() {
+    let bins = FakeBins::acquire("depscan-gh-token");
+    let work = TempDir::new("depscan-gh-token-repo");
+    let seen = work.join("env.txt");
+    bins.script(
+        "renovate",
+        &format!("env > '{}'\necho '{NO_UPDATE_LINE}'", seen.display()),
+    );
+
+    let got = scan_repo(work.path(), REPO, Some("ghp_scan"), 30);
+
+    assert!(got.is_some(), "{got:?}");
+    let env = std::fs::read_to_string(&seen).unwrap();
+    assert!(
+        env.lines().any(|l| l == "GITHUB_COM_TOKEN=ghp_scan"),
+        "token not exported to renovate:\n{env}"
+    );
+}
+
+/// A configured token wins over the `gh` login, and `gh` is not even asked.
+#[test]
+fn configured_token_takes_precedence_over_gh() {
+    let bins = FakeBins::acquire("depscan-token-cfg");
+    bins.ok("gh", "gho_from_gh");
+
+    let got = github_token(ForgeName::Github, Some("ghp_configured"));
+
+    assert_eq!(got.as_deref(), Some("ghp_configured"));
+    assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
+}
+
+/// Without a configured token, a GitHub repo gets the `gh` login for
+/// github.com.
+#[test]
+fn github_repo_falls_back_to_the_gh_login() {
+    let bins = FakeBins::acquire("depscan-token-gh");
+    bins.ok("gh", "gho_from_gh");
+
+    let got = github_token(ForgeName::Github, None);
+
+    assert_eq!(got.as_deref(), Some("gho_from_gh"));
+    assert_eq!(
+        bins.calls_to("gh"),
+        vec![vec!["gh", "auth", "token", "--hostname", "github.com"]]
+    );
+}
+
+/// Repos not hosted on GitHub get no token, configured or not.
+#[test]
+fn non_github_repo_gets_no_token() {
+    let bins = FakeBins::acquire("depscan-token-gitlab");
+    bins.ok("gh", "gho_from_gh");
+
+    assert_eq!(
+        github_token(ForgeName::Gitlab, Some("ghp_configured")),
+        None
+    );
+    assert_eq!(github_token(ForgeName::Gitlab, None), None);
+    assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
+}
+
+/// A logged-out `gh` exits non-zero with a message; that message must not
+/// be handed to Renovate as a token.
+#[test]
+fn failed_gh_login_is_no_token() {
+    let bins = FakeBins::acquire("depscan-token-nogh");
+    bins.fail("gh", 1, "no oauth token found for github.com");
+
+    assert_eq!(github_token(ForgeName::Github, None), None);
+}
+
+/// A failed `gh` is no token even when what it printed looks like one:
+/// the exit status decides, not the shape of the output.
+#[test]
+fn failed_gh_exit_is_no_token_whatever_it_printed() {
+    let bins = FakeBins::acquire("depscan-token-gh-fail-tokenish");
+    bins.script("gh", "echo gho_stale\nexit 1");
+
+    assert_eq!(github_token(ForgeName::Github, None), None);
+}
+
+/// `gh` succeeding but adding a notice (stderr is merged in) is not a
+/// token: handing Renovate the whole text would fail every lookup.
+#[test]
+fn gh_output_beyond_one_token_is_no_token() {
+    let bins = FakeBins::acquire("depscan-token-gh-notice");
+    bins.script(
+        "gh",
+        "echo gho_from_gh\necho 'A new release of gh is available' >&2\nexit 0",
+    );
+
+    assert_eq!(github_token(ForgeName::Github, None), None);
 }

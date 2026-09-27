@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::util::{drain_pipe, join_pipes, kill_tree};
+use crate::domain::ForgeName;
+use crate::util::{drain_pipe, join_pipes, kill_tree, run_cmd};
 
 /// One update candidate, matching the `dep_update` finding schema.
 #[derive(Debug, Clone)]
@@ -27,10 +28,11 @@ pub struct DepCandidate {
     pub detail: String,
 }
 
-/// The only variables Renovate's child sees, besides the sanitised `PATH`
-/// and the two logging switches: what a Node process needs to find its
-/// home, a temp dir and a proxy. Everything else -- `GH_TOKEN`, cloud
-/// credentials, whatever the daemon was started with -- stays behind.
+/// The only variables Renovate's child sees, besides the sanitised `PATH`,
+/// the two logging switches and the GitHub token from [`github_token`]:
+/// what a Node process needs to find its home, a temp dir and a proxy.
+/// Everything else -- `GH_TOKEN`, cloud credentials, whatever the daemon
+/// was started with -- stays behind.
 const FORWARDED_ENV: &[&str] = &[
     "HOME",
     "TMPDIR",
@@ -43,6 +45,38 @@ const FORWARDED_ENV: &[&str] = &[
     "HTTPS_PROXY",
     "NO_PROXY",
 ];
+
+/// Where Renovate reads the token for its github.com lookups (Actions,
+/// GitHub tags and releases) when the platform is not GitHub itself.
+/// Without one those deps are skipped as `github-token-required` and the
+/// run still exits 0.
+const GITHUB_TOKEN_ENV: &str = "GITHUB_COM_TOKEN";
+
+/// The token Renovate's github.com lookups get for a repo on `forge`.
+///
+/// Only GitHub-hosted repos get one. `configured` (config.json
+/// `renovate.githubToken`) wins; otherwise the operator's `gh` login for
+/// github.com. `None` when neither is available -- the scan still runs,
+/// without the GitHub-hosted deps.
+pub fn github_token(forge: ForgeName, configured: Option<&str>) -> Option<String> {
+    if forge != ForgeName::Github {
+        return None;
+    }
+    if let Some(token) = configured {
+        return Some(token.to_owned());
+    }
+    let (rc, out) = run_cmd(&["gh", "auth", "token", "--hostname", "github.com"], 10);
+    let token = out.trim();
+    // `run_cmd` merges stderr into the output: anything beyond one bare
+    // token is a message, not a token. Never log `out`.
+    if rc != 0 || token.is_empty() || token.contains(char::is_whitespace) {
+        tracing::warn!(
+            "dep_scan: no gh token for github.com (rc={rc}); GitHub-hosted deps are skipped"
+        );
+        return None;
+    }
+    Some(token.to_owned())
+}
 
 /// The operator's `renovate`, and the `PATH` to run it with.
 ///
@@ -87,9 +121,18 @@ fn is_executable_file(p: &Path) -> bool {
 }
 
 /// Run Renovate in local dry-run mode and return update candidates.
-/// Returns None on failure (not installed, timeout, parse error) —
-/// the caller falls back to the AI-based analysis job.
-pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Vec<DepCandidate>> {
+/// `github_token` is exported as [`GITHUB_TOKEN_ENV`].
+/// Returns None when Renovate has no answer for the repo -- it failed (not
+/// installed, timeout, non-zero exit) or looked up no dependency at all
+/// (none found, or all skipped, e.g. an unsupported ecosystem or GitHub
+/// deps without a token). The caller then falls back to the AI-based
+/// analysis job. `Some(vec![])` means every dependency looked up is current.
+pub fn scan_repo(
+    repo_path: &Path,
+    repo_name: &str,
+    github_token: Option<&str>,
+    timeout_s: u64,
+) -> Option<Vec<DepCandidate>> {
     let Some((renovate, clean_path)) = resolve_renovate(repo_path) else {
         tracing::debug!("dep_scan: no installed renovate usable for {repo_name}");
         return None;
@@ -105,6 +148,9 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
         if let Some(value) = std::env::var_os(key) {
             cmd.env(key, value);
         }
+    }
+    if let Some(token) = github_token {
+        cmd.env(GITHUB_TOKEN_ENV, token);
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -141,8 +187,7 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
                 kill_tree(&mut child);
                 let output = join_pipes(so, se);
                 // A non-zero exit means the lookup is untrustworthy even when
-                // it logged plenty: fall back to the AI job. An empty Some()
-                // still means "renovate ran, nothing to update".
+                // it logged plenty: fall back to the AI job.
                 if !status.success() {
                     tracing::warn!(
                         "dep_scan: renovate failed (rc={:?}) for {repo_name}",
@@ -150,9 +195,14 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
                     );
                     return None;
                 }
-                let candidates = parse_renovate_output(&output, repo_name);
+                let (candidates, looked_up) = parse_renovate_output(&output, repo_name);
+                if looked_up == 0 {
+                    tracing::info!("dep_scan: renovate looked up no dependencies for {repo_name}");
+                    return None;
+                }
                 tracing::info!(
-                    "dep_scan: {repo_name} — {} update candidates from renovate",
+                    "dep_scan: {repo_name} — {} update candidates from renovate \
+                     ({looked_up} dependencies looked up)",
                     candidates.len()
                 );
                 return Some(candidates);
@@ -175,14 +225,17 @@ pub fn scan_repo(repo_path: &Path, repo_name: &str, timeout_s: u64) -> Option<Ve
     }
 }
 
+/// The update candidates, and how many dependencies Renovate actually
+/// looked up (those without a `skipReason`).
 #[allow(
     clippy::too_many_lines,
     reason = "one field-by-field decode of renovate's JSONL, where each \
               step reads as the shape of the record being parsed"
 )]
-fn parse_renovate_output(output: &str, repo_name: &str) -> Vec<DepCandidate> {
+fn parse_renovate_output(output: &str, repo_name: &str) -> (Vec<DepCandidate>, usize) {
     let mut candidates = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut looked_up = 0;
 
     for line in output.lines() {
         let obj: serde_json::Value = match serde_json::from_str(line) {
@@ -211,6 +264,10 @@ fn parse_renovate_output(output: &str, repo_name: &str) -> Vec<DepCandidate> {
                 let Some(deps) = pf_obj.get("deps").and_then(|v| v.as_array()) else {
                     continue;
                 };
+                looked_up += deps
+                    .iter()
+                    .filter(|d| d.get("skipReason").is_none())
+                    .count();
                 for dep in deps {
                     let dep_name = dep
                         .get("depName")
@@ -300,7 +357,7 @@ fn parse_renovate_output(output: &str, repo_name: &str) -> Vec<DepCandidate> {
             }
         }
     }
-    candidates
+    (candidates, looked_up)
 }
 
 fn normalize_update_type(ut: &str) -> &str {

@@ -70,6 +70,7 @@ fn test_config(cache_ttl_s: f64) -> Config {
         scan_interval_days: 1.0,
         modernization_interval_days: 30,
         standards_interval_days: 30,
+        renovate_github_token: None,
     }
 }
 

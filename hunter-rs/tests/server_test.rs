@@ -102,6 +102,7 @@ async fn test_state() -> TestState {
         scan_interval_days: 1.0,
         modernization_interval_days: 30,
         standards_interval_days: 30,
+        renovate_github_token: None,
     };
     TestState {
         state: AppState {

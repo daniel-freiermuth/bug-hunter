@@ -32,6 +32,7 @@ struct RawConfig {
     scan: RawScan,
     modernization: RawScan,
     standards: RawScan,
+    renovate: RawRenovate,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -86,6 +87,30 @@ struct RawCaps {
 struct RawScan {
     #[serde(rename = "intervalDays")]
     interval_days: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawRenovate {
+    #[serde(rename = "githubToken")]
+    github_token: Option<String>,
+}
+
+/// A credential read from config.json. `Debug` prints a placeholder, so
+/// logging the `Config` never logs the value.
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(***)")
+    }
 }
 
 /// Which `Host` header names the HTTP server answers to.
@@ -172,6 +197,10 @@ pub struct Config {
     pub modernization_interval_days: i64,
     /// standards.intervalDays — per-repo standards audit cadence gate.
     pub standards_interval_days: i64,
+    /// renovate.githubToken — the token Renovate's github.com lookups use
+    /// for GitHub-hosted repos, in place of the operator's `gh` login
+    /// (see `dep_scan::github_token`).
+    pub renovate_github_token: Option<Secret>,
 }
 
 impl Config {
@@ -295,6 +324,15 @@ impl Config {
         )?;
         let standards_interval_days =
             whole_days("standards.intervalDays", raw.standards.interval_days)?;
+        // An empty token would win over the `gh` login and then fail every
+        // lookup, which is worse than not setting it.
+        let renovate_github_token = match raw.renovate.github_token {
+            Some(t) if t.trim().is_empty() => anyhow::bail!(
+                "{}: renovate.githubToken must not be empty (omit it to use the gh login)",
+                cfg_path.display()
+            ),
+            t => t.map(Secret),
+        };
         let llm_provider = match raw.backend.llm_provider.as_deref() {
             None => LlmProvider::Anthropic,
             Some(name) => LlmProvider::parse(name).ok_or_else(|| {
@@ -385,6 +423,7 @@ impl Config {
             scan_interval_days,
             modernization_interval_days,
             standards_interval_days,
+            renovate_github_token,
         })
     }
 }
