@@ -512,3 +512,65 @@ async fn kind_token_history_counts_an_unresumed_job_at_its_own_cost() {
         "each completed job alone, with the orphan suspension nowhere in it"
     );
 }
+
+/// A withdrawal hands off into the closed PR's harvest as the next
+/// attempt of the engage's chain, so the harvest is `resumed_from` an
+/// engage. The engage's cost is engage work: counted into the harvest's
+/// chain it would bring a harvest to its give-up ceiling on its first
+/// resume, and counted into the harvest history it would inflate every
+/// harvest's reservation. The tree is the one thing shared across the
+/// kinds, so the workspace origin still reaches the engage.
+#[tokio::test]
+async fn a_handoff_harvest_is_accounted_apart_from_the_engage_it_continues() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_bare_repo(&pool).await;
+    for t in [10_000, 20_000, 30_000] {
+        sqlx::query(
+            "INSERT INTO jobs (kind, repo_id, state, tokens_new, started_at, finished_at) \
+             VALUES ('harvest', 1, 'done', ?1, 1000, 2000)",
+        )
+        .bind(t)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let insert = |kind: &'static str, state: &'static str, tokens: i64, from: Option<i64>| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO jobs (kind, repo_id, state, tokens_new, resumed_from, started_at, \
+                 finished_at) VALUES (?1, 1, ?2, ?3, ?4, 3000, 4000)",
+            )
+            .bind(kind)
+            .bind(state)
+            .bind(tokens)
+            .bind(from)
+            .execute(&pool)
+            .await
+            .unwrap()
+            .last_insert_rowid()
+        }
+    };
+    let engage = insert("engage", "done", 500_000, None).await;
+    let handoff = insert("harvest", "suspended", 40_000, Some(engage)).await;
+    let resumed = insert("harvest", "done", 5_000, Some(handoff)).await;
+    let store = open_store(pool, &path).await;
+
+    let chain = store.resume_chain_stats(handoff).await.unwrap();
+    assert_eq!(
+        (chain.total, chain.attempts, chain.max_single),
+        (45_000, 2, 40_000),
+        "only the harvest's own attempts count toward its give-up ceiling"
+    );
+    let history = store.kind_token_history("harvest").await.unwrap();
+    assert_eq!(
+        history,
+        vec![10_000, 20_000, 30_000, 45_000],
+        "the handoff chain is a harvest sample without the engage's cost"
+    );
+    assert_eq!(
+        store.resume_origin_job(resumed).await.unwrap(),
+        engage,
+        "the handoff harvest keeps working in the engage chain's workspace"
+    );
+}

@@ -15,9 +15,10 @@
 mod support;
 
 use hunter::config::Config;
-use hunter::domain::{FindingJobKind, FindingStatus, ForgeName};
+use hunter::domain::{FindingJobKind, FindingStatus, ForgeName, JobState};
 use hunter::scheduler::{Candidate, pick_next, run_harvest};
 use hunter::store::{FindingInsert, Store};
+use hunter::types::RunResult;
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, fresh_store};
 
 const REPO_URL: &str = "https://github.com/acme/widget";
@@ -765,4 +766,93 @@ async fn a_diff_containing_fences_stays_one_block() {
         prompt.contains(&format!("\n`````diff\n{MD_DIFF}`````\n")),
         "{prompt}"
     );
+}
+
+/// How many times `gh pr diff` ran.
+fn diff_fetches(bins: &FakeBins) -> usize {
+    bins.calls_to("gh")
+        .iter()
+        .filter(|c| {
+            c.get(1).map(String::as_str) == Some("pr")
+                && c.get(2).map(String::as_str) == Some("diff")
+        })
+        .count()
+}
+
+/// A merged PR's changes are on the default branch the tree is made
+/// from, so its harvest has no use for the diff. Fetching it anyway
+/// costs a forge call per harvest and, for a large PR, a failure that
+/// would fail a review which never needed it.
+#[tokio::test]
+async fn a_merged_harvest_fetches_no_diff() {
+    let bins = FakeBins::acquire("harvest-merged-no-diff");
+    gh_default(&bins);
+    let f = fixture("harvest-merged-no-diff", FindingStatus::PrOpen).await;
+    f.store.mark_pr_merged(f.fid, 7, 2).await.unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::noop();
+
+    run_harvest(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].prompt.starts_with("merged "), "{}", runs[0].prompt);
+    assert_eq!(diff_fetches(&bins), 0, "{:?}", bins.calls_to("gh"));
+}
+
+/// A suspended closed-PR review picks up in its own transcript, which
+/// already holds the playbook and the diff: the resume is told only to
+/// carry on. Re-sending the playbook would restart the review on top of
+/// the half done one, and re-fetching the diff is a forge call whose
+/// result nobody reads.
+#[tokio::test]
+async fn a_resumed_closed_harvest_gets_neither_the_playbook_nor_the_diff_again() {
+    let bins = FakeBins::acquire("harvest-closed-resume");
+    gh_default(&bins);
+    let f = fixture("harvest-closed-resume", FindingStatus::Closed).await;
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let suspending = ScriptedBackend::new(|tree| {
+        let session = tree.parent().unwrap().join("session").join("session.jsonl");
+        RunResult {
+            exit_code: None,
+            killed_reason: Some("cap".to_owned()),
+            tokens_new: 30_000,
+            calls: 3,
+            session_file: Some(session.to_string_lossy().into_owned()),
+            duration_s: 1.0,
+            stdout_tail: "stopped".to_owned(),
+            usage_delta: None,
+        }
+    });
+    let cold = run_harvest(&f.store, &f.cfg, &finding, &suspending, None)
+        .await
+        .unwrap();
+    assert_eq!(cold.state, Some(JobState::Suspended), "{cold:?}");
+    assert_eq!(diff_fetches(&bins), 1, "the cold review carries the diff");
+
+    let plan = match pick_next(&f.store, &f.cfg, None).await.unwrap() {
+        Some(Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("expected the suspended harvest to be resumed, got {other:?}"),
+    };
+    assert!(!plan.handoff);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = classifying(close_reason("superseded"));
+    run_harvest(&f.store, &f.cfg, &finding, &backend, Some(&plan))
+        .await
+        .unwrap();
+
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].prompt,
+        "Continue the work you were doing in this session. You were interrupted; \
+         pick up where you left off."
+    );
+    assert_eq!(
+        runs[0].resume_from.as_deref(),
+        Some(plan.session_file.as_path())
+    );
+    assert_eq!(diff_fetches(&bins), 1, "{:?}", bins.calls_to("gh"));
 }

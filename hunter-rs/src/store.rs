@@ -1277,6 +1277,13 @@ impl Store {
     /// successors via the rows that name this one — because `job_id`
     /// can be any link, not just the newest.
     ///
+    /// Only links between jobs of `job_id`'s own kind count. A
+    /// withdrawal's handoff creates a harvest `resumed_from` the engage,
+    /// so the link crosses kinds there; the engage's spend and attempt
+    /// are its own work, and counting them would bring the harvest to
+    /// its give-up ceiling for work it never did. The workspace a chain
+    /// shares still crosses kinds: that is [`Self::resume_origin_job`].
+    ///
     /// The depth cap is the termination guarantee. `UNION` de-duplicates
     /// against rows already produced, but cannot stop a cycle once
     /// `depth` is carried: each revisit arrives with a larger depth and
@@ -1297,12 +1304,13 @@ impl Store {
         sqlx::query_as!(
             ResumeChainStats,
             r#"
-            WITH RECURSIVE chain(id, resumed_from, depth) AS (
-                SELECT id, resumed_from, 0 FROM jobs WHERE id = ?1
+            WITH RECURSIVE chain(id, resumed_from, kind, depth) AS (
+                SELECT id, resumed_from, kind, 0 FROM jobs WHERE id = ?1
                 UNION
-                SELECT j.id, j.resumed_from, c.depth + 1
+                SELECT j.id, j.resumed_from, j.kind, c.depth + 1
                 FROM jobs j, chain c
                 WHERE c.depth < ?2
+                  AND j.kind = c.kind
                   AND (j.id = c.resumed_from OR j.resumed_from = c.id)
             )
             SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64",
@@ -1332,6 +1340,11 @@ impl Store {
     ///
     /// One hop back is not enough: a resume of a resume still writes the
     /// original's path. So this walks `resumed_from` to the top.
+    ///
+    /// Unlike [`Self::resume_chain_stats`] this crosses kinds on purpose:
+    /// a harvest handed off from a withdrawing engage continues the
+    /// engage's transcript in the engage's tree, so its workspace is the
+    /// engage chain's.
     ///
     /// `MIN(id)` is exact rather than a heuristic: `resumed_from` is
     /// written once at INSERT naming a row that already exists, so ids
@@ -1822,7 +1835,10 @@ impl Store {
     /// `suspended` attempts alone, so a `done` row is the last link of its
     /// chain and no two `done` rows share one. That makes "the 20 most
     /// recent `done` rows" already "the 20 most recent completed chains".
-    /// Depth-capped like [`Self::resume_chain_stats`], for the same reason.
+    /// Depth-capped like [`Self::resume_chain_stats`], for the same reason,
+    /// and like it follows only links within `kind`: a harvest handed off
+    /// from a withdrawing engage is `resumed_from` that engage, whose cost
+    /// is engage work and would otherwise inflate the harvest's estimate.
     ///
     /// `RECENT_COMPLETED_WINDOW` is the other half, and it bounds how far
     /// back the estimate can be dragged. An estimator that reads all
@@ -1861,7 +1877,7 @@ impl Store {
                 UNION
                 SELECT c.head, j.id, j.resumed_from, c.depth + 1
                   FROM jobs j, chain c
-                 WHERE c.depth < ?3 AND j.id = c.resumed_from
+                 WHERE c.depth < ?3 AND j.id = c.resumed_from AND j.kind = ?1
             )
             SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64" FROM (
                 SELECT DISTINCT c.head AS head, c.id AS id, j.tokens_new AS tokens_new
