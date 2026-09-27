@@ -2232,14 +2232,44 @@ pub async fn run_test_gap(
 ) -> anyhow::Result<CycleSummary> {
     run_analysis_job(store, cfg, repo, &TEST_GAP_SPEC, backend, resume).await
 }
-/// Dependency scan. Renovate answers it for free when it is installed
-/// and finds something; otherwise an AI worker does.
-#[allow(
-    clippy::too_many_lines,
-    reason = "two alternative bodies for one job kind — the zero-token \
-              Renovate path and the AI fallback — and the choice between \
-              them is a single `match` on what the scan returned"
-)]
+/// The zero-token Renovate scan of the repo at its fetched tip, with the
+/// GitHub token the repo's forge qualifies for. `None` means Renovate has
+/// no answer (see `scan_repo`).
+async fn renovate_scan(
+    cfg: &Config,
+    repo: &Repo,
+    rpath: &std::path::Path,
+) -> Option<Vec<crate::dep_scan::DepCandidate>> {
+    let work_root = cfg.work_root.clone();
+    let rp = rpath.to_owned();
+    let rn = repo.name.clone();
+    let rid = repo.id;
+    let tip = format!("origin/{}", repo.default_branch);
+    let forge = repo.forge;
+    let configured = cfg.renovate_github_token.clone();
+    tokio::task::spawn_blocking(move || {
+        // Renovate reads manifests, and the fetch-only clone's own files
+        // are never updated, so it scans a throwaway tree at the fetched tip.
+        let scan = match crate::workspace::ScanTree::create(&work_root, &rp, rid, &tip) {
+            Ok(scan) => scan,
+            Err(e) => {
+                tracing::warn!("dep_update {rn}: {e}");
+                return None;
+            }
+        };
+        let token = crate::dep_scan::github_token(
+            forge,
+            configured.as_ref().map(crate::config::Secret::expose),
+        );
+        crate::dep_scan::scan_repo(scan.path(), &rn, token.as_deref(), 120)
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+/// Dependency scan. Renovate answers it for free whenever it can;
+/// otherwise an AI worker does.
 pub async fn run_dep_update(
     store: &Store,
     cfg: &Config,
@@ -2273,104 +2303,78 @@ pub async fn run_dep_update(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    // Try Renovate (zero tokens) — fall back to AI if unavailable. It
-    // reads manifests, and the fetch-only clone's own files are never
-    // updated, so it scans a throwaway tree at the fetched tip instead.
-    let candidates = tokio::task::spawn_blocking({
-        let work_root = cfg.work_root.clone();
-        let rp = rpath.clone();
-        let rn = repo.name.clone();
-        let rid = repo.id;
-        let tip = format!("origin/{}", repo.default_branch);
-        move || {
-            let scan = match crate::workspace::ScanTree::create(&work_root, &rp, rid, &tip) {
-                Ok(scan) => scan,
-                Err(e) => {
-                    tracing::warn!("dep_update {rn}: {e}");
-                    return None;
-                }
-            };
-            crate::dep_scan::scan_repo(scan.path(), &rn, 120)
-        }
-    })
-    .await
-    .ok()
-    .flatten();
+    // Try Renovate (zero tokens). Its answer is authoritative even when it
+    // is "nothing to update"; only an unavailable scan falls back to AI.
+    let Some(c) = renovate_scan(cfg, repo, &rpath).await else {
+        tracing::info!(
+            "dep_update {}: renovate unavailable, falling back to AI",
+            repo.name
+        );
+        return run_analysis_job(store, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await;
+    };
 
-    match candidates {
-        Some(ref c) if !c.is_empty() => {
-            // Write candidates to JSON and ingest via the standard path
-            let out_path = cfg
-                .work_root
-                .join("out")
-                .join(format!("dep_scan_{}.json", repo.id));
-            let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(std::path::Path::new(".")));
-            let json_entries: Vec<_> = c
-                .iter()
-                .map(|cand| {
-                    serde_json::json!({
-                        "fingerprint": cand.fingerprint,
-                        "file": cand.file,
-                        "ecosystem": cand.ecosystem,
-                        "package": cand.package,
-                        "current_version": cand.current_version,
-                        "latest_version": cand.latest_version,
-                        "update_type": cand.update_type,
-                        "severity": cand.severity,
-                        "confidence": cand.confidence,
-                        "summary": cand.summary,
-                        "detail": cand.detail,
-                    })
-                })
-                .collect();
-            let _ = std::fs::write(
-                &out_path,
-                serde_json::to_string_pretty(&json_entries).unwrap_or_default(),
-            );
-
-            let counts = crate::ingest::ingest_findings(
-                store,
-                repo.id,
-                &out_path,
-                Some(FindingType::DepUpdate),
-                None,
-                None,
-            )
-            .await;
-            let _ = store
-                .log_event(
-                    "dep_update",
-                    &format!(
-                        "{}: renovate scan +{} new / {} dup / {} invalid (0 tok)",
-                        repo.name, counts.inserted, counts.duplicates, counts.invalid,
-                    ),
-                    None,
-                    None,
-                )
-                .await;
-
-            // Only advance timestamp after successful ingestion (no invalid entries)
-            if counts.invalid == 0 {
-                let _ = store.set_last_dep_update(repo.id).await;
-            }
-
-            Ok(CycleSummary {
-                kind: Some(RepoJobKind::DepUpdate.into()),
-                repo: Some(repo.name.clone()),
-                state: Some(JobState::Done),
-                ingest: Some(counts),
-                ..Default::default()
+    // Write candidates to JSON and ingest via the standard path
+    let out_path = cfg
+        .work_root
+        .join("out")
+        .join(format!("dep_scan_{}.json", repo.id));
+    let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(std::path::Path::new(".")));
+    let json_entries: Vec<_> = c
+        .iter()
+        .map(|cand| {
+            serde_json::json!({
+                "fingerprint": cand.fingerprint,
+                "file": cand.file,
+                "ecosystem": cand.ecosystem,
+                "package": cand.package,
+                "current_version": cand.current_version,
+                "latest_version": cand.latest_version,
+                "update_type": cand.update_type,
+                "severity": cand.severity,
+                "confidence": cand.confidence,
+                "summary": cand.summary,
+                "detail": cand.detail,
             })
-        }
-        _ => {
-            // Renovate not available or found nothing — fall back to AI
-            tracing::info!(
-                "dep_update {}: renovate unavailable or empty, falling back to AI",
-                repo.name
-            );
-            run_analysis_job(store, cfg, repo, &DEP_UPDATE_SPEC, backend, resume).await
-        }
+        })
+        .collect();
+    // A write that fails must end the cycle: ingesting from `out_path`
+    // anyway would re-file whatever an earlier scan left there.
+    std::fs::write(&out_path, serde_json::to_string_pretty(&json_entries)?)
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", out_path.display()))?;
+
+    let counts = crate::ingest::ingest_findings(
+        store,
+        repo.id,
+        &out_path,
+        Some(FindingType::DepUpdate),
+        None,
+        None,
+    )
+    .await;
+    let _ = store
+        .log_event(
+            "dep_update",
+            &format!(
+                "{}: renovate scan +{} new / {} dup / {} invalid (0 tok)",
+                repo.name, counts.inserted, counts.duplicates, counts.invalid,
+            ),
+            None,
+            None,
+        )
+        .await;
+
+    // Only advance timestamp after successful ingestion (no invalid entries)
+    if counts.invalid == 0 {
+        let _ = store.set_last_dep_update(repo.id).await;
     }
+
+    Ok(CycleSummary {
+        kind: Some(RepoJobKind::DepUpdate.into()),
+        repo: Some(repo.name.clone()),
+        state: Some(JobState::Done),
+        ingest: Some(counts),
+        ..Default::default()
+    })
 }
 pub async fn run_refactor(
     store: &Store,

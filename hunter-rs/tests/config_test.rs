@@ -30,6 +30,39 @@ fn err(dir: &TempDir, json: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// renovate.githubToken
+// ---------------------------------------------------------------------------
+
+/// An empty token would take precedence over the `gh` login and then fail
+/// every GitHub lookup.
+#[test]
+fn empty_renovate_github_token_rejected() {
+    let dir = TempDir::new("cfg-renovate-token-empty");
+    let msg = err(&dir, r#"{"renovate": {"githubToken": "  "}}"#);
+    assert!(msg.contains("renovate.githubToken"), "{msg}");
+}
+
+/// The token loads, and printing the config does not print it.
+#[test]
+fn renovate_github_token_loads_and_is_redacted() {
+    let dir = TempDir::new("cfg-renovate-token");
+    let cfg = load(&dir, r#"{"renovate": {"githubToken": "ghp_s3cret"}}"#).unwrap();
+    assert_eq!(
+        cfg.renovate_github_token
+            .as_ref()
+            .map(hunter::config::Secret::expose),
+        Some("ghp_s3cret")
+    );
+    let printed = format!("{cfg:?}");
+    assert!(!printed.contains("ghp_s3cret"), "{printed}");
+    // Redacted, not hidden: the operator can still see a token is set.
+    assert!(
+        printed.contains("renovate_github_token: Some(Secret(***))"),
+        "{printed}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Worker limits: zero is the tightest limit, not "disabled"
 // ---------------------------------------------------------------------------
 

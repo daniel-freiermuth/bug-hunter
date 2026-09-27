@@ -372,6 +372,10 @@ quota source for one installation.
   default) and `openai-codex` both use the same short/long-window scavenging
   ramps but map to their provider's OMP usage records. It must match the
   provider selected by `models`.
+- `renovate.githubToken` — optional token for the dependency scan's
+  github.com lookups (Actions, GitHub tags/releases). Only GitHub-hosted
+  repos get a token: this one if set, else the `gh auth token --hostname
+  github.com` login. Without either, those deps are silently skipped.
 - `serve` controls who can reach the dashboard (Rust daemon only; the Python
   rollback always serves loopback). Defaults keep it local:
   - `serve.host` — address to bind, default `127.0.0.1`. `0.0.0.0` listens
