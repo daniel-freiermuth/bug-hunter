@@ -3911,6 +3911,58 @@ async fn continue_into_harvest(
     }
 }
 
+/// Record a harvest that failed before its job row exists. Nothing else
+/// records such an attempt: left alone, a PR whose view or diff never loads
+/// stays unharvested, and as the oldest pending one it is picked again on
+/// every cycle, starving the tier. `key` leaves out the error text so repeats
+/// of one outage count as identical.
+///
+/// Not for a handoff: it is an extra chance, not one of the harvest's own
+/// attempts, and counting it would cost the cold harvest, which still
+/// runs, part of its budget of tries. It is logged, and the finding stays
+/// `closed` and pending.
+async fn harvest_prefetch_failed(
+    store: &Store,
+    fid: i64,
+    handoff: bool,
+    key: &str,
+    what: &str,
+    e: &impl std::fmt::Display,
+) {
+    if handoff {
+        let _ = store
+            .log_event(
+                "error",
+                &format!(
+                    "harvest #{fid}: PR/MR {what} failed: {e}; counted no attempt, \
+                     it will be harvested cold"
+                ),
+                None,
+                Some(fid),
+            )
+            .await;
+        return;
+    }
+    let streak = store.record_harvest_attempt(fid, key).await.unwrap_or(1);
+    if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
+        let _ = store.mark_pr_harvested(fid, now_ms()).await;
+        let _ = store.clear_harvest_attempts(fid).await;
+        let _ = store.log_event("error",
+            &format!("harvest #{fid}: gave up after {streak} identical failures (PR/MR {what} failed: {e}) -- not reviewed, will not retry"),
+            None, Some(fid),
+        ).await;
+    } else {
+        let _ = store
+            .log_event(
+                "error",
+                &format!("harvest #{fid}: PR/MR {what} failed: {e}, will retry"),
+                None,
+                Some(fid),
+            )
+            .await;
+    }
+}
+
 /// Run harvest job (`scheduler.run_harvest`).
 ///
 /// One job kind for both ends of a PR's life. A merged PR is reviewed for
@@ -4033,17 +4085,11 @@ pub async fn run_harvest(
     };
 
     let fg = forge::forge_for(repo.forge);
+    let handoff = resume.is_some_and(|p| p.handoff);
     let pr = match fg.view_pr_engage(&repo.url, pr_number) {
         Ok(p) => p,
         Err(e) => {
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!("harvest #{fid}: PR/MR view failed: {e}"),
-                    None,
-                    Some(fid),
-                )
-                .await;
+            harvest_prefetch_failed(store, fid, handoff, "pr view failed", "view", &e).await;
             anyhow::bail!("PR/MR view failed");
         }
     };
@@ -4054,51 +4100,8 @@ pub async fn run_harvest(
     let pr_diff = if closed && fresh {
         match fg.pr_diff(&repo.url, pr_number) {
             Ok(d) => d,
-            Err(e) if resume.is_some_and(|p| p.handoff) => {
-                // A handoff is an extra chance, not one of the harvest's own
-                // attempts: counting it would cost the cold harvest, which
-                // still runs, part of its budget of tries. The finding stays
-                // `closed` and pending.
-                let _ = store
-                    .log_event(
-                        "error",
-                        &format!(
-                            "harvest #{fid}: PR/MR diff failed: {e}; counted no attempt, \
-                             it will be harvested cold"
-                        ),
-                        None,
-                        Some(fid),
-                    )
-                    .await;
-                anyhow::bail!("PR/MR diff failed");
-            }
             Err(e) => {
-                // No job exists yet, so nothing else records this attempt:
-                // left alone, a PR whose diff never loads stays unharvested,
-                // and as the oldest pending one it is picked again on every
-                // cycle, starving the tier. The streak key leaves out the
-                // error text so repeats of one outage count as identical.
-                let streak = store
-                    .record_harvest_attempt(fid, "pr diff failed")
-                    .await
-                    .unwrap_or(1);
-                if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
-                    let _ = store.mark_pr_harvested(fid, now_ms()).await;
-                    let _ = store.clear_harvest_attempts(fid).await;
-                    let _ = store.log_event("error",
-                        &format!("harvest #{fid}: gave up after {streak} identical failures (PR/MR diff failed: {e}) -- not reviewed, will not retry"),
-                        None, Some(fid),
-                    ).await;
-                } else {
-                    let _ = store
-                        .log_event(
-                            "error",
-                            &format!("harvest #{fid}: PR/MR diff failed: {e}, will retry"),
-                            None,
-                            Some(fid),
-                        )
-                        .await;
-                }
+                harvest_prefetch_failed(store, fid, handoff, "pr diff failed", "diff", &e).await;
                 anyhow::bail!("PR/MR diff failed");
             }
         }
