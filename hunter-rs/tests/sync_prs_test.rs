@@ -6,7 +6,7 @@
 //! engage work. Its decisions are what is pinned here, through the public
 //! entry point and a scripted `gh pr view`:
 //!
-//! * merged / unparseable / failing-view / URL-less findings;
+//! * merged / unparseable / failing-view / URL-less / repo-gone findings;
 //! * the first-sync watermark baseline, so our own PR chatter is not news;
 //! * static reasons, their fingerprint, and the suppression an engage
 //!   decline buys — lifted by a push or by a changed reason;
@@ -40,6 +40,7 @@ const LATER_MS: i64 = 1_767_326_400_000;
 
 struct Fixture {
     cfg: Config,
+    db: std::path::PathBuf,
     store: Store,
     fid: i64,
     /// Last: fields drop in declaration order, and the directory has to
@@ -114,7 +115,7 @@ impl Fixture {
 /// A GitHub repo and one `pr_open` finding pointing at [`PR_URL`].
 async fn fixture(label: &str) -> Fixture {
     let dir = TempDir::new(label);
-    let (_db, store) = fresh_store(&dir, "sync").await;
+    let (db, store) = fresh_store(&dir, "sync").await;
     let repos_root = dir.subdir("repos");
     let rid = store
         .add_repo("widget", REPO_URL, &repos_root, "main", ForgeName::Github)
@@ -141,6 +142,7 @@ async fn fixture(label: &str) -> Fixture {
     cfg.work_root = dir.subdir("work_root");
     Fixture {
         cfg,
+        db,
         store,
         fid,
         _dir: dir,
@@ -285,6 +287,45 @@ async fn a_failing_pr_view_is_an_error_and_stays_pr_open() {
         events.iter().any(|e| e.kind == "error"
             && e.finding_id == Some(f.fid)
             && e.message.contains("PR view failed")),
+        "{events:?}"
+    );
+}
+
+/// A repo soft-deleted while one of its findings still sits in `pr_open`.
+/// `soft_delete_repo` refuses a repo with findings, so the row is marked
+/// directly — the state a removal racing the cycle leaves behind. The
+/// finding must stay where a later sync can reach it, without a forge call
+/// for a repo the daemon no longer knows.
+#[tokio::test]
+async fn a_finding_whose_repo_is_gone_is_an_error_and_stays_pr_open() {
+    let f = fixture("sync-repo-gone").await;
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::query("UPDATE repos SET deleted_at = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let bins = FakeBins::acquire("sync-repo-gone");
+    serve_pr(&bins, &pr(&json!({ "state": "MERGED" })));
+
+    let result = f.sync().await;
+
+    assert_eq!(
+        (result.errors, result.synced, result.merged),
+        (1, 0, 0),
+        "{result:?}"
+    );
+    assert_eq!(f.status().await, FindingStatus::PrOpen);
+    assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
+    assert!(f.store.get_pr_state(f.fid).await.unwrap().is_none());
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "error"
+            && e.finding_id == Some(f.fid)
+            && e.message.contains("repo")
+            && e.message.contains("missing")),
         "{events:?}"
     );
 }
