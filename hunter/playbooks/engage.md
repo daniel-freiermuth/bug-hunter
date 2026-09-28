@@ -57,10 +57,10 @@ Title: {{PR_TITLE}}
    drift predates this PR) -- an explicit human instruction outranks the
    default "stay minimal" scope discipline; or (b) if you still judge it
    genuinely wrong to do here, give a NEW, more specific technical reason
-   than before AND a concrete next step (e.g. "I'll open a dedicated
-   formatting PR instead of folding it into this dependency bump" —
-   actually propose that follow-up via FOLLOW-UPS.json if there's a
-   fresher engagement occasion for it, or say so plainly if not). A
+   than before AND a concrete next step (e.g. "this belongs in a dedicated
+   formatting PR instead of this dependency bump" — say so plainly in
+   PR-REPLY.md; the review that runs once this PR merges or closes reads
+   the discussion and files it). A
    verbatim-repeated decline reads as the human's instruction being
    ignored, not as a considered response — never do that.
 3. Merge conflict -> bring {{BRANCH}} up to date with
@@ -69,17 +69,12 @@ Title: {{PR_TITLE}}
 
    If resolving reveals your diff is now a no-op or strictly behind what
    {{DEFAULT_BRANCH}} already ships (something else landed the same or a
-   related change first) — do NOT just conclude "nothing left, withdraw"
-   without one more check: WHY was this PR's original target capped below
-   the finding's actual goal in the first place? If that was a real
-   technical constraint (e.g. "can't reach 2.60.1 yet, needs a coordinated
-   Kotlin/KSP bump") and whatever superseded you just resolved exactly that
-   constraint, the goal may now be MORE achievable than when you started,
-   not moot. Re-verify against the current state of {{DEFAULT_BRANCH}}
-   (same evidence discipline as forming the original PR — real commands,
-   not memory) and, if a real further step is now open, propose it via
-   FOLLOW-UPS.json (see Deliverables) before withdrawing. Only skip this if
-   what landed already fully achieves or exceeds the original goal.
+   related change first), withdraw (see Deliverables) and name what
+   superseded you: the commit or PR, verified with real commands, not
+   memory. Do NOT propose follow-ups here. Once the PR is closed, a
+   separate review establishes why it closed and what the superseding
+   change left open, and files that; your withdrawal reason is its
+   starting point, so make it precise.
 4. Failing checks -> reproduce locally where possible, fix minimally,
    commit. If the failure is unrelated flake, say so in PR-REPLY.md instead.
 
@@ -90,36 +85,5 @@ Title: {{PR_TITLE}}
   questions, or why a suggestion was declined. No filler, no restating the
   PR description.
 - If the feedback shows the fix is fundamentally wrong, or this PR is
-  superseded/obsolete and step 3's re-check found nothing further to
-  propose: write WITHDRAW.md at the worktree root with the technical
-  reasoning instead of PR-REPLY.md, and commit nothing new.
-- FOLLOW-UPS.json at the worktree root, NOT COMMITTED, OPTIONAL — write
-  ALONGSIDE WITHDRAW.md when step 3's re-check found the underlying goal is
-  now MORE achievable (not just "something changed"). The scheduler ingests
-  it into the finding queue right after withdrawing, so the opportunity
-  becomes a fresh, triage-able finding instead of a closed PR nobody
-  re-reads.
-
-  A JSON array. Every entry sets its own `"type"`
-  (bug | dep_update | test_gap | refactor | modernization | standards) plus
-  the common fields `fingerprint`
-  ("{{REPO_NAME}}:path/file.ext:short-slug"), `file`, `severity`,
-  `confidence`, `summary`, `detail`, and
-  `"introduced_by": "deferred from PR #{{PR_NUMBER}}"`. Each type ALSO has
-  REQUIRED fields, and an entry that omits one — or gets its shape wrong —
-  is rejected at ingest: the follow-up is lost, not queued.
-  - `bug`: `bug_class`, exactly one of
-    `boundary|error-path|race|contract-drift|leak|logic`. No other value is
-    accepted — do not invent one.
-  - `dep_update` (the usual one here, "the same package could now go
-    further"): `ecosystem`, `package`, `current_version`, `latest_version`,
-    `update_type`.
-  - `test_gap`: `missing_tests` — a NON-EMPTY JSON ARRAY of strings, e.g.
-    `["error path: invalid input", "boundary: empty array"]`, NOT a string
-    containing a list — and `test_file`.
-  - `refactor`: `smell_type`, `suggested_refactor`.
-  - `modernization`: `modernization_class`, `current_approach`,
-    `proposed_approach`.
-  - `standards`: `standard_section` (the heading it violates, e.g.
-    "Type safety / Domain types over primitives"), `current_approach`,
-    `proposed_approach`.
+  superseded/obsolete: write WITHDRAW.md at the worktree root with the
+  technical reasoning instead of PR-REPLY.md, and commit nothing new.

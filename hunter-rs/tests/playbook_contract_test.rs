@@ -308,15 +308,45 @@ fn harvest_prompt_renders() {
     assert_usable("harvest", &prompt);
 }
 
-/// `harvest` and `engage` are the playbooks whose workers INVENT findings
+/// Rendered for both trees the closed-PR harvest runs in: the builder
+/// writes a different `{{WORKTREE_STATE}}` for each, and both reach a
+/// worker.
+#[test]
+fn harvest_closed_prompt_renders() {
+    let repo = sample_repo();
+    let finding = sample_finding(FindingType::Bug);
+    for tree in [
+        playbooks::ClosedTree::DefaultBranch,
+        playbooks::ClosedTree::PrHead,
+    ] {
+        let prompt = playbooks::build_harvest_closed_prompt(
+            &root(),
+            &finding,
+            Path::new("/tmp/worktree"),
+            &repo,
+            &sample_pr_view(),
+            7,
+            "diff --git a/x b/x\n",
+            tree,
+            "repo notes",
+        )
+        .expect(
+            "harvest-closed.md must render with the slots build_harvest_closed_prompt supplies",
+        );
+        assert_usable("harvest-closed", &prompt);
+    }
+}
+
+/// The harvest playbooks are the ones whose workers INVENT findings
 /// of any type, and `ingest` rejects an entry that omits (or misshapes) a
 /// required field for its type — the follow-up is dropped, not queued,
 /// and only a truncated `ingest:` error event survives. Seven such losses
 /// are on record: four `test_gap` entries without a usable `missing_tests`
 /// (2026-09-12, 2026-09-22) and three `bug` entries with no `bug_class`
 /// (2026-09-18, 2026-09-22), each because the playbook spelled out the
-/// shapes for some types and not others — engage did not spell out any,
-/// it pointed at a "same schema as `apply_improvement.md`" that does not
+/// shapes for some types and not others — engage (which offered them on
+/// withdrawal until the harvest took that over) did not spell out any, it
+/// pointed at a "same schema as `apply_improvement.md`" that does not
 /// exist. The instructions and the validator have to agree field by field.
 ///
 /// Scope is derived, not listed: every playbook that offers
@@ -366,7 +396,7 @@ fn followup_playbooks_name_every_required_field_they_ask_workers_to_emit() {
     }
     assert!(
         checked >= 2,
-        "expected harvest and engage to offer FOLLOW-UPS.json, found {checked}"
+        "expected harvest and harvest-closed to offer FOLLOW-UPS.json, found {checked}"
     );
 }
 
@@ -394,6 +424,7 @@ fn every_playbook_is_covered_by_this_test() {
         "recheck",
         "engage",
         "harvest",
+        "harvest-closed",
     ]
     .iter()
     .map(|s| (*s).to_owned())

@@ -414,6 +414,104 @@ pub fn build_harvest_prompt(
     render(&template, &slots)
 }
 
+/// What the closed-PR harvest's tree holds (`{{WORKTREE_STATE}}`).
+///
+/// The worker has to know whether the files in front of it are the PR's
+/// or the default branch's, or it will read one as the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosedTree {
+    /// A fresh tree detached at the default branch: the cold harvest.
+    DefaultBranch,
+    /// The withdrawing engage's own tree, still at the PR's head: the
+    /// harvest that continues it in the same session.
+    PrHead,
+}
+
+/// How much of a closed PR's diff one prompt carries, in characters.
+///
+/// About 10,000 tokens. The two hand-run closed harvests cost 23,000 and
+/// 40,000 tokens in total, so an uncapped diff could easily cost more than
+/// the review of it; a PR larger than this is summarised by its title,
+/// body and discussion anyway, and the worker can read the rest with git.
+pub const PR_DIFF_CAP_CHARS: usize = 40_000;
+
+/// The PR's diff for `{{PR_DIFF}}` as a whole fenced block.
+///
+/// The fence is one backtick longer than the longest backtick run in the
+/// diff (and at least three): a diff of a markdown file carries its own
+/// ``` lines, and a fixed fence would end the block at the first of them,
+/// leaving the rest of the diff to read as prompt text.
+fn fenced_diff(diff: &str) -> String {
+    let body = capped_diff(diff);
+    let longest = body.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest.max(2) + 1);
+    let newline = if body.ends_with('\n') { "" } else { "\n" };
+    format!("{fence}diff\n{body}{newline}{fence}")
+}
+
+/// The PR's diff, cut at [`PR_DIFF_CAP_CHARS`] with a marker saying so,
+/// so a truncated diff is never mistaken for the whole.
+fn capped_diff(diff: &str) -> String {
+    if diff.trim().is_empty() {
+        return "(empty diff)".to_owned();
+    }
+    match diff.char_indices().nth(PR_DIFF_CAP_CHARS) {
+        None => diff.to_owned(),
+        Some((cut, _)) => {
+            let rest = diff[cut..].chars().count();
+            format!(
+                "{}\n[diff truncated here: {rest} more characters not shown]",
+                &diff[..cut]
+            )
+        }
+    }
+}
+
+pub fn build_harvest_closed_prompt(
+    root: &Path,
+    finding: &Finding,
+    worktree: &Path,
+    repo: &Repo,
+    pr: &PrView,
+    pr_number: i64,
+    pr_diff: &str,
+    tree: ClosedTree,
+    repo_notes: &str,
+) -> Result<String> {
+    let notes = notes_or_default(repo_notes, "(No notes yet)");
+    let db = &repo.default_branch;
+    let state = match tree {
+        ClosedTree::DefaultBranch => format!(
+            "checked out at {db}'s HEAD, which does NOT contain this PR's changes; \
+             the PR's diff is below"
+        ),
+        ClosedTree::PrHead => format!(
+            "checked out at the PR's head branch; {db} is origin/{db}; the PR's diff is below"
+        ),
+    };
+    let template = read_template(root, "harvest-closed.md")?;
+    let mut slots = HashMap::new();
+    slots.insert("WORKTREE", worktree.display().to_string());
+    slots.insert("WORKTREE_STATE", state);
+    slots.insert("REPO_NAME", repo.name.clone());
+    slots.insert("DEFAULT_BRANCH", db.clone());
+    slots.insert("FINDING_JSON", finding_json(finding));
+    slots.insert("PR_NUMBER", pr_number.to_string());
+    slots.insert("PR_TITLE", pr.title.clone());
+    slots.insert(
+        "PR_BODY",
+        if pr.body.is_empty() {
+            "(no description)".to_owned()
+        } else {
+            pr.body.clone()
+        },
+    );
+    slots.insert("PR_DIFF", fenced_diff(pr_diff));
+    slots.insert("FEEDBACK", feedback_blocks(pr, 8000));
+    slots.insert("REPO_NOTES", notes);
+    render(&template, &slots)
+}
+
 pub fn build_recheck_prompt(
     root: &Path,
     finding: &Finding,

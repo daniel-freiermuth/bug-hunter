@@ -59,7 +59,7 @@ A non-string `name` on `/api/repos` used to belong in that row and no longer doe
 
 ### 0.4 Status vocabulary (types.py)
 
-- `FINDING_STATUSES` = all of `Status` (types.py:66): `new, rechecking, queued, fixing, pr_open, merged, rejected, wontfix, note` (types.py:23-32).
+- `FINDING_STATUSES` = all of `Status` (types.py:66): `new, rechecking, queued, fixing, pr_open, merged, rejected, wontfix, note` (types.py:23-32). Rust (`FindingStatus::ALL`) adds `closed` and `superseded`, which only the scheduler sets; neither is a verdict status, so this endpoint still refuses both.
 - `VERDICT_STATUSES` = `queued, rejected, wontfix, note, merged` (types.py:78-84).
 - `REASON_REQUIRED` = `rejected, wontfix` (types.py:85).
 

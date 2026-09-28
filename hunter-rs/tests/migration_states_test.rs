@@ -25,6 +25,7 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
+use hunter::domain::FindingStatus;
 use hunter::store::Store;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Executor, Row, SqlitePool};
@@ -340,6 +341,103 @@ async fn upgrading_rewrites_name_derived_clone_paths() {
         odd.path, "/somewhere/else",
         "an unrecognised path is left alone"
     );
+
+    drop(store);
+}
+
+/// Upgrading hands the closures that predate the closed-PR harvest to it.
+///
+/// Every closure before that harvest set its finding `rejected`; the
+/// harvest now selects `closed` alone, because a human's later `rejected`
+/// looks the same. So 016 moves exactly the closure rejections — a
+/// `rejected` finding whose PR is CLOSED and not yet harvested — and must
+/// leave every other `rejected` alone: one already harvested was
+/// classified, one with an open PR or no PR at all was a human's verdict.
+/// The closure's reason stays: the harvest starts from it.
+///
+/// Seeded at the state just before 016 so that rolling forward executes it.
+#[tokio::test]
+async fn upgrading_hands_pre_harvest_closures_to_the_closed_pr_harvest() {
+    let (_dir, path) = scratch("mig-closed-await-harvest");
+
+    let before_016 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 16)
+        .expect("migration 016 exists");
+    let pool = seed_state(&path, before_016).await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) \
+         VALUES (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // 1: closure, awaiting harvest. 2: closure, already harvested.
+    // 3: rejected with its PR still open. 4: rejected, never had a PR.
+    for (id, reason) in [
+        (1, "PR closed without merge (closed by maintainer)"),
+        (2, "PR closed without merge (harvested)"),
+        (3, "wrong: the PR fixes nothing"),
+        (4, "wrong: not a bug"),
+    ] {
+        sqlx::query(
+            "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, \
+             summary, status, verdict_reason, created_at, updated_at) \
+             VALUES (?1, 'bug', 1, 'fp-' || ?1, 'high', 0.9, 's', 'rejected', ?2, 1, 1)",
+        )
+        .bind(id)
+        .bind(reason)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO pr_state (finding_id, pr_number, state, synced_at, harvested_at) VALUES \
+         (1, 11, 'CLOSED', 1, NULL), (2, 12, 'CLOSED', 1, 5), (3, 13, 'OPEN', 1, NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+
+    let mut got = Vec::new();
+    for id in 1..=4 {
+        let f = store.get_finding(id).await.unwrap().unwrap();
+        got.push((id, f.status, f.verdict_reason.unwrap()));
+    }
+    assert_eq!(
+        got,
+        vec![
+            (
+                1,
+                FindingStatus::Closed,
+                "PR closed without merge (closed by maintainer)".to_owned()
+            ),
+            (
+                2,
+                FindingStatus::Rejected,
+                "PR closed without merge (harvested)".to_owned()
+            ),
+            (
+                3,
+                FindingStatus::Rejected,
+                "wrong: the PR fixes nothing".to_owned()
+            ),
+            (4, FindingStatus::Rejected, "wrong: not a bug".to_owned()),
+        ],
+        "only the unharvested closure moves to closed, keeping its reason"
+    );
+
+    let pending: Vec<i64> = store
+        .list_pending_harvest()
+        .await
+        .unwrap()
+        .iter()
+        .map(|f| f.id)
+        .collect();
+    assert_eq!(pending, vec![1], "the moved closure is due its harvest");
 
     drop(store);
 }

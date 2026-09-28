@@ -14,6 +14,9 @@
     { key: "pr_review", label: "PR Review", filter: (f: FindingOut) => f.status === "pr_open" && !!f.needs_attention },
     { key: "pr_open", label: "PR Open", filter: (f: FindingOut) => f.status === "pr_open" && !f.needs_attention },
     { key: "merged", label: "Merged", filter: (f: FindingOut) => f.status === "merged" },
+    // Closed unmerged and not yet harvested: still in flight, because the
+    // harvest has yet to say whether the finding was wrong or superseded.
+    { key: "closed", label: "Closed", filter: (f: FindingOut) => f.status === "closed" },
   ];
 
   // All findings in pipeline statuses
@@ -41,9 +44,15 @@
   const notes = $derived(
     store.findings.filter((f) => f.status === "note")
   );
+  // The finding was valid and its work landed another way. Not
+  // suppressed, so kept apart from the section above.
+  const superseded = $derived(
+    store.findings.filter((f) => f.status === "superseded")
+  );
 
-  // Collapsible state for suppressed/notes — collapsed by default
+  // Collapsible state for suppressed/superseded/notes — collapsed by default
   let suppressedOpen = $state(false);
+  let supersededOpen = $state(false);
   let notesOpen = $state(false);
 
   // Findings with a verdict in flight. Both buttons write the same row
@@ -134,6 +143,32 @@
     </div>
   {/if}
 
+  <!-- Superseded — collapsible -->
+  {#if superseded.length > 0}
+    <div class="collapsible-section">
+      <button class="section-toggle" aria-expanded={supersededOpen} onclick={() => { supersededOpen = !supersededOpen; }}>
+        <span class="toggle-arrow">{supersededOpen ? "▾" : "▸"}</span>
+        Superseded
+        <span class="section-count">{superseded.length}</span>
+      </button>
+      {#if supersededOpen}
+        <div class="section-body">
+          {#each superseded as f (f.id)}
+            <div class="item-card">
+              <div class="item-header">
+                <span class="item-badge superseded">superseded</span>
+                <span class="item-id">#{f.id}</span>
+                <span class="item-fp">{f.fingerprint}</span>
+              </div>
+              <div class="item-summary">{f.summary}</div>
+              <div class="item-detail">{f.verdict_reason ?? "(no reason)"}</div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
+
   <!-- Notes — collapsible -->
   {#if notes.length > 0}
     <div class="collapsible-section">
@@ -197,7 +232,7 @@
   /* ── Board ──────────────────────────────────────────────────── */
   .board {
     display: grid;
-    grid-template-columns: repeat(6, minmax(0, 1fr));
+    grid-template-columns: repeat(7, minmax(0, 1fr));
     gap: 0.625rem;
     min-height: 200px;
   }
@@ -338,6 +373,10 @@
   .item-badge.note {
     background: rgba(78, 168, 222, 0.12);
     color: var(--accent);
+  }
+  .item-badge.superseded {
+    background: rgba(68, 238, 136, 0.12);
+    color: var(--ok);
   }
   .item-id {
     color: var(--text-dim);

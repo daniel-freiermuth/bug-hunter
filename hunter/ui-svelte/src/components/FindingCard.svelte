@@ -29,6 +29,8 @@
       case "fixing": return "status-fixing";
       case "pr_open": return "status-pr-open";
       case "merged": return "status-merged";
+      case "closed": return "status-closed";
+      case "superseded": return "status-superseded";
       case "rejected": return "status-rejected";
       case "wontfix": return "status-wontfix";
       case "note": return "status-note";
@@ -437,6 +439,10 @@
   .status-queued, .status-fixing  { background: rgba(255, 153, 0, 0.12); color: var(--sev-medium); }
   .status-pr-open                 { background: rgba(68, 238, 136, 0.12); color: var(--ok); }
   .status-merged                  { background: rgba(68, 238, 136, 0.18); color: var(--ok); }
+  /* Closed unmerged, awaiting its harvest: not a failure (and not suppressed),
+     so amber like the other in-flight states rather than red. */
+  .status-closed                  { background: rgba(255, 153, 0, 0.08); color: var(--sev-medium); }
+  .status-superseded              { background: rgba(68, 238, 136, 0.08); color: var(--ok); }
   .status-rejected                { background: rgba(238, 85, 68, 0.12); color: var(--bad); }
   .status-wontfix, .status-note   { background: rgba(136, 136, 136, 0.12); color: var(--text-dim); }
   .status-default                 { background: rgba(255, 255, 255, 0.06); color: var(--text-dim); }
