@@ -4207,6 +4207,17 @@ async fn push_and_reply(start: &EngageStart, state: JobState) -> Result<(bool, b
         let push_url = fg.ssh_url(&repo.url);
         let wts = worktree.to_string_lossy().to_string();
         let hr = head_ref.clone();
+        // Leased to the PR head the chain's tree was created at, with the
+        // expected commit spelled out: the worker may rewrite that history,
+        // but a commit pushed to the branch since -- while this attempt ran,
+        // or while a resume of it waited, suspended, for the budget -- is
+        // not in the tree, and forcing over it would delete it from the PR.
+        // A refused push fails the attempt with the attention left
+        // unaddressed, so a cold engage takes it up on the branch as it now
+        // is. The explicit `<ref>:<sha>` form reads no remote-tracking ref,
+        // so it works against the raw URL; `--force` must not be added, as
+        // it overrides the lease.
+        let lease = format!("--force-with-lease={hr}:{}", start.pinned);
         let (prc, pout) = tokio::task::spawn_blocking(move || {
             run_cmd_sync(
                 &[
@@ -4214,7 +4225,7 @@ async fn push_and_reply(start: &EngageStart, state: JobState) -> Result<(bool, b
                     "-C",
                     &wts,
                     "push",
-                    "--force",
+                    &lease,
                     &push_url,
                     &format!("HEAD:{hr}"),
                 ],

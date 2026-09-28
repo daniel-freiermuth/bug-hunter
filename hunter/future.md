@@ -611,7 +611,9 @@ Invariants that MUST survive the port (all currently enforced and tested):
 - Workers never push to a repo's default branch (infra guard, not prompt-only).
 - PR-branch history rewrites before merge are normal workflow, not violations.
 - Plain `--force` on raw-URL pushes (`--force-with-lease` structurally fails
-  without a named remote — twice-learned).
+  without a named remote — twice-learned). The engage push is the exception:
+  it leases with an explicit `<ref>:<sha>` (the tree's pinned PR head), which
+  reads no tracking ref, so it cannot delete commits pushed while it ran.
 - Fix-queue drains before new hunts; PR feedback sync is never delayed by
   token-budget backoff.
 - run_cycle survives anything; the daemon loop never dies to a job error.
