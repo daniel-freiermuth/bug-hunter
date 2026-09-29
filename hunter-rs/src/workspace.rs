@@ -110,6 +110,44 @@ fn git(argv: &[&str]) -> (i32, String) {
     crate::util::run_cmd(argv, GIT_TIMEOUT_S)
 }
 
+/// `git worktree prune`, after unlocking every registration whose
+/// directory is gone.
+///
+/// Plain prune skips a locked worktree, and git locks each new one with
+/// reason `initializing` for the length of `worktree add`. A daemon killed
+/// mid-add (observed 2026-09-29: a restart during a checkout slowed by a
+/// full disk) leaves a registration that no prune removes and that keeps
+/// its branch checked out, so `branch -D` refuses the branch and every
+/// later `worktree add -b` of it fails with "a branch named ... already
+/// exists" -- 400 failed fix jobs, one per cycle, until unlocked by hand.
+///
+/// Unlocking is safe because a lock only protects a directory that may
+/// come back (removable media), and nothing does that to a clone here:
+/// every worktree of one is a tree this daemon made under `work_root`.
+/// A registration whose directory still exists is never touched. One that
+/// is gone but was never locked is unlocked too, which git refuses
+/// harmlessly; telling the two apart would buy nothing, since prune
+/// removes both.
+fn prune_worktrees(clone: &str) {
+    let (rc, out) = git(&["git", "-C", clone, "worktree", "list", "--porcelain", "-z"]);
+    if rc == 0 {
+        for path in missing_worktrees(&out) {
+            git(&["git", "-C", clone, "worktree", "unlock", path]);
+        }
+    }
+    git(&["git", "-C", clone, "worktree", "prune"]);
+}
+
+/// Paths in `git worktree list --porcelain -z` output whose directory does
+/// not exist. Every field is NUL-terminated, and each record's path is its
+/// `worktree <path>` field.
+fn missing_worktrees(porcelain: &str) -> impl Iterator<Item = &str> {
+    porcelain
+        .split('\0')
+        .filter_map(|field| field.strip_prefix("worktree "))
+        .filter(|p| !Path::new(p).exists())
+}
+
 /// The commit `rev` names in `clone`, or `None`.
 pub fn resolve(clone: &Path, rev: &str) -> Option<String> {
     let c = clone.to_string_lossy();
@@ -182,7 +220,7 @@ fn add_tree(ws: &Workspace, spec: &TreeSpec) -> Result<String, String> {
             // by the failed attempt is removed first, or the retry's add
             // would fail on the directory instead.
             let _ = std::fs::remove_dir_all(&ws.tree);
-            git(&["git", "-C", &c, "worktree", "prune"]);
+            prune_worktrees(&c);
             git(&["git", "-C", &c, "branch", "-D", name]);
             let (rc, out) = add();
             if rc != 0 {
@@ -230,7 +268,7 @@ fn release_tree(ws: &Workspace) {
         }
     }
     if let Some(c) = &clone {
-        git(&["git", "-C", c, "worktree", "prune"]);
+        prune_worktrees(c);
     }
 }
 
@@ -308,7 +346,7 @@ impl ScanTree {
             let _ = std::fs::remove_dir_all(&self.path);
         }
         if self.clone.is_dir() {
-            git(&["git", "-C", &c, "worktree", "prune"]);
+            prune_worktrees(&c);
         }
     }
 }
@@ -358,7 +396,7 @@ pub struct SweepReport {
 ///     aged by the finish time of the jobs that recorded a transcript in
 ///     it, else by its mtime. Never one a live job recorded.
 /// (d) `git worktree prune` on every repo clone, so a tree removed by hand
-///     does not keep its branch locked.
+///     or by a killed `worktree add` does not keep its branch checked out.
 /// (e) `<work_root>/scan/*`: leftovers of an interrupted Renovate scan.
 ///
 /// Kept, always, whatever the job table says: the clones under
@@ -520,7 +558,7 @@ async fn prune_clones_and_scans(store: &Store, work_root: &Path) -> anyhow::Resu
             remove_legacy_tree(scan);
         }
         for clone in &clones {
-            git(&["git", "-C", &clone.to_string_lossy(), "worktree", "prune"]);
+            prune_worktrees(&clone.to_string_lossy());
         }
     })
     .await?;

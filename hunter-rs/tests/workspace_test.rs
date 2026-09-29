@@ -403,6 +403,48 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     );
 }
 
+/// A daemon killed during `git worktree add` leaves the registration
+/// locked (`initializing`) with its directory gone. Plain prune skips a
+/// locked worktree, so the sweep must unlock it first -- but only one
+/// whose directory is really gone: a locked tree that exists is kept.
+#[tokio::test]
+async fn the_sweep_prunes_a_locked_registration_whose_tree_is_gone() {
+    let f = fixture("ws-locked-stale", "main").await;
+    let gone = f.cfg.work_root.join("jobs").join("41").join("tree");
+    let kept = f.dir.join("kept-tree");
+    for (path, branch) in [(&gone, "stale-branch"), (&kept, "kept-branch")] {
+        let p = path.to_string_lossy();
+        git(
+            &f.clone,
+            &["worktree", "add", "-b", branch, &p, "origin/main"],
+        );
+        git(
+            &f.clone,
+            &["worktree", "lock", "--reason", "initializing", &p],
+        );
+    }
+    std::fs::remove_dir_all(gone.parent().unwrap()).unwrap();
+
+    workspace::sweep(&f.store, &f.cfg.work_root, hunter::util::now_ms())
+        .await
+        .unwrap();
+
+    let listed = git(&f.clone, &["worktree", "list", "--porcelain"]);
+    assert!(
+        !listed.contains(gone.to_string_lossy().as_ref()),
+        "the stale registration is pruned: {listed}"
+    );
+    git(&f.clone, &["branch", "-D", "stale-branch"]);
+    let kept_record = listed
+        .split("\n\n")
+        .find(|r| r.contains(kept.to_string_lossy().as_ref()))
+        .unwrap_or_else(|| panic!("a tree that still exists stays registered: {listed}"));
+    assert!(
+        kept_record.contains("locked initializing"),
+        "and keeps its lock: {kept_record}"
+    );
+}
+
 // -- invariant 4: a fresh fix takes over a suspended fix's branch ------------
 
 /// A queued bug finding on repo 1, the state `run_fix` expects.
