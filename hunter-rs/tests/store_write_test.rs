@@ -440,7 +440,7 @@ async fn finished_since_is_strictly_after_and_skips_denied_null_tokens() {
     insert_job(&pool, "done", None, Some(222), Some(10_001)).await; // strictly after
     insert_job(&pool, "denied", None, None, Some(10_500)).await; // NULL tokens_new
     insert_job(&pool, "running", Some(5_000), None, None).await; // running excluded
-    insert_job(&pool, "queued", None, None, None).await; // NULL finished_at
+    insert_job(&pool, "failed", None, None, None).await; // NULL finished_at
     let store = rw_store(&path).await;
 
     assert_eq!(store.finished_since(10_000).await.unwrap(), 222);

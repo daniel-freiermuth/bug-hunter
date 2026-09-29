@@ -348,8 +348,8 @@ for the schema — most columns carry comments explaining *why*, not just *what*
   streak tracking (fix/recheck) for the give-up mechanism.
 - **`jobs`** — one row per worker invocation: kind, cap/actual tokens,
   exit/kill reason, timing, and `resumed_from` (the suspended attempt this
-  one continues). States are `queued | running | done | failed | killed |
-  suspended | denied`; `suspended` is a pause with a session file to
+  one continues). States are `running | done | failed | killed | suspended |
+  denied`; `suspended` is a pause with a session file to
   continue, everything else killed is terminal. The audit trail for "what
   did hunter actually spend, and on what."
 - **`pr_state`** — one row per finding with an open/merged PR: forge state,

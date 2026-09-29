@@ -175,7 +175,6 @@ impl std::str::FromStr for ClosureClass {
 #[serde(rename_all = "snake_case")]
 #[sqlx(rename_all = "snake_case")]
 pub enum JobState {
-    Queued,
     Running,
     Done,
     Failed,
@@ -192,7 +191,6 @@ pub enum JobState {
 impl JobState {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Queued => "queued",
             Self::Running => "running",
             Self::Done => "done",
             Self::Failed => "failed",
