@@ -4461,6 +4461,40 @@ fn read_close_reason(worktree: &Path) -> Result<CloseVerdict, CloseFailure> {
     })
 }
 
+/// How soon a disk denial is retried. Measuring is free, so this only
+/// bounds how long freed space goes unused.
+const DISK_RETRY_MS: i64 = 5 * 60_000;
+
+/// The cycle's denial when `cfg.work_root` is short of space, else `None`.
+///
+/// A filesystem that cannot be measured does not deny: that is a missing
+/// number, not a full disk, and every job would otherwise stop on it.
+fn disk_gate(cfg: &Config) -> Option<String> {
+    match nix::sys::statvfs::statvfs(&cfg.work_root) {
+        Ok(st) => disk_denial(
+            cfg,
+            st.blocks_available().saturating_mul(st.fragment_size()),
+        ),
+        Err(e) => {
+            tracing::warn!("disk gate: cannot stat {}: {e}", cfg.work_root.display());
+            None
+        }
+    }
+}
+
+/// The denial for `free` bytes under `cfg.work_root`: `Some` below
+/// `cfg.min_free_disk_bytes`, `None` at or above it.
+pub fn disk_denial(cfg: &Config, free: u64) -> Option<String> {
+    (free < cfg.min_free_disk_bytes).then(|| {
+        format!(
+            "disk: {} MiB free under {} < {} MiB",
+            free >> 20,
+            cfg.work_root.display(),
+            cfg.min_free_disk_bytes >> 20
+        )
+    })
+}
+
 /// Run one cycle: sync PRs, `pick_next`, dispatch to the appropriate runner (`scheduler.run_cycle`).
 pub async fn run_cycle(
     store: &Store,
@@ -4508,6 +4542,18 @@ async fn run_cycle_inner(
     } else {
         None
     };
+
+    // Before picking, so no job of any kind -- cold, resumed or forced --
+    // starts writing a tree, a build or a transcript into a full disk.
+    if let Some(reason) = disk_gate(cfg) {
+        let _ = store.log_event("deny", &reason, None, None).await;
+        return Ok(CycleSummary {
+            denied: Some(reason),
+            retry_at: Some(now_ms() + DISK_RETRY_MS),
+            sync,
+            ..Default::default()
+        });
+    }
 
     let picked = pick_next(store, cfg, force_repo).await?;
     if picked.is_none() {

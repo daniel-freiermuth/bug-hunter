@@ -70,6 +70,7 @@ fn test_config(root: &Path) -> Config {
         cache_ttl_s: 3600.0,
         poll_s: 2.0,
         session_grace_s: 120,
+        min_free_disk_bytes: 0,
         model_default: None,
         model_smol: None,
         model_hunt: None,
