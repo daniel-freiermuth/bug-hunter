@@ -25,7 +25,7 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
-use hunter::domain::FindingStatus;
+use hunter::domain::{FindingStatus, JobState};
 use hunter::store::Store;
 use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Executor, Row, SqlitePool};
@@ -438,6 +438,65 @@ async fn upgrading_hands_pre_harvest_closures_to_the_closed_pr_harvest() {
         .map(|f| f.id)
         .collect();
     assert_eq!(pending, vec![1], "the moved closure is due its harvest");
+
+    drop(store);
+}
+
+/// Upgrading closes the job rows the Python daemon left `queued`.
+///
+/// `JobState` no longer has a `queued` variant, so a row still carrying it
+/// would fail to decode wherever jobs are listed. 017 turns exactly those
+/// rows into `failed` jobs finished at their start, with no tokens, and
+/// leaves every other row as it was.
+///
+/// Seeded at the state just before 017 so that rolling forward executes it.
+#[tokio::test]
+async fn upgrading_closes_jobs_left_queued() {
+    let (_dir, path) = scratch("mig-queued-jobs");
+
+    let before_017 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 17)
+        .expect("migration 017 exists");
+    let pool = seed_state(&path, before_017).await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) \
+         VALUES (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, repo_id, state, started_at, finished_at, tokens_new) VALUES \
+         (1, 'hunt', 1, 'queued', 1000, NULL, NULL), \
+         (2, 'hunt', 1, 'done', 2000, 3000, 500)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+
+    let mut got: Vec<(i64, JobState)> = store
+        .list_jobs(10)
+        .await
+        .expect("every job row decodes")
+        .iter()
+        .map(|j| (j.job.id, j.job.state))
+        .collect();
+    got.sort_unstable_by_key(|(id, _)| *id);
+    assert_eq!(got, vec![(1, JobState::Failed), (2, JobState::Done)]);
+
+    let pool = open(&path).await;
+    let (finished_at, tokens_new, notes): (Option<i64>, Option<i64>, Option<String>) =
+        sqlx::query_as("SELECT finished_at, tokens_new, notes FROM jobs WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(finished_at, Some(1000), "finished at its start");
+    assert_eq!(tokens_new, None, "no spend is invented");
+    assert!(notes.unwrap().contains("never started"));
 
     drop(store);
 }
