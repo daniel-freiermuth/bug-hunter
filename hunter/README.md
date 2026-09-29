@@ -455,5 +455,6 @@ budget denied → short retry if the ramp is actively rising, otherwise sleep
 to the window reset; genuinely idle → 15 minutes. PR-comment polling is
 decoupled from the token-budget backoff loop, so a long budget-driven sleep
 never delays noticing new PR feedback. Every wake re-checks the budget gate
-before spending anything.
+before spending anything, and starts no job while the filesystem holding
+`workRoot` has less than 1 GiB free (retried every 5 minutes).
 

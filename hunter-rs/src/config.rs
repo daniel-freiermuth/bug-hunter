@@ -8,6 +8,16 @@ use crate::backends::omp_scavenge::LlmProvider;
 use anyhow::Context;
 use serde::Deserialize;
 
+/// Free space `work_root` must have for the scheduler to start a job.
+///
+/// Below it the cycle is denied before anything is picked. The clones,
+/// every job's tree, the per-repo cargo caches and the database all live
+/// under `work_root` by default, and running out mid-job fails in ways
+/// that outlast the shortage: on 2026-09-29 a full disk failed every
+/// checkout and a restart during one left a locked worktree that wedged
+/// the fix queue.
+pub const MIN_FREE_DISK_BYTES: u64 = 1 << 30;
+
 /// On-disk shape of config.json — only the keys the serve path needs
 /// (API-CONTRACT.md §12). Unknown keys are ignored (serde default).
 #[derive(Debug, Default, Deserialize)]
@@ -177,6 +187,10 @@ pub struct Config {
     /// `maxWallS` next to it in the same loop is a parameter for the same
     /// reason.
     pub session_grace_s: u64,
+    /// Free bytes `work_root` needs before a job starts. Always
+    /// [`MIN_FREE_DISK_BYTES`]; a field only so the gate is testable
+    /// without filling a disk.
+    pub min_free_disk_bytes: u64,
     pub model_default: Option<String>,
     pub model_smol: Option<String>,
     pub model_hunt: Option<String>,
@@ -407,6 +421,7 @@ impl Config {
             cache_ttl_s: raw.budget.cache_ttl_s.unwrap_or(3600.0),
             poll_s,
             session_grace_s,
+            min_free_disk_bytes: MIN_FREE_DISK_BYTES,
             model_default: raw.models.default,
             model_smol: raw.models.smol,
             model_hunt: raw.models.hunt,
