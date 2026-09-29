@@ -111,6 +111,36 @@ async fn leftover_branch_without_a_worktree_does_not_wedge_the_fix() {
     );
 }
 
+/// The same branch, still checked out by a registration whose tree is
+/// gone and which git left locked: what a daemon killed during
+/// `git worktree add` leaves behind. `prune` skips a locked worktree and
+/// `branch -D` refuses a checked-out branch, so without unlocking it every
+/// later attempt failed (observed 2026-09-29: 400 cycles, finding 3949).
+#[tokio::test]
+async fn leftover_branch_held_by_a_killed_worktree_add_does_not_wedge_the_fix() {
+    let f = fixture("fix-locked-leftover").await;
+    let tree = f.cfg.work_root.join("jobs").join("999").join("tree");
+    let t = tree.to_string_lossy();
+    git(&f.repo_dir, &["worktree", "add", "-b", BRANCH, &t, "main"]);
+    git(
+        &f.repo_dir,
+        &["worktree", "lock", "--reason", "initializing", &t],
+    );
+    std::fs::remove_dir_all(tree.parent().unwrap()).unwrap();
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code");
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary.outcome.as_deref(),
+        Some("rejected"),
+        "the worker ran and its verdict was recorded: {summary:?}"
+    );
+}
+
 /// The same run with no leftover branch, so the test above is known to be
 /// asserting on a difference rather than on a path that always works.
 #[tokio::test]
