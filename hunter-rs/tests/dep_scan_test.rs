@@ -18,7 +18,7 @@ mod support;
 use std::path::Path;
 
 use hunter::dep_scan::{github_token, scan_repo};
-use hunter::domain::ForgeName;
+use hunter::domain::{ForgeName, Severity};
 use support::{FakeBins, TempDir};
 
 const REPO: &str = "acme/widget";
@@ -72,7 +72,7 @@ fn success_with_candidates_parses_them() {
     assert_eq!(c.current_version, "1.2.0");
     assert_eq!(c.latest_version, "1.3.0");
     assert_eq!(c.update_type, "minor");
-    assert_eq!(c.severity, "medium");
+    assert_eq!(c.severity, Severity::Medium);
     assert_eq!(
         c.fingerprint,
         "acme/widget:npm:left-pad:^1.2.0\u{2192}1.3.0"
@@ -236,7 +236,7 @@ fn malformed_lines_do_not_discard_good_ones() {
     let serde = &got[1];
     assert_eq!(serde.ecosystem, "crate");
     assert_eq!(serde.update_type, "major");
-    assert_eq!(serde.severity, "high");
+    assert_eq!(serde.severity, Severity::High);
 }
 
 /// The scanner runs Renovate *in the repo*, since `--platform=local`
@@ -302,16 +302,16 @@ fn single_candidate(
 #[test]
 fn update_type_and_vulnerability_decide_severity() {
     for (ut, vuln, severity) in [
-        ("major", false, "high"),
-        ("major", true, "high"),
-        ("minor", false, "medium"),
-        ("minor", true, "medium"),
+        ("major", false, Severity::High),
+        ("major", true, Severity::High),
+        ("minor", false, Severity::Medium),
+        ("minor", true, Severity::Medium),
         // Neither major nor minor: the advisory flag is the only thing
         // that lifts it off the floor.
-        ("patch", false, "low"),
-        ("patch", true, "high"),
-        ("replacement", false, "low"),
-        ("replacement", true, "high"),
+        ("patch", false, Severity::Low),
+        ("patch", true, Severity::High),
+        ("replacement", false, Severity::Low),
+        ("replacement", true, Severity::High),
     ] {
         let c = single_candidate(&format!("sev-{ut}-{vuln}"), ut, vuln);
         assert_eq!(
@@ -354,7 +354,7 @@ fn housekeeping_update_types_normalise_to_patch() {
     ] {
         let c = single_candidate(&format!("norm-{ut}"), ut, false);
         assert_eq!(c.update_type, "patch", "{ut} should normalise to patch");
-        assert_eq!(c.severity, "low");
+        assert_eq!(c.severity, Severity::Low);
         assert!((c.confidence - 0.95).abs() < f64::EPSILON);
     }
 }

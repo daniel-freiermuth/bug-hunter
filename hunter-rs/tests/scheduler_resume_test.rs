@@ -1596,7 +1596,7 @@ async fn repo_with_finding(
             &FindingInsert {
                 fingerprint: "alpha:README.md:seed:1".to_owned(),
                 file: "README.md".to_owned(),
-                severity: "medium".to_owned(),
+                severity: hunter::domain::Severity::Medium,
                 confidence: 0.9,
                 summary: "a real bug".to_owned(),
                 ..Default::default()
@@ -1668,6 +1668,59 @@ async fn repeated_suspensions_of_a_recheck_are_not_a_stuck_streak() {
     assert_eq!(finding.status, FindingStatus::Rechecking, "{outcomes:?}");
     assert_eq!(finding.recheck_attempts, 0);
     assert!(outcomes.iter().all(|o| o.as_deref() == Some("suspended")));
+}
+
+/// Run one confirmed recheck of a medium finding whose verdict file names
+/// `updated_severity`, and return the finding as every whole-list read
+/// sees it afterwards.
+async fn confirmed_recheck_with_severity(raw: &'static str) -> hunter::types::Finding {
+    let (dir, path, pool) = fresh_db().await;
+    let store = rw_store(&path).await;
+    let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
+    let cfg = test_config(dir.path());
+    let out = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
+    let worker = ScriptedBackend::new(move |_| {
+        let verdict = serde_json::json!({
+            "verdict": "confirmed",
+            "reason": "still there",
+            "updated_severity": raw,
+        });
+        std::fs::write(&out, verdict.to_string()).unwrap();
+        support::done()
+    });
+
+    let finding = store.get_finding(fid).await.unwrap().unwrap();
+    let summary = run_recheck(&store, &cfg, &finding, &worker, None)
+        .await
+        .unwrap();
+    assert_eq!(summary.outcome.as_deref(), Some("confirmed"), "{summary:?}");
+
+    // The reads are whole-list queries decoding `severity` as a
+    // `Severity`: one undecodable row fails every one of them.
+    let all = store
+        .list_findings(&hunter::store::FindingFilter::default())
+        .await
+        .expect("findings still decode after the recheck");
+    assert_eq!(all.len(), 1);
+    all.into_iter().next().unwrap()
+}
+
+/// A worker's `updated_severity` is stored canonically: `"High"` is a
+/// high finding, not a row that no read can decode.
+#[tokio::test]
+async fn a_recheck_severity_in_any_case_is_stored_canonically() {
+    let finding = confirmed_recheck_with_severity("High").await;
+    assert_eq!(finding.severity, hunter::domain::Severity::High);
+    assert_eq!(finding.status, FindingStatus::New);
+}
+
+/// A severity outside the enum is dropped; the confirmation still lands
+/// and the finding keeps the severity it had.
+#[tokio::test]
+async fn a_recheck_severity_outside_the_enum_is_not_stored() {
+    let finding = confirmed_recheck_with_severity("critical").await;
+    assert_eq!(finding.severity, hunter::domain::Severity::Medium);
+    assert_eq!(finding.status, FindingStatus::New);
 }
 
 /// Minimal `gh pr view --json` payload that `view_pr_engage` can parse.

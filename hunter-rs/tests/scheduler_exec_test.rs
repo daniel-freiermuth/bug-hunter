@@ -527,10 +527,10 @@ async fn upsert_finding_and_queries() {
     let row = hunter::store::FindingInsert {
         fingerprint: "my-fp".into(),
         file: "lib.rs".into(),
-        severity: "high".into(),
+        severity: hunter::domain::Severity::High,
         confidence: 0.9,
         summary: "test finding".into(),
-        bug_class: Some("logic".into()),
+        bug_class: Some(hunter::domain::BugClass::Logic),
         ..Default::default()
     };
     let (id, inserted) = store.upsert_finding(1, &row, "bug", None).await.unwrap();

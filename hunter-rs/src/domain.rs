@@ -212,12 +212,26 @@ impl std::fmt::Display for JobState {
 // ---------------------------------------------------------------------------
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, sqlx::Type, TS,
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    sqlx::Type,
+    TS,
 )]
 #[serde(rename_all = "snake_case")]
 #[sqlx(rename_all = "snake_case")]
 pub enum Severity {
     Low,
+    /// What ingest assumes when a worker names none.
+    #[default]
     Medium,
     High,
 }
