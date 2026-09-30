@@ -48,6 +48,12 @@ Rust: `enum Verdict { Granted { cap_tokens: Option<i64>, reason: String }, Denie
 ### 1.5 `Outlook` (backend.py:74-86)
 `{ normal: Verdict, prioritized: Verdict }`. **INVARIANT: prioritized is at least as permissive as normal — if normal is Granted, prioritized must also be Granted** (backend.py:77-78). Scheduler indexes `outlook.prioritized if override else outlook.normal` and never tells the backend which it wanted (backend.py:80-82; scheduler.py:420). omp_scavenge guarantees it by construction (§2.2 decide).
 
+The Rust daemon wraps the provider backend in `OverdriveBackend`, controlled by
+the process-local scheduler overdrive atomic. When enabled, it promotes
+`prioritized` to both returned paths for every caller. It does not alter the
+provider verdict: pacing may be waived up to the remaining 1.0 hard-limit
+headroom, while an exhausted window or zero headroom remains denied.
+
 ### 1.6 `SpendLedger` (backend.py:95-148) — narrow port from Store
 Purpose (backend.py:96-103): compute spend the provider's probe hasn't seen; log window observations + calibration samples; estimate window capacity. Implemented by `Store`; `ThreadLocalLedger` (store.py:1604-1665) wraps it with one Store/SQLite connection per thread (scheduler loop, prober, HTTP handlers — store.py:1607-1610; per-thread `threading.local` cache :1616-1625, plain delegation :1629-1665). **Rust: an sqlx pool makes ThreadLocalLedger unnecessary — implement SpendLedger directly on the pool-backed Store.**
 
@@ -493,7 +499,7 @@ deliberately unimplemented, so this section is a map rather than a plan.
 
 **Callers**: `src/scheduler.rs` has `pick_next`, `anticipated_tokens`, `record_job`, `run_cycle` and every runner (`run_hunt`, `run_recheck`, `run_fix`, `run_engage`, `run_harvest`, plus the repo-level `run_test_gap`/`run_dep_update`/`run_refactor`/`run_modernize`/`run_standards`) and `sync_prs`. `src/daemon.rs` has `run_daemon` (UI server task + usage-prober task + scheduler loop in one process), `acquire_lockfile`, `reconcile_and_log`, `describe_cycle` and `compute_sleep_s`, with `USAGE_PROBE_TICK_S = 60` (daemon.rs:18) probing `keep_fresh()` at startup and each tick (daemon.rs:288-305).
 
-**Wake path**: the loop sleeps on `compute_sleep_s` but races that against its `Notify` and the shared shutdown watch channel (daemon.rs:351-358, latching `stop` from the watch rather than inferring it from the winning branch, :359-361), and sets the `cycle_running` flag around each cycle (daemon.rs:312, :320). POST `/api/cycle` and a mode-setting POST `/api/override` notify it in-process — see API-CONTRACT-WRITES.md §§2,5.
+**Wake path**: the loop sleeps on `compute_sleep_s` but races that against its `Notify` and the shared shutdown watch channel. POST `/api/cycle`, `/api/scheduler`, `/api/overdrive`, and mode-setting POST `/api/override` notify it in-process. Overdrive promotion occurs in the shared backend wrapper, so the next scheduler decision and `/api/summary` preview use the same mode.
 
 ---
 

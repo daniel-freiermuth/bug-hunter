@@ -115,6 +115,7 @@ async fn test_state() -> TestState {
             scheduler: hunter::server::SchedulerHandle {
                 running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                overdrive: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             },
         },

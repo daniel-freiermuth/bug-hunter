@@ -210,6 +210,10 @@ linear ramps, never letting spend get ahead of either:
   `HEADROOM_MS` in `hunter-rs/src/backends/omp_scavenge/capacity.rs`) so a freshly-opened window is never
   immediately claimed, then ramps 0→1 over what's left. Unspent capacity at
   reset is wasted — there's no rollover.
+- **Overdrive**: the Status-page toggle promotes every job to the prioritized
+  budget path. It bypasses both pacing ramps and spends only the provider's
+  remaining hard-limit headroom; an exhausted provider window is still denied.
+  The toggle is process-local and resets to off when the daemon restarts.
 - **In-flight accounting**: a running job's *anticipated* cost is reserved
   before the next decision, so concurrent/rapid cycles can't overshoot
   either ramp. It is an estimate from history, not the job's granted cap:
@@ -265,7 +269,7 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 
 | Page | Shows |
 |---|---|
-| **Status** | Budget bars (used + available, per window), what the scheduler is doing right now / why it isn't, and the recent event log |
+| **Status** | Budget bars (used + available, per window), Run/Pause and Overdrive controls, what the scheduler is doing right now / why it isn't, and the recent event log |
 | **Inbox** | New findings awaiting triage, with per-type filters |
 | **Kanban / Pipeline** | Findings in flight (queued → fixing → pr\_open), suppressed (rejected/wontfix) and informational (note) findings |
 | **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand |
@@ -291,6 +295,7 @@ JSON routes — the UI's only client, but usable directly. Served by axum
 | POST | `/api/verdict` | Set a finding's triage status (queue for fix, wontfix, reject, note) |
 | POST | `/api/cycle` | Trigger one scheduler cycle immediately |
 | POST | `/api/scheduler` | Pause or resume automatic scheduler cycles (`{"paused": boolean}`); a running job is allowed to finish |
+| POST | `/api/overdrive` | Enable or disable global prioritized budget mode (`{"enabled": boolean}`); provider hard stops remain enforced |
 | POST | `/api/recheck` | Queue a finding for recheck |
 | POST | `/api/unqueue` | Pull a finding back out of the fix queue |
 | POST | `/api/override` | Set/clear a finding's budget override (`once` \| `exempt`) |

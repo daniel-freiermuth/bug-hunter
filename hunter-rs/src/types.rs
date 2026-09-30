@@ -353,6 +353,7 @@ pub struct Summary {
     pub last_cycle: Option<Event>,
     pub cycle_running: bool,
     pub scheduler_paused: bool,
+    pub scheduler_overdrive: bool,
     pub current_job: Option<Job>,
     pub next_candidate: Option<NextCandidate>,
     pub scheduler_state: Option<SchedulerState>,

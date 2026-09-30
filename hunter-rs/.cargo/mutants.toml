@@ -81,4 +81,7 @@ exclude_re = [
     # nothing else. Whether the daemon sweeps at all is tested
     # (`daemon_test`), and that mutant is not excluded.
     "(match guard .*|replace != with ==) in sweep_workspaces",
+    # `OverdriveBackend` only changes `decide`; every other method forwards
+    # to the provider backend verbatim. `decide` is not excluded.
+    "<impl Backend for OverdriveBackend>::(keep_fresh|status_html|run) ",
 ]

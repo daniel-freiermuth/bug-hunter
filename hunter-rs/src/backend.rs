@@ -14,6 +14,11 @@
 //! paid for by specifying the markup byte-exactly instead
 //! (BACKEND-CONTRACT.md §2.3).
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use async_trait::async_trait;
 
 /// The two budget/model classes the scheduler collapses all job kinds into
@@ -170,6 +175,58 @@ pub trait Backend: Send + Sync {
         resume_from: Option<&std::path::Path>,
     ) -> anyhow::Result<crate::types::RunResult>;
 }
+/// Runtime budget-mode switch shared by the scheduler and HTTP controls.
+///
+/// Overdrive promotes the backend's prioritized verdict to the normal path
+/// for every job. The provider still owns the prioritized verdict, including
+/// its hard-stop denial and remaining-headroom cap.
+pub struct OverdriveBackend {
+    inner: Arc<dyn Backend>,
+    enabled: Arc<AtomicBool>,
+}
+
+impl OverdriveBackend {
+    pub fn new(inner: Arc<dyn Backend>, enabled: Arc<AtomicBool>) -> Self {
+        Self { inner, enabled }
+    }
+}
+
+#[async_trait]
+impl Backend for OverdriveBackend {
+    async fn decide(&self, anticipated_tokens: i64) -> anyhow::Result<Outlook> {
+        let outlook = self.inner.decide(anticipated_tokens).await?;
+        if self.enabled.load(Ordering::SeqCst) {
+            Ok(Outlook {
+                normal: outlook.prioritized.clone(),
+                prioritized: outlook.prioritized,
+            })
+        } else {
+            Ok(outlook)
+        }
+    }
+
+    async fn keep_fresh(&self) -> anyhow::Result<bool> {
+        self.inner.keep_fresh().await
+    }
+
+    async fn status_html(&self) -> anyhow::Result<String> {
+        self.inner.status_html().await
+    }
+
+    async fn run(
+        &self,
+        ws: &crate::workspace::Workspace,
+        prompt: &str,
+        cap_tokens: Option<i64>,
+        max_wall_s: i64,
+        job_class: JobClass,
+        resume_from: Option<&std::path::Path>,
+    ) -> anyhow::Result<crate::types::RunResult> {
+        self.inner
+            .run(ws, prompt, cap_tokens, max_wall_s, job_class, resume_from)
+            .await
+    }
+}
 
 /// Deterministic backend for router tests: no window data, ever.
 pub struct NullBackend;
@@ -205,5 +262,68 @@ impl Backend for NullBackend {
         _resume_from: Option<&std::path::Path>,
     ) -> anyhow::Result<crate::types::RunResult> {
         anyhow::bail!("NullBackend cannot run workers")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct SplitVerdictBackend;
+
+    #[async_trait]
+    impl Backend for SplitVerdictBackend {
+        async fn decide(&self, _anticipated_tokens: i64) -> anyhow::Result<Outlook> {
+            Ok(Outlook {
+                normal: Verdict::Denied {
+                    reason: "pacing ramp".to_owned(),
+                    retry_at: Some(1_000.0),
+                },
+                prioritized: Verdict::Granted {
+                    cap_tokens: Some(42),
+                    reason: "prio override".to_owned(),
+                },
+            })
+        }
+
+        async fn keep_fresh(&self) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn status_html(&self) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn run(
+            &self,
+            _ws: &crate::workspace::Workspace,
+            _prompt: &str,
+            _cap_tokens: Option<i64>,
+            _max_wall_s: i64,
+            _job_class: JobClass,
+            _resume_from: Option<&std::path::Path>,
+        ) -> anyhow::Result<crate::types::RunResult> {
+            unreachable!("budget-mode test never starts a worker")
+        }
+    }
+
+    #[tokio::test]
+    async fn overdrive_promotes_the_provider_prioritized_verdict() -> anyhow::Result<()> {
+        let enabled = Arc::new(AtomicBool::new(false));
+        let backend = OverdriveBackend::new(Arc::new(SplitVerdictBackend), enabled.clone());
+
+        let normal = backend.decide(1).await?;
+        assert!(matches!(normal.normal, Verdict::Denied { .. }));
+        assert!(matches!(normal.prioritized, Verdict::Granted { .. }));
+
+        enabled.store(true, Ordering::SeqCst);
+        let overdrive = backend.decide(1).await?;
+        let expected = Verdict::Granted {
+            cap_tokens: Some(42),
+            reason: "prio override".to_owned(),
+        };
+        assert_eq!(overdrive.normal, expected);
+        assert_eq!(overdrive.prioritized, expected);
+        Ok(())
     }
 }

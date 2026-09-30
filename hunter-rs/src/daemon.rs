@@ -240,12 +240,18 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         "unknown backend_type: {:?}",
         cfg.backend_type
     );
-    let backend: Arc<dyn Backend> = Arc::new(crate::backends::omp_scavenge::OmpScavengeBackend {
-        cfg: cfg.clone(),
-        ledger: store.clone() as Arc<dyn crate::backend::SpendLedger>,
-        agent_db: crate::backends::omp_scavenge::default_agent_db(),
-        prober: Arc::new(crate::backend::CmdProber),
-    });
+    let scheduler_overdrive = Arc::new(AtomicBool::new(false));
+    let provider_backend: Arc<dyn Backend> =
+        Arc::new(crate::backends::omp_scavenge::OmpScavengeBackend {
+            cfg: cfg.clone(),
+            ledger: store.clone() as Arc<dyn crate::backend::SpendLedger>,
+            agent_db: crate::backends::omp_scavenge::default_agent_db(),
+            prober: Arc::new(crate::backend::CmdProber),
+        });
+    let backend: Arc<dyn Backend> = Arc::new(crate::backend::OverdriveBackend::new(
+        provider_backend,
+        scheduler_overdrive.clone(),
+    ));
 
     let cycle_running = Arc::new(AtomicBool::new(false));
     let scheduler_paused = Arc::new(AtomicBool::new(false));
@@ -259,6 +265,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         scheduler: crate::server::SchedulerHandle {
             running: cycle_running.clone(),
             paused: scheduler_paused.clone(),
+            overdrive: scheduler_overdrive,
             wake: wake.clone(),
         },
     };

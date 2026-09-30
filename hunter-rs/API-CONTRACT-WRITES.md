@@ -23,7 +23,7 @@ Shared conventions (error envelope `{"error": "<msg>"}`, `_send` headers, Row sh
 `do_POST` (server.py:419-456) first reads `Content-Type` (default `''`) and requires `ctype.startswith('application/json')` (server.py:409-410). Failure -> `415 {"error": "Content-Type must be application/json"}` (server.py:411). Notes:
 
 - **Prefix match**: `application/json; charset=utf-8` passes.
-- The gate applies to **all 9 routes including `/api/cycle`**, which never reads a body.
+- The gate applies to **every POST route including `/api/cycle`**, which never reads a body.
 - **Every UI POST clears the gate**: the Svelte UI routes all of them through one `post()` helper that sets `Content-Type: application/json` and a JSON body (`ui-svelte/src/lib/api.svelte.ts:104-110`); the bare `api()` wrapper sets no headers (`api.svelte.ts:32-45`) and is never called directly by a read either — every GET goes through `get()` (`:76-87`), which adds the abort deadline. The body-less `/api/cycle` call is `post("/api/cycle", {})` (`ui-svelte/src/pages/StatusPage.svelte:12`), i.e. it sends `{}` and passes. (This supersedes the old vanilla-`app.ts` discrepancy where `runCycle` sent no header and got a 415.)
 
 ### 0.2 Route dispatch and error taxonomy
@@ -112,11 +112,37 @@ Handler `_cycle` (server.py:489-518). **Never reads the body** (only the §0.1 g
 - Reconcile writes (store.py:1303-1352): findings stuck at `'fixing'` -> `set_status(id, "queued")` (store.py:1339-1341); jobs stuck at `'running'` -> `update_job(state="killed", killed_reason="orphaned", finished_at=now_ms(), notes="reconciled at cycle startup -- prior process died mid-job")` (store.py:1343-1351; `update_job` store.py:1191-1198). Each touched row also gets a `log_event("error", ...)` with the exact formats at server.py:126-139 (`f"reconciled #{f['id']} stuck 'fixing' -> 'queued' -- prior process died mid-fix"` / `f"reconciled orphaned {r['kind']} job #{r['id']} (finding {r.get('finding_id')}) -- prior process died mid-job"`).
 - `run_cycle` itself spawns workers, writes jobs/findings/pr_state, shells out to git/gh — the entire scheduler.
 
-**Rust implementation** (superseded the forwarding proxy this section originally specified): the proxy was only sound while the Python process owned `_cycle_lock`, `_wake` and the backend singleton. Since the scheduler moved into the Rust daemon, those live here, and forwarding to a process that no longer exists made every trigger a 502. `AppState.scheduler: SchedulerHandle` now carries the loop's `running: Arc<AtomicBool>` and its `wake: Arc<Notify>`. The handler checks `running` (409 `{"error":"busy"}`), otherwise notifies and returns 202 `{"started": true}`. The busy check is advisory, as Python's non-blocking `acquire` was: a trigger racing the loop into its next cycle is held as a notify permit and runs on the following iteration instead of being dropped. `cycle_running` in `GET /api/summary` and the `"working"` activity status (§3 priority 2) read the same flag.
+**Rust implementation**: `AppState.scheduler: SchedulerHandle` carries the loop's `running`, `paused`, and `overdrive` atomics plus its `wake: Arc<Notify>`. `/api/cycle` returns 409 `{"error":"paused"}` while paused, 409 `{"error":"busy"}` while a cycle is running, otherwise notifies the loop and returns 202 `{"started":true}`. The busy check is advisory: a trigger racing the loop into its next cycle is held as a notify permit and runs on the following iteration instead of being dropped.
 
 **UI** (`StatusPage.runCycle`, `ui-svelte/src/pages/StatusPage.svelte:9-29`): `post("/api/cycle", {})` — header and `{}` body per §0.1, so the gate passes and the real status codes are reached. This is the one caller that compares `status` to literals rather than reading `r.ok`, because here the code *is* the information: 409 -> button text "busy", 202 -> "started…", anything else -> "error" (:13-17); then `store.refresh()`. The button is re-armed after 2.5 s in `finally`, so it recovers even when the request never reached the server (:22-28).
 
 ---
+## 2.1 POST /api/scheduler — pause or resume the scheduler
+
+**Request**: `{"paused": boolean}`. Missing or non-boolean values return
+`400 {"error":"paused must be a boolean"}`.
+
+**Success**: `200 {"paused": <value>}`. The process-local flag changes
+immediately and the loop is notified. Pausing blocks new cycles; a worker
+already running is allowed to finish. The flag resets to false on restart.
+
+## 2.2 POST /api/overdrive — global prioritized budget mode
+
+**Request**: `{"enabled": boolean}`. Missing or non-boolean values return
+`400 {"error":"enabled must be a boolean"}`.
+
+**Success**: `200 {"overdrive": <value>}`. The process-local flag changes
+immediately and the loop is notified, so a budget-denied scheduler can retry.
+While enabled, `OverdriveBackend` promotes the provider backend's
+`Outlook.prioritized` verdict to the normal path for every job. This bypasses
+pacing ramps but does not synthesize a grant: provider exhaustion and zero
+hard-limit headroom remain denied. The flag resets to false on restart.
+
+The Status-page toggle refreshes `/api/summary` after the write and renders
+from `scheduler_overdrive`; it can be changed while the scheduler is paused.
+
+---
+
 
 ## 3. POST /api/recheck — queue a `new` finding for recheck
 
@@ -323,7 +349,7 @@ Handler `_add_repo_note` (server.py:701-725).
 - **CSRF**: the `application/json` prefix gate on all POSTs (server.py:409-412, the HTTP 415 at :411) blocks HTML-form/simple cross-origin requests; combined with loopback-only bind `127.0.0.1` (server.py:903) and no CORS headers anywhere. GETs have no gate.
 - **Process exclusivity**: exclusive non-blocking `flock` on `<work_root>/hunter.lock`, held for process lifetime; loser exits with a SystemExit message (server.py:65-87). Both `serve()` (server.py:922) and `daemon()` (server.py:1244) take it.
 - **Cycle exclusivity**: `_cycle_lock` (server.py:93) — POST /api/cycle (server.py:490), daemon loop (server.py:1266-1299), summary's `cycle_running` probe (server.py:311).
-- **Daemon wake**: `_wake` event, set only by /api/override with a non-null mode (server.py:591-592), polled every ≤5 s during daemon sleep (server.py:1305-1310), cleared at loop top (server.py:1267, 1302).
+- **Daemon wake**: `SchedulerHandle.wake` is notified by `/api/cycle`, `/api/scheduler`, `/api/overdrive`, and budget-override changes so the loop reacts without waiting for its current sleep deadline.
 - **No per-row or per-table write locks**: every request builds its own `Store`/connection (server.py:157-160); serialization is SQLite-level (WAL, default 5 s busy timeout). Handlers are not atomic across their multiple store calls (§0.3); e.g. two concurrent verdicts on the same finding interleave at statement granularity — last `UPDATE` wins, both events logged.
 - **Response-then-side-effect ordering**: /api/override writes the response *before* `_wake.set()` (server.py:590-592); /api/cycle responds 202 while the cycle thread runs concurrently (server.py:517-518). All other endpoints complete every write before responding.
 
@@ -333,6 +359,8 @@ Handler `_add_repo_note` (server.py:701-725).
 |---|---|---|---|
 | /api/verdict | 200 | `{"ok": true, "finding": Row}` | `get_finding` (store.py:859-861) |
 | /api/cycle | 202 / 409 | `{"started": true}` / `{"error": "busy"}` | — |
+| /api/scheduler | 200 | `{"paused": bool}` | `/api/summary.scheduler_paused` |
+| /api/overdrive | 200 | `{"overdrive": bool}` | `/api/summary.scheduler_overdrive` |
 | /api/recheck | 200 | `{"queued": true, "finding": Row}` | `get_finding` |
 | /api/unqueue | 200 | `{"ok": true, "finding": Row}` | `get_finding` |
 | /api/override (all-clear) | 200 | `{"ok": true, "cleared": n}` | — |
