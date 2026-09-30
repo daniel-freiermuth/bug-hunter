@@ -3539,8 +3539,7 @@ pub async fn run_engage(
             let reason = std::fs::read_to_string(&withdraw).unwrap_or_default();
             let mut forge_closed = false;
             if fg.owner_repo(&repo.url).is_some() {
-                let comment: String = reason.chars().take(800).collect();
-                if let Err(err) = fg.close_pr(&repo.url, pr_number, &comment) {
+                if let Err(err) = fg.close_pr(&repo.url, pr_number, &reason) {
                     // close_pr posts the withdrawal reason and only then closes,
                     // so a failure here means the PR is still OPEN on the forge.
                     // Recording the verdict anyway would mark it closed locally
