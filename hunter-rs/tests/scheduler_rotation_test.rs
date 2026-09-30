@@ -129,9 +129,9 @@ async fn last_test_gap_at(store: &Store) -> i64 {
 async fn a_killed_analysis_attempt_bumps_the_rotation_timestamp() {
     let (_dir, path, _pool, cfg) = fixture("rotation-killed").await;
     let store = Store::connect(&path).await.unwrap();
-    // A wallclock kill is never a suspension, transcript or not, so this
+    // An unmetered kill is never a suspension, transcript or not, so this
     // is the plain killed outcome.
-    let backend = stopped_worker("wallclock", true);
+    let backend = stopped_worker("unmetered", true);
 
     let summary = run_cycle(&store, &cfg, &backend, None).await;
 

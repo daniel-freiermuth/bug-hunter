@@ -242,47 +242,62 @@ async fn record_job_cap_kill_with_a_session_suspends() {
     );
 }
 
-/// A wallclock kill is never a suspension, transcript or not.
+/// A wallclock kill that did work and left a transcript is a pause.
 ///
-/// An unbounded overrun is the runaway signature: the job was not short
-/// of budget, it was not converging. Resuming it would buy the same
-/// non-convergence another full wall-clock window.
+/// Long work outlives one wall-clock slot; restarting it from scratch
+/// repays everything already done (F#4082: three 45-min kills, ~785k
+/// tokens, no progress kept). Runaways are bounded by the resume ceiling.
 #[tokio::test]
-async fn record_job_wallclock_kill_stays_killed_even_with_a_session() {
+async fn record_job_wallclock_kill_with_work_and_a_session_suspends() {
     let (_dir, path, pool) = fresh_db().await;
     seed_repo(&pool).await;
     let store = rw_store(&path).await;
-    let job_id = store
-        .create_job(
-            RepoJobKind::Hunt.into(),
-            1,
-            None,
-            Some(50_000),
-            hunter::domain::JobState::Running,
-            None,
-            None,
-        )
-        .await
-        .unwrap()
-        .id;
-    let rr = RunResult {
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        ids.push(
+            store
+                .create_job(
+                    RepoJobKind::Hunt.into(),
+                    1,
+                    None,
+                    Some(50_000),
+                    hunter::domain::JobState::Running,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+                .id,
+        );
+    }
+    let rr = |tokens_new| RunResult {
         exit_code: None,
         killed_reason: Some("wallclock".to_owned()),
-        tokens_new: 50_000,
+        tokens_new,
         calls: 20,
         session_file: Some("/tmp/sess.jsonl".to_owned()),
         duration_s: 1800.0,
         stdout_tail: "ran out of wall clock".to_owned(),
         usage_delta: Some(0.1),
     };
-    let state = hunter::scheduler::record_job(&store, job_id, &rr, Some("claude-4"), None)
+    let worked = hunter::scheduler::record_job(&store, ids[0], &rr(50_000), None, None)
         .await
         .unwrap();
-    assert_eq!(state, hunter::domain::JobState::Killed);
-    assert!(
-        store.list_resumable_jobs().await.unwrap().is_empty(),
-        "a runaway must never be offered for resumption"
-    );
+    assert_eq!(worked, hunter::domain::JobState::Suspended);
+    // Nothing metered means nothing to continue: resuming would re-run
+    // whatever stalled before the first answer.
+    let idle = hunter::scheduler::record_job(&store, ids[1], &rr(0), None, None)
+        .await
+        .unwrap();
+    assert_eq!(idle, hunter::domain::JobState::Killed);
+    let resumable: Vec<i64> = store
+        .list_resumable_jobs()
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+        .collect();
+    assert_eq!(resumable, vec![ids[0]]);
 }
 
 // -- 2. create_job + update_job round-trip -----------------------------------

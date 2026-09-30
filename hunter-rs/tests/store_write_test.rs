@@ -1190,9 +1190,9 @@ async fn set_tokens(pool: &SqlitePool, job_id: i64, tokens: i64) {
 }
 
 /// Only `suspended` is resumable, and the freshest suspension comes
-/// first. A wallclock kill sits in the same table looking similar and
-/// must never appear here: an unbounded overrun is the runaway
-/// signature, and resuming it would only repeat it.
+/// first. A killed job sits in the same table looking similar and must
+/// never appear here: `job_state` already decided it is not worth
+/// continuing.
 #[tokio::test]
 async fn resumable_jobs_are_the_suspended_ones_newest_first() {
     let (_dir, path, pool) = fresh_db().await;
