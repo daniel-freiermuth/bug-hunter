@@ -828,9 +828,15 @@ const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 /// handing omp one exact path, and a cap kill with no transcript has
 /// nothing to hand it.
 ///
+/// A wallclock kill that did metered work and left a transcript is a
+/// pause too. Long work legitimately outlives one wall-clock slot: F#4082's
+/// engage (jobs 4952-4954, 2026-09-30) was killed three times at 45 min
+/// mid-remediation, and each fresh restart threw away ~260k tokens of
+/// progress to redo the same opening moves. A genuine runaway is still
+/// bounded — by [`MAX_RESUME_ATTEMPTS`] and the [`GIVE_UP_MULTIPLE`] spend
+/// ceiling on the resume chain — rather than by discarding its work.
+///
 /// Every other `killed_reason` stays `Killed` and is never resumed.
-/// Wallclock above all: an unbounded overrun is the runaway signature,
-/// and continuing a runaway only buys it more wall clock.
 ///
 /// A worker that exited unsuccessfully on its own -- a provider error
 /// omp's own retries did not absorb, a dead connection after the host
@@ -849,6 +855,7 @@ const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 fn job_state(rr: &RunResult) -> JobState {
     match rr.killed_reason.as_deref() {
         Some("cap") if rr.session_file.is_some() => JobState::Suspended,
+        Some("wallclock") if rr.session_file.is_some() && rr.tokens_new > 0 => JobState::Suspended,
         Some("resume-unavailable") => JobState::Failed,
         Some(_) => JobState::Killed,
         None if rr.exit_code == Some(0) => JobState::Done,

@@ -183,9 +183,9 @@ pub enum JobState {
     /// intact, so the work can be continued in a new job rather than
     /// started over. Either the worker hit the token bound, or it died
     /// after doing metered work (a provider error, a dead connection, the
-    /// daemon going down under it). A wallclock kill is NOT this -- an
-    /// unbounded overrun is the runaway signature, and resuming it would
-    /// just repeat it. See `scheduler::job_state`.
+    /// daemon going down under it), or a wallclock kill after doing
+    /// metered work. Resume chains are bounded by the give-up ceiling.
+    /// See `scheduler::job_state`.
     Suspended,
     Denied,
 }
