@@ -1408,6 +1408,35 @@ impl Store {
         .await
     }
 
+    /// Tokens recorded by every strict ancestor of `job_id`, of any kind.
+    ///
+    /// That is everything already metered out of the transcript directory
+    /// `job_id` shares with its chain: the walk is the one
+    /// [`Self::resume_origin_job`] makes to find that directory, so a
+    /// harvest handed off from an engage counts the engage's spend here,
+    /// where [`Self::resume_chain_stats`] (same kind only, for the give-up
+    /// ceiling) does not.
+    pub async fn ancestor_tokens(&self, job_id: i64) -> sqlx::Result<i64> {
+        sqlx::query_scalar!(
+            r#"
+            WITH RECURSIVE ancestry(id, resumed_from, depth) AS (
+                SELECT id, resumed_from, 0 FROM jobs WHERE id = ?1
+                UNION
+                SELECT j.id, j.resumed_from, a.depth + 1
+                FROM jobs j, ancestry a
+                WHERE a.depth < ?2
+                  AND j.id = a.resumed_from
+            )
+            SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64"
+            FROM jobs WHERE id IN (SELECT id FROM ancestry WHERE id <> ?1)
+            "#,
+            job_id,
+            RESUME_CHAIN_MAX_DEPTH
+        )
+        .fetch_one(&self.pool)
+        .await
+    }
+
     /// Take a suspended attempt out of the resumable pool for good.
     ///
     /// The ways a suspension ends without being continued: the
@@ -1749,6 +1778,35 @@ impl Store {
             notes,
             model,
             usage_delta,
+            finished_at,
+            job_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record an orphaned running job as `suspended`: the prior process
+    /// died while its worker had done metered work, and the transcript is
+    /// on disk for the resume tier to continue. `killed_reason` stays
+    /// `orphaned` so the row still says how the attempt ended.
+    pub async fn suspend_orphan(
+        &self,
+        job_id: i64,
+        session_file: &str,
+        tokens_new: i64,
+        notes: &str,
+        finished_at: i64,
+    ) -> sqlx::Result<()> {
+        let suspended = JobState::Suspended;
+        sqlx::query!(
+            "UPDATE jobs SET state = ?1, pid = NULL, killed_reason = 'orphaned', \
+             session_file = ?2, tokens_new = ?3, notes = ?4, finished_at = ?5 \
+             WHERE id = ?6",
+            suspended,
+            session_file,
+            tokens_new,
+            notes,
             finished_at,
             job_id
         )

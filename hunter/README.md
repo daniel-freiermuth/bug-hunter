@@ -140,10 +140,15 @@ what actually runs):
 4. **Recheck** the oldest finding stuck in `rechecking`.
 5. **Fix** the oldest queued finding.
 6. **Resume** the newest suspended attempt that can still be continued.
-   A worker killed for running out of window headroom (and only that:
-   never a wallclock overrun, which is the runaway signature) keeps its
-   session and comes back as `suspended` rather than `killed`, and the
-   next cycle hands omp that exact session instead of starting cold.
+   A worker killed for running out of window headroom keeps its session
+   and comes back as `suspended` rather than `killed`, and the next cycle
+   hands omp that exact session instead of starting cold. So does one
+   that died after doing metered work — a provider error omp's retries
+   did not absorb, a connection lost across a laptop suspend, or the
+   daemon going down mid-job (found at the next startup). Never a
+   wallclock overrun, which is the runaway signature, and never an
+   attempt that failed before spending a token (a misconfigured model or
+   an exhausted account fails the same way again).
    Ranked here because a suspension has already been paid for — it
    outranks *starting* new background work, never a human waiting on a
    PR. Restarting costs a flat ~37k-token session floor and then redoes

@@ -64,7 +64,36 @@ pub fn acquire_lockfile(work_root: &Path) -> anyhow::Result<std::fs::File> {
 }
 
 /// Recover orphaned jobs/findings from a crashed prior process.
-pub async fn reconcile_and_log(store: &Store) -> anyhow::Result<()> {
+///
+/// A job still `running` here outlived the process that ran it. When its
+/// chain's session directory holds a transcript with metered work from
+/// this attempt, the job is recorded `suspended`, so the resume tier
+/// continues it instead of the work being lost; the same rule
+/// `scheduler::job_state` applies to a worker that died on its own. The
+/// rest are marked killed as before -- among them every job that died
+/// before its worker made a call, such as the fix jobs killed inside
+/// `git worktree add` on 2026-09-29.
+pub async fn reconcile_and_log(store: &Store, work_root: &Path) -> anyhow::Result<()> {
+    for j in store.list_running_jobs().await? {
+        if let Some((session_file, tokens)) = orphan_work(store, work_root, &j).await? {
+            let note = "reconciled at cycle startup -- prior process died mid-job; \
+                        transcript kept for the resume";
+            store
+                .suspend_orphan(j.id, &session_file, tokens, note, crate::util::now_ms())
+                .await?;
+            let _ = store
+                .log_event(
+                    "resume",
+                    &format!(
+                        "orphaned {} job #{} suspended for resume ({tokens} tok of work in {})",
+                        j.kind, j.id, session_file
+                    ),
+                    Some(j.id),
+                    j.finding_id,
+                )
+                .await;
+        }
+    }
     let (findings, jobs) = store.reconcile_orphaned_jobs().await?;
     for f in &findings {
         let _ = store
@@ -100,6 +129,32 @@ pub async fn reconcile_and_log(store: &Store) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// `(session_file, tokens)` of the work orphaned job `j` did itself,
+/// when it did any and nothing is still running in its tree.
+///
+/// The chain's session directory is shared by every attempt, so the
+/// ledger there also holds what earlier attempts already recorded --
+/// across kinds, when an engage handed its session to a harvest. That is
+/// subtracted, as the harness meters a resume against its base.
+async fn orphan_work(
+    store: &Store,
+    work_root: &Path,
+    j: &crate::types::Job,
+) -> anyhow::Result<Option<(String, i64)>> {
+    let origin = store.resume_origin_job(j.id).await?;
+    let ws = crate::workspace::Workspace::for_chain(work_root, Path::new(""), origin);
+    let Some((file, tokens, _)) =
+        crate::backends::omp_scavenge::harness::ledger_dir_usage(&ws.session)
+    else {
+        return Ok(None);
+    };
+    let own = tokens - store.ancestor_tokens(j.id).await?;
+    if own <= 0 || crate::workspace::tree_in_use(&ws.tree) {
+        return Ok(None);
+    }
+    Ok(Some((file.to_string_lossy().into_owned(), own)))
 }
 
 /// Release finished chains' trees and reclaim old workspaces and the
@@ -368,7 +423,7 @@ pub async fn run_daemon(cfg: Config) -> anyhow::Result<()> {
         let sleep_s: f64;
         cycle_running.store(true, Ordering::SeqCst);
         let cycle_result: anyhow::Result<CycleSummary> = async {
-            reconcile_and_log(&store).await?;
+            reconcile_and_log(&store, &cfg.work_root).await?;
             crate::server::reap_deleted_repos(&store, &cfg.work_root, &repo_notes).await;
             sweep_workspaces(&store, &cfg.work_root).await;
             let summary = crate::scheduler::run_cycle(&store, &cfg, &*backend, None).await;
