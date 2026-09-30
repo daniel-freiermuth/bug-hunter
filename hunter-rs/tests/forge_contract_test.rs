@@ -26,8 +26,8 @@ const GL_NESTED: &str = "https://gitlab.com/group/sub/widget";
 const GL_SELF_HOSTED: &str = "https://git.example.com/team/proj";
 const PR: i64 = 7;
 
-/// Three bytes per character, so a byte-indexed truncation at 800 lands
-/// mid-codepoint (800 = 266 × 3 + 2) and panics.
+/// Multibyte, so a withdrawal reason's length in bytes and in characters
+/// differ; any cap on either would show up as a shortened comment.
 const WIDE: &str = "あ";
 
 const GH_VIEW_JSON: &str = r#"{"state":"OPEN","mergeable":"MERGEABLE","reviewDecision":"APPROVED","headRefName":"fix/x","headRefOid":"cafe","updatedAt":"2026-01-02T03:04:05Z","title":"t","body":"b","comments":[],"reviews":[],"statusCheckRollup":[]}"#;
@@ -172,10 +172,10 @@ fn github_close_treats_whitespace_as_a_real_comment() {
     assert_eq!(value_after(&calls[comment], "--body"), Some("   "));
 }
 
-/// 800 *characters*, not 800 bytes. Slicing a multibyte reason at byte 800
-/// panics mid-codepoint, which took down the whole withdrawal path.
+/// The withdrawal reason is posted whole. It used to be cut at 800
+/// characters, which silently chopped detailed withdrawals mid-word.
 #[test]
-fn github_close_truncates_the_comment_to_800_chars_not_bytes() {
+fn github_close_posts_the_whole_comment() {
     let bins = FakeBins::acquire("forge-gh-close-wide");
     bins.ok("gh", "");
 
@@ -189,9 +189,7 @@ fn github_close_truncates_the_comment_to_800_chars_not_bytes() {
     let calls = bins.calls();
     let comment = position_of(&calls, "gh", &["pr", "comment"]).expect("comment call");
     let posted = value_after(&calls[comment], "--body").expect("--body value");
-    assert_eq!(posted.chars().count(), 800, "truncated by characters");
-    assert_eq!(posted.len(), 2400, "which is 2400 bytes, not 800");
-    assert_eq!(posted, WIDE.repeat(800), "the leading 800 characters");
+    assert_eq!(posted, reason, "the whole reason, untruncated");
     assert!(
         position_of(&calls, "gh", &["pr", "close"]).is_some(),
         "and the close still happens: {calls:?}"
@@ -283,7 +281,7 @@ fn gitlab_close_skips_an_empty_comment_and_still_closes() {
 }
 
 #[test]
-fn gitlab_close_truncates_the_comment_to_800_chars_not_bytes() {
+fn gitlab_close_posts_the_whole_comment() {
     let bins = FakeBins::acquire("forge-gl-close-wide");
     bins.ok("glab", "");
 
@@ -299,9 +297,7 @@ fn gitlab_close_truncates_the_comment_to_800_chars_not_bytes() {
     let posted = field
         .strip_prefix("body=")
         .unwrap_or_else(|| panic!("note body must be sent as `body=`, got {field:?}"));
-    assert_eq!(posted.chars().count(), 800, "truncated by characters");
-    assert_eq!(posted.len(), 2400, "which is 2400 bytes, not 800");
-    assert_eq!(posted, WIDE.repeat(800), "the leading 800 characters");
+    assert_eq!(posted, reason, "the whole reason, untruncated");
     assert!(
         position_of(&calls, "glab", &["mr", "close"]).is_some(),
         "and the close still happens: {calls:?}"
