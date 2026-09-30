@@ -832,6 +832,18 @@ const MAX_CONSECUTIVE_SAME_FAILURE: i64 = 3;
 /// Wallclock above all: an unbounded overrun is the runaway signature,
 /// and continuing a runaway only buys it more wall clock.
 ///
+/// A worker that exited unsuccessfully on its own -- a provider error
+/// omp's own retries did not absorb, a dead connection after the host
+/// slept, a SIGTERM from outside -- is a pause too, provided this attempt
+/// did metered work (`tokens_new > 0`) and left a transcript. Job 4912
+/// (2026-09-29) lost 105k tokens of test-gap work to one `aborted`
+/// stream across a laptop suspend, and was then not retried for a day.
+/// The work condition is what keeps configuration errors out: in the
+/// whole job history every `model_not_supported` failure and every rate
+/// limit hit before the first answer spent zero tokens, so it stays
+/// `Failed` instead of being resumed into the same wall. A failure that
+/// repeats after doing work is bounded by the resume give-up ceiling.
+///
 /// `resume-unavailable` is `Failed` rather than `Killed` because nothing
 /// was spawned — there was no run to kill, the attempt could not start.
 fn job_state(rr: &RunResult) -> JobState {
@@ -840,6 +852,7 @@ fn job_state(rr: &RunResult) -> JobState {
         Some("resume-unavailable") => JobState::Failed,
         Some(_) => JobState::Killed,
         None if rr.exit_code == Some(0) => JobState::Done,
+        None if rr.session_file.is_some() && rr.tokens_new > 0 => JobState::Suspended,
         None => JobState::Failed,
     }
 }
@@ -1218,7 +1231,7 @@ async fn open_workspace(
 
 /// Release a chain's tree once its job has ended, unless the job table
 /// says the chain is still `running` or `suspended` — a suspension is a
-/// budget pause, and its tree is the state the resume continues.
+/// pause, and its tree is the state the resume continues.
 ///
 /// Best effort: a tree that could not be released is picked up by the
 /// sweep before the next cycle.
@@ -1830,9 +1843,9 @@ pub async fn run_recheck(
         ..Default::default()
     };
     if state == JobState::Suspended {
-        // A suspension is a budget pause, not a failure: the worker ran out
-        // of window headroom mid-work and its tree and transcript are kept
-        // for the resume. Counting it toward the streak would turn three
+        // A suspension is a pause, not a failure: the worker stopped
+        // mid-work (out of window headroom, or died after doing work) and
+        // its tree and transcript are kept for the resume. Counting it toward the streak would turn three
         // pauses of one healthy recheck into "stuck" and reset the finding.
         // It stays rechecking, where the recheck tier continues it.
         let _ = store
@@ -2808,9 +2821,9 @@ pub async fn run_fix(
         let failure = failure.unwrap_or_else(|| "unknown failure".to_owned());
         let tail = crate::util::tail(&rr.stdout_tail, 300);
         if state == JobState::Suspended {
-            // A suspension is a budget pause, not a failure: the worker ran
-            // out of window headroom mid-work and its tree and transcript are
-            // kept for the resume. Counting it toward the streak would turn
+            // A suspension is a pause, not a failure: the worker stopped
+            // mid-work (out of window headroom, or died after doing work) and
+            // its tree and transcript are kept for the resume. Counting it toward the streak would turn
             // three pauses of one healthy fix into "stuck" and reject the
             // finding. Back to queued, where the fix tier continues it.
             let _ = store.set_finding_status(fid, FindingStatus::Queued).await;
@@ -4213,9 +4226,9 @@ pub async fn run_harvest(
         ..Default::default()
     };
     if state == JobState::Suspended {
-        // A suspension is a budget pause, not a failure: the worker ran out
-        // of window headroom mid-work and its tree and transcript are kept
-        // for the resume. Counting it toward the streak would turn three
+        // A suspension is a pause, not a failure: the worker stopped
+        // mid-work (out of window headroom, or died after doing work) and
+        // its tree and transcript are kept for the resume. Counting it toward the streak would turn three
         // pauses of one healthy harvest into "stuck" and give the PR up.
         // It stays unharvested, where the harvest tier continues it.
         let _ = store

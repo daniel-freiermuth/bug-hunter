@@ -593,3 +593,153 @@ async fn fix_attempt_streak_tracking() {
     assert_eq!(f.fix_attempts, 0);
     assert!(f.last_fix_failure.is_none());
 }
+
+// -- 3b. reconcile_and_log: an orphan that did work is kept for resume -------
+
+/// A daemon killed mid-job leaves the row `running`. When the chain's
+/// session directory holds a transcript with metered work, the job is
+/// suspended with that transcript so the resume tier continues it; a job
+/// that died before its first call (the 2026-09-29 fix jobs killed inside
+/// `git worktree add`) is still reconciled `killed`.
+#[tokio::test]
+async fn reconcile_suspends_an_orphan_that_did_work_and_kills_one_that_did_not() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    let store = rw_store(&path).await;
+    let work_root = dir.subdir("work_root");
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let id = store
+            .create_job(
+                hunter::domain::RepoJobKind::TestGap.into(),
+                1,
+                None,
+                Some(100_000),
+                hunter::domain::JobState::Running,
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+            .id;
+        std::fs::create_dir_all(work_root.join("jobs").join(id.to_string()).join("session"))
+            .unwrap();
+        ids.push(id);
+    }
+    let (worked, empty) = (ids[0], ids[1]);
+    let transcript = work_root
+        .join("jobs")
+        .join(worked.to_string())
+        .join("session")
+        .join("2026-09-29T21-39-39-038Z_x.jsonl");
+    std::fs::write(
+        &transcript,
+        r#"{"message":{"role":"assistant","usage":{"input":1000,"output":100,"cacheRead":0,"cacheWrite":500}}}
+"#,
+    )
+    .unwrap();
+
+    hunter::daemon::reconcile_and_log(&store, &work_root)
+        .await
+        .unwrap();
+
+    let jobs = store.list_jobs(10).await.unwrap();
+    let row = |id: i64| jobs.iter().find(|j| j.job.id == id).unwrap().job.clone();
+    let w = row(worked);
+    assert_eq!(w.state, hunter::domain::JobState::Suspended);
+    assert_eq!(w.session_file.as_deref(), transcript.to_str());
+    assert_eq!(w.tokens_new, Some(1600));
+    assert_eq!(row(empty).state, hunter::domain::JobState::Killed);
+    let resumable: Vec<i64> = store
+        .list_resumable_jobs()
+        .await
+        .unwrap()
+        .iter()
+        .map(|j| j.id)
+        .collect();
+    assert_eq!(resumable, vec![worked]);
+}
+
+/// One assistant call worth 1,600 new tokens, in omp's ledger format.
+const CALL_1600: &str = r#"{"message":{"role":"assistant","usage":{"input":1000,"output":100,"cacheRead":0,"cacheWrite":500}}}"#;
+
+/// A harvest handed off from an engage continues the engage's transcript
+/// in the engage's session directory, so the ledger there holds the
+/// engage's recorded spend too. Only what the harvest added is its own:
+/// none, and it is killed as before; one more call, and it is suspended
+/// with exactly that call's tokens.
+#[tokio::test]
+async fn reconcile_counts_only_the_orphans_own_work_in_a_handed_off_transcript() {
+    for (extra_calls, expected) in [(0, None), (1, Some(1600))] {
+        let (dir, path, pool) = fresh_db().await;
+        seed_repo(&pool).await;
+        seed_findings(&pool).await;
+        sqlx::raw_sql(
+            "INSERT INTO jobs (id, kind, repo_id, finding_id, state, tokens_new, started_at, finished_at) \
+             VALUES (10, 'engage', 1, 2, 'done', 1600, 1000, 2000); \
+             INSERT INTO jobs (id, kind, repo_id, finding_id, state, started_at, resumed_from) \
+             VALUES (11, 'harvest', 1, 2, 'running', 3000, 10);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let store = rw_store(&path).await;
+        let work_root = dir.subdir("work_root");
+        let session = work_root.join("jobs").join("10").join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        let lines = vec![CALL_1600; 1 + extra_calls].join("\n") + "\n";
+        std::fs::write(session.join("s.jsonl"), lines).unwrap();
+
+        hunter::daemon::reconcile_and_log(&store, &work_root)
+            .await
+            .unwrap();
+
+        let jobs = store.list_jobs(10).await.unwrap();
+        let harvest = &jobs.iter().find(|j| j.job.id == 11).unwrap().job;
+        match expected {
+            None => assert_eq!(harvest.state, hunter::domain::JobState::Killed),
+            Some(tokens) => {
+                assert_eq!(harvest.state, hunter::domain::JobState::Suspended);
+                assert_eq!(harvest.tokens_new, Some(tokens));
+            }
+        }
+    }
+}
+
+/// A worker that outlived its daemon (one run by hand and killed) is
+/// still in its tree. Resuming that chain would put a second worker in
+/// the same tree and transcript, so the orphan is killed, not suspended.
+#[tokio::test]
+async fn reconcile_does_not_suspend_an_orphan_whose_worker_is_still_running() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    sqlx::raw_sql(
+        "INSERT INTO jobs (id, kind, repo_id, state, started_at) VALUES (5, 'test_gap', 1, 'running', 1000);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    let work_root = dir.subdir("work_root");
+    let chain = work_root.join("jobs").join("5");
+    std::fs::create_dir_all(chain.join("session")).unwrap();
+    std::fs::create_dir_all(chain.join("tree")).unwrap();
+    std::fs::write(
+        chain.join("session").join("s.jsonl"),
+        format!("{CALL_1600}\n"),
+    )
+    .unwrap();
+    let mut worker = std::process::Command::new("sleep")
+        .arg("30")
+        .current_dir(chain.join("tree"))
+        .spawn()
+        .unwrap();
+
+    let result = hunter::daemon::reconcile_and_log(&store, &work_root).await;
+    worker.kill().unwrap();
+    worker.wait().unwrap();
+    result.unwrap();
+
+    let jobs = store.list_jobs(10).await.unwrap();
+    assert_eq!(jobs[0].job.state, hunter::domain::JobState::Killed);
+}

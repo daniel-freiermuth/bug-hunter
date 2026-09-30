@@ -153,7 +153,7 @@ pub fn ctx_at_suspension(session_file: &Path) -> Option<i64> {
 ///
 /// Returns `None` until the directory holds at least one ledger — that is
 /// the "not metered yet" signal `run_worker` waits on, and kills on.
-fn ledger_dir_usage(run_dir: &Path) -> Option<(PathBuf, i64, i64)> {
+pub fn ledger_dir_usage(run_dir: &Path) -> Option<(PathBuf, i64, i64)> {
     let mut files: Vec<PathBuf> = fs::read_dir(run_dir)
         .ok()?
         .flatten()

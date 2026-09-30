@@ -203,3 +203,60 @@ async fn a_suspended_analysis_attempt_does_not_bump_the_rotation_timestamp() {
     assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
     assert_eq!(plan.kind.to_string(), "test_gap");
 }
+
+/// A worker that exited unsuccessfully on its own, after doing work.
+fn died_worker(tokens_new: i64, leaves_session: bool) -> ScriptedBackend {
+    ScriptedBackend::new(move |tree| {
+        let session = leaves_session.then(|| {
+            let file = tree.parent().unwrap().join("session").join("session.jsonl");
+            std::fs::write(&file, "{}\n").unwrap();
+            file.to_string_lossy().into_owned()
+        });
+        RunResult {
+            exit_code: Some(1),
+            killed_reason: None,
+            tokens_new,
+            calls: 26,
+            session_file: session,
+            duration_s: 1.0,
+            stdout_tail: "Working...\naborted".to_owned(),
+            usage_delta: None,
+        }
+    })
+}
+
+/// A worker that died on its own after doing work -- job 4912, whose
+/// stream died across a laptop suspend -- is a pause like a cap kill:
+/// suspended, no rotation bump, and the resume tier claims it next.
+#[tokio::test]
+async fn an_attempt_that_died_after_doing_work_is_suspended_for_resume() {
+    let (_dir, path, _pool, cfg) = fixture("rotation-died").await;
+    let store = Store::connect(&path).await.unwrap();
+
+    let summary = run_cycle(&store, &cfg, &died_worker(105_327, true), None).await;
+
+    assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
+    assert_eq!(last_test_gap_at(&store).await, STALE_TEST_GAP);
+    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    match picked {
+        Some(Candidate::Resume { plan, .. }) => {
+            assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
+        }
+        other => panic!("the resume tier must claim the died attempt, got {other:?}"),
+    }
+}
+
+/// The same exit with no metered work stays a failure: in the whole job
+/// history that is the signature of a configuration error
+/// (`model_not_supported`, a rate limit before the first answer), which a
+/// resume would only run into again.
+#[tokio::test]
+async fn an_attempt_that_died_before_doing_any_work_stays_failed() {
+    let (_dir, path, _pool, cfg) = fixture("rotation-died-empty").await;
+    let store = Store::connect(&path).await.unwrap();
+
+    let summary = run_cycle(&store, &cfg, &died_worker(0, true), None).await;
+
+    assert_eq!(summary.state, Some(JobState::Failed), "{summary:?}");
+    assert!(last_test_gap_at(&store).await > STALE_TEST_GAP);
+}
