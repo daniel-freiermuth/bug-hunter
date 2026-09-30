@@ -150,11 +150,11 @@ pub struct FindingInsert {
     pub file: String,
     pub symbol: Option<String>,
     pub line: Option<i64>,
-    pub severity: String,
+    pub severity: Severity,
     pub confidence: f64,
     pub summary: String,
     pub detail: Option<String>,
-    pub bug_class: Option<String>,
+    pub bug_class: Option<BugClass>,
     pub evidence_plan: Option<String>,
     pub introduced_by: Option<String>,
     pub ecosystem: Option<String>,
@@ -179,7 +179,7 @@ pub struct FindingAnalysisUpdate {
     pub summary: Option<String>,
     pub detail: Option<String>,
     pub confidence: Option<f64>,
-    pub severity: Option<String>,
+    pub severity: Option<Severity>,
 }
 
 /// Filters for GET /api/findings (all optional, combined with AND).
@@ -2134,8 +2134,8 @@ impl Store {
         let file = &row.file;
         let symbol = row.symbol.as_deref();
         let line = row.line;
-        let bug_class = row.bug_class.as_deref();
-        let severity = &row.severity;
+        let bug_class = row.bug_class;
+        let severity = row.severity;
         let confidence = row.confidence;
         let summary = &row.summary;
         let detail = row.detail.as_deref();
@@ -2513,7 +2513,7 @@ impl Store {
         let now = now_ms();
         let summary = fields.summary.as_deref();
         let detail = fields.detail.as_deref();
-        let severity = fields.severity.as_deref();
+        let severity = fields.severity;
         sqlx::query!(
             "UPDATE findings SET \
              updated_at = ?1, \

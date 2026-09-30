@@ -65,7 +65,7 @@ async fn a_cycle_short_of_disk_is_denied_before_any_job_starts() {
             &FindingInsert {
                 fingerprint: "fp-open-pr".to_owned(),
                 file: "src/lib.rs".to_owned(),
-                severity: "medium".to_owned(),
+                severity: hunter::domain::Severity::Medium,
                 confidence: 0.9,
                 summary: "a bug with a PR".to_owned(),
                 ..Default::default()

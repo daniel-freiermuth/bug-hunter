@@ -58,7 +58,7 @@ async fn fixture(label: &str) -> Fixture {
             &FindingInsert {
                 fingerprint: "fp-fix-1".to_owned(),
                 file: "src/lib.rs".to_owned(),
-                severity: "medium".to_owned(),
+                severity: hunter::domain::Severity::Medium,
                 confidence: 0.9,
                 summary: "a real bug".to_owned(),
                 ..Default::default()

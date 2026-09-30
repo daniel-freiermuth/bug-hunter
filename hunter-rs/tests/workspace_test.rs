@@ -455,7 +455,7 @@ async fn queued_finding(store: &Store) -> i64 {
             &FindingInsert {
                 fingerprint: "fp-fix-1".to_owned(),
                 file: "README.md".to_owned(),
-                severity: "medium".to_owned(),
+                severity: hunter::domain::Severity::Medium,
                 confidence: 0.9,
                 summary: "a real bug".to_owned(),
                 ..Default::default()

@@ -245,23 +245,17 @@ pub async fn ingest_findings(
         // lines, and it cannot drift out of step with it.
         let bug_class = (entry_type == FindingType::Bug)
             .then(|| str_field("bug_class").and_then(|s| s.parse::<BugClass>().ok()))
-            .flatten()
-            .map(|c| c.as_str().to_owned());
+            .flatten();
         let insert = FindingInsert {
             fingerprint: str_field("fingerprint").unwrap_or("").to_owned(),
             file: str_field("file").unwrap_or("").to_owned(),
             symbol: opt_str("symbol"),
             line: obj.get("line").and_then(serde_json::Value::as_i64),
-            // Store the canonical spelling, not what the worker typed.
-            // Validation accepts any case (`Severity::parse` lowercases),
-            // but the column is decoded back as a `Severity`, whose sqlx
-            // representation is lowercase — persisting "HIGH" writes a row
-            // that every later read of this repo's findings fails to
-            // decode, not just this one.
+            // Validation accepts any case (`Severity::parse` lowercases);
+            // the typed field stores the canonical spelling whatever the
+            // worker typed.
             severity: Severity::parse(str_field("severity").unwrap_or("medium"))
-                .unwrap_or(Severity::Medium)
-                .as_str()
-                .to_owned(),
+                .unwrap_or(Severity::Medium),
             confidence,
             summary: str_field("summary").unwrap_or("").to_owned(),
             detail: opt_str("detail"),

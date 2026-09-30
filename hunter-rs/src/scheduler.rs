@@ -10,6 +10,7 @@ use std::path::Path;
 use crate::config::Config;
 use crate::domain::{
     ClosureClass, FindingJobKind, FindingStatus, FindingType, JobKind, JobState, RepoJobKind,
+    Severity,
 };
 use crate::store::{CreatedJob, FindingFilter, Store, StoreWriteError, SyncPrData};
 use crate::types::{Finding, Job, Repo};
@@ -1918,11 +1919,27 @@ pub async fn run_recheck(
 
     let verdict_str = match outcome {
         RecheckOutcome::Confirmed => {
+            // The worker's spelling is not stored: the column is decoded as
+            // a `Severity` by every whole-list read of the repo, so one
+            // undecodable row would fail all of them. A value outside the
+            // enum is dropped and the finding keeps its severity.
+            let raw_severity = verdict_obj.updated_severity.as_deref();
+            let severity = raw_severity.and_then(Severity::parse);
+            if let (Some(raw), None) = (raw_severity, severity) {
+                let _ = store
+                    .log_event(
+                        "recheck",
+                        &format!("#{fid} ignored unknown updated_severity {raw:?}"),
+                        Some(job),
+                        Some(fid),
+                    )
+                    .await;
+            }
             let update = crate::store::FindingAnalysisUpdate {
                 summary: verdict_obj.updated_summary.clone(),
                 detail: verdict_obj.updated_detail.clone(),
                 confidence: verdict_obj.updated_confidence,
-                severity: verdict_obj.updated_severity.clone(),
+                severity,
             };
             let _ = store.update_finding_analysis(fid, &update).await;
             let _ = store.set_finding_status(fid, FindingStatus::New).await;

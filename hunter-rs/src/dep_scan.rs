@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::domain::ForgeName;
+use crate::domain::{ForgeName, Severity};
 use crate::util::{drain_pipe, join_pipes, kill_tree, run_cmd};
 
 /// One update candidate, matching the `dep_update` finding schema.
@@ -22,7 +22,7 @@ pub struct DepCandidate {
     pub current_version: String,
     pub latest_version: String,
     pub update_type: String,
-    pub severity: String,
+    pub severity: Severity,
     pub confidence: f64,
     pub summary: String,
     pub detail: String,
@@ -313,16 +313,16 @@ fn parse_renovate_output(output: &str, repo_name: &str) -> (Vec<DepCandidate>, u
                         }
 
                         let severity = match update_type {
-                            "major" => "high",
-                            "minor" => "medium",
+                            "major" => Severity::High,
+                            "minor" => Severity::Medium,
                             _ if u
                                 .get("isVulnerabilityAlert")
                                 .and_then(serde_json::Value::as_bool)
                                 .unwrap_or(false) =>
                             {
-                                "high"
+                                Severity::High
                             }
-                            _ => "low",
+                            _ => Severity::Low,
                         };
                         let confidence = match update_type {
                             "patch" => 0.95,
@@ -340,7 +340,7 @@ fn parse_renovate_output(output: &str, repo_name: &str) -> (Vec<DepCandidate>, u
                             current_version: current_clean.to_owned(),
                             latest_version: new_version.to_owned(),
                             update_type: update_type.to_owned(),
-                            severity: severity.to_owned(),
+                            severity,
                             confidence,
                             summary: format!(
                                 "{dep_name}: {update_type} update {current} \u{2192} {new_version}"
