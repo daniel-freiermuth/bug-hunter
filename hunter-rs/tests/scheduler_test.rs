@@ -336,8 +336,10 @@ async fn pick_next_budget_override_jumps_the_queue() {
 
 // -- summary integration (oneshot router, NullBackend) -------------------------
 
-#[tokio::test]
-async fn summary_paused_on_denied_candidate() {
+/// `/api/summary` over a queued fix finding (id 5) and no running job,
+/// with the daemon's backend wiring: `NullBackend` behind the overdrive
+/// switch.
+async fn summary_over_queued_fix(overdrive: bool) -> Value {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     seed_finding(&pool, 5, 1, "queued", "queued bug").await;
@@ -345,14 +347,19 @@ async fn summary_paused_on_denied_candidate() {
 
     let mut config = test_config(3600.0);
     config.ui_dir = dir.subdir("ui");
+    let overdrive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(overdrive));
     let state = AppState {
         store: Arc::new(store),
         config: Arc::new(config),
-        backend: Arc::new(hunter::backend::NullBackend),
+        backend: Arc::new(hunter::backend::OverdriveBackend::new(
+            Arc::new(hunter::backend::NullBackend),
+            overdrive.clone(),
+        )),
         repo_notes: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         scheduler: hunter::server::SchedulerHandle {
             running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paused: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overdrive,
             wake: std::sync::Arc::new(tokio::sync::Notify::new()),
         },
     };
@@ -370,8 +377,12 @@ async fn summary_paused_on_denied_candidate() {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
-    let v: Value = serde_json::from_slice(&body).unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
 
+#[tokio::test]
+async fn summary_paused_on_denied_candidate() {
+    let v = summary_over_queued_fix(false).await;
     assert!(v["current_job"].is_null());
     assert_eq!(v["cycle_running"], Value::Bool(false));
 
@@ -392,4 +403,20 @@ async fn summary_paused_on_denied_candidate() {
         v["backend_status_html"],
         r#"<div class="scv-note">No window data available</div>"#
     );
+}
+
+#[tokio::test]
+async fn summary_overdrive_prioritizes_candidate_but_keeps_hard_denial() {
+    let v = summary_over_queued_fix(true).await;
+    assert_eq!(v["scheduler_overdrive"], Value::Bool(true));
+
+    // Overdrive routes the plain (un-overridden) candidate through the
+    // prioritized path, and the preview must say so ...
+    let nc = &v["next_candidate"];
+    assert_eq!(nc["id"], 5);
+    assert_eq!(nc["is_prioritized"], Value::Bool(true));
+    // ... but a provider hard stop still denies it.
+    assert_eq!(nc["budget_state"], "denied");
+    assert_eq!(nc["budget_reason"], "no window data -- deny until fresh");
+    assert_eq!(v["activity_status"]["kind"], "paused");
 }

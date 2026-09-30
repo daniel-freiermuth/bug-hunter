@@ -14,6 +14,7 @@ const summary = {
   last_cycle: null,
   cycle_running: false,
   scheduler_paused: false,
+  scheduler_overdrive: false,
   current_job: null,
   next_candidate: null,
   scheduler_state: null,
@@ -38,10 +39,13 @@ describe("isSummary", () => {
     expect(isSummary({ ...summary, activity_status: {} })).toBe(false);
   });
 
-  it("rejects a missing or non-boolean scheduler_paused", () => {
+  it("rejects missing or non-boolean scheduler controls", () => {
     expect(isSummary({ ...summary, scheduler_paused: undefined })).toBe(false);
     expect(isSummary({ ...summary, scheduler_paused: null })).toBe(false);
     expect(isSummary({ ...summary, scheduler_paused: "false" })).toBe(false);
+    expect(isSummary({ ...summary, scheduler_overdrive: undefined })).toBe(false);
+    expect(isSummary({ ...summary, scheduler_overdrive: null })).toBe(false);
+    expect(isSummary({ ...summary, scheduler_overdrive: "false" })).toBe(false);
   });
 
   // StatusPage's branches read these with no `?.`, so a body that claims

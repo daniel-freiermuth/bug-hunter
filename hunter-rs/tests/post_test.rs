@@ -155,6 +155,7 @@ async fn test_state() -> TestState {
             scheduler: hunter::server::SchedulerHandle {
                 running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                overdrive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 wake: Arc::new(tokio::sync::Notify::new()),
             },
         },
@@ -1573,4 +1574,62 @@ async fn a_non_boolean_pause_request_is_refused() {
             .paused
             .load(std::sync::atomic::Ordering::SeqCst)
     );
+}
+
+// -- /api/overdrive -----------------------------------------------------------
+
+async fn summary_overdrive(state: &AppState) -> bool {
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/summary")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v: Value = serde_json::from_slice(&bytes).unwrap();
+    v["scheduler_overdrive"]
+        .as_bool()
+        .expect("/api/summary must report scheduler_overdrive")
+}
+
+#[tokio::test]
+async fn overdrive_round_trips_and_wakes_the_scheduler() {
+    let state = test_state().await;
+    assert!(!summary_overdrive(&state).await);
+
+    let (status, body) = post(&state, "/api/overdrive", json!({ "enabled": "yes" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {body}");
+    assert_eq!(body, json!({ "error": "enabled must be a boolean" }));
+    assert!(!summary_overdrive(&state).await);
+
+    let (status, body) = post(&state, "/api/overdrive", json!({ "enabled": true })).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body, json!({ "overdrive": true }));
+    assert!(
+        state
+            .scheduler
+            .overdrive
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the flag shared with the budget backend must be set"
+    );
+    assert!(summary_overdrive(&state).await);
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            state.scheduler.wake.notified()
+        )
+        .await
+        .is_ok(),
+        "enabling overdrive must wake a budget-blocked scheduler"
+    );
+
+    let (status, body) = post(&state, "/api/overdrive", json!({ "enabled": false })).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body, json!({ "overdrive": false }));
+    assert!(!summary_overdrive(&state).await);
 }

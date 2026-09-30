@@ -69,6 +69,8 @@ Handler: server.py:216-217 -> `_summary()` (server.py:256-333) -> `_validate_sum
 | `repos` | array of Repo | `store.list_repos()`: `SELECT * FROM repos WHERE deleted_at IS NULL ORDER BY name`, rows through `_repo_row` (store.py:592-596, 116-128), then pydantic-narrowed to `RepoDict` (types.py:143-158): `id:int, name:str, url:str, path:str, forge:str, default_branch:str, last_hunt_sha:str\|null, last_hunt_at:int\|null, enabled:int (0/1, NOT bool), added_at:int`. The narrowing drops the 6 `last_*_at` migration columns here; `deleted_at` is already gone before it (§7). |
 | `last_cycle` | Event object or null | first event with `kind == "cycle"` within `recent_events(limit=500)` (server.py:267-270). Event shape: see /api/events. |
 | `cycle_running` | bool | `_cycle_lock.locked()` (server.py:311,326) — true JSON boolean. |
+| `scheduler_paused` | bool | process-local pause flag from `SchedulerHandle`; blocks new cycles but does not interrupt a running worker. |
+| `scheduler_overdrive` | bool | process-local overdrive flag from `SchedulerHandle`; when true every budget decision uses the backend's prioritized verdict. Resets to false on daemon restart. |
 | `current_job` | Job object or null | `store.current_job()` (store.py:1243-1280), see below. |
 | `next_candidate` | object or null | computed only when `current_job` is null AND `scheduler.pick_next` yields a candidate (server.py:276-308); see below. |
 | `scheduler_state` | object or null | `store.get_scheduler_state()`: `SELECT * FROM scheduler_state WHERE id = 1` (store.py:1295-1301). Shape (types.py:109-114): `id:1, state:str ("idle"\|"denied"\|"error"), detail:str, next_wake_at:int\|null (epoch ms), updated_at:int`. Null until the daemon loop has run once. |
@@ -82,7 +84,7 @@ JobDict keys (types.py:117-140): `id:int, kind:str, repo_id:int, repo_name:str, 
 
 ### next_candidate (server.py:276-308, TypedDict server.py:970-983)
 
-Built from `scheduler.pick_next(store, cfg)` (exceptions swallowed -> null) and `backend.decide(anticipated_tokens=...)`; verdict = `outlook.prioritized` if the finding has `budget_override` set, else `outlook.normal` (server.py:286-291).
+Built from `scheduler.pick_next(store, cfg)` (exceptions swallowed -> null) and `backend.decide(anticipated_tokens=...)`; verdict = `outlook.prioritized` when the finding has `budget_override` set or scheduler overdrive is enabled, else `outlook.normal`.
 
 | key | type | source |
 |---|---|---|
@@ -90,7 +92,7 @@ Built from `scheduler.pick_next(store, cfg)` (exceptions swallowed -> null) and 
 | `id` | int | target row id |
 | `label` | string or null | `target.get("summary") or target.get("name") or target.get("fingerprint")` (server.py:300-302) |
 | `is_finding` | bool | `kind in ("engage","harvest","recheck","fix")` (server.py:285) |
-| `is_prioritized` | bool | `bool(budget_override)` (server.py:304) |
+| `is_prioritized` | bool | true when the finding has a budget override or scheduler overdrive is enabled |
 | `budget_state` | string | `"denied"` or `"allowed"` — only these two values are ever emitted (server.py:292-296) |
 | `budget_reason` | string | `Denied.reason` / `Granted.reason` |
 | `budget_retry_at` | number or null | `Denied.retry_at` (epoch ms, float) when denied; always null when allowed (server.py:292-296) |
@@ -369,7 +371,7 @@ Cite the symbol names below, not the line numbers: the numbers are a hint for fi
 
 `lib/validate.ts` is the only client-side check, and it is deliberately *not* a schema mirror: it checks what a component dereferences with no `?.`, plus every `{#each}` key, because Svelte 5 throws `each_key_duplicate` inside the component — past the store, where setting `error` could still have shown the operator a dashboard. Because the five polled responses are validated as a unit (§13.1), a violation anywhere in this list takes all of them down.
 
-- `/api/summary` — `isSummary` (`validate.ts:83-96`): `activity_status` an object with a string `kind`; the field that `kind` implies — `job` object for `running`, `candidate` object for `paused` and `ready`, string `detail` for `error`, nothing for the kinds whose branches render no payload (`hasActivityFields`, `:68-80`); string `backend_status_html`; `counts` and `type_counts` objects (contents unchecked); `repos` an array of objects each carrying a **distinct numeric `id`**.
+- `/api/summary` — `isSummary` (`validate.ts:83-99`): `activity_status` an object with a string `kind`; the field that `kind` implies — `job` object for `running`, `candidate` object for `paused` and `ready`, string `detail` for `error`, nothing for the kinds whose branches render no payload; string `backend_status_html`; `counts` and `type_counts` objects; boolean `scheduler_paused` and `scheduler_overdrive`; `repos` an array of objects each carrying a **distinct numeric `id`**.
 - `/api/stats` — `isStats` (`:99-108`): `totals` an object; `by_kind` rows with a distinct **string** `kind`; `by_finding` rows with a distinct **numeric** `finding_id`.
 - `/api/findings` — `isFindingList` (`:144-146`): rows with distinct numeric `id`, and each row's `timeline`, when present and non-null, rows with distinct numeric `id`.
 - `/api/jobs` — `isJobList` (`:149-151`): rows with distinct numeric `id`, and `produced_finding_ids`, when present and non-null, an array with no repeated entry.
@@ -415,5 +417,5 @@ No Svelte code reads `body.error`. Every caller branches on `r.ok` or `r.status`
 
 ## 14. Appendix: POST endpoints (out of scope for round 1)
 
-All under `do_POST` (server.py:419-456); all require `Content-Type: application/json` else `415`:
-`POST /api/verdict` (set finding status), `POST /api/cycle` (trigger cycle; 202/409-busy), `POST /api/recheck`, `POST /api/unqueue`, `POST /api/override` (budget override incl. `id:"all"` clear), `POST /api/repo` (update), `POST /api/repos` (add, 201), `POST /api/repo/delete`, `POST /api/repo/notes` (append note, 201).
+All under the Axum router; all require `Content-Type: application/json` else `415`:
+`POST /api/verdict` (set finding status), `POST /api/cycle` (trigger cycle; 202/409-busy), `POST /api/scheduler` (pause/resume), `POST /api/overdrive` (global prioritized budget mode), `POST /api/recheck`, `POST /api/unqueue`, `POST /api/override` (budget override incl. `id:"all"` clear), `POST /api/repo` (update), `POST /api/repos` (add, 201), `POST /api/repo/delete`, `POST /api/repo/notes` (append note, 201).

@@ -6,6 +6,7 @@
   let btnText = $state("Run Cycle");
   let btnDisabled = $state(false);
   let schedulerBusy = $state(false);
+  let overdriveBusy = $state(false);
 
   async function toggleScheduler() {
     if (!store.summary) return;
@@ -21,6 +22,23 @@
       console.error("scheduler control request failed", err);
     } finally {
       schedulerBusy = false;
+    }
+  }
+
+  async function toggleOverdrive() {
+    if (!store.summary) return;
+    overdriveBusy = true;
+    try {
+      const r = await post("/api/overdrive", { enabled: !store.summary.scheduler_overdrive });
+      if (!r.ok) {
+        console.error(`overdrive control request refused: HTTP ${r.status}`);
+        return;
+      }
+      await store.refresh();
+    } catch (err) {
+      console.error("overdrive control request failed", err);
+    } finally {
+      overdriveBusy = false;
     }
   }
 
@@ -81,16 +99,28 @@
 
       <!-- Cycle control card -->
       <div class="dash-card cycle-card">
-        <button
-          class="scheduler-btn"
-          class:paused={store.summary.scheduler_paused}
-          disabled={schedulerBusy}
-          onclick={toggleScheduler}
-          aria-label={store.summary.scheduler_paused ? "Resume hunter" : "Pause hunter"}
-        >
-          <span class="scheduler-icon">{store.summary.scheduler_paused ? "▶" : "⏸"}</span>
-          <span>{store.summary.scheduler_paused ? "Resume hunter" : "Pause hunter"}</span>
-        </button>
+        <div class="mode-buttons">
+          <button
+            class="scheduler-btn"
+            class:paused={store.summary.scheduler_paused}
+            disabled={schedulerBusy}
+            onclick={toggleScheduler}
+            aria-label={store.summary.scheduler_paused ? "Resume hunter" : "Pause hunter"}
+          >
+            <span class="scheduler-icon">{store.summary.scheduler_paused ? "▶" : "⏸"}</span>
+            <span>{store.summary.scheduler_paused ? "Resume hunter" : "Pause hunter"}</span>
+          </button>
+          <button
+            class="overdrive-btn"
+            class:active={store.summary.scheduler_overdrive}
+            disabled={overdriveBusy}
+            onclick={toggleOverdrive}
+            aria-pressed={store.summary.scheduler_overdrive}
+            title="Use prioritized budget for every job. Provider hard stops still apply."
+          >
+            {store.summary.scheduler_overdrive ? "Overdrive active" : "Enable overdrive"}
+          </button>
+        </div>
         <button
           class="cycle-btn"
           class:ready={activityKind === "ready" && !btnDisabled && !store.summary.cycle_running}
@@ -223,26 +253,47 @@
     flex-direction: column;
     align-items: flex-end;
     justify-content: center;
-    min-width: 180px;
+    min-width: 368px;
   }
 
-  .scheduler-btn {
+  .mode-buttons {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.5rem;
+  }
+
+  .scheduler-btn,
+  .overdrive-btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 0.5rem;
     min-width: 180px;
-    padding: 0.875rem 1.25rem;
+    padding: 0.875rem 1rem;
     border-radius: var(--radius-md);
-    background: var(--bad);
-    color: var(--bg);
     font-size: 1rem;
     font-weight: 700;
   }
-  .scheduler-btn:hover:not(:disabled) { filter: brightness(1.12); }
-  .scheduler-btn:disabled { opacity: 0.55; cursor: default; }
+  .scheduler-btn {
+    background: var(--bad);
+    color: var(--bg);
+  }
+  .scheduler-btn:hover:not(:disabled),
+  .overdrive-btn:hover:not(:disabled) { filter: brightness(1.12); }
+  .scheduler-btn:disabled,
+  .overdrive-btn:disabled { opacity: 0.55; cursor: default; }
   .scheduler-btn.paused { background: var(--ok); }
   .scheduler-icon { font-size: 1.25rem; line-height: 1; }
+
+  .overdrive-btn {
+    background: transparent;
+    border: 1px solid var(--sev-medium);
+    color: var(--sev-medium);
+  }
+  .overdrive-btn.active {
+    background: var(--sev-medium);
+    color: var(--bg);
+  }
 
   .cycle-btn {
     margin-top: 0.625rem;
@@ -330,7 +381,11 @@
       grid-template-columns: 1fr;
     }
     .cycle-card {
-      align-items: flex-start;
+      align-items: stretch;
+      min-width: 0;
+    }
+    .mode-buttons {
+      grid-template-columns: 1fr;
     }
     .last-cycle {
       text-align: left;

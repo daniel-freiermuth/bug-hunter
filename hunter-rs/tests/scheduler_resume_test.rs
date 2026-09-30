@@ -1496,6 +1496,7 @@ async fn previewed_reservation(store: &Arc<Store>, root: &Path) -> Option<i64> {
         scheduler: SchedulerHandle {
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             paused: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            overdrive: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             wake: Arc::new(tokio::sync::Notify::new()),
         },
     };

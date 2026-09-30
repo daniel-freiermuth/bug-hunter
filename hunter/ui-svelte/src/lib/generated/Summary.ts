@@ -21,4 +21,4 @@ counts: { [key in string]: number },
 /**
  * Only observed types; may be {}.
  */
-type_counts: { [key in string]: number }, repos: Array<RepoBrief>, last_cycle: Event | null, cycle_running: boolean, scheduler_paused: boolean, current_job: Job | null, next_candidate: NextCandidate | null, scheduler_state: SchedulerState | null, activity_status: ActivityStatus, };
+type_counts: { [key in string]: number }, repos: Array<RepoBrief>, last_cycle: Event | null, cycle_running: boolean, scheduler_paused: boolean, scheduler_overdrive: boolean, current_job: Job | null, next_candidate: NextCandidate | null, scheduler_state: SchedulerState | null, activity_status: ActivityStatus, };
