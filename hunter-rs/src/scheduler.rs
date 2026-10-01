@@ -9,8 +9,8 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::domain::{
-    ClosureClass, FindingJobKind, FindingStatus, FindingType, JobKind, JobState, RepoJobKind,
-    Severity,
+    BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, JobKind, JobState,
+    RepoJobKind, Severity,
 };
 use crate::store::{CreatedJob, FindingFilter, Store, StoreWriteError, SyncPrData};
 use crate::types::{Finding, Job, Repo};
@@ -84,7 +84,7 @@ pub enum Candidate {
         finding_id: i64,
         repo_id: i64,
         label: Option<String>,
-        budget_override: Option<String>,
+        budget_override: Option<BudgetOverride>,
     },
     /// Continue a suspended attempt instead of redoing it.
     ///
@@ -95,7 +95,7 @@ pub enum Candidate {
     /// tier carries the repo name and no override.
     Resume {
         label: Option<String>,
-        budget_override: Option<String>,
+        budget_override: Option<BudgetOverride>,
         /// Boxed: a plan carries its workspace's paths and dwarfs the
         /// other variants.
         plan: Box<ResumePlan>,
@@ -135,23 +135,17 @@ impl Candidate {
         }
     }
 
-    pub fn budget_override(&self) -> Option<&str> {
+    pub fn budget_override(&self) -> Option<BudgetOverride> {
         match self {
             Self::Finding {
                 budget_override, ..
             }
             | Self::Resume {
                 budget_override, ..
-            } => budget_override.as_deref(),
+            } => *budget_override,
             Self::Repo { .. } => None,
         }
     }
-}
-
-/// Python's truthiness on `budget_override`: NULL and "" are both "no
-/// override" (`if f.get("budget_override")` in `scheduler.pick_next`).
-fn override_of(f: &Finding) -> Option<&str> {
-    f.budget_override.as_deref().filter(|s| !s.is_empty())
 }
 
 /// Candidate for a finding-target kind (engage/harvest/recheck/fix).
@@ -169,7 +163,7 @@ fn finding_candidate(kind: FindingJobKind, f: &Finding) -> Candidate {
         finding_id: f.id,
         repo_id: f.repo_id,
         label: Some(label),
-        budget_override: override_of(f).map(str::to_owned),
+        budget_override: f.budget_override,
     }
 }
 
@@ -274,7 +268,7 @@ pub async fn pick_next(
         (FindingJobKind::Recheck, &rechecking),
         (FindingJobKind::Fix, &queued),
     ] {
-        if let Some(f) = items.iter().find(|f| override_of(f).is_some()) {
+        if let Some(f) = items.iter().find(|f| f.budget_override.is_some()) {
             return Ok(Some(finding_pick(store, cfg, kind, f).await?));
         }
     }
@@ -558,7 +552,7 @@ async fn finding_pick(
         if let Some(plan) = resume_plan(store, cfg, job).await? {
             return Ok(Candidate::Resume {
                 label: fresh.label().map(str::to_owned),
-                budget_override: fresh.budget_override().map(str::to_owned),
+                budget_override: fresh.budget_override(),
                 plan: Box::new(plan),
             });
         }
@@ -1620,7 +1614,7 @@ async fn handle_recheck_failure(
     fid: i64,
     job: i64,
     failure: &str,
-    override_mode: Option<&str>,
+    override_mode: Option<BudgetOverride>,
 ) -> CycleSummary {
     let streak = store
         .record_recheck_attempt(fid, failure)
@@ -1649,7 +1643,7 @@ async fn handle_recheck_failure(
             .await;
         summary.outcome = Some("requeued".into());
     }
-    if override_mode == Some("once") {
+    if override_mode == Some(BudgetOverride::Once) {
         let _ = store.set_budget_override(fid, None).await;
     }
     summary.clone()
@@ -1742,7 +1736,7 @@ pub async fn run_recheck(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
-    let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
+    let override_mode = finding.budget_override;
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -1869,7 +1863,7 @@ pub async fn run_recheck(
             .await;
         summary.outcome = Some("suspended".into());
         summary.worktree = Some(ws.tree.to_string_lossy().into_owned());
-        if override_mode == Some("once") {
+        if override_mode == Some(BudgetOverride::Once) {
             let _ = store.set_budget_override(fid, None).await;
         }
         return Ok(summary);
@@ -2003,7 +1997,7 @@ pub async fn run_recheck(
     };
     summary.verdict = Some(verdict_str.to_owned());
     summary.reason = Some(reason.to_owned());
-    if override_mode == Some("once") {
+    if override_mode == Some(BudgetOverride::Once) {
         let _ = store.set_budget_override(fid, None).await;
     }
     Ok(summary)
@@ -2522,7 +2516,7 @@ pub async fn run_fix(
         "improve"
     };
     let branch = format!("{branch_prefix}/{slug}-{fid}");
-    let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
+    let override_mode = finding.budget_override;
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -2777,7 +2771,7 @@ pub async fn run_fix(
                                 .await;
                             summary.outcome = Some("pr_open".into());
                             summary.pr_url = Some(pr_url);
-                            if override_mode == Some("once") {
+                            if override_mode == Some(BudgetOverride::Once) {
                                 let _ = store.set_budget_override(fid, None).await;
                             }
                             let _ = store
@@ -2806,7 +2800,7 @@ pub async fn run_fix(
                                     .await;
                                 summary.outcome = Some("pr_open".into());
                                 summary.pr_url = Some(pr_url);
-                                if override_mode == Some("once") {
+                                if override_mode == Some(BudgetOverride::Once) {
                                     let _ = store.set_budget_override(fid, None).await;
                                 }
                                 let _ = store
@@ -2904,7 +2898,7 @@ pub async fn run_fix(
                 summary.failure = Some(failure);
             }
         }
-        if override_mode == Some("once") {
+        if override_mode == Some(BudgetOverride::Once) {
             let _ = store.set_budget_override(fid, None).await;
         }
         let _ = store
@@ -3433,7 +3427,7 @@ pub async fn run_engage(
         }
     }
 
-    let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
+    let override_mode = finding.budget_override;
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -3773,7 +3767,7 @@ pub async fn run_engage(
                 .await;
             summary.outcome = Some("retry".into());
             summary.failure = Some(fail.clone());
-            if override_mode == Some("once") {
+            if override_mode == Some(BudgetOverride::Once) {
                 let _ = store.set_budget_override(fid, None).await;
             }
             break 'post summary;
@@ -3813,7 +3807,7 @@ pub async fn run_engage(
             )
             .await;
         summary.outcome = Some("engaged".into());
-        if override_mode == Some("once") {
+        if override_mode == Some(BudgetOverride::Once) {
             let _ = store.set_budget_override(fid, None).await;
         }
         summary
@@ -4102,7 +4096,7 @@ pub async fn run_harvest(
         }
     }
 
-    let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
+    let override_mode = finding.budget_override;
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -4267,7 +4261,7 @@ pub async fn run_harvest(
             .await;
         summary.outcome = Some("suspended".into());
         summary.worktree = Some(worktree.to_string_lossy().into_owned());
-        if override_mode == Some("once") {
+        if override_mode == Some(BudgetOverride::Once) {
             let _ = store.set_budget_override(fid, None).await;
         }
         return Ok(summary);
@@ -4336,7 +4330,7 @@ pub async fn run_harvest(
             summary.outcome = Some("retry".into());
         }
         summary.failure = Some(detail.clone());
-        if override_mode == Some("once") {
+        if override_mode == Some(BudgetOverride::Once) {
             let _ = store.set_budget_override(fid, None).await;
         }
         return Ok(summary);
@@ -4369,7 +4363,7 @@ pub async fn run_harvest(
                     .await;
                 summary.outcome = Some("retry".into());
                 summary.failure = Some(format!("recording the classification failed: {e}"));
-                if override_mode == Some("once") {
+                if override_mode == Some(BudgetOverride::Once) {
                     let _ = store.set_budget_override(fid, None).await;
                 }
                 return Ok(summary);
@@ -4410,7 +4404,7 @@ pub async fn run_harvest(
         )
         .await;
     summary.outcome = Some("harvested".into());
-    if override_mode == Some("once") {
+    if override_mode == Some(BudgetOverride::Once) {
         let _ = store.set_budget_override(fid, None).await;
     }
     Ok(summary)

@@ -26,7 +26,8 @@ use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::domain::{
-    BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState, RepoJobKind, Severity,
+    BudgetOverride, BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState,
+    RepoJobKind, Severity,
 };
 use crate::types::{
     Event, Finding, Job, JobListEntry, PrState, Repo, SchedulerState, StatsByFinding, StatsByKind,
@@ -461,7 +462,7 @@ impl Store {
                    severity AS "severity: Severity", confidence, summary, detail, status AS "status: FindingStatus", pr_url,
                    created_at, updated_at, bug_class AS "bug_class: BugClass", evidence_plan,
                    introduced_by, rung_achieved, verdict_reason,
-                   budget_override, fix_attempts, last_fix_failure,
+                   budget_override AS "budget_override: BudgetOverride", fix_attempts, last_fix_failure,
                    recheck_attempts, last_recheck_failure, ecosystem, package,
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
@@ -531,11 +532,11 @@ impl Store {
     }
 
     /// UPDATE findings SET `budget_override` = ?, `updated_at` = now WHERE id = ?.
-    /// mode: Some("once") | Some("exempt") | None (clear).
+    /// `None` clears the override.
     pub async fn set_budget_override(
         &self,
         finding_id: i64,
-        mode: Option<&str>,
+        mode: Option<BudgetOverride>,
     ) -> sqlx::Result<()> {
         let now = now_ms();
         sqlx::query!(
@@ -917,7 +918,7 @@ impl Store {
                    severity AS "severity: Severity", confidence, summary, detail, status AS "status: FindingStatus", pr_url,
                    created_at, updated_at, bug_class AS "bug_class: BugClass", evidence_plan,
                    introduced_by, rung_achieved, verdict_reason,
-                   budget_override, fix_attempts, last_fix_failure,
+                   budget_override AS "budget_override: BudgetOverride", fix_attempts, last_fix_failure,
                    recheck_attempts, last_recheck_failure, ecosystem, package,
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
@@ -2035,7 +2036,7 @@ impl Store {
                    severity AS "severity: Severity", confidence, summary, detail, status AS "status: FindingStatus", pr_url,
                    created_at, updated_at, bug_class AS "bug_class: BugClass", evidence_plan,
                    introduced_by, rung_achieved, verdict_reason,
-                   budget_override, fix_attempts, last_fix_failure,
+                   budget_override AS "budget_override: BudgetOverride", fix_attempts, last_fix_failure,
                    recheck_attempts, last_recheck_failure, ecosystem, package,
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
@@ -2078,7 +2079,7 @@ impl Store {
                    severity AS "severity: Severity", confidence, summary, detail, status AS "status: FindingStatus", pr_url,
                    created_at, updated_at, bug_class AS "bug_class: BugClass", evidence_plan,
                    introduced_by, rung_achieved, verdict_reason,
-                   budget_override, fix_attempts, last_fix_failure,
+                   budget_override AS "budget_override: BudgetOverride", fix_attempts, last_fix_failure,
                    recheck_attempts, last_recheck_failure, ecosystem, package,
                    current_version, latest_version, update_type,
                    security_advisory, missing_tests, test_file, smell_type,
@@ -2444,7 +2445,7 @@ impl Store {
                    f.severity AS "severity: Severity", f.confidence, f.summary, f.detail, f.status AS "status: FindingStatus", f.pr_url,
                    f.created_at, f.updated_at, f.bug_class AS "bug_class: BugClass", f.evidence_plan,
                    f.introduced_by, f.rung_achieved, f.verdict_reason,
-                   f.budget_override, f.fix_attempts, f.last_fix_failure,
+                   f.budget_override AS "budget_override: BudgetOverride", f.fix_attempts, f.last_fix_failure,
                    f.recheck_attempts, f.last_recheck_failure, f.ecosystem, f.package,
                    f.current_version, f.latest_version, f.update_type,
                    f.security_advisory, f.missing_tests, f.test_file, f.smell_type,
@@ -2484,7 +2485,7 @@ impl Store {
                    f.summary, f.detail, f.status AS "status: FindingStatus", f.pr_url,
                    f.created_at, f.updated_at, f.bug_class AS "bug_class: BugClass",
                    f.evidence_plan, f.introduced_by, f.rung_achieved, f.verdict_reason,
-                   f.budget_override, f.fix_attempts, f.last_fix_failure,
+                   f.budget_override AS "budget_override: BudgetOverride", f.fix_attempts, f.last_fix_failure,
                    f.recheck_attempts, f.last_recheck_failure, f.ecosystem, f.package,
                    f.current_version, f.latest_version, f.update_type,
                    f.security_advisory, f.missing_tests, f.test_file, f.smell_type,

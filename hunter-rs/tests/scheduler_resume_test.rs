@@ -781,7 +781,10 @@ async fn an_overridden_finding_resumes_its_suspended_attempt_under_the_override(
 
     let picked = pick_next(&store, &cfg, None).await.unwrap().unwrap();
 
-    assert_eq!(picked.budget_override(), Some("once"));
+    assert_eq!(
+        picked.budget_override(),
+        Some(hunter::domain::BudgetOverride::Once)
+    );
     assert_eq!(resume_plan_of(Some(picked)).predecessor_id, 20);
 }
 

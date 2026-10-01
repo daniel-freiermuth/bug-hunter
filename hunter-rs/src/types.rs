@@ -20,7 +20,9 @@
 //!   "present but possibly null" as plain Option; "absent OR null" as
 //!   Option<Option<T>> (None = absent, Some(None) = null).
 
-use crate::domain::{BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState, Severity};
+use crate::domain::{
+    BudgetOverride, BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState, Severity,
+};
 use serde::Serialize;
 use ts_rs::TS;
 
@@ -121,7 +123,7 @@ pub struct Finding {
     pub introduced_by: Option<String>,
     pub rung_achieved: Option<i64>,
     pub verdict_reason: Option<String>,
-    pub budget_override: Option<String>,
+    pub budget_override: Option<BudgetOverride>,
     pub fix_attempts: i64,
     pub last_fix_failure: Option<String>,
     pub recheck_attempts: i64,
