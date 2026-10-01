@@ -233,8 +233,9 @@ async fn list_attention(store: &Store) -> sqlx::Result<Vec<Finding>> {
 /// ([`finding_pick`]).
 ///
 /// Read-only but for retiring suspensions that can never be continued —
-/// a chain past the give-up ceiling, or one whose working directory is
-/// gone — which [`resume_plan`] does as it skips over them. Those writes
+/// a chain past the give-up ceiling, one whose working directory is
+/// gone, or a fix/recheck whose finding has left the status its executor
+/// acts on — which [`resume_plan`] does as it skips over them. Those writes
 /// are best-effort precisely because this function is also the
 /// `/api/summary` preview, which may hold a read-only handle — the
 /// candidate is skipped either way, and the scheduler's own next cycle
@@ -575,9 +576,10 @@ async fn finding_pick(
 /// it edit files that are not there. A row from before per-chain
 /// workspaces fails this too: its transcript and tree are in the old
 /// layout, and its row has no pinned commit. And the chain must be under
-/// the give-up ceiling.
+/// the give-up ceiling, and a fix or recheck's finding still in the
+/// status its executor acts on.
 ///
-/// Failing either is permanent, so the job is retired here rather than
+/// Failing any is permanent, so the job is retired here rather than
 /// skipped. A skip leaves the row `suspended`: it is offered again every
 /// cycle and never leaves the table. Refusing from inside the executor
 /// would be worse — this tier outranks repo rotation, so the same
@@ -592,6 +594,38 @@ async fn resume_plan(store: &Store, cfg: &Config, job: Job) -> anyhow::Result<Op
     let Some(repo) = store.get_repo_by_id(job.repo_id).await? else {
         return Ok(None);
     };
+    // A fix or recheck executor refuses a finding that has left the
+    // status it acts on (`run_fix`, `run_recheck`) without touching this
+    // row, so offering it would make the same refusal the pick of every
+    // cycle. The operator moves a finding there (unqueue, a verdict);
+    // nothing moves it back on the chain's behalf, so this is retired
+    // like any other dead end. `fixing` still counts for a fix: it is the
+    // window before `run_fix`, or startup reconciliation, puts the
+    // finding back to `queued`.
+    let acts_on: &[FindingStatus] = match job.kind {
+        JobKind::Finding(FindingJobKind::Fix) => &[FindingStatus::Queued, FindingStatus::Fixing],
+        JobKind::Finding(FindingJobKind::Recheck) => &[FindingStatus::Rechecking],
+        _ => &[],
+    };
+    if !acts_on.is_empty()
+        && let Some(fid) = job.finding_id
+        && let Some(finding) = store.get_finding(fid).await?
+        && !acts_on.contains(&finding.status)
+    {
+        let msg = format!(
+            "resume {} {}: job {} retired, finding #{fid} is {}",
+            job.kind, repo.name, job.id, finding.status
+        );
+        // Best-effort, like the retirements below. `killed_reason` is
+        // left alone: the attempt really did stop on its own reason.
+        let _ = store
+            .retire_suspended_job(job.id, JobState::Killed, None, &msg)
+            .await;
+        let _ = store
+            .log_event("resume", &msg, Some(job.id), job.finding_id)
+            .await;
+        return Ok(None);
+    }
     let origin_job_id = store.resume_origin_job(job.id).await?;
     let workspace = crate::workspace::Workspace::for_chain(
         &cfg.work_root,

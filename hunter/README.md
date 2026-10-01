@@ -178,7 +178,7 @@ definition at least its own cap, and the largest attempt is discounted
 because one enormous attempt says the job is big, not that the chain is
 stuck.
 
-Two more things end a suspension, because after either one it can never
+Three more things end a suspension, because after any of them it can never
 usefully be continued, and a suspension nobody ends stays `suspended`
 forever:
 
@@ -199,6 +199,13 @@ forever:
   pinned commit — so the suspension is marked `killed` (reason
   `workdir-gone`) when selection reaches it, and selection moves on to
   the next candidate the same cycle.
+- **Finding moved on.** A suspended fix whose finding is no longer
+  `queued`, or a suspended recheck whose finding is no longer
+  `rechecking` — unqueued, or given a verdict — is marked `killed` when
+  selection reaches it, and selection moves on the same cycle. Their
+  executors refuse such a finding without touching the row, so
+  offering it would pick the same refusal every cycle, ahead of every
+  repo scan.
 
 ### Budget policy
 
