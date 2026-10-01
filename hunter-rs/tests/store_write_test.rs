@@ -190,7 +190,7 @@ async fn delete_repo_refusal_message_is_byte_exact_and_clean_delete_works() {
         "an invisible repo is still holding its id until its files are gone"
     );
     store.forget_deleted_repo(2).await.unwrap();
-    assert!(store.deleted_repo_ids().await.unwrap().is_empty());
+    assert_eq!(store.deleted_repo_ids().await.unwrap(), [] as [i64; 0]);
 }
 
 // -- 3b. create_job vs a soft-deleted repo --------------------------------
@@ -264,7 +264,7 @@ async fn create_job_refuses_a_soft_deleted_repo_and_leaves_it_reapable() {
     // id, so the reaper's DELETE goes through instead of hitting the FK.
     assert_eq!(store.deleted_repo_ids().await.unwrap(), vec![2]);
     store.forget_deleted_repo(2).await.unwrap();
-    assert!(store.deleted_repo_ids().await.unwrap().is_empty());
+    assert_eq!(store.deleted_repo_ids().await.unwrap(), [] as [i64; 0]);
     let still_there = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM repos WHERE id = 2")
         .fetch_one(&pool)
         .await

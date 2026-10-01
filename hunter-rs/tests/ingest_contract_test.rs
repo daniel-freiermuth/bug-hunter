@@ -330,7 +330,7 @@ async fn a_job_given_a_finding_produces_nothing() {
         .into_iter()
         .find(|e| e.job.id == fix)
         .unwrap();
-    assert!(entry.produced_finding_ids.is_empty());
+    assert_eq!(entry.produced_finding_ids, [] as [i64; 0]);
     assert_eq!(entry.job.finding_id, Some(found[0]));
 }
 

@@ -599,7 +599,7 @@ fn github_view_accepts_valid_json_with_fields_missing() {
         .expect("an empty object is valid JSON");
     assert_eq!(view.state, PrState::Open, "absent state defaults to open");
     assert_eq!(view.mergeable, Mergeable::Unknown);
-    assert!(view.head_ref.is_empty());
+    assert_eq!(view.head_ref, "");
     assert!(view.comments.is_empty());
 
     bins.ok(

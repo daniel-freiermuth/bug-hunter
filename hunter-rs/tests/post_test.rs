@@ -1232,7 +1232,10 @@ async fn a_reclaimed_id_is_never_reissued() {
     assert_eq!(status, StatusCode::OK);
     hunter::server::reap_deleted_repos(&state.store, &state.config.work_root, &state.repo_notes)
         .await;
-    assert!(state.store.deleted_repo_ids().await.unwrap().is_empty());
+    assert_eq!(
+        state.store.deleted_repo_ids().await.unwrap(),
+        [] as [i64; 0]
+    );
 
     let (status, body) = post(
         &state,

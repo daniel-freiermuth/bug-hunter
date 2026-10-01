@@ -791,7 +791,7 @@ async fn a_finding_rejected_after_its_pr_closed_is_not_picked() {
     );
 }
 
-/// A diff that carries its own ``` and ```` lines (a markdown file) stays
+/// A diff with three- and four-backtick fence lines (a markdown file) stays
 /// one block: the fence is longer than any backtick run in it, so the
 /// block closes only after the whole diff.
 #[tokio::test]
