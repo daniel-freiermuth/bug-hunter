@@ -1,10 +1,11 @@
-//! omp-scavenge backend — spends idle Claude-subscription capacity by
+//! omp-scavenge backend — spends idle subscription capacity by
 //! scavenging omp's local usage mirror. Port of
 //! `hunter/backends/omp_scavenge`/ per BACKEND-CONTRACT.md §2.
 //!
-//! `capacity`: the two-ramp window math. `facade`: `decide`, `keep_fresh`
-//! and `status_html`. `harness`: `run_worker`, the usage-delta sandwich
-//! around it, and `Backend::run`.
+//! `provider`: each provider's quota windows, as data. `capacity`: the
+//! window reading and ramp math. `facade`: `decide`, `keep_fresh` and
+//! `status_html`, one loop over the provider's windows. `harness`:
+//! `run_worker`, the usage-delta sandwich around it, and `Backend::run`.
 pub mod capacity;
 mod facade;
 pub mod harness;

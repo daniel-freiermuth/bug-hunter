@@ -30,20 +30,20 @@ fn now_ms() -> i64 {
 
 #[test]
 fn test_ramp_7d_none_returns_1() {
-    assert_eq!(ramp_7d(None, now_ms()), 1.0);
+    assert_eq!(ramp_linear(None, WEEK_MS, now_ms()), 1.0);
 }
 
 #[test]
 fn test_ramp_7d_expired_returns_1() {
     let now = now_ms();
-    assert_eq!(ramp_7d(Some(now - 1000), now), 1.0);
+    assert_eq!(ramp_linear(Some(now - 1000), WEEK_MS, now), 1.0);
 }
 
 #[test]
 fn test_ramp_7d_midpoint_returns_half() {
     let now = now_ms();
     let resets = now + WEEK_MS / 2;
-    let r = ramp_7d(Some(resets), now);
+    let r = ramp_linear(Some(resets), WEEK_MS, now);
     assert!((r - 0.5).abs() < 1e-6, "expected ~0.5, got {r}");
 }
 
@@ -51,7 +51,7 @@ fn test_ramp_7d_midpoint_returns_half() {
 fn test_ramp_7d_start_returns_zero() {
     let now = now_ms();
     let resets = now + WEEK_MS;
-    let r = ramp_7d(Some(resets), now);
+    let r = ramp_linear(Some(resets), WEEK_MS, now);
     assert!((r - 0.0).abs() < 1e-6, "expected ~0.0, got {r}");
 }
 
@@ -59,7 +59,7 @@ fn test_ramp_7d_start_returns_zero() {
 fn test_ramp_7d_bad_data_clamped() {
     let now = now_ms();
     let resets = now + 2 * WEEK_MS;
-    let r = ramp_7d(Some(resets), now);
+    let r = ramp_linear(Some(resets), WEEK_MS, now);
     assert!(r <= 1.0, "expected ≤1.0, got {r}");
 }
 
@@ -69,13 +69,13 @@ fn test_ramp_7d_bad_data_clamped() {
 
 #[test]
 fn test_ramp_5h_none_returns_none() {
-    assert!(ramp_5h(None, now_ms()).is_none());
+    assert!(ramp_after_headroom(None, FIVE_H_MS, now_ms()).is_none());
 }
 
 #[test]
 fn test_ramp_5h_expired_returns_none() {
     let now = now_ms();
-    assert!(ramp_5h(Some(now - 1000), now).is_none());
+    assert!(ramp_after_headroom(Some(now - 1000), FIVE_H_MS, now).is_none());
 }
 
 #[test]
@@ -83,7 +83,7 @@ fn test_ramp_5h_15min_elapsed_returns_zero() {
     let now = now_ms();
     // 15 min elapsed: resets_at = now + (5h - 15m)
     let resets = now + FIVE_H_MS - 15 * 60 * 1000;
-    let r = ramp_5h(Some(resets), now).expect("should be Some");
+    let r = ramp_after_headroom(Some(resets), FIVE_H_MS, now).expect("should be Some");
     assert!((r - 0.0).abs() < 1e-9, "expected 0.0, got {r}");
 }
 
@@ -93,7 +93,7 @@ fn test_ramp_5h_halfway_returns_half() {
     // 2.75h elapsed: resets_at = now + (5h - 2.75h) = now + 2.25h
     let elapsed_ms = (2.75 * 3_600_000.0) as i64;
     let resets = now + FIVE_H_MS - elapsed_ms;
-    let r = ramp_5h(Some(resets), now).expect("should be Some");
+    let r = ramp_after_headroom(Some(resets), FIVE_H_MS, now).expect("should be Some");
     assert!((r - 0.5).abs() < 1e-6, "expected ~0.5, got {r}");
 }
 
@@ -101,7 +101,7 @@ fn test_ramp_5h_halfway_returns_half() {
 fn test_ramp_5h_just_started_never_negative() {
     let now = now_ms();
     let resets = now + FIVE_H_MS; // just started, 0 elapsed
-    let r = ramp_5h(Some(resets), now).expect("should be Some");
+    let r = ramp_after_headroom(Some(resets), FIVE_H_MS, now).expect("should be Some");
     assert!(r >= 0.0, "expected ≥0.0, got {r}");
     assert!((r - 0.0).abs() < 1e-9, "expected 0.0, got {r}");
 }
@@ -112,7 +112,7 @@ fn test_ramp_5h_just_started_never_negative() {
 
 #[test]
 fn test_retry_at_7d_none_returns_none() {
-    assert!(retry_at_7d(None, 0.5).is_none());
+    assert!(retry_at_linear(None, WEEK_MS, 0.5).is_none());
 }
 
 #[test]
@@ -120,11 +120,11 @@ fn test_retry_at_7d_round_trip() {
     let now = now_ms();
     let resets = now + (0.4 * WEEK_MS as f64) as i64;
     for u in [0.0, 0.1, 0.5, 0.9] {
-        let rt = retry_at_7d(Some(resets), u).expect("should be Some");
-        let back = ramp_7d(Some(resets), rt as i64);
+        let rt = retry_at_linear(Some(resets), WEEK_MS, u).expect("should be Some");
+        let back = ramp_linear(Some(resets), WEEK_MS, rt as i64);
         assert!(
             (back - u).abs() < 1e-9,
-            "round-trip failed for u={u}: ramp_7d(resets, retry_at_7d(resets, {u})) = {back}"
+            "round-trip failed for u={u}: ramp_linear(resets, WEEK_MS, retry_at_linear(resets, WEEK_MS, {u})) = {back}"
         );
     }
 }
@@ -135,7 +135,7 @@ fn test_retry_at_7d_round_trip() {
 
 #[test]
 fn test_retry_at_5h_none_returns_none() {
-    assert!(retry_at_5h(None, 0.5).is_none());
+    assert!(retry_at_after_headroom(None, FIVE_H_MS, 0.5).is_none());
 }
 
 #[test]
@@ -143,11 +143,11 @@ fn test_retry_at_5h_round_trip() {
     let now = now_ms();
     let resets = now + (3.2 * 3_600_000.0) as i64;
     for u in [0.0, 0.25, 0.5, 0.9] {
-        let rt = retry_at_5h(Some(resets), u).expect("should be Some");
-        let back = ramp_5h(Some(resets), rt as i64).expect("should be Some");
+        let rt = retry_at_after_headroom(Some(resets), FIVE_H_MS, u).expect("should be Some");
+        let back = ramp_after_headroom(Some(resets), FIVE_H_MS, rt as i64).expect("should be Some");
         assert!(
             (back - u).abs() < 1e-9,
-            "round-trip failed for u={u}: ramp_5h(resets, retry_at_5h(resets, {u})) = {back}"
+            "round-trip failed for u={u}: ramp_after_headroom(resets, FIVE_H_MS, retry_at_after_headroom(resets, FIVE_H_MS, {u})) = {back}"
         );
     }
 }
@@ -156,12 +156,12 @@ fn test_retry_at_5h_round_trip() {
 fn test_retry_at_5h_zero_equals_window_start_plus_headroom() {
     let now = now_ms();
     let resets = now + 4 * 3_600_000; // resets in 4h → elapsed 1h
-    let rt = retry_at_5h(Some(resets), 0.0).expect("should be Some");
+    let rt = retry_at_after_headroom(Some(resets), FIVE_H_MS, 0.0).expect("should be Some");
     let window_start = (resets - FIVE_H_MS) as f64;
     let expected = window_start + HEADROOM_MS as f64;
     assert!(
         (rt - expected).abs() < 1.0,
-        "expected retry_at_5h(resets,0) = window_start + HEADROOM; got {rt}, expected {expected}"
+        "expected retry_at_after_headroom(resets, FIVE_H_MS, 0) = window_start + HEADROOM; got {rt}, expected {expected}"
     );
 }
 
@@ -478,22 +478,55 @@ async fn test_read_windows_zero_resets_kept() {
 
 #[test]
 fn test_ramp_7d_zero_resets_returns_1() {
-    assert_eq!(ramp_7d(Some(0), now_ms()), 1.0);
+    assert_eq!(ramp_linear(Some(0), WEEK_MS, now_ms()), 1.0);
 }
 
 #[test]
 fn test_ramp_5h_zero_resets_returns_none() {
-    assert!(ramp_5h(Some(0), now_ms()).is_none());
+    assert!(ramp_after_headroom(Some(0), FIVE_H_MS, now_ms()).is_none());
 }
 
 #[test]
 fn test_retry_at_7d_zero_returns_none() {
-    assert!(retry_at_7d(Some(0), 0.5).is_none());
+    assert!(retry_at_linear(Some(0), WEEK_MS, 0.5).is_none());
 }
 
 #[test]
 fn test_retry_at_5h_zero_returns_none() {
-    assert!(retry_at_5h(Some(0), 0.5).is_none());
+    assert!(retry_at_after_headroom(Some(0), FIVE_H_MS, 0.5).is_none());
+}
+
+// ============================================================
+// Provider quota tables
+// ============================================================
+
+/// The window order is policy (first denial wins, the shortest window
+/// keys freshness, the longest one the usage delta), and a fallback
+/// capacity pointing at a missing window would resolve to 0 and stop
+/// reservations from counting. Both must hold for every provider before
+/// any calibration history exists.
+#[test]
+fn every_quota_is_ordered_longest_first_with_positive_fallbacks() {
+    for provider in LlmProvider::ALL {
+        let quota = provider.quota();
+        assert!(!quota.windows.is_empty(), "{provider:?} has no windows");
+        assert!(
+            quota
+                .windows
+                .windows(2)
+                .all(|pair| pair[0].period_ms > pair[1].period_ms),
+            "{provider:?} windows are not longest first"
+        );
+        let no_history = vec![None; quota.windows.len()];
+        for (index, window) in quota.windows.iter().enumerate() {
+            let capacity = quota.capacity(index, &no_history);
+            assert!(
+                capacity > 0.0,
+                "{provider:?} {}: fallback capacity {capacity}",
+                window.limit_id
+            );
+        }
+    }
 }
 
 // ============================================================

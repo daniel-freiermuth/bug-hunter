@@ -9,12 +9,11 @@ use std::collections::BTreeMap;
 
 use std::path::Path;
 
-/// THE tunable: human headroom at 5h-window start (`capacity.HEADROOM_MS`).
+/// THE tunable: human headroom at the start of an
+/// [`ramp_after_headroom`] window (`capacity.HEADROOM_MS`).
 pub const HEADROOM_MS: i64 = 30 * 60 * 1000;
 pub const WEEK_MS: i64 = 604_800_000;
 pub const FIVE_H_MS: i64 = 18_000_000;
-/// 5h ramp span after headroom: 4.5 h.
-pub const RAMP_MS: i64 = FIVE_H_MS - HEADROOM_MS;
 
 /// One provider window as read from omp's usage mirror.
 #[derive(Debug, Clone)]
@@ -38,7 +37,7 @@ pub fn default_agent_db() -> std::path::PathBuf {
 }
 
 /// Read the newest `usage_history` row per `limit_id` of the provider; roll
-/// expired short/long cycles forward (used=0, status=ok, `recorded_at=cycle`
+/// expired quota windows forward (used=0, status=ok, `recorded_at=cycle`
 /// start), DROP any other expired row (Anthropic's per-model-class limits).
 /// Missing file or ANY sqlite error -> empty map. `BTreeMap`: deny-reason
 /// precedence needs ascending `limit_id` order.
@@ -91,9 +90,8 @@ async fn read_windows_async(
         .read_only(true);
     let pool = sqlx::SqlitePool::connect_with(opts).await?;
 
-    // Every limit of the provider, not just its short and long window:
+    // Every limit of the provider, not just its quota windows:
     // Anthropic's per-model-class weekly limits gate spending too.
-    let limits = provider.windows();
     let rows = sqlx::query(
         "SELECT limit_id, used_fraction, status, resets_at, recorded_at \
          FROM ( \
@@ -133,11 +131,9 @@ async fn read_windows_async(
             // Truthy resets_at (> 0) that has expired (<= now_ms).
             // Some(0) is falsy like Python's `not resets_at`.
             Some(r) if r > 0 && r <= now_ms => {
-                let period = if limit_id == limits.short.limit_id {
-                    limits.short.period_ms
-                } else if limit_id == limits.long.limit_id {
-                    limits.long.period_ms
-                } else {
+                // Account-wide windows roll forward; any other expired
+                // row (Anthropic's per-model-class limits) is dropped.
+                let Some(period) = provider.quota().window(&limit_id).map(|w| w.period_ms) else {
                     continue;
                 };
                 // Roll forward: advance resets_at by period until > now,
@@ -180,49 +176,60 @@ async fn read_windows_async(
     Ok(result)
 }
 
-/// not `resets_at` or expired -> 1.0; else min(elapsed/week, 1.0).
-pub fn ramp_7d(resets_at: Option<i64>, now_ms: i64) -> f64 {
+/// Linear pacing: allowance = elapsed fraction of the `period_ms` cycle
+/// ending at `resets_at`, capped at 1.0. No `resets_at` (or 0) -> 1.0.
+pub fn ramp_linear(resets_at: Option<i64>, period_ms: i64, now_ms: i64) -> f64 {
     match resets_at {
         None | Some(0) => 1.0,
         // An expired window needs no arm of its own: elapsed is then at
-        // least a full week, so the `.min(1.0)` below already returns 1.0.
-        // A guard here would be unfalsifiable — no input distinguishes it.
+        // least a full period, so the `.min(1.0)` below already returns
+        // 1.0. A guard here would be unfalsifiable — no input
+        // distinguishes it.
         Some(r) => {
-            let elapsed = (now_ms - (r - WEEK_MS)) as f64;
-            (elapsed / WEEK_MS as f64).min(1.0)
+            let elapsed = (now_ms - (r - period_ms)) as f64;
+            (elapsed / period_ms as f64).min(1.0)
         }
     }
 }
 
-/// not `resets_at` or expired -> None (no active window: opener allowed);
-/// else max(0, (elapsed - HEADROOM) / RAMP).
-pub fn ramp_5h(resets_at: Option<i64>, now_ms: i64) -> Option<f64> {
+/// Pacing after `HEADROOM_MS`: allowance 0 for the cycle's first
+/// `HEADROOM_MS` (left to the human), then linear to 1.0 at the reset.
+/// No `resets_at` (or 0), or expired -> None: no active window, so it
+/// does not gate and the next job opens it.
+pub fn ramp_after_headroom(resets_at: Option<i64>, period_ms: i64, now_ms: i64) -> Option<f64> {
     match resets_at {
         None | Some(0) => None,
         Some(r) if r <= now_ms => None, // expired
         Some(r) => {
-            let elapsed = (FIVE_H_MS - (r - now_ms)) as f64;
-            Some(((elapsed - HEADROOM_MS as f64) / RAMP_MS as f64).max(0.0))
+            let elapsed = (period_ms - (r - now_ms)) as f64;
+            Some(((elapsed - HEADROOM_MS as f64) / (period_ms - HEADROOM_MS) as f64).max(0.0))
         }
     }
 }
 
-/// Exact inverse of `ramp_7d`; None when `resets_at` is None/0.
-pub fn retry_at_7d(resets_at: Option<i64>, effective_used: f64) -> Option<f64> {
+/// Exact inverse of [`ramp_linear`]; None when `resets_at` is None/0.
+pub fn retry_at_linear(resets_at: Option<i64>, period_ms: i64, effective_used: f64) -> Option<f64> {
     match resets_at {
         None | Some(0) => None,
         Some(r) => {
-            let raw = (r - WEEK_MS) as f64 + effective_used * WEEK_MS as f64;
+            let raw = (r - period_ms) as f64 + effective_used * period_ms as f64;
             Some(raw.min(r as f64))
         }
     }
 }
 
-pub fn retry_at_5h(resets_at: Option<i64>, effective_used: f64) -> Option<f64> {
+/// Exact inverse of [`ramp_after_headroom`]; None when `resets_at` is None/0.
+pub fn retry_at_after_headroom(
+    resets_at: Option<i64>,
+    period_ms: i64,
+    effective_used: f64,
+) -> Option<f64> {
     match resets_at {
         None | Some(0) => None,
         Some(r) => {
-            let raw = (r - FIVE_H_MS) as f64 + HEADROOM_MS as f64 + effective_used * RAMP_MS as f64;
+            let raw = (r - period_ms) as f64
+                + HEADROOM_MS as f64
+                + effective_used * (period_ms - HEADROOM_MS) as f64;
             Some(raw.min(r as f64))
         }
     }

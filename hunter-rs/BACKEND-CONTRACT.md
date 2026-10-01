@@ -4,6 +4,24 @@ Extracted 2026-09-13 from the Python source at the paths cited below. Companion 
 
 Sources of truth: `hunter/backend.py`; `hunter/backends/omp_scavenge/{__init__,facade,capacity,harness}.py`; `hunter/store.py`; `hunter/types.py`; call sites in `hunter/server.py` + `hunter/scheduler.py`; tests `tests/test_budget.py`, `tests/test_unaccounted_tokens.py`, `tests/test_refresh_stale_probe.py`, `tests/test_store.py`, `tests/test_server.py`.
 
+**Rust quota windows:** the Python 5h pass and 7d pass below are one loop
+in Rust. `LlmProvider::quota()` (provider.rs) lists each provider's
+quota windows, longest period first. Each window has a `limit_id`, a
+status label, a period, a pacing, optional extra limits that gate with it,
+and a fallback capacity. `Pacing::Linear` is `ramp_7d`/`retry_at_7d` over
+the window's period (`ramp_linear`/`retry_at_linear`), and
+`Pacing::AfterHeadroom` is `ramp_5h`/`retry_at_5h` over it
+(`ramp_after_headroom`/`retry_at_after_headroom`). Anthropic's 7d window
+takes `anthropic:7d:<class>` as extra limits, which replaces the `":7d" in
+lid` test. The list order is policy: the first window that denies supplies
+the reason and `retry_at`; the longest window's rows are the usage delta;
+the shortest window keys `keep_fresh` staleness. `Reservation` (gate,
+budget, capacity) is per window. A capacity fallback is either a constant
+(`_TOK_PER_FRAC_5H` for the 5h windows) or another window's capacity
+divided by the period ratio (`cap_5h / _5H_7D_RATIO` for the 7d windows).
+**Every denial reason, 5h included, starts with the row's `limit_id`**
+(`anthropic:5h: used …`), not the Python 5h pass's literal `5h:`.
+
 **Rust clock:** `decide_with_windows` accepts an explicit timestamp and
 uses it for pacing and both headroom calculations; `Backend::decide` reads
 the clock once and passes that same value to `read_windows` and the
@@ -103,7 +121,7 @@ VALUES (?,?,?,?,?)  -- observed_at = now_ms()
 ```
 
 **`estimate_capacity(limit_id, min_delta=0.02, sample_limit=200) -> f64 | None`** (backend.py:144-148; store.py:1397-1434; Rust `Store::estimate_capacity`, store.rs:2393-2445, where `sample_limit` is the constant `SAMPLE_LIMIT = 200` and `min_delta` is not in the signature at all). The implementation is **max tokens hunter ever spent in one completed window cycle** (store.py:1422-1434; the docstrings backend.py:147 and store.py:1400-1405 now say so) — no fraction correlation, no p75, and **`min_delta` is dead** (never referenced in store.py:1397-1434; ThreadLocalLedger just forwards it, store.py:1662-1665). Keep the param for signature parity or delete in both. Algorithm:
-1. `period_ms = {"anthropic:5h": 18_000_000, "anthropic:7d": 604_800_000}.get(limit_id)` (`_PERIOD_MS` store.py:1392-1395; store.rs:2396-2401); unknown → `None` (store.py:1407-1409). Called with per-model-class lids (from status()) it correctly returns None. **Rust:** the period comes from `LlmProvider::window_period` (provider.rs), which knows every provider's short and long window, so `openai-codex:primary` (5h) and `openai-codex:secondary` (7d) calibrate too.
+1. `period_ms = {"anthropic:5h": 18_000_000, "anthropic:7d": 604_800_000}.get(limit_id)` (`_PERIOD_MS` store.py:1392-1395; store.rs:2396-2401); unknown → `None` (store.py:1407-1409). Called with per-model-class lids (from status()) it correctly returns None. **Rust:** the period comes from `LlmProvider::window_period` (provider.rs), which knows every provider's quota windows, so `openai-codex:primary` (5h) and `openai-codex:secondary` (7d) calibrate too.
 2. **One statement** (store.rs:2413-2443), not one per cycle: a `cycles` CTE picks the completed cycles from `window_log`, deduping `resets_at` into 10 s buckets and keeping the newest `sample_limit`; a correlated scalar subquery sums hunter's spend inside each cycle's half-open `(resets − period_ms, resets]` window; the outer `MAX` takes the winner. Python still runs the cycle query and then one SUM per cycle (store.py:1413-1433) — same answer, N+1 round trips.
 ```sql
 WITH cycles AS (
@@ -253,6 +271,9 @@ Constants: `_TOK_PER_FRAC_5H = 200_000 / 0.10 = 2_000_000.0` (:42; comment :39-4
 2. `fallback = min(w.recorded_at for w in windows.values(), default=0)`; `probe_at_5h = windows["anthropic:5h"].recorded_at` if present else fallback; likewise 7d (:113-117). (Regression fix: per-window probe_at, never a shared min — see test 47 below.)
 3. `base = running + anticipated` (:119); `unaccounted_5h = base + ledger.finished_since(probe_at_5h)` (:120); `unaccounted_7d = base + ledger.finished_since(probe_at_7d)` (:121).
 4. `cap_5h, cap_7d = _capacities()` (:123; body :128-136) — `estimate_capacity("anthropic:5h") or _TOK_PER_FRAC_5H`; `estimate_capacity("anthropic:7d") or (cap_5h / _5H_7D_RATIO)`. Note `or`: None and 0 both fall back. Single derivation point, shared with `_frac_to_tokens` (Rust: derived once and carried on `Reservation`).
+   **Rust:** `SpendLedger::estimate_capacity` returns only strictly positive
+   `Some` values; a zero-spend cycle returns `None`. Reservation code relies
+   on this contract rather than redundantly filtering zero a second time.
 5. Gate reservation `gate_X = unaccounted_X / cap_X if cap_X else 0.0` (:124-125). Cap reservation `budget_X = gate_X − (anticipated / cap_X if cap_X else 0.0)` — equivalently, the same fraction recomputed from `unaccounted_X − anticipated`.
 
    **Gate vs cap — the invariant.** The gate reserves `anticipated`; the cap MUST NOT, so a granted `cap_tokens` is always `>= anticipated`. Why: the headroom a grant computes IS the anticipated job's budget, so reserving its cost first and then handing it what remains counts that cost twice and gives it `headroom − anticipated` tokens to do work worth `anticipated`. A job that clears the gate by a hair is then capped far below its own session floor and killed by the watchdog having produced nothing, while the tokens it did spend still count against the window. The gate's question — "if this job also runs, does the window cross its ramp?" — genuinely needs the job's own cost in the answer, so the gate keeps `gate_X` with its conditions and reason strings unchanged; every cap computation uses `budget_X`: the all-passed headroom AND both `prio and not is_exhausted` override arms.

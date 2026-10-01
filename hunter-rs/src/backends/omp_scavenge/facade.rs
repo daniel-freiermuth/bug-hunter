@@ -8,22 +8,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::capacity::{
-    self, FIVE_H_MS, HEADROOM_MS, WEEK_MS, WindowState, ramp_5h, ramp_7d, retry_at_5h, retry_at_7d,
-};
-use super::provider::LlmProvider;
+use super::capacity::{self, HEADROOM_MS, WindowState};
+use super::provider::{LlmProvider, Pacing};
 
 use crate::backend::SpendLedger;
 use crate::backend::{Backend, JobClass, Outlook, Prober, Verdict};
 use crate::config::Config;
 
-/// 200 k ≈ 10% of a 5h window (`facade._TOK_PER_FRAC_5H`).
-const TOK_PER_FRAC_5H: f64 = 2_000_000.0;
-/// 5h / 7d period ratio ≈ 0.0297619.
-const RATIO_5H_7D: f64 = FIVE_H_MS as f64 / WEEK_MS as f64;
-/// All omp-scavenge vocabulary (short/long windows, ramp math, probe
-/// staleness) is confined to this type; provider-specific quirks live in
-/// `LlmProvider`.
+/// All omp-scavenge vocabulary (quota windows, ramp math, probe
+/// staleness) is confined to this type; which windows a provider has and
+/// how each paces is data in `LlmProvider::quota`.
 pub struct OmpScavengeBackend {
     pub cfg: Config,
     pub ledger: Arc<dyn SpendLedger>,
@@ -69,107 +63,86 @@ fn as_fraction(tokens: i64, capacity: f64) -> f64 {
     }
 }
 
-/// The inflight reservation for one `decide` call, as a fraction of each
-/// window's capacity. Field names match the Python dataclass.
+/// One quota window's inflight reservation for one `decide` call, as a
+/// fraction of the window's capacity. Field names follow the Python
+/// dataclass.
 ///
 /// Two reservations, because the gate and the cap ask different questions
-/// of the same number. `gate_*` counts `anticipated` in: the gate asks "if
+/// of the same number. `gate` counts `anticipated` in: the gate asks "if
 /// this job also runs, does the window cross its ramp?", and the job's own
-/// cost belongs in that answer. `budget_*` leaves it out, because the
+/// cost belongs in that answer. `budget` leaves it out, because the
 /// headroom a grant computes IS the job's budget — charging `anticipated`
 /// against the reservation and then handing the job what remains counts
 /// that cost twice, giving it `headroom - anticipated` tokens to do work
 /// worth `anticipated`. A job that clears the gate by a hair would then be
 /// capped far below its own session floor and killed by the watchdog
 /// having produced nothing, while the tokens it did spend still count
-/// against the window. Taking every cap from `budget_*` makes
+/// against the window. Taking every cap from `budget` makes
 /// `cap >= anticipated` hold whenever the gate grants.
 #[derive(Clone, Copy)]
 struct Reservation {
     /// Gate view: running + finished-since-probe + `anticipated`.
-    gate_5h: f64,
-    gate_7d: f64,
+    gate: f64,
     /// Cap view: the same, without `anticipated`.
-    budget_5h: f64,
-    budget_7d: f64,
-    /// Capacities the fractions were taken against.
-    cap_5h: f64,
-    cap_7d: f64,
+    budget: f64,
+    /// Capacity in tokens the fractions were taken against.
+    capacity: f64,
+}
+
+impl Reservation {
+    /// Fraction → token cap (`facade.OmpScavengeBackend._frac_to_tokens`).
+    fn tokens(self, frac: f64) -> i64 {
+        (frac * self.capacity) as i64
+    }
 }
 
 impl OmpScavengeBackend {
-    /// Fraction → token cap (`facade.OmpScavengeBackend._frac_to_tokens`).
-    ///
-    /// Both caps come from `unaccounted_fraction`, which derives them the
-    /// way Python does: each window's own `estimate_capacity`, falling
-    /// back to the 5h constant and — for 7d — to 5h ÷ period ratio when
-    /// there is not yet history to estimate from. Python recomputes them
-    /// here; passing them in is the same value with fewer ledger reads.
-    #[allow(clippy::similar_names)]
-    fn frac_to_tokens(frac: f64, dim: &str, cap_5h: f64, cap_7d: f64) -> i64 {
-        if dim == "5h" || dim.contains(":5h") {
-            (frac * cap_5h) as i64
-        } else {
-            (frac * cap_7d) as i64
-        }
-    }
-
-    /// Inflight reservation as fraction per window
+    /// Inflight reservation per quota window, in `Quota::windows` order
     /// (`facade.OmpScavengeBackend._unaccounted_fraction` / `_reservation`).
-    /// See [`Reservation`] for why there are two of them.
-    #[allow(clippy::similar_names)]
-    async fn unaccounted_fraction(
+    /// See [`Reservation`] for why each has two views.
+    ///
+    /// Each window's capacity is its own `estimate_capacity`, else its
+    /// fallback (a constant, or a shorter window's capacity scaled by the
+    /// period ratio) while there is not yet history to estimate from.
+    async fn reservations(
         &self,
         windows: &BTreeMap<String, WindowState>,
         anticipated: i64,
-    ) -> anyhow::Result<Reservation> {
+    ) -> anyhow::Result<Vec<Reservation>> {
+        let quota = self.cfg.llm_provider.quota();
         let running = self.ledger.running_estimate().await?;
-
-        let limits = self.cfg.llm_provider.windows();
-        let fallback = windows.values().map(|w| w.recorded_at).min().unwrap_or(0);
-        let probe_at_5h = windows
-            .get(limits.short.limit_id)
-            .map_or(fallback, |w| w.recorded_at);
-        let probe_at_7d = windows
-            .get(limits.long.limit_id)
-            .map_or(fallback, |w| w.recorded_at);
-
+        let fallback_probe = windows.values().map(|w| w.recorded_at).min().unwrap_or(0);
         let base = running + anticipated;
-        let unaccounted_5h = base + self.ledger.finished_since(probe_at_5h).await?;
-        let unaccounted_7d = base + self.ledger.finished_since(probe_at_7d).await?;
 
-        let cap_5h = self
-            .ledger
-            .estimate_capacity(limits.short.limit_id)
-            .await?
-            .filter(|&v| v > 0.0)
-            .unwrap_or(TOK_PER_FRAC_5H);
-        let cap_7d = self
-            .ledger
-            .estimate_capacity(limits.long.limit_id)
-            .await?
-            .filter(|&v| v > 0.0)
-            .unwrap_or(cap_5h / RATIO_5H_7D);
+        let mut estimates = Vec::with_capacity(quota.windows.len());
+        for window in quota.windows {
+            estimates.push(self.ledger.estimate_capacity(window.limit_id).await?);
+        }
 
-        let gate_5h = as_fraction(unaccounted_5h, cap_5h);
-        let gate_7d = as_fraction(unaccounted_7d, cap_7d);
-        let budget_5h = as_fraction(unaccounted_5h - anticipated, cap_5h);
-        let budget_7d = as_fraction(unaccounted_7d - anticipated, cap_7d);
-        Ok(Reservation {
-            gate_5h,
-            gate_7d,
-            budget_5h,
-            budget_7d,
-            cap_5h,
-            cap_7d,
-        })
+        let mut reservations = Vec::with_capacity(quota.windows.len());
+        for (index, window) in quota.windows.iter().enumerate() {
+            // Per-window probe time, never a shared minimum: spend is
+            // unaccounted only since the probe that saw this window.
+            let probe_at = windows
+                .get(window.limit_id)
+                .map_or(fallback_probe, |w| w.recorded_at);
+            let unaccounted = base + self.ledger.finished_since(probe_at).await?;
+            let capacity = quota.capacity(index, &estimates);
+            reservations.push(Reservation {
+                gate: as_fraction(unaccounted, capacity),
+                budget: as_fraction(unaccounted - anticipated, capacity),
+                capacity,
+            });
+        }
+        Ok(reservations)
     }
 
-    /// Single verdict: 7d ramps first, then 5h (`facade.OmpScavengeBackend._decide_inner`).
+    /// Single verdict (`facade.OmpScavengeBackend._decide_inner`): every
+    /// row each quota window gates, longest window first.
     fn decide_inner(
         provider: LlmProvider,
         windows: &BTreeMap<String, WindowState>,
-        resv: Reservation,
+        reservations: &[Reservation],
         prio: bool,
         now_ms: i64,
     ) -> Verdict {
@@ -180,167 +153,98 @@ impl OmpScavengeBackend {
             };
         }
 
-        // Long-window pass: every long window the provider reports, which
-        // for Anthropic includes the per-model-class weekly limits.
-        let limits = provider.windows();
-        for (lid, window) in windows {
-            if !provider.is_long_window(lid) {
-                continue;
-            }
-            if let Some(resets_at) = window.resets_at
-                && resets_at > 0
-                && resets_at <= now_ms
-            {
-                continue;
-            }
-            let Some(reported) = provider.effective_used(window) else {
-                continue;
-            };
-            let effective_used = reported + resv.gate_7d;
-            let allowed = ramp_7d(window.resets_at, now_ms);
-            if effective_used < allowed {
-                continue;
-            }
-
-            let exhausted = provider.is_hard_stop(window);
-            let retry_at = if exhausted {
-                window.resets_at.map(|reset| reset as f64)
-            } else {
-                retry_at_7d(window.resets_at, effective_used)
-            };
-            let reason = format!(
-                "{lid}: used {reported:.2} + unaccounted {res:.2} = {effective_used:.2} >= ramp {allowed:.2}",
-                res = resv.gate_7d
-            );
-            if prio && !exhausted {
-                // Headroom for THIS job, so the reservation it is
-                // measured against must not already contain it.
-                let cap = Self::frac_to_tokens(
-                    (1.0 - (reported + resv.budget_7d)).max(0.0),
-                    "7d",
-                    resv.cap_5h,
-                    resv.cap_7d,
-                );
-                if cap > 0 {
-                    return Verdict::Granted {
-                        cap_tokens: Some(cap),
-                        reason: format!("prio override ({reason})"),
-                    };
+        let quota = provider.quota();
+        for (quota_window, resv) in quota.windows.iter().zip(reservations) {
+            for (lid, window) in windows.iter().filter(|(lid, _)| quota_window.gates(lid)) {
+                if let Some(resets_at) = window.resets_at
+                    && resets_at > 0
+                    && resets_at <= now_ms
+                {
+                    continue;
                 }
-            }
-            return Verdict::Denied { reason, retry_at };
-        }
+                let Some(reported) = quota.effective_used(window) else {
+                    continue;
+                };
+                // None: no active window, so it does not gate (the next
+                // job opens it).
+                let Some(allowed) = quota_window.ramp(window.resets_at, now_ms) else {
+                    continue;
+                };
+                let effective_used = reported + resv.gate;
+                if effective_used < allowed {
+                    continue;
+                }
 
-        // 5h pass.
-        if let Some(w5) = windows.get(limits.short.limit_id)
-            && let Some(reported) = provider.effective_used(w5)
-            && let Some(allowed) = ramp_5h(w5.resets_at, now_ms)
-        {
-            let eff = reported + resv.gate_5h;
-            if eff >= allowed {
-                let is_exhausted = w5.status.as_deref() == Some("exhausted");
-                let retry = if is_exhausted {
-                    w5.resets_at.map(|r| r as f64)
+                let exhausted = quota.is_hard_stop(window);
+                let retry_at = if exhausted {
+                    window.resets_at.map(|reset| reset as f64)
                 } else {
-                    retry_at_5h(w5.resets_at, eff)
+                    quota_window.retry_at(window.resets_at, effective_used)
                 };
                 let reason = format!(
-                    "5h: used {reported:.2} + unaccounted {res:.2} = {eff:.2} >= ramp {allowed:.2}",
-                    res = resv.gate_5h
+                    "{lid}: used {reported:.2} + unaccounted {res:.2} = {effective_used:.2} >= ramp {allowed:.2}",
+                    res = resv.gate
                 );
-
-                if prio && !is_exhausted {
-                    // Same as the 7d arm: the cap is this job's budget.
-                    let headroom_frac = (1.0 - (reported + resv.budget_5h)).max(0.0);
-                    let cap = Self::frac_to_tokens(headroom_frac, "5h", resv.cap_5h, resv.cap_7d);
-                    if cap <= 0 {
-                        return Verdict::Denied {
-                            reason,
-                            retry_at: retry,
+                if prio && !exhausted {
+                    // Headroom for THIS job, so the reservation it is
+                    // measured against must not already contain it.
+                    let cap = resv.tokens((1.0 - (reported + resv.budget)).max(0.0));
+                    if cap > 0 {
+                        return Verdict::Granted {
+                            cap_tokens: Some(cap),
+                            reason: format!("prio override ({reason})"),
                         };
                     }
-                    return Verdict::Granted {
-                        cap_tokens: Some(cap),
-                        reason: format!("prio override ({reason})"),
-                    };
                 }
-                return Verdict::Denied {
-                    reason,
-                    retry_at: retry,
-                };
+                return Verdict::Denied { reason, retry_at };
             }
-            // allowed is None → opener / no active window → skip.
         }
 
         // Gate and cap use the same decision-time snapshot.
-        let headroom = Self::compute_headroom(provider, windows, resv, prio, now_ms);
+        let headroom = Self::compute_headroom(provider, windows, reservations, prio, now_ms);
         Verdict::Granted {
             cap_tokens: headroom,
             reason: "ok".to_owned(),
         }
     }
 
-    /// Min headroom in tokens across windows
+    /// Min headroom in tokens across every gating row
     /// (`facade.OmpScavengeBackend._compute_headroom`).
     ///
-    /// Measured against `budget_*` (see [`Reservation`]): this headroom is
+    /// Measured against `budget` (see [`Reservation`]): this headroom is
     /// what the anticipated job is allowed to spend, not what is left once
     /// it has spent it.
     fn compute_headroom(
         provider: LlmProvider,
         windows: &BTreeMap<String, WindowState>,
-        resv: Reservation,
+        reservations: &[Reservation],
         prio: bool,
         now_ms: i64,
     ) -> Option<i64> {
+        let quota = provider.quota();
         let mut caps: Vec<i64> = Vec::new();
-
-        let limits = provider.windows();
-        for (lid, window) in windows {
-            let Some(used) = provider.effective_used(window) else {
-                continue;
-            };
-            if provider.is_long_window(lid) {
-                let ceiling = if prio {
-                    1.0
-                } else {
-                    ramp_7d(window.resets_at, now_ms)
+        for (quota_window, resv) in quota.windows.iter().zip(reservations) {
+            for (_, window) in windows.iter().filter(|(lid, _)| quota_window.gates(lid)) {
+                let Some(used) = quota.effective_used(window) else {
+                    continue;
                 };
-                caps.push(Self::frac_to_tokens(
-                    (ceiling - used - resv.budget_7d).max(0.0),
-                    "7d",
-                    resv.cap_5h,
-                    resv.cap_7d,
-                ));
-            } else if lid == limits.short.limit_id
-                && let Some(ceiling) = ramp_5h(window.resets_at, now_ms)
-            {
-                let ceiling = if prio { 1.0 } else { ceiling };
-                caps.push(Self::frac_to_tokens(
-                    (ceiling - used - resv.budget_5h).max(0.0),
-                    "5h",
-                    resv.cap_5h,
-                    resv.cap_7d,
-                ));
+                let Some(ramp) = quota_window.ramp(window.resets_at, now_ms) else {
+                    continue;
+                };
+                let ceiling = if prio { 1.0 } else { ramp };
+                caps.push(resv.tokens((ceiling - used - resv.budget).max(0.0)));
             }
         }
-
-        caps.iter().copied().min()
+        caps.into_iter().min()
     }
 
-    /// Log observations and calibrate the selected provider's two windows.
+    /// Log observations and calibrate the selected provider's quota windows.
     async fn observe(&self, windows: &BTreeMap<String, WindowState>) -> anyhow::Result<()> {
         let now = crate::util::now_ms();
-        let limits = self.cfg.llm_provider.windows();
+        let quota = self.cfg.llm_provider.quota();
 
         for window in windows.values() {
-            let horizon = if window.limit_id == limits.short.limit_id {
-                Some(limits.short.period_ms)
-            } else if window.limit_id == limits.long.limit_id {
-                Some(limits.long.period_ms)
-            } else {
-                None
-            };
+            let horizon = quota.window(&window.limit_id).map(|w| w.period_ms);
 
             if let Some(period_ms) = horizon
                 && let (Some(resets), Some(used_fraction)) =
@@ -382,14 +286,16 @@ impl OmpScavengeBackend {
         Ok(())
     }
 
-    /// Max `used_fraction` across long windows, or None (`facade.OmpScavengeBackend._usage_snapshot`).
+    /// Max `used_fraction` across the rows the longest quota window gates,
+    /// or None (`facade.OmpScavengeBackend._usage_snapshot`).
     /// Blocking — meant for `spawn_blocking`.
     fn _usage_snapshot_sync(agent_db: &std::path::Path, provider: LlmProvider) -> Option<f64> {
         let now = crate::util::now_ms();
+        let longest = provider.quota().windows.first()?;
         let windows = capacity::read_windows(agent_db, provider, now);
         windows
             .iter()
-            .filter(|(lid, _)| provider.is_long_window(lid))
+            .filter(|(lid, _)| longest.gates(lid))
             .filter_map(|(_, w)| w.used_fraction)
             .reduce(f64::max)
     }
@@ -400,17 +306,14 @@ impl OmpScavengeBackend {
 impl OmpScavengeBackend {
     /// Runs decide logic on a usage snapshot at an explicit decision time.
     /// `Backend::decide` supplies the clock; tests can exercise exact resets.
-    #[allow(clippy::similar_names)]
     pub async fn decide_with_windows(
         &self,
         windows: &BTreeMap<String, WindowState>,
         anticipated_tokens: i64,
         now: i64,
     ) -> anyhow::Result<Outlook> {
-        let resv = self
-            .unaccounted_fraction(windows, anticipated_tokens)
-            .await?;
-        let normal = Self::decide_inner(self.cfg.llm_provider, windows, resv, false, now);
+        let resv = self.reservations(windows, anticipated_tokens).await?;
+        let normal = Self::decide_inner(self.cfg.llm_provider, windows, &resv, false, now);
 
         let prioritized = match &normal {
             Verdict::Granted {
@@ -419,7 +322,7 @@ impl OmpScavengeBackend {
             } => {
                 // Normal granted → prioritized may upgrade its headroom.
                 let prio_headroom =
-                    Self::compute_headroom(self.cfg.llm_provider, windows, resv, true, now);
+                    Self::compute_headroom(self.cfg.llm_provider, windows, &resv, true, now);
                 match (prio_headroom, normal_cap) {
                     (Some(ph), None) => Verdict::Granted {
                         cap_tokens: Some(ph),
@@ -434,7 +337,7 @@ impl OmpScavengeBackend {
             }
             Verdict::Denied { .. } => {
                 // Normal denied → compute prioritized with prio=true.
-                Self::decide_inner(self.cfg.llm_provider, windows, resv, true, now)
+                Self::decide_inner(self.cfg.llm_provider, windows, &resv, true, now)
             }
         };
 
@@ -445,16 +348,21 @@ impl OmpScavengeBackend {
     }
 
     /// Staleness predicate behind `keep_fresh`'s probe gate: fresh iff the
-    /// provider's short window exists and its age is within `stale_after_s`,
-    /// inclusive — an age landing exactly on the threshold is still fresh.
-    /// A missing short window (or no windows at all) is not fresh.
+    /// provider's shortest quota window exists and its age is within
+    /// `stale_after_s`, inclusive — an age landing exactly on the threshold
+    /// is still fresh. A missing shortest window (or no windows at all) is
+    /// not fresh.
     ///
     /// Split out from `keep_fresh` so the boundary is observable without
     /// the wall-clock read that derives `age_s`.
     pub fn is_fresh(&self, windows: &BTreeMap<String, WindowState>) -> bool {
-        windows
-            .get(self.cfg.llm_provider.windows().short.limit_id)
-            .is_some_and(|short| short.age_s <= self.cfg.stale_after_s)
+        self.cfg
+            .llm_provider
+            .quota()
+            .windows
+            .last()
+            .and_then(|shortest| windows.get(shortest.limit_id))
+            .is_some_and(|shortest| shortest.age_s <= self.cfg.stale_after_s)
     }
 }
 
@@ -473,8 +381,9 @@ pub struct StatusInputs {
     pub now_ms: i64,
     pub provider: LlmProvider,
     pub windows: BTreeMap<String, WindowState>,
-    pub unaccounted_5h: f64,
-    pub unaccounted_7d: f64,
+    /// Quota window `limit_id` -> in-flight reservation (its gate
+    /// fraction). Missing windows count as 0.
+    pub unaccounted: BTreeMap<&'static str, f64>,
     /// `limit_id` -> estimated window capacity in tokens, when known.
     pub capacities: BTreeMap<String, Option<f64>>,
     pub stale_after_s: f64,
@@ -500,45 +409,50 @@ pub fn render_status(inputs: &StatusInputs) -> String {
     }
     let mut fragments: Vec<String> = Vec::new();
 
-    let limits = inputs.provider.windows();
+    let quota = inputs.provider.quota();
     for (lid, w) in &inputs.windows {
-        let label = if lid == limits.short.limit_id {
-            "5h window".to_owned()
-        } else if lid == limits.long.limit_id {
-            "7d window".to_owned()
-        } else {
-            // Extra limits (Anthropic's `anthropic:7d:<class>`, Codex's
-            // `openai-codex:<model>:<window>`) keep their id minus the
-            // provider prefix.
-            let name = lid
-                .strip_prefix(inputs.provider.name())
-                .and_then(|rest| rest.strip_prefix(':'))
-                .unwrap_or(lid);
-            format!("{name} window")
+        let quota_window = quota.gating_window(lid);
+        let label = match quota_window {
+            Some(quota_window) if quota_window.limit_id == lid => quota_window.label.to_owned(),
+            _ => {
+                // Extra limits (Anthropic's `anthropic:7d:<class>`, Codex's
+                // `openai-codex:<model>:<window>`) keep their id minus the
+                // provider prefix.
+                let name = lid
+                    .strip_prefix(inputs.provider.name())
+                    .and_then(|rest| rest.strip_prefix(':'))
+                    .unwrap_or(lid);
+                format!("{name} window")
+            }
         };
         let used_pct = match w.used_fraction {
             Some(f) => format!("{:.0}%", f * 100.0),
             None => "?".to_owned(),
         };
 
-        let (unacct, ramp_val, elapsed_frac): (f64, Option<f64>, Option<f64>) =
-            if lid == limits.short.limit_id {
-                let ramp = ramp_5h(w.resets_at, inputs.now_ms);
+        // `elapsed_ms`: time into an active after-headroom window, which is
+        // what the headroom note needs.
+        let (unacct, ramp_val, elapsed_ms): (f64, Option<f64>, Option<i64>) = match quota_window {
+            Some(quota_window) => {
+                let ramp = quota_window.ramp(w.resets_at, inputs.now_ms);
+                let period = quota_window.period_ms;
                 // A ramp exists only while the window is active, i.e.
                 // `resets_at` is in the future.
-                let elapsed = ramp.and(w.resets_at).map(|reset| {
-                    (FIVE_H_MS as f64 - (reset - inputs.now_ms) as f64) / FIVE_H_MS as f64
-                });
-                (inputs.unaccounted_5h, ramp, elapsed)
-            } else if inputs.provider.is_long_window(lid) {
-                (
-                    inputs.unaccounted_7d,
-                    Some(ramp_7d(w.resets_at, inputs.now_ms)),
-                    None,
-                )
-            } else {
-                (0.0, None, None)
-            };
+                let elapsed_ms = match (quota_window.pacing, ramp, w.resets_at) {
+                    (Pacing::AfterHeadroom, Some(_), Some(reset)) => {
+                        Some(period - (reset - inputs.now_ms))
+                    }
+                    _ => None,
+                };
+                let unacct = inputs
+                    .unaccounted
+                    .get(quota_window.limit_id)
+                    .copied()
+                    .unwrap_or(0.0);
+                (unacct, ramp, elapsed_ms)
+            }
+            None => (0.0, None, None),
+        };
 
         // fill_pct: round-half-to-even (Python's round()), clamped 0..100.
         let fill_pct =
@@ -601,18 +515,14 @@ pub fn render_status(inputs: &StatusInputs) -> String {
             None => "reset unknown".to_owned(),
         };
 
-        let headroom_str = match (elapsed_frac, ramp_val) {
-            (Some(ef), Some(r)) if r == 0.0 && ef > 0.0 => {
-                let headroom_remain_ms = HEADROOM_MS as f64 - ef * FIVE_H_MS as f64;
-                if headroom_remain_ms > 0.0 {
-                    format!(
-                        " \u{00b7} headroom {}m",
-                        (headroom_remain_ms / 60_000.0) as i64
-                    )
-                } else {
-                    String::new()
-                }
-            }
+        // Counts down the window's first HEADROOM_MS. Never for a reset more
+        // than one window ahead (negative elapsed), which would otherwise
+        // read as more headroom than there is.
+        let headroom_str = match elapsed_ms {
+            Some(elapsed_ms) if (1..HEADROOM_MS).contains(&elapsed_ms) => format!(
+                " \u{00b7} headroom {}m",
+                (HEADROOM_MS - elapsed_ms) / 60_000
+            ),
             _ => String::new(),
         };
 
@@ -737,7 +647,7 @@ impl Backend for OmpScavengeBackend {
         }
 
         // anticipated=0: bars show observable state, not gate's hypothetical.
-        let resv = self.unaccounted_fraction(&windows, 0).await?;
+        let resv = self.reservations(&windows, 0).await?;
         let mut capacities = BTreeMap::new();
         for lid in windows.keys() {
             capacities.insert(lid.clone(), self.ledger.estimate_capacity(lid).await?);
@@ -747,8 +657,15 @@ impl Backend for OmpScavengeBackend {
             now_ms,
             provider: self.cfg.llm_provider,
             windows,
-            unaccounted_5h: resv.gate_5h,
-            unaccounted_7d: resv.gate_7d,
+            unaccounted: self
+                .cfg
+                .llm_provider
+                .quota()
+                .windows
+                .iter()
+                .zip(&resv)
+                .map(|(quota_window, resv)| (quota_window.limit_id, resv.gate))
+                .collect(),
             capacities,
             stale_after_s: self.cfg.stale_after_s,
         }))

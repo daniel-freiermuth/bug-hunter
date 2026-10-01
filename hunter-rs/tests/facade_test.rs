@@ -1612,7 +1612,11 @@ async fn codex_high_short_window_usage_denies() {
         .await
         .unwrap();
     assert!(is_denied(&outlook.normal));
-    assert!(reason(&outlook.normal).contains("5h"));
+    assert!(
+        reason(&outlook.normal).starts_with("openai-codex:primary:"),
+        "{}",
+        reason(&outlook.normal)
+    );
 }
 
 /// The long-window pass reads Codex's own weekly limit, not the
