@@ -38,7 +38,7 @@ around), `git`, and the `gh` CLI (or `glab` for GitLab repos)
 authenticated for whatever repos you register.
 
 ```sh
-cp hunter/config.anthropic.example.json hunter/config.json  # or config.openai-codex.example.json
+cp hunter/config.anthropic.example.json hunter/config.json  # or config.openai-codex.example.json / config.github-copilot.example.json
 (cd hunter/ui-svelte && npm ci)           # once per checkout, and after a dependency change
 cd hunter-rs
 just build                                # UI bundle (ui-svelte/ -> hunter/ui/) + release binary
@@ -203,8 +203,8 @@ forever:
 ### Budget policy
 
 `backends/omp_scavenge` reads omp's local usage mirror
-(`~/.omp/agent/agent.db:usage_history`) and gates every job against two
-linear ramps, never letting spend get ahead of either:
+(`~/.omp/agent/agent.db:usage_history`). Anthropic and OpenAI Codex jobs
+are gated against two linear ramps:
 
 - **7-day ramp**: allowed fraction = elapsed fraction of the week. Spreads
   spending evenly so a burst early in the week doesn't starve the rest of
@@ -215,8 +215,16 @@ linear ramps, never letting spend get ahead of either:
   `HEADROOM_MS` in `hunter-rs/src/backends/omp_scavenge/capacity.rs`) so a freshly-opened window is never
   immediately claimed, then ramps 0→1 over what's left. Unspent capacity at
   reset is wasted — there's no rollover.
+- **GitHub Copilot**: premium-request usage follows one calendar-month
+  ramp: allowed fraction = elapsed fraction of the actual UTC month
+  (28–31 days). There is no 5-hour window. Unknown quota or an expired
+  monthly observation denies work until refreshed; exhausted quota denies
+  both normal and prioritized work. Accounts that report no premium-request
+  limit are not treated as unlimited capacity. Copilot's chat and
+  completions limits are not read or shown: they never gate hunter's jobs
+  (unlimited on paid plans; the free plan has no premium quota).
 - **Overdrive**: the Status-page toggle promotes every job to the prioritized
-  budget path. It bypasses both pacing ramps and spends only the provider's
+  budget path. It bypasses pacing and spends only the provider's
   remaining hard-limit headroom; an exhausted provider window is still denied.
   The toggle is process-local and resets to off when the daemon restarts.
 - **In-flight accounting**: a running job's *anticipated* cost is reserved
@@ -383,6 +391,9 @@ cp config.anthropic.example.json config.json
 
 # OpenAI Codex
 cp config.openai-codex.example.json config.json
+
+# GitHub Copilot
+cp config.github-copilot.example.json config.json
 ```
 
 The templates share operational settings but pair the provider with compatible
@@ -396,10 +407,17 @@ quota source for one installation.
 - `models` — fuzzy names, anything omp's `--model` flag accepts. `default`
   applies to all workers; `smol` is for lightweight helper tasks; `hunt`/
   `fix` override per job family; `null` inherits `default`.
-- `backend.llmProvider` selects the OMP quota source. `anthropic` (the
-  default) and `openai-codex` both use the same short/long-window scavenging
-  ramps but map to their provider's OMP usage records. It must match the
-  provider selected by `models`.
+- `backend.llmProvider` selects the OMP quota source: `anthropic` (default),
+  `openai-codex`, or `github-copilot`. It must match the provider selected
+  by `models`. The Copilot template uses provider-qualified model names
+  to avoid fuzzy matching a model from another provider. Authenticate
+  with `omp login github-copilot`; inspect quota with
+  `omp usage --provider github-copilot`.
+- Copilot meters premium **requests**, while hunter's worker watchdog
+  meters **tokens**. Monthly token capacity is an estimate from completed
+  calendar-month spend; without history it uses the existing long-window
+  fallback (67.2M tokens). This is not an exact request-to-token conversion
+  and cannot guarantee that a job won't exhaust its provider quota.
 - `renovate.githubToken` — optional token for the dependency scan's
   github.com lookups (Actions, GitHub tags/releases). Only GitHub-hosted
   repos get a token: this one if set, else the `gh auth token --hostname

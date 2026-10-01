@@ -2124,3 +2124,230 @@ async fn gate_and_cap_judge_the_same_instant() {
     let prio = cap_tokens(&o.prioritized).expect("granted with a cap");
     assert!((prio - 1_000_000).abs() <= 2, "prioritized cap {prio}");
 }
+
+fn copilot_backend(ledger: FakeLedger) -> OmpScavengeBackend {
+    let mut config = cfg();
+    config.llm_provider = hunter::backends::omp_scavenge::LlmProvider::GitHubCopilot;
+    make_backend_with(ledger, config, FakeProber::new(0))
+}
+
+fn current_month_bounds(now: i64) -> (i64, i64) {
+    use chrono::Datelike;
+
+    let start = chrono::DateTime::from_timestamp_millis(now)
+        .unwrap()
+        .date_naive()
+        .with_day(1)
+        .unwrap();
+    let reset = start.checked_add_months(chrono::Months::new(1)).unwrap();
+    (
+        start
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis(),
+        reset
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis(),
+    )
+}
+
+/// Copilot has only a monthly quota: normal spending tracks elapsed calendar
+/// time, while priority may use the remaining quota without bypassing its cap.
+#[tokio::test]
+async fn copilot_monthly_pacing_and_prioritized_caps() {
+    const CALIBRATED_CAPACITY: f64 = 10_000_000.0;
+    let now = now_ms();
+    let (start, reset) = current_month_bounds(now);
+    let elapsed = (now - start) as f64 / (reset - start) as f64;
+    let mut ledger = FakeLedger::new(0, 0);
+    ledger
+        .capacity
+        .insert("copilot:premium".to_owned(), CALIBRATED_CAPACITY);
+    let backend = copilot_backend(ledger);
+    let over_ramp = f64::midpoint(1.0, elapsed);
+    let windows = BTreeMap::from([(
+        "copilot:premium".to_owned(),
+        ws("copilot:premium", over_ramp, "ok", reset, 60.0),
+    )]);
+
+    let outlook = backend.decide_with_windows(&windows, 0, now).await.unwrap();
+    assert!(is_denied(&outlook.normal), "{:?}", outlook.normal);
+    let priority_cap = cap_tokens(&outlook.prioritized).expect("priority may bypass pacing");
+    let expected_priority_cap = ((1.0 - over_ramp) * CALIBRATED_CAPACITY) as i64;
+    assert!(
+        (priority_cap - expected_priority_cap).abs() <= 2,
+        "priority cap {priority_cap}, expected {expected_priority_cap}"
+    );
+    let retry = retry_at(&outlook.normal).expect("monthly pacing provides a retry time");
+    let expected_retry = start as f64 + over_ramp * (reset - start) as f64;
+    assert!(
+        (retry - expected_retry).abs() < 1.0,
+        "monthly retry {retry}, expected {expected_retry}"
+    );
+
+    let under_ramp = elapsed / 2.0;
+    let windows = BTreeMap::from([(
+        "copilot:premium".to_owned(),
+        ws("copilot:premium", under_ramp, "ok", reset, 60.0),
+    )]);
+    let outlook = backend.decide_with_windows(&windows, 0, now).await.unwrap();
+    let normal_cap = cap_tokens(&outlook.normal).expect("usage below monthly pacing is granted");
+    let expected_normal_cap = ((elapsed - under_ramp) * CALIBRATED_CAPACITY) as i64;
+    assert!(
+        (normal_cap - expected_normal_cap).abs() <= 1,
+        "monthly cap {normal_cap}, expected {expected_normal_cap}"
+    );
+    assert!(is_granted(&outlook.prioritized));
+    assert!(cap_tokens(&outlook.prioritized).unwrap() >= normal_cap);
+}
+
+/// Before any month has been calibrated, Copilot's token capacity is the
+/// long-window fallback of 67.2M, and a grant below the ramp is sized from
+/// it. Every other Copilot test injects a calibrated capacity.
+#[tokio::test]
+async fn copilot_uncalibrated_capacity_is_the_long_window_fallback() {
+    let at = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .timestamp_millis()
+    };
+    let (start, now, reset) = (
+        at("2024-02-01T00:00:00Z"),
+        at("2024-02-15T00:00:00Z"),
+        at("2024-03-01T00:00:00Z"),
+    );
+    let elapsed = (now - start) as f64 / (reset - start) as f64;
+    let used = elapsed / 2.0;
+    let windows = BTreeMap::from([(
+        "copilot:premium".to_owned(),
+        ws("copilot:premium", used, "ok", reset, 60.0),
+    )]);
+
+    let outlook = copilot_backend(FakeLedger::new(0, 0))
+        .decide_with_windows(&windows, 0, now)
+        .await
+        .unwrap();
+
+    let cap = cap_tokens(&outlook.normal).expect("usage below the ramp is granted");
+    let expected = ((elapsed - used) * 67_200_000.0) as i64;
+    assert!(
+        (cap - expected).abs() <= 1,
+        "cap {cap}, expected {expected}"
+    );
+}
+
+/// A monthly observation stops funding work exactly at its reset, even if
+/// it was read before the boundary and still reports unused premium quota.
+#[tokio::test]
+async fn copilot_monthly_quota_expires_at_the_exact_reset() {
+    let reset = chrono::DateTime::parse_from_rfc3339("2024-03-01T00:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    let windows = BTreeMap::from([(
+        "copilot:premium".to_owned(),
+        ws("copilot:premium", 0.25, "ok", reset, 0.0),
+    )]);
+    let mut ledger = FakeLedger::new(0, 0);
+    ledger
+        .capacity
+        .insert("copilot:premium".to_owned(), 1_000_000.0);
+    let backend = copilot_backend(ledger);
+
+    let active = backend
+        .decide_with_windows(&windows, 50_000, reset - 1)
+        .await
+        .unwrap();
+    assert!(is_granted(&active.normal), "{:?}", active.normal);
+    assert!(is_granted(&active.prioritized), "{:?}", active.prioritized);
+    assert!(cap_tokens(&active.normal).unwrap() >= 50_000);
+
+    for now in [reset, reset + 1] {
+        let expired = backend
+            .decide_with_windows(&windows, 50_000, now)
+            .await
+            .unwrap();
+        assert!(is_denied(&expired.normal), "{:?}", expired.normal);
+        assert!(is_denied(&expired.prioritized), "{:?}", expired.prioritized);
+    }
+}
+
+/// The provider's exhausted status is authoritative even when its reported
+/// request fraction is below one; priority cannot waive actual exhaustion.
+#[tokio::test]
+async fn copilot_exhausted_status_refuses_normal_and_prioritized() {
+    let (_, reset) = current_month_bounds(now_ms());
+    let windows = BTreeMap::from([(
+        "copilot:premium".to_owned(),
+        ws("copilot:premium", 0.1, "exhausted", reset, 60.0),
+    )]);
+    let outlook = copilot_backend(FakeLedger::new(0, 0))
+        .decide_with_windows(&windows, 0, now_ms())
+        .await
+        .unwrap();
+    assert!(is_denied(&outlook.normal), "{:?}", outlook.normal);
+    assert!(is_denied(&outlook.prioritized), "{:?}", outlook.prioritized);
+}
+
+/// Missing request fraction or monthly reset cannot be treated as spare
+/// capacity, including the no-limits response on some Copilot accounts.
+#[tokio::test]
+async fn copilot_unknown_quota_refuses_normal_and_prioritized() {
+    let (_, reset) = current_month_bounds(now_ms());
+    let backend = copilot_backend(FakeLedger::new(0, 0));
+    for (fraction, reset) in [(None, Some(reset)), (Some(0.0), None), (None, None)] {
+        let mut monthly = ws(
+            "copilot:premium",
+            0.0,
+            "ok",
+            reset.unwrap_or_default(),
+            60.0,
+        );
+        monthly.used_fraction = fraction;
+        monthly.resets_at = reset;
+        let windows = BTreeMap::from([("copilot:premium".to_owned(), monthly)]);
+        let outlook = backend
+            .decide_with_windows(&windows, 0, now_ms())
+            .await
+            .unwrap();
+        assert!(is_denied(&outlook.normal), "{:?}", outlook.normal);
+        assert!(is_denied(&outlook.prioritized), "{:?}", outlook.prioritized);
+    }
+    let outlook = backend
+        .decide_with_windows(&BTreeMap::new(), 0, now_ms())
+        .await
+        .unwrap();
+    assert!(is_denied(&outlook.normal));
+    assert!(is_denied(&outlook.prioritized));
+}
+
+/// A monthly-only provider uses its premium observation's age, not a missing
+/// short window or a fresher foreign provider's observation.
+#[test]
+fn copilot_monthly_freshness_uses_configured_stale_threshold() {
+    let (_, reset) = current_month_bounds(now_ms());
+    let mut config = cfg_with(300.0, "omp");
+    config.llm_provider = hunter::backends::omp_scavenge::LlmProvider::GitHubCopilot;
+    let backend = make_backend_with(FakeLedger::new(0, 0), config, FakeProber::new(0));
+    for (age, expected_fresh) in [(60.0, true), (300.0, true), (300.001, false)] {
+        let windows = BTreeMap::from([
+            (
+                "copilot:premium".to_owned(),
+                ws("copilot:premium", 0.1, "ok", reset, age),
+            ),
+            (
+                "anthropic:5h".to_owned(),
+                ws("anthropic:5h", 0.0, "ok", now_ms() + FIVE_H_MS, 0.0),
+            ),
+        ]);
+        assert_eq!(
+            backend.is_fresh(&windows),
+            expected_fresh,
+            "monthly observation age {age}"
+        );
+    }
+    let foreign_only = healthy_windows(0.0, 4.5);
+    assert!(!backend.is_fresh(&foreign_only));
+}

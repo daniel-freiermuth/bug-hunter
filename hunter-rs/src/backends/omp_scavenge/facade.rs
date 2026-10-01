@@ -244,7 +244,9 @@ impl OmpScavengeBackend {
         let quota = self.cfg.llm_provider.quota();
 
         for window in windows.values() {
-            let horizon = quota.window(&window.limit_id).map(|w| w.period_ms);
+            let horizon = quota
+                .window(&window.limit_id)
+                .and_then(|w| w.period.length_ms(window.resets_at));
 
             if let Some(period_ms) = horizon
                 && let (Some(resets), Some(used_fraction)) =
@@ -312,6 +314,21 @@ impl OmpScavengeBackend {
         anticipated_tokens: i64,
         now: i64,
     ) -> anyhow::Result<Outlook> {
+        let quota = self.cfg.llm_provider.quota();
+        if let Some(missing) = quota
+            .windows
+            .iter()
+            .find(|window| window.is_missing(windows, now))
+        {
+            let denied = Verdict::Denied {
+                reason: format!("{} unknown -- deny until fresh", missing.limit_id),
+                retry_at: None,
+            };
+            return Ok(Outlook {
+                normal: denied.clone(),
+                prioritized: denied,
+            });
+        }
         let resv = self.reservations(windows, anticipated_tokens).await?;
         let normal = Self::decide_inner(self.cfg.llm_provider, windows, &resv, false, now);
 
@@ -435,11 +452,11 @@ pub fn render_status(inputs: &StatusInputs) -> String {
         let (unacct, ramp_val, elapsed_ms): (f64, Option<f64>, Option<i64>) = match quota_window {
             Some(quota_window) => {
                 let ramp = quota_window.ramp(w.resets_at, inputs.now_ms);
-                let period = quota_window.period_ms;
+                let period = quota_window.period.length_ms(w.resets_at);
                 // A ramp exists only while the window is active, i.e.
                 // `resets_at` is in the future.
-                let elapsed_ms = match (quota_window.pacing, ramp, w.resets_at) {
-                    (Pacing::AfterHeadroom, Some(_), Some(reset)) => {
+                let elapsed_ms = match (quota_window.pacing, ramp, w.resets_at, period) {
+                    (Pacing::AfterHeadroom, Some(_), Some(reset), Some(period)) => {
                         Some(period - (reset - inputs.now_ms))
                     }
                     _ => None,

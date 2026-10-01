@@ -126,14 +126,19 @@ async fn read_windows_async(
         let status: Option<String> = row.try_get("status")?;
         let resets_at: Option<i64> = row.try_get("resets_at")?;
         let recorded_at: i64 = row.try_get("recorded_at")?;
+        let quota = provider.quota();
+        if !quota.reads_other_limits && quota.gating_window(&limit_id).is_none() {
+            continue;
+        }
 
         match resets_at {
             // Truthy resets_at (> 0) that has expired (<= now_ms).
             // Some(0) is falsy like Python's `not resets_at`.
             Some(r) if r > 0 && r <= now_ms => {
-                // Account-wide windows roll forward; any other expired
-                // row (Anthropic's per-model-class limits) is dropped.
-                let Some(period) = provider.quota().window(&limit_id).map(|w| w.period_ms) else {
+                // Fixed-period windows roll forward; any other expired row
+                // (Anthropic's per-model-class limits, a calendar month
+                // that omp has not re-probed) is dropped.
+                let Some(period) = quota.window(&limit_id).and_then(|w| w.period.fixed_ms()) else {
                     continue;
                 };
                 // Roll forward: advance resets_at by period until > now,
