@@ -7,7 +7,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use hunter::domain::{FindingJobKind, FindingType, RepoJobKind};
-use hunter::store::Store;
+use hunter::store::{JobOutcome, Store};
 use hunter::types::RunResult;
 use sqlx::SqlitePool;
 use support::{TempDir, fresh_pool};
@@ -336,16 +336,18 @@ async fn create_and_update_job_round_trip() {
     store
         .complete_job(
             job_id,
-            hunter::domain::JobState::Done,
-            80_000,
-            25,
-            Some(0),
-            None,
-            Some("/tmp/s.json"),
-            Some("completed"),
-            Some("claude-4"),
-            Some(0.03),
-            2000,
+            &JobOutcome {
+                state: hunter::domain::JobState::Done,
+                tokens_new: 80_000,
+                calls: 25,
+                exit_code: Some(0),
+                killed_reason: None,
+                session_file: Some("/tmp/s.json"),
+                notes: Some("completed"),
+                model: Some("claude-4"),
+                usage_delta: Some(0.03),
+                finished_at: 2000,
+            },
         )
         .await
         .unwrap();

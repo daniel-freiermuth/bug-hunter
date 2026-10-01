@@ -109,6 +109,26 @@ pub struct SessionRef {
     pub finished_at: Option<i64>,
 }
 
+/// Everything [`Store::complete_job`] writes when a job finishes.
+///
+/// Named fields rather than positional arguments: the outcome carries
+/// four optional strings and three integers whose order the compiler
+/// cannot check, and a swapped `tokens_new`/`calls` corrupts the ledger
+/// the per-kind token budget is estimated from.
+#[derive(Debug, Clone, Copy)]
+pub struct JobOutcome<'a> {
+    pub state: JobState,
+    pub tokens_new: i64,
+    pub calls: i64,
+    pub exit_code: Option<i64>,
+    pub killed_reason: Option<&'a str>,
+    pub session_file: Option<&'a str>,
+    pub notes: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub usage_delta: Option<f64>,
+    pub finished_at: i64,
+}
+
 /// Allowed /api/repo update fields, post-coercion (WRITES contract §6).
 #[derive(Debug, Default)]
 pub struct RepoUpdate {
@@ -1750,20 +1770,19 @@ impl Store {
     }
 
     /// Record a completed job (all outcome fields set at once).
-    pub async fn complete_job(
-        &self,
-        job_id: i64,
-        state: JobState,
-        tokens_new: i64,
-        calls: i64,
-        exit_code: Option<i64>,
-        killed_reason: Option<&str>,
-        session_file: Option<&str>,
-        notes: Option<&str>,
-        model: Option<&str>,
-        usage_delta: Option<f64>,
-        finished_at: i64,
-    ) -> sqlx::Result<()> {
+    pub async fn complete_job(&self, job_id: i64, outcome: &JobOutcome<'_>) -> sqlx::Result<()> {
+        let JobOutcome {
+            state,
+            tokens_new,
+            calls,
+            exit_code,
+            killed_reason,
+            session_file,
+            notes,
+            model,
+            usage_delta,
+            finished_at,
+        } = *outcome;
         sqlx::query!(
             "UPDATE jobs SET state = ?1, pid = NULL, tokens_new = ?2, calls = ?3, \
              exit_code = ?4, killed_reason = ?5, session_file = ?6, notes = ?7, \
