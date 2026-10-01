@@ -717,6 +717,105 @@ async fn a_suspension_whose_working_directory_is_gone_is_retired() {
     assert_eq!(resume_events(&pool, 10).await, vec![(msg, None)]);
 }
 
+/// A suspended `kind` attempt at finding 5, whose status the operator
+/// has since changed to `status`, beside an enabled repo with rotation
+/// work. Returns the summary of the cycle that follows.
+async fn cycle_after_operator_moved_the_finding(
+    kind: &str,
+    status: FindingStatus,
+) -> (TempDir, SqlitePool, Store, hunter::scheduler::CycleSummary) {
+    let (dir, path, pool) = fresh_db().await;
+    cloned_repo(&dir, &pool).await;
+    seed_history(&pool).await;
+    sqlx::query(
+        "INSERT INTO findings \
+         (id, type, repo_id, fingerprint, severity, confidence, summary, status, \
+          created_at, updated_at) \
+         VALUES (5, 'bug', 1, 'fp5', 'high', 0.9, 'bug 5', 'queued', 1000, 1000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let session = seed_session_in(&dir, 10, CTX);
+    seed_finding_suspension(&pool, 10, kind, 5, &session).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+    // What /api/unqueue and /api/verdict write.
+    store.set_finding_status(5, status).await.unwrap();
+
+    let summary = hunter::scheduler::run_cycle(&store, &cfg, &GateProbe::default(), None).await;
+    (dir, pool, store, summary)
+}
+
+/// A suspended fix whose finding the operator took out of the queue is
+/// retired, and the cycle falls through to rotation.
+///
+/// `run_fix` refuses a finding that is not `queued` without touching the
+/// suspended row, so offering it from the resume tier — which outranks
+/// rotation — skipped the same candidate every cycle and no repo was
+/// ever scanned again.
+#[tokio::test]
+async fn a_suspended_fix_whose_finding_was_unqueued_is_retired_not_reoffered() {
+    let (_dir, pool, store, summary) =
+        cycle_after_operator_moved_the_finding("fix", FindingStatus::New).await;
+
+    assert_eq!(
+        (summary.kind, summary.skipped.as_deref()),
+        (Some(JobKind::Repo(RepoJobKind::Hunt)), None),
+        "the cycle must reach rotation, got {summary:?}"
+    );
+    let (state, reason, _) = job_row(&pool, 10).await;
+    assert_eq!(state, JobState::Killed.as_str());
+    assert_eq!(reason.as_deref(), Some("cap"), "it really stopped on cap");
+    assert!(store.list_resumable_jobs().await.unwrap().is_empty());
+}
+
+/// The same for a suspended recheck whose finding was given a verdict:
+/// `run_recheck` refuses anything not `rechecking`.
+#[tokio::test]
+async fn a_suspended_recheck_whose_finding_got_a_verdict_is_retired_not_reoffered() {
+    let (_dir, pool, store, summary) =
+        cycle_after_operator_moved_the_finding("recheck", FindingStatus::Rejected).await;
+
+    assert_eq!(
+        (summary.kind, summary.skipped.as_deref()),
+        (Some(JobKind::Repo(RepoJobKind::Hunt)), None),
+        "the cycle must reach rotation, got {summary:?}"
+    );
+    let (state, _, _) = job_row(&pool, 10).await;
+    assert_eq!(state, JobState::Killed.as_str());
+    assert!(store.list_resumable_jobs().await.unwrap().is_empty());
+}
+
+/// A fix suspended while its finding still reads `fixing` is left
+/// alone: that is the window between the job's suspension and
+/// `run_fix` (or startup reconciliation) putting the finding back to
+/// `queued`, not an operator's decision.
+#[tokio::test]
+async fn a_suspended_fix_whose_finding_still_reads_fixing_stays_resumable() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    sqlx::query(
+        "INSERT INTO findings \
+         (id, type, repo_id, fingerprint, severity, confidence, summary, status, \
+          created_at, updated_at) \
+         VALUES (5, 'bug', 1, 'fp5', 'high', 0.9, 'bug 5', 'fixing', 1000, 1000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let session = seed_session(&dir);
+    seed_finding_suspension(&pool, 10, "fix", 5, &session).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+
+    let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
+
+    assert_eq!(plan.predecessor_id, 10);
+    assert_eq!(job_row(&pool, 10).await.0, JobState::Suspended.as_str());
+}
+
 /// A flagged pull request whose engage was cap-killed continues that
 /// engage instead of starting a fresh one.
 ///
