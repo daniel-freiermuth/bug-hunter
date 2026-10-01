@@ -272,9 +272,8 @@ impl OmpScavengeBackend {
             // allowed is None → opener / no active window → skip.
         }
 
-        // All passed — compute headroom (fresh now_ms: second clock read).
-        let headroom_now = crate::util::now_ms();
-        let headroom = Self::compute_headroom(provider, windows, resv, prio, headroom_now);
+        // Gate and cap use the same decision-time snapshot.
+        let headroom = Self::compute_headroom(provider, windows, resv, prio, now_ms);
         Verdict::Granted {
             cap_tokens: headroom,
             reason: "ok".to_owned(),
@@ -399,15 +398,15 @@ impl OmpScavengeBackend {
 // ---- public testing seam --------------------------------------------------
 
 impl OmpScavengeBackend {
-    /// Testing seam: runs decide logic on pre-built windows (skips
-    /// `read_windows`).  Not part of the Backend trait.
+    /// Runs decide logic on a usage snapshot at an explicit decision time.
+    /// `Backend::decide` supplies the clock; tests can exercise exact resets.
     #[allow(clippy::similar_names)]
     pub async fn decide_with_windows(
         &self,
         windows: &BTreeMap<String, WindowState>,
         anticipated_tokens: i64,
+        now: i64,
     ) -> anyhow::Result<Outlook> {
-        let now = crate::util::now_ms();
         let resv = self
             .unaccounted_fraction(windows, anticipated_tokens)
             .await?;
@@ -418,11 +417,9 @@ impl OmpScavengeBackend {
                 cap_tokens: normal_cap,
                 ..
             } => {
-                // Normal granted → prioritized = normal, with possible
-                // prio-headroom upgrade (fresh now_ms).
-                let prio_now = crate::util::now_ms();
+                // Normal granted → prioritized may upgrade its headroom.
                 let prio_headroom =
-                    Self::compute_headroom(self.cfg.llm_provider, windows, resv, true, prio_now);
+                    Self::compute_headroom(self.cfg.llm_provider, windows, resv, true, now);
                 match (prio_headroom, normal_cap) {
                     (Some(ph), None) => Verdict::Granted {
                         cap_tokens: Some(ph),
@@ -679,7 +676,10 @@ impl Backend for OmpScavengeBackend {
         let provider = self.cfg.llm_provider;
         let windows =
             tokio::task::spawn_blocking(move || capacity::read_windows(&db, provider, now)).await?;
-        self.decide_with_windows(&windows, anticipated_tokens).await
+        // The same `now` as the read: a reset landing between two clock
+        // reads would leave an un-rolled window that `decide_inner` skips.
+        self.decide_with_windows(&windows, anticipated_tokens, now)
+            .await
     }
 
     async fn keep_fresh(&self) -> anyhow::Result<bool> {
