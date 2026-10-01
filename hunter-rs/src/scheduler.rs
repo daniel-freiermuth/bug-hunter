@@ -12,7 +12,7 @@ use crate::domain::{
     ClosureClass, FindingJobKind, FindingStatus, FindingType, JobKind, JobState, RepoJobKind,
     Severity,
 };
-use crate::store::{CreatedJob, FindingFilter, Store, StoreWriteError, SyncPrData};
+use crate::store::{CreatedJob, FindingFilter, JobOutcome, Store, StoreWriteError, SyncPrData};
 use crate::types::{Finding, Job, Repo};
 use crate::util::now_ms;
 
@@ -909,21 +909,21 @@ pub async fn record_job(
     } else {
         None
     };
-    let exit_code = rr.exit_code.map(i64::from);
-    let now = now_ms();
     store
         .complete_job(
             job_id,
-            state,
-            rr.tokens_new,
-            rr.calls,
-            exit_code,
-            rr.killed_reason.as_deref(),
-            rr.session_file.as_deref(),
-            notes,
-            model,
-            rr.usage_delta,
-            now,
+            &JobOutcome {
+                state,
+                tokens_new: rr.tokens_new,
+                calls: rr.calls,
+                exit_code: rr.exit_code.map(i64::from),
+                killed_reason: rr.killed_reason.as_deref(),
+                session_file: rr.session_file.as_deref(),
+                notes,
+                model,
+                usage_delta: rr.usage_delta,
+                finished_at: now_ms(),
+            },
         )
         .await?;
 
