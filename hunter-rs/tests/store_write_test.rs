@@ -653,6 +653,120 @@ async fn estimate_capacity_calibrates_codex_windows_over_their_periods() {
 }
 
 #[tokio::test]
+async fn estimate_capacity_uses_actual_calendar_month_boundaries() {
+    for (start_date, reset_date) in [
+        ("2023-02-01", "2023-03-01"), // 28 days
+        ("2024-02-01", "2024-03-01"), // leap February: 29 days
+        ("2024-04-01", "2024-05-01"), // 30 days
+        ("2024-01-01", "2024-02-01"), // 31 days
+        ("2023-12-01", "2024-01-01"), // year rollover
+    ] {
+        let (_dir, path, pool) = fresh_db().await;
+        seed_repo(&pool).await;
+        let timestamp = |date: &str| {
+            chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        };
+        let start = timestamp(start_date);
+        let reset = timestamp(reset_date);
+        let observed = reset - 1_000;
+        for limit_id in ["copilot:premium", "copilot:premium:model-class", "unknown"] {
+            sqlx::query!(
+                "INSERT INTO window_log \
+                 (observed_at, limit_id, used_fraction, status, resets_at, source_age_s) \
+                 VALUES (?, ?, 0.9, 'ok', ?, 1)",
+                observed,
+                limit_id,
+                reset,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Exact start and pre-month spend are excluded; exact reset is included.
+        insert_job(&pool, "done", None, Some(9_000_000), Some(start - 1)).await;
+        insert_job(&pool, "done", None, Some(8_000_000), Some(start)).await;
+        insert_job(&pool, "done", None, Some(100_000), Some(start + 1)).await;
+        insert_job(&pool, "done", None, Some(200_000), Some(reset)).await;
+        insert_job(&pool, "done", None, Some(7_000_000), Some(reset + 1)).await;
+        let store = rw_store(&path).await;
+        assert_eq!(
+            store.estimate_capacity("copilot:premium").await.unwrap(),
+            Some(300_000.0),
+            "calendar cycle {start_date} through {reset_date}",
+        );
+        for limit_id in ["copilot:premium:model-class", "unknown"] {
+            assert_eq!(store.estimate_capacity(limit_id).await.unwrap(), None);
+        }
+    }
+}
+
+#[tokio::test]
+async fn estimate_capacity_monthly_uses_max_of_newest_200_completed_cycles() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    // 201 distinct completed months: the oldest, highest-spend one is omitted.
+    for month_index in 1_u32..=201 {
+        let year = 2000 + (month_index / 12) as i32;
+        let month = month_index % 12 + 1;
+        let reset = chrono::NaiveDate::from_ymd_opt(year, month, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+        let observed = reset - 1_000;
+        // Duplicate observations must not consume the completed-cycle allowance.
+        for _ in 0..2 {
+            sqlx::query!(
+                "INSERT INTO window_log \
+                 (observed_at, limit_id, used_fraction, status, resets_at, source_age_s) \
+                 VALUES (?, 'copilot:premium', 0.9, 'ok', ?, 1)",
+                observed,
+                reset,
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let tokens = match month_index {
+            1 => 9_000_000,
+            2 => 500_000, // oldest included cycle, not the newest cycle
+            _ => 100_000,
+        };
+        insert_job(&pool, "done", None, Some(tokens), Some(reset - 1)).await;
+    }
+    // An unfinished cycle must never calibrate, even with greater spend.
+    let future_reset = chrono::NaiveDate::from_ymd_opt(2100, 2, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
+    let observed = future_reset - 1_000;
+    sqlx::query!(
+        "INSERT INTO window_log \
+         (observed_at, limit_id, used_fraction, status, resets_at, source_age_s) \
+         VALUES (?, 'copilot:premium', 0.9, 'ok', ?, 1)",
+        observed,
+        future_reset,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    insert_job(&pool, "done", None, Some(8_000_000), Some(future_reset - 1)).await;
+    let store = rw_store(&path).await;
+    assert_eq!(
+        store.estimate_capacity("copilot:premium").await.unwrap(),
+        Some(500_000.0),
+    );
+}
+
+#[tokio::test]
 async fn estimate_capacity_zero_spend_returns_none() {
     let (_dir, path, pool) = fresh_db().await;
     let now = std::time::SystemTime::now()

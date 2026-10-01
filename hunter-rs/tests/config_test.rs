@@ -283,7 +283,7 @@ fn bad_serve_settings_are_refused() {
 }
 
 #[test]
-fn llm_provider_defaults_to_anthropic_and_accepts_codex() {
+fn llm_provider_defaults_to_anthropic_and_accepts_supported_providers() {
     let default_dir = TempDir::new("cfg-provider-default");
     let default = Config::load(default_dir.path()).expect("default configuration");
     assert_eq!(
@@ -312,11 +312,22 @@ fn llm_provider_defaults_to_anthropic_and_accepts_codex() {
         codex.llm_provider,
         hunter::backends::omp_scavenge::LlmProvider::OpenAiCodex
     );
+
+    let copilot_dir = TempDir::new("cfg-provider-copilot");
+    let copilot = load(
+        &copilot_dir,
+        r#"{"backend": {"llmProvider": "github-copilot"}}"#,
+    )
+    .expect("Copilot provider configuration");
+    assert_eq!(
+        copilot.llm_provider,
+        hunter::backends::omp_scavenge::LlmProvider::GitHubCopilot
+    );
 }
 
 #[test]
 fn unknown_llm_provider_is_rejected() {
     let dir = TempDir::new("cfg-provider-invalid");
-    let message = err(&dir, r#"{"backend": {"llmProvider": "github-copilot"}}"#);
+    let message = err(&dir, r#"{"backend": {"llmProvider": "unknown-provider"}}"#);
     assert!(message.contains("backend.llmProvider"), "{message}");
 }

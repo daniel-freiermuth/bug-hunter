@@ -2898,11 +2898,13 @@ impl crate::backend::SpendLedger for Store {
     async fn estimate_capacity(&self, limit_id: &str) -> sqlx::Result<Option<f64>> {
         // Newest completed cycles considered (store.py sample_limit=200).
         const SAMPLE_LIMIT: i64 = 200;
-        // Per-model-class / unknown lids have no known period.
-        let Some(period_ms) = crate::backends::omp_scavenge::LlmProvider::window_period(limit_id)
+        // Per-model-class / unknown lids have no known period. A calendar
+        // month binds NULL: the SQL derives each cycle's own start.
+        let Some(period) = crate::backends::omp_scavenge::LlmProvider::window_period(limit_id)
         else {
             return Ok(None);
         };
+        let period_ms = period.fixed_ms();
         let now = now_ms();
         // One statement, not one per cycle. Previously this fetched up to
         // SAMPLE_LIMIT cycles and then ran a SUM over `jobs` for each of
@@ -2931,7 +2933,13 @@ impl crate::backend::SpendLedger for Store {
                     FROM jobs j
                     WHERE j.state NOT IN ('denied', 'running')
                       AND j.tokens_new IS NOT NULL
-                      AND j.finished_at > c.resets - ?4
+                      AND j.finished_at > CASE
+                          WHEN ?4 IS NULL THEN CAST(strftime(
+                              '%s', c.resets / 1000, 'unixepoch',
+                              'start of month', '-1 month'
+                          ) AS INTEGER) * 1000
+                          ELSE c.resets - ?4
+                      END
                       AND j.finished_at <= c.resets
                 ) AS spent
                 FROM cycles c

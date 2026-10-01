@@ -175,6 +175,14 @@ async fn make_agent_db(
     dir: &TempDir,
     rows: &[(&str, Option<f64>, &str, Option<i64>, i64)],
 ) -> PathBuf {
+    make_agent_db_with_provider(dir, "anthropic", rows).await
+}
+
+async fn make_agent_db_with_provider(
+    dir: &TempDir,
+    provider: &str,
+    rows: &[(&str, Option<f64>, &str, Option<i64>, i64)],
+) -> PathBuf {
     use sqlx::sqlite::SqliteConnectOptions;
 
     let path = dir.join("agent.db");
@@ -204,9 +212,10 @@ async fn make_agent_db(
             "INSERT INTO usage_history \
              (recorded_at, provider, account_key, limit_id, label, \
               used_fraction, status, resets_at) \
-             VALUES (?, 'anthropic', 'acct', ?, ?, ?, ?, ?)",
+             VALUES (?, ?, 'acct', ?, ?, ?, ?, ?)",
         )
         .bind(recorded)
+        .bind(provider)
         .bind(lid)
         .bind(lid)
         .bind(uf)
@@ -507,6 +516,12 @@ fn test_retry_at_5h_zero_returns_none() {
 /// any calibration history exists.
 #[test]
 fn every_quota_is_ordered_longest_first_with_positive_fallbacks() {
+    use hunter::backends::omp_scavenge::provider::Period;
+    // A calendar month at its shortest, so the order holds for every month.
+    let shortest_ms = |period: Period| match period {
+        Period::Fixed(period_ms) => period_ms,
+        Period::CalendarMonth => 28 * 24 * 3_600_000,
+    };
     for provider in LlmProvider::ALL {
         let quota = provider.quota();
         assert!(!quota.windows.is_empty(), "{provider:?} has no windows");
@@ -514,7 +529,7 @@ fn every_quota_is_ordered_longest_first_with_positive_fallbacks() {
             quota
                 .windows
                 .windows(2)
-                .all(|pair| pair[0].period_ms > pair[1].period_ms),
+                .all(|pair| shortest_ms(pair[0].period) > shortest_ms(pair[1].period)),
             "{provider:?} windows are not longest first"
         );
         let no_history = vec![None; quota.windows.len()];
@@ -709,5 +724,169 @@ async fn test_read_windows_undecodable_row_degrades() {
     assert!(
         logs.contains("reading omp usage windows failed"),
         "the decode failure must be logged, got: {logs}"
+    );
+}
+
+/// Copilot's provider column is authoritative: its limit ID deliberately
+/// does not start with `github-copilot`, and other providers may share a DB.
+#[tokio::test]
+async fn copilot_read_windows_selects_provider_not_limit_prefix() {
+    let now = chrono::DateTime::parse_from_rfc3339("2024-02-15T00:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    let reset = chrono::DateTime::parse_from_rfc3339("2024-03-01T00:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    let dir = TempDir::new("cap-copilot-provider");
+    let db = make_agent_db_with_provider(
+        &dir,
+        "github-copilot",
+        &[
+            (
+                "copilot:premium",
+                Some(0.25),
+                "ok",
+                Some(reset),
+                now - 60_000,
+            ),
+            // Limits hunter never gates on are not read at all, so a row
+            // omp stopped writing (chat/completions once unlimited) cannot
+            // linger as a stale bar.
+            ("copilot:chat", Some(0.1), "ok", Some(reset), now - 600_000),
+            ("copilot:completions", Some(0.0), "ok", Some(reset), now),
+            ("copilot:model:gpt-5", Some(0.3), "ok", Some(reset), now),
+        ],
+    )
+    .await;
+    // Newer foreign rows with the same limit ID must not shadow Copilot.
+    make_agent_db_with_provider(
+        &dir,
+        "anthropic",
+        &[
+            ("copilot:premium", Some(1.0), "exhausted", Some(reset), now),
+            ("anthropic:7d", Some(0.9), "ok", Some(now + WEEK_MS), now),
+        ],
+    )
+    .await;
+    make_agent_db_with_provider(
+        &dir,
+        "openai-codex",
+        &[(
+            "openai-codex:secondary",
+            Some(0.8),
+            "ok",
+            Some(now + WEEK_MS),
+            now,
+        )],
+    )
+    .await;
+
+    let windows =
+        tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::GitHubCopilot, now))
+            .await
+            .unwrap();
+    assert_eq!(
+        windows.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec!["copilot:premium"]
+    );
+    let monthly = &windows["copilot:premium"];
+    assert_eq!(monthly.used_fraction, Some(0.25));
+    assert_eq!(monthly.status.as_deref(), Some("ok"));
+    assert_eq!(monthly.resets_at, Some(reset));
+    assert_eq!(monthly.recorded_at, now - 60_000);
+    assert_eq!(monthly.age_s, 60.0);
+}
+
+/// Calendar quota cannot be replenished by guessing a 30-day period:
+/// at the reset and throughout missed months it stays unknown until refresh.
+#[tokio::test]
+async fn copilot_read_windows_discards_expired_monthly_quota() {
+    let reset = chrono::DateTime::parse_from_rfc3339("2024-03-01T00:00:00Z")
+        .unwrap()
+        .timestamp_millis();
+    for timestamp in [
+        "2024-03-01T00:00:00Z",
+        "2024-03-02T00:00:00Z",
+        "2024-04-15T00:00:00Z",
+    ] {
+        let now = chrono::DateTime::parse_from_rfc3339(timestamp)
+            .unwrap()
+            .timestamp_millis();
+        let dir = TempDir::new("cap-copilot-expired");
+        let db = make_agent_db_with_provider(
+            &dir,
+            "github-copilot",
+            &[(
+                "copilot:premium",
+                Some(0.9),
+                "ok",
+                Some(reset),
+                reset - 3_600_000,
+            )],
+        )
+        .await;
+        let windows =
+            tokio::task::spawn_blocking(move || read_windows(&db, LlmProvider::GitHubCopilot, now))
+                .await
+                .unwrap();
+        assert!(
+            windows.is_empty(),
+            "expired quota was fabricated at {timestamp}: {windows:?}"
+        );
+    }
+}
+
+/// Monthly pacing and its retry inverse follow actual calendar boundaries,
+/// including leap February and the December-to-January year transition.
+#[test]
+fn copilot_monthly_ramp_and_retry_use_actual_calendar_month() {
+    let monthly = LlmProvider::GitHubCopilot.quota().windows.first().unwrap();
+    for (start, reset) in [
+        ("2023-02-01T00:00:00Z", "2023-03-01T00:00:00Z"),
+        ("2024-02-01T00:00:00Z", "2024-03-01T00:00:00Z"),
+        ("2024-04-01T00:00:00Z", "2024-05-01T00:00:00Z"),
+        ("2024-12-01T00:00:00Z", "2025-01-01T00:00:00Z"),
+    ] {
+        let start = chrono::DateTime::parse_from_rfc3339(start)
+            .unwrap()
+            .timestamp_millis();
+        let reset = chrono::DateTime::parse_from_rfc3339(reset)
+            .unwrap()
+            .timestamp_millis();
+        for fraction in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let at = start + ((reset - start) as f64 * fraction) as i64;
+            let ramp = monthly.ramp(Some(reset), at).unwrap();
+            assert!(
+                (ramp - fraction).abs() < 1e-9,
+                "calendar ramp {ramp}, expected {fraction}"
+            );
+            let retry = monthly.retry_at(Some(reset), fraction).unwrap();
+            assert!(
+                (retry - at as f64).abs() < 1.0,
+                "calendar retry {retry}, expected {at}"
+            );
+        }
+    }
+}
+
+/// The cycle start is the first of the previous month, the same boundary
+/// `Store::estimate_capacity`'s SQL uses, even when the reset is not on a
+/// month boundary: pacing and calibration must agree on one cycle.
+#[test]
+fn copilot_off_boundary_reset_starts_at_the_previous_month_start() {
+    let monthly = LlmProvider::GitHubCopilot.quota().windows.first().unwrap();
+    let ms = |s: &str| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .unwrap()
+            .timestamp_millis()
+    };
+    let start = ms("2026-10-01T00:00:00Z");
+    let reset = ms("2026-11-15T12:00:00Z");
+    let mid = start + (reset - start) / 2;
+    assert!((monthly.ramp(Some(reset), mid).unwrap() - 0.5).abs() < 1e-9);
+    let retry = monthly.retry_at(Some(reset), 0.5).unwrap();
+    assert!(
+        (retry - mid as f64).abs() < 1.0,
+        "retry {retry}, expected {mid}"
     );
 }

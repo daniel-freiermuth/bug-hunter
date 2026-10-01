@@ -22,6 +22,27 @@ divided by the period ratio (`cap_5h / _5H_7D_RATIO` for the 7d windows).
 **Every denial reason, 5h included, starts with the row's `limit_id`**
 (`anthropic:5h: used …`), not the Python 5h pass's literal `5h:`.
 
+**Rust provider extension:** `backend.llmProvider` accepts `anthropic`,
+`openai-codex`, and `github-copilot`. Copilot's OMP provider id is
+`github-copilot`, but its one quota window is `copilot:premium`, labelled
+“Monthly premium requests”: linear pacing over a UTC calendar month
+(`Period::CalendarMonth`), so the ramp and its retry inverse use the
+actual month's length. A window's cycle starts at 00:00 UTC on the first
+of the month before its reset's month, the same boundary
+`Store::estimate_capacity`'s SQL uses. The window is `required`: a missing
+row, fraction or future reset denies both paths
+(`copilot:premium unknown -- deny until fresh`); a reset at exactly the
+decision instant has expired. Priority bypasses pacing,
+not exhaustion (`exhausted_is_hard_stop`). Expired calendar-month rows are
+discarded until an OMP probe refreshes them, never rolled forward as
+fictitious unused quota. Freshness is keyed to the premium quota as the
+provider's shortest (only) window. `reads_other_limits: false`: chat and
+completions are not read, being unlimited on paid plans, where omp stops
+writing them and their last rows would linger as stale bars. Before
+calibration history exists, the token cap uses the 67.2M long-window
+fallback; Copilot charges requests, so this token estimate is not a
+billing guarantee.
+
 **Rust clock:** `decide_with_windows` accepts an explicit timestamp and
 uses it for pacing and both headroom calculations; `Backend::decide` reads
 the clock once and passes that same value to `read_windows` and the
@@ -121,7 +142,7 @@ VALUES (?,?,?,?,?)  -- observed_at = now_ms()
 ```
 
 **`estimate_capacity(limit_id, min_delta=0.02, sample_limit=200) -> f64 | None`** (backend.py:144-148; store.py:1397-1434; Rust `Store::estimate_capacity`, store.rs:2393-2445, where `sample_limit` is the constant `SAMPLE_LIMIT = 200` and `min_delta` is not in the signature at all). The implementation is **max tokens hunter ever spent in one completed window cycle** (store.py:1422-1434; the docstrings backend.py:147 and store.py:1400-1405 now say so) — no fraction correlation, no p75, and **`min_delta` is dead** (never referenced in store.py:1397-1434; ThreadLocalLedger just forwards it, store.py:1662-1665). Keep the param for signature parity or delete in both. Algorithm:
-1. `period_ms = {"anthropic:5h": 18_000_000, "anthropic:7d": 604_800_000}.get(limit_id)` (`_PERIOD_MS` store.py:1392-1395; store.rs:2396-2401); unknown → `None` (store.py:1407-1409). Called with per-model-class lids (from status()) it correctly returns None. **Rust:** the period comes from `LlmProvider::window_period` (provider.rs), which knows every provider's quota windows, so `openai-codex:primary` (5h) and `openai-codex:secondary` (7d) calibrate too.
+1. `period_ms = {"anthropic:5h": 18_000_000, "anthropic:7d": 604_800_000}.get(limit_id)` (`_PERIOD_MS` store.py:1392-1395; store.rs:2396-2401); unknown → `None` (store.py:1407-1409). Called with per-model-class lids (from status()) it correctly returns None. **Rust:** the period comes from `LlmProvider::window_period` (provider.rs), which knows every provider's quota windows, so `openai-codex:primary` (5h) and `openai-codex:secondary` (7d) calibrate too. A calendar-month window (`copilot:premium`) binds a NULL period: each completed cycle starts at the previous UTC month boundary, not at a fixed 30-day offset.
 2. **One statement** (store.rs:2413-2443), not one per cycle: a `cycles` CTE picks the completed cycles from `window_log`, deduping `resets_at` into 10 s buckets and keeping the newest `sample_limit`; a correlated scalar subquery sums hunter's spend inside each cycle's half-open `(resets − period_ms, resets]` window; the outer `MAX` takes the winner. Python still runs the cycle query and then one SUM per cycle (store.py:1413-1433) — same answer, N+1 round trips.
 ```sql
 WITH cycles AS (
