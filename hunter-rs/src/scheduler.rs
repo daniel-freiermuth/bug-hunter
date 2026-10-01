@@ -1742,7 +1742,7 @@ pub async fn run_recheck(
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
-    let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
+    let override_mode = override_of(finding);
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -2522,7 +2522,7 @@ pub async fn run_fix(
         "improve"
     };
     let branch = format!("{branch_prefix}/{slug}-{fid}");
-    let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
+    let override_mode = override_of(finding);
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -3433,7 +3433,7 @@ pub async fn run_engage(
         }
     }
 
-    let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
+    let override_mode = override_of(finding);
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -4102,7 +4102,7 @@ pub async fn run_harvest(
         }
     }
 
-    let override_mode = finding.budget_override.as_deref().filter(|s| !s.is_empty());
+    let override_mode = override_of(finding);
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
