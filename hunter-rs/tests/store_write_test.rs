@@ -14,7 +14,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use hunter::backend::SpendLedger;
-use hunter::domain::{FindingStatus, ForgeName, JobState, RepoJobKind};
+use hunter::domain::{BudgetOverride, FindingStatus, ForgeName, JobState, RepoJobKind};
 use hunter::store::{RepoUpdate, ResumeChainStats, Store, StoreWriteError};
 use sqlx::SqlitePool;
 use sqlx::sqlite::SqliteConnectOptions;
@@ -113,9 +113,12 @@ async fn budget_override_set_clear_and_clear_all_only_touches_non_null() {
     let store = rw_store(&path).await;
 
     // Set on a clean row, then clear it.
-    store.set_budget_override(3, Some("once")).await.unwrap();
+    store
+        .set_budget_override(3, Some(BudgetOverride::Once))
+        .await
+        .unwrap();
     let f = store.get_finding(3).await.unwrap().unwrap();
-    assert_eq!(f.budget_override.as_deref(), Some("once"));
+    assert_eq!(f.budget_override, Some(BudgetOverride::Once));
     assert!(f.updated_at > 1000);
 
     store.set_budget_override(3, None).await.unwrap();

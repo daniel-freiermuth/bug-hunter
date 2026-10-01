@@ -431,7 +431,10 @@ async fn override_set_once_row_updated_and_wakes_loop() {
     assert_eq!(body["ok"], json!(true));
     assert_eq!(body["finding"]["budget_override"], "once");
     let finding = state.store.get_finding(1).await.unwrap().unwrap();
-    assert_eq!(finding.budget_override.as_deref(), Some("once"));
+    assert_eq!(
+        finding.budget_override,
+        Some(hunter::domain::BudgetOverride::Once)
+    );
     // Setting an override must not wait for the loop's next natural wake.
     tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
         .await

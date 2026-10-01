@@ -27,7 +27,7 @@ use serde_json::{Map, Value, json};
 use tower_http::set_header::SetResponseHeaderLayer;
 
 use crate::config::{Config, HostAllowList};
-use crate::domain::{FindingStatus, FindingType, ForgeName, Severity};
+use crate::domain::{BudgetOverride, FindingStatus, FindingType, ForgeName, Severity};
 use crate::store::{FindingFilter, RepoUpdate, Store, StoreWriteError};
 use crate::types::{
     ActivityStatus, BudgetState, Event, Finding, FindingDetail, FindingOut, JobListEntry, Repo,
@@ -873,19 +873,17 @@ async fn override_(
     )?;
     let mode = match &mode_val {
         Value::Null => None,
-        Value::String(s) if s == "once" || s == "exempt" => Some(s.clone()),
-        _ => {
-            return Err(ApiError::BadRequest(
-                "mode must be 'once', 'exempt', or null".to_owned(),
-            ));
-        }
+        v => Some(
+            v.as_str()
+                .and_then(|s| s.parse::<BudgetOverride>().ok())
+                .ok_or_else(|| {
+                    ApiError::BadRequest("mode must be 'once', 'exempt', or null".to_owned())
+                })?,
+        ),
     };
     fetch_finding(&state.store, fid).await?;
-    state
-        .store
-        .set_budget_override(fid, mode.as_deref())
-        .await?;
-    let label = mode.as_deref().unwrap_or("cleared");
+    state.store.set_budget_override(fid, mode).await?;
+    let label = mode.map_or("cleared", BudgetOverride::as_str);
     state
         .store
         .log_event(

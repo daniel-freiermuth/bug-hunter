@@ -98,6 +98,49 @@ impl std::fmt::Display for FindingStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Budget override
+// ---------------------------------------------------------------------------
+
+/// A finding's budget override (`findings.budget_override`, TEXT; NULL is
+/// "no override"). Either mode runs the finding under the backend's
+/// prioritized outlook; `Once` is cleared after the next attempt, `Exempt`
+/// stays until cleared by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, sqlx::Type, TS)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(rename_all = "snake_case")]
+pub enum BudgetOverride {
+    Once,
+    Exempt,
+}
+
+impl BudgetOverride {
+    pub const ALL: [Self; 2] = [Self::Once, Self::Exempt];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Exempt => "exempt",
+        }
+    }
+}
+
+impl std::fmt::Display for BudgetOverride {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for BudgetOverride {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|m| m.as_str() == s)
+            .ok_or_else(|| format!("unknown budget override {s:?}"))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Why a pull request closed without merging
 // ---------------------------------------------------------------------------
 

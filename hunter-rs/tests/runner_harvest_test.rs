@@ -15,7 +15,7 @@
 mod support;
 
 use hunter::config::Config;
-use hunter::domain::{FindingJobKind, FindingStatus, ForgeName, JobState};
+use hunter::domain::{BudgetOverride, FindingJobKind, FindingStatus, ForgeName, JobState};
 use hunter::scheduler::{Candidate, pick_next, run_harvest};
 use hunter::store::{FindingInsert, Store};
 use hunter::types::RunResult;
@@ -501,7 +501,10 @@ async fn a_classification_that_cannot_be_recorded_is_retried() {
 async fn a_classification_that_cannot_be_recorded_spends_only_a_once_override() {
     let bins = FakeBins::acquire("harvest-record-fails-override");
     gh_default(&bins);
-    for (mode, left) in [("once", None), ("exempt", Some("exempt"))] {
+    for (mode, left) in [
+        (BudgetOverride::Once, None),
+        (BudgetOverride::Exempt, Some(BudgetOverride::Exempt)),
+    ] {
         let f = fixture(
             &format!("harvest-record-fails-{mode}"),
             FindingStatus::Closed,
@@ -541,7 +544,7 @@ async fn a_classification_that_cannot_be_recorded_spends_only_a_once_override() 
             "{mode}: {summary:?}"
         );
         let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
-        assert_eq!(after.budget_override.as_deref(), left, "{mode} override");
+        assert_eq!(after.budget_override, left, "{mode} override");
     }
 }
 

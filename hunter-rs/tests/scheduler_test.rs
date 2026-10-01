@@ -331,7 +331,10 @@ async fn pick_next_budget_override_jumps_the_queue() {
     let c = pick_next(&store, &cfg, None).await.unwrap().unwrap();
     assert_eq!(c.job_kind(), FindingJobKind::Fix.into());
     assert_eq!(c.target_id(), 5);
-    assert_eq!(c.budget_override(), Some("once"));
+    assert_eq!(
+        c.budget_override(),
+        Some(hunter::domain::BudgetOverride::Once)
+    );
 }
 
 // -- summary integration (oneshot router, NullBackend) -------------------------
