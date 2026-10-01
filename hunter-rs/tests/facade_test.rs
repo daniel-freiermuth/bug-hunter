@@ -255,7 +255,10 @@ fn retry_at(v: &Verdict) -> Option<f64> {
 #[tokio::test]
 async fn test_empty_windows_deny() {
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&BTreeMap::new(), 0).await.unwrap();
+    let o = b
+        .decide_with_windows(&BTreeMap::new(), 0, now_ms())
+        .await
+        .unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("no window data"));
 }
@@ -274,7 +277,7 @@ async fn test_stale_5h_low_usage_allows_via_ramp() {
         ws("anthropic:7d", 0.10, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(
         is_granted(&o.normal),
         "expected Granted, got {:?}",
@@ -296,7 +299,7 @@ async fn test_stale_5h_high_usage_denies() {
         ws("anthropic:7d", 0.10, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("5h"));
 }
@@ -315,7 +318,7 @@ async fn test_own_finished_jobs_count() {
         ws("anthropic:7d", 0.10, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 1_600_000));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("5h"));
 }
@@ -337,7 +340,7 @@ async fn test_denied_by_7d_ramp() {
         ),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("7d"));
 }
@@ -369,7 +372,7 @@ async fn test_unaccounted_reservations_independent_7d() {
         ),
     );
     let b = make_backend(FakeLedger::new(0, 20_000_000));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("7d"));
 }
@@ -390,7 +393,7 @@ async fn test_unaccounted_reservations_independent_5h() {
         ws("anthropic:7d", 0.02, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 5_000_000));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("5h"));
 }
@@ -411,7 +414,7 @@ async fn test_7d_used_above_ramp_deny() {
         ),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("ramp"));
     let rt = retry_at(&o.normal).expect("retry_at should be Some");
@@ -432,7 +435,7 @@ async fn test_7d_used_below_ramp_allow() {
         ws("anthropic:7d", 0.30, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_granted(&o.normal));
 }
 
@@ -453,7 +456,7 @@ async fn test_5h_first_30min_deny() {
         ws("anthropic:7d", 0.01, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("5h"));
     assert!(reason(&o.normal).contains("ramp"));
@@ -475,7 +478,7 @@ async fn test_5h_at_exactly_30min_deny() {
         ws("anthropic:7d", 0.01, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
 }
 
@@ -496,7 +499,7 @@ async fn test_5h_halfway_low_usage_allow() {
         ws("anthropic:7d", 0.01, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_granted(&o.normal));
 }
 
@@ -516,7 +519,7 @@ async fn test_5h_halfway_high_usage_deny() {
         ws("anthropic:7d", 0.01, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("5h"));
     assert!(reason(&o.normal).contains("ramp"));
@@ -546,7 +549,7 @@ async fn test_5h_end_high_usage_allow() {
         ws("anthropic:7d", 0.10, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_granted(&o.normal));
 }
 
@@ -565,7 +568,7 @@ async fn test_5h_exhausted_deny() {
         ws("anthropic:7d", 0.10, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     let rt = retry_at(&o.normal).expect("retry_at should be Some");
     assert!(
@@ -589,7 +592,7 @@ async fn test_5h_exhausted_stale_still_denies() {
         ws("anthropic:7d", 0.10, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     let rt = retry_at(&o.normal).expect("retry_at should be Some");
     assert!(
@@ -616,7 +619,7 @@ async fn test_7d_denial_during_5h_headroom() {
         ws("anthropic:7d", 0.30, "ok", resets_7d, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(
         reason(&o.normal).starts_with("anthropic:7d"),
@@ -638,7 +641,7 @@ async fn test_no_5h_window_allow() {
         ws("anthropic:7d", 0.10, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_granted(&o.normal));
     assert!(cap_tokens(&o.normal).is_some_and(|c| c > 0));
 }
@@ -659,7 +662,7 @@ async fn test_no_5h_window_7d_over_deny() {
         ),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("7d"));
 }
@@ -686,7 +689,7 @@ async fn test_expired_model_class_window_ignored() {
         },
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_granted(&o.normal), "{:?}", o.normal);
 }
 
@@ -700,7 +703,7 @@ async fn test_7d_window_with_unknown_reset_denies_once_full() {
         ws("anthropic:7d", 1.0, "ok", 0, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal), "{:?}", o.normal);
     assert!(
         reason(&o.normal).starts_with("anthropic:7d:"),
@@ -725,7 +728,7 @@ async fn test_active_model_class_window_gates() {
         ),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("7d"));
 }
@@ -735,7 +738,7 @@ async fn test_active_model_class_window_gates() {
 async fn test_healthy_allow() {
     let w = healthy_windows(0.05, 4.5);
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_granted(&o.normal));
     assert!(cap_tokens(&o.normal).is_some_and(|c| c > 0));
 }
@@ -765,7 +768,7 @@ async fn test_decide_denies_on_unaccounted_alone_through_rollover() {
     );
     // ledger finished=2_900_000 → res_5h ≈ 1.45 → eff 1.45 ≥ .556 → Denied.
     let b = make_backend(FakeLedger::new(0, 2_900_000));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(reason(&o.normal).contains("5h"));
 }
@@ -784,7 +787,7 @@ async fn test_decide_denies_on_unaccounted_alone_through_rollover() {
 async fn test_unaccounted_no_jobs() {
     let w = healthy_windows(0.05, 4.5);
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_granted(&o.normal));
 }
 
@@ -793,7 +796,7 @@ async fn test_unaccounted_no_jobs() {
 async fn test_unaccounted_running_job() {
     let w = healthy_windows(0.05, 4.5);
     let b = make_backend(FakeLedger::new(150_000, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     // With 150k running and 2M cap, res ≈ 0.075 — still granted.
     assert!(is_granted(&o.normal));
 }
@@ -803,7 +806,7 @@ async fn test_unaccounted_running_job() {
 async fn test_unaccounted_anticipated() {
     let w = healthy_windows(0.05, 4.5);
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 80_000).await.unwrap();
+    let o = b.decide_with_windows(&w, 80_000, now_ms()).await.unwrap();
     // With anticipated 80k and 2M cap, res ≈ 0.04 — still granted.
     assert!(is_granted(&o.normal));
 }
@@ -814,7 +817,7 @@ async fn test_unaccounted_finished_job_probe_scope() {
     let w = healthy_windows(0.05, 4.5);
     // FakeLedger always returns finished=50_000 regardless of ts.
     let b = make_backend(FakeLedger::new(0, 50_000));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     // res ≈ 50k/2M = 0.025 — small, still granted.
     assert!(is_granted(&o.normal));
 }
@@ -828,7 +831,7 @@ async fn test_unaccounted_stale_7d_probe() {
     // structure doesn't break; real Store tests (58-66) cover the delta.
     let w = healthy_windows(0.05, 4.5);
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_granted(&o.normal));
 }
 
@@ -843,7 +846,7 @@ async fn test_unaccounted_fallback_min_probe() {
         ws("anthropic:7d", 0.10, "ok", now + WEEK_MS / 2, 3600.0),
     );
     let b = make_backend(FakeLedger::new(0, 10_000));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     // 10k on 67.2M cap is tiny → Granted.
     assert!(is_granted(&o.normal));
 }
@@ -1201,7 +1204,10 @@ async fn test_failed_invalidate_does_not_block_read() {
 #[tokio::test]
 async fn test_prio_both_denied_empty_windows() {
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&BTreeMap::new(), 0).await.unwrap();
+    let o = b
+        .decide_with_windows(&BTreeMap::new(), 0, now_ms())
+        .await
+        .unwrap();
     assert!(is_denied(&o.normal));
     assert!(is_denied(&o.prioritized));
 }
@@ -1211,7 +1217,7 @@ async fn test_prio_both_denied_empty_windows() {
 async fn test_prio_granted_when_normal_granted() {
     let w = healthy_windows(0.05, 4.5);
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_granted(&o.normal));
     assert!(is_granted(&o.prioritized));
     // Prio headroom should be ≥ normal headroom.
@@ -1237,7 +1243,7 @@ async fn test_prio_override_7d_pacing() {
         ),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal), "normal should be denied");
     assert!(
         is_granted(&o.prioritized),
@@ -1267,7 +1273,7 @@ async fn test_prio_override_5h_pacing() {
         ws("anthropic:7d", 0.01, "ok", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(
         is_granted(&o.prioritized),
@@ -1286,7 +1292,7 @@ async fn test_prio_exhausted_not_waived() {
         ws("anthropic:7d", 1.0, "exhausted", now + WEEK_MS / 2, 60.0),
     );
     let b = make_backend(FakeLedger::new(0, 0));
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
     assert!(is_denied(&o.normal));
     assert!(
         is_denied(&o.prioritized),
@@ -1330,7 +1336,7 @@ async fn the_7d_cap_prefers_the_7d_estimate_over_the_5h_ratio() {
         .insert("anthropic:7d".to_owned(), 9_000_000.0);
 
     let b = make_backend(ledger);
-    let o = b.decide_with_windows(&w, 0).await.unwrap();
+    let o = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
 
     let cap = match &o.prioritized {
         hunter::backend::Verdict::Granted { cap_tokens, .. } => cap_tokens.expect("a token cap"),
@@ -1395,7 +1401,10 @@ async fn test_granted_cap_covers_the_anticipated_job() {
         .insert("anthropic:5h".to_owned(), 1_000_000.0);
 
     let b = make_backend(ledger);
-    let o = b.decide_with_windows(&w, ANTICIPATED).await.unwrap();
+    let o = b
+        .decide_with_windows(&w, ANTICIPATED, now_ms())
+        .await
+        .unwrap();
 
     assert!(
         is_granted(&o.normal),
@@ -1449,7 +1458,10 @@ async fn test_prio_override_cap_excludes_the_anticipated_job() {
         .insert("anthropic:5h".to_owned(), 1_000_000.0);
 
     let b = make_backend(ledger);
-    let o = b.decide_with_windows(&w, ANTICIPATED).await.unwrap();
+    let o = b
+        .decide_with_windows(&w, ANTICIPATED, now_ms())
+        .await
+        .unwrap();
 
     assert!(
         is_denied(&o.normal),
@@ -1499,8 +1511,8 @@ async fn test_cap_is_the_same_headroom_whatever_the_job_anticipates() {
         .insert("anthropic:5h".to_owned(), 1_000_000.0);
     let b = make_backend(ledger);
 
-    let cold = b.decide_with_windows(&w, 0).await.unwrap();
-    let warm = b.decide_with_windows(&w, 200_000).await.unwrap();
+    let cold = b.decide_with_windows(&w, 0, now_ms()).await.unwrap();
+    let warm = b.decide_with_windows(&w, 200_000, now_ms()).await.unwrap();
 
     assert!(is_granted(&cold.normal), "{:?}", cold.normal);
     assert!(is_granted(&warm.normal), "{:?}", warm.normal);
@@ -1551,7 +1563,10 @@ async fn test_7d_prio_override_cap_excludes_the_anticipated_job() {
         .insert("anthropic:7d".to_owned(), 10_000_000.0);
     let b = make_backend(ledger);
 
-    let o = b.decide_with_windows(&w, ANTICIPATED).await.unwrap();
+    let o = b
+        .decide_with_windows(&w, ANTICIPATED, now_ms())
+        .await
+        .unwrap();
 
     assert!(is_denied(&o.normal), "{:?}", o.normal);
     assert!(reason(&o.normal).contains("7d"), "{:?}", o.normal);
@@ -1592,7 +1607,10 @@ async fn codex_high_short_window_usage_denies() {
         ),
     );
 
-    let outlook = backend.decide_with_windows(&windows, 0).await.unwrap();
+    let outlook = backend
+        .decide_with_windows(&windows, 0, now_ms())
+        .await
+        .unwrap();
     assert!(is_denied(&outlook.normal));
     assert!(reason(&outlook.normal).contains("5h"));
 }
@@ -1623,7 +1641,10 @@ async fn codex_long_window_over_its_ramp_denies() {
         ),
     );
 
-    let outlook = backend.decide_with_windows(&windows, 0).await.unwrap();
+    let outlook = backend
+        .decide_with_windows(&windows, 0, now_ms())
+        .await
+        .unwrap();
     assert!(is_denied(&outlook.normal), "{:?}", outlook.normal);
     assert!(
         reason(&outlook.normal).starts_with("openai-codex:secondary:"),
@@ -1666,7 +1687,7 @@ async fn test_running_jobs_shrink_the_5h_cap() {
         .insert("anthropic:5h".to_owned(), 1_000_000.0);
 
     let o = make_backend(ledger)
-        .decide_with_windows(&w, 0)
+        .decide_with_windows(&w, 0, now_ms())
         .await
         .unwrap();
 
@@ -1690,7 +1711,7 @@ async fn test_running_jobs_shrink_the_7d_cap() {
         .insert("anthropic:7d".to_owned(), 10_000_000.0);
 
     let o = make_backend(ledger)
-        .decide_with_windows(&w, 0)
+        .decide_with_windows(&w, 0, now_ms())
         .await
         .unwrap();
 
@@ -1725,7 +1746,7 @@ async fn test_running_jobs_shrink_the_5h_prio_override_cap() {
         .insert("anthropic:5h".to_owned(), 1_000_000.0);
 
     let o = make_backend(ledger)
-        .decide_with_windows(&w, 0)
+        .decide_with_windows(&w, 0, now_ms())
         .await
         .unwrap();
 
@@ -1779,7 +1800,7 @@ async fn seven_day_override(used_7d: f64) -> hunter::backend::Outlook {
         .capacity
         .insert("anthropic:7d".to_owned(), 10_000_000.0);
     make_backend(ledger)
-        .decide_with_windows(&w, 0)
+        .decide_with_windows(&w, 0, now_ms())
         .await
         .unwrap()
 }
@@ -2066,4 +2087,36 @@ async fn codex_status_html_shows_only_codex_windows() {
     assert!(html.contains("<b>5h window</b><span>94% used"), "{html}");
     assert!(html.contains("<b>7d window</b><span>15% used"), "{html}");
     assert!(!html.contains("50% used"), "Anthropic row leaked: {html}");
+}
+
+/// Gate and cap judge the same instant. The cap used to re-read the wall
+/// clock, so a window that expired between the window read and that second
+/// read stopped capping: here, at a decision instant long past, both
+/// windows would look expired (5h skipped, 7d ramp 1.0) and the grant
+/// would be capped by 0.9 of the week, not by the 5h ramp.
+#[tokio::test]
+async fn gate_and_cap_judge_the_same_instant() {
+    const DECIDED_AT: i64 = 1_700_000_000_000;
+    let mut windows = BTreeMap::new();
+    windows.insert(
+        "anthropic:5h".to_owned(),
+        // Elapsed 4.5h of 5h: ramp (4.5h - 0.5h) / 4.5h = 0.889.
+        ws("anthropic:5h", 0.5, "ok", DECIDED_AT + HOUR_MS / 2, 60.0),
+    );
+    windows.insert(
+        "anthropic:7d".to_owned(),
+        ws("anthropic:7d", 0.10, "ok", DECIDED_AT + WEEK_MS / 2, 60.0),
+    );
+
+    let o = make_backend(FakeLedger::new(0, 0))
+        .decide_with_windows(&windows, 0, DECIDED_AT)
+        .await
+        .unwrap();
+
+    // (0.889 - 0.5) of the 2M fallback 5h capacity.
+    let cap = cap_tokens(&o.normal).expect("granted with a cap");
+    assert!((cap - 777_777).abs() <= 2, "normal cap {cap}");
+    // Prioritized: (1.0 - 0.5) of the same 5h capacity.
+    let prio = cap_tokens(&o.prioritized).expect("granted with a cap");
+    assert!((prio - 1_000_000).abs() <= 2, "prioritized cap {prio}");
 }

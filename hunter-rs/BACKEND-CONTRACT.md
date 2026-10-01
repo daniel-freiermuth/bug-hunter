@@ -4,6 +4,12 @@ Extracted 2026-09-13 from the Python source at the paths cited below. Companion 
 
 Sources of truth: `hunter/backend.py`; `hunter/backends/omp_scavenge/{__init__,facade,capacity,harness}.py`; `hunter/store.py`; `hunter/types.py`; call sites in `hunter/server.py` + `hunter/scheduler.py`; tests `tests/test_budget.py`, `tests/test_unaccounted_tokens.py`, `tests/test_refresh_stale_probe.py`, `tests/test_store.py`, `tests/test_server.py`.
 
+**Rust clock:** `decide_with_windows` accepts an explicit timestamp and
+uses it for pacing and both headroom calculations; `Backend::decide` reads
+the clock once and passes that same value to `read_windows` and the
+decision. A reset landing between two clock reads would otherwise leave an
+un-rolled window that the gate skips as expired.
+
 ---
 
 ## 0. Where the backend touches the HTTP layer
@@ -267,6 +273,10 @@ Constants: `_TOK_PER_FRAC_5H = 200_000 / 0.10 = 2_000_000.0` (:42; comment :39-4
 5. **All passed** (:227-230): `headroom = _compute_headroom(windows, res, prio=prio)`; `return Granted(cap_tokens=headroom, reason="ok")` — headroom may be None (unbounded) when no window had a usable used_fraction.
 
 **`_compute_headroom(windows, res, *, prio) -> int | None`** (:232-269). Min headroom in tokens across windows, taken against `res.budget_X` — the reservation that EXCLUDES the anticipated job (see `_unaccounted_fraction` item 5). Fresh `now_ms = time.time()*1000` (:248 — second clock read inside one decide()). Per window: skip `used_fraction is None` (:252-253). `:7d` lids: `ceiling = 1.0 if prio else ramp_7d(w.resets_at, now_ms)`; `frac = max(0.0, ceiling − capacity.effective_used(w, res.budget_7d))`; `tok = _frac_to_tokens(frac, "7d")` (:254-259). `:5h` lids: `allowed = ramp_5h(…)`; only if not None: `ceiling = 1.0 if prio else allowed`; same with `res.budget_5h`, dim "5h" (:260-267). `return min(caps) if caps else None` (:269).
+
+**Rust clock:** unlike the historical Python implementation above, admission
+and headroom use one explicit decision-time snapshot. Tests can inject the
+exact reset without racing a second wall-clock read.
 
 **`_frac_to_tokens(frac, dim) -> int`** (:271-276): `cap_5h, cap_7d = _capacities()`; `dim == "5h" or ":5h" in dim` → `int(frac * cap_5h)`; else → `int(frac * cap_7d)`. Both caps come from the one derivation `_unaccounted_fraction` uses: the 7d estimate is consulted, and the 5h-times-ratio value is only the fallback when there is not yet enough history to estimate one. (An earlier revision of this document claimed the 7d estimate was *not* consulted here and told the port to reproduce that asymmetry verbatim. It was a mis-transcription: the 7d estimate has always been read. The Rust port matches the source, not that sentence.)
 
