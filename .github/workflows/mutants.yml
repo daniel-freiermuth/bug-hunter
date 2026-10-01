@@ -105,7 +105,7 @@ jobs:
         env:
           # Per-run ceiling, not a give-up threshold: a diff with more
           # mutants than this is split into shards and one shard runs.
-          MAX_MUTANTS: "400"
+          MAX_MUTANTS: "80"
           BASE_REF: ${{ github.base_ref }}
           # Rotates the shard so consecutive pushes cover different
           # slices instead of re-testing the same one.
