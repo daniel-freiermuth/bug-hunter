@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
+
 use crate::config::Config;
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, JobKind, JobState,
@@ -1533,6 +1535,39 @@ async fn fetch_tip(store: &Store, repo: &Repo) -> anyhow::Result<String> {
     Ok(tip)
 }
 
+/// The findings a cold repo-level prompt hands its worker: those of each
+/// of `types` already rejected or declined, each with its verdict's
+/// anchor, and those still on file.
+///
+/// Any read failing is an error, never an empty list: a worker told
+/// that nothing is settled spends a metered run rediscovering findings an
+/// operator already turned down. Callers load these before the budget
+/// gate so a failed read refuses the job before anything is reserved,
+/// written or spawned.
+async fn prior_findings(
+    store: &Store,
+    rid: i64,
+    types: &[&str],
+    label: &str,
+) -> anyhow::Result<(Vec<crate::suppression::Suppressed>, Vec<Finding>)> {
+    let mut suppressed = Vec::new();
+    let mut known = Vec::new();
+    for &ft in types {
+        suppressed.extend(
+            crate::suppression::suppressed(store, rid, ft)
+                .await
+                .with_context(|| format!("{label}: loading suppressed {ft} findings"))?,
+        );
+        known.extend(
+            store
+                .known_active(rid, ft)
+                .await
+                .with_context(|| format!("{label}: loading known {ft} findings"))?,
+        );
+    }
+    Ok((suppressed, known))
+}
+
 /// Run a hunt job (`scheduler.run_hunt`).
 ///
 /// `resume` continues a suspended attempt: no sync, the diff range ending
@@ -1749,6 +1784,15 @@ pub async fn run_hunt(
     // again on the next cold hunt.
     let full_scope = diff_range.starts_with(EMPTY_TREE);
 
+    // A resume hands its worker a "carry on", not a playbook, so it reads
+    // neither list.
+    let (suppressed, known) = if resume.is_some() {
+        (Vec::new(), Vec::new())
+    } else {
+        let types = [FindingType::Bug.as_str()];
+        prior_findings(store, rid, &types, &format!("hunt {rname}")).await?
+    };
+
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -1827,13 +1871,7 @@ pub async fn run_hunt(
         .join(format!("job{out_job}.findings.json"));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
-    let suppressions =
-        crate::suppression::suppression_list(store, repo, &[FindingType::Bug.as_str()], &pinned)
-            .await;
-    let known = store
-        .known_active(rid, FindingType::Bug.as_str())
-        .await
-        .unwrap_or_default();
+    let suppressions = crate::suppression::suppression_list(repo, suppressed, &pinned).await;
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
     let prompt = match resume {
         Some(_) => RESUME_PROMPT.to_owned(),
@@ -2545,6 +2583,17 @@ async fn run_analysis_job(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
+    let types: Vec<&str> = std::iter::once(&spec.finding_type)
+        .chain(spec.also_files)
+        .map(|ft| ft.as_str())
+        .collect();
+    // As in `run_hunt`: read before the budget gate, and only for a cold job.
+    let (suppressed, known) = if resume.is_some() {
+        (Vec::new(), Vec::new())
+    } else {
+        prior_findings(store, rid, &types, &format!("{kind} {rname}")).await?
+    };
+
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -2604,15 +2653,7 @@ async fn run_analysis_job(
         .join(format!("job{out_job}.{}.json", spec.out_plural));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
-    let types: Vec<&str> = std::iter::once(&spec.finding_type)
-        .chain(spec.also_files)
-        .map(|ft| ft.as_str())
-        .collect();
-    let suppressions = crate::suppression::suppression_list(store, repo, &types, &pinned).await;
-    let mut known = Vec::new();
-    for ft in &types {
-        known.extend(store.known_active(rid, ft).await.unwrap_or_default());
-    }
+    let suppressions = crate::suppression::suppression_list(repo, suppressed, &pinned).await;
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
     let prompt = match resume {
         Some(_) => RESUME_PROMPT.to_owned(),
