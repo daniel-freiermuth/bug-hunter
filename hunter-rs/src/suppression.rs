@@ -165,27 +165,32 @@ fn changed_since(clone: &Path, anchor: &VerdictAnchor, at: &str) -> Option<Chang
     (!files.is_empty()).then_some(Changed::Files { since, files })
 }
 
-/// The suppression list for a scan of `repo` at commit `at`, over the
-/// finding types `types`: every suppressed finding with its status and
+/// A suppressed finding and the anchor of its verdict, if it has one.
+pub type Suppressed = (Finding, Option<VerdictAnchor>);
+
+/// `repo_id`'s suppressed findings of `finding_type`, each with its anchor.
+pub async fn suppressed(
+    store: &Store,
+    repo_id: i64,
+    finding_type: &str,
+) -> sqlx::Result<Vec<Suppressed>> {
+    let mut anchors = store.suppression_anchors(repo_id, finding_type).await?;
+    Ok(store
+        .suppressions(repo_id, finding_type)
+        .await?
+        .into_iter()
+        .map(|f| {
+            let anchor = anchors.remove(&f.id);
+            (f, anchor)
+        })
+        .collect())
+}
+
+/// The suppression list for a scan of `repo` at commit `at`, from its
+/// [`suppressed`] findings `entries`: every one with its status and
 /// reason, its anchor's condition when it has one, and whether the code
 /// its verdict depends on has changed since.
-pub async fn suppression_list(
-    store: &Store,
-    repo: &Repo,
-    types: &[&str],
-    at: &str,
-) -> Vec<Suppression> {
-    let mut entries: Vec<(Finding, Option<VerdictAnchor>)> = Vec::new();
-    for ft in types {
-        let mut anchors: BTreeMap<i64, VerdictAnchor> = store
-            .suppression_anchors(repo.id, ft)
-            .await
-            .unwrap_or_default();
-        for f in store.suppressions(repo.id, ft).await.unwrap_or_default() {
-            let anchor = anchors.remove(&f.id);
-            entries.push((f, anchor));
-        }
-    }
+pub async fn suppression_list(repo: &Repo, entries: Vec<Suppressed>, at: &str) -> Vec<Suppression> {
     let clone = PathBuf::from(&repo.path);
     let at = at.to_owned();
     tokio::task::spawn_blocking(move || {

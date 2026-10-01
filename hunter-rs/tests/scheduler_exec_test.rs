@@ -6,11 +6,11 @@ mod support;
 
 use std::path::{Path, PathBuf};
 
-use hunter::domain::{FindingJobKind, FindingType, RepoJobKind};
+use hunter::domain::{FindingJobKind, FindingType, ForgeName, RepoJobKind};
 use hunter::store::{JobOutcome, Store};
 use hunter::types::RunResult;
 use sqlx::SqlitePool;
-use support::{TempDir, fresh_pool};
+use support::{GitRepo, ScriptedBackend, TempDir, fresh_pool};
 
 /// The guard comes FIRST in the tuple so every caller binds it first:
 /// locals drop in reverse declaration order, so the directory outlives
@@ -821,4 +821,135 @@ async fn a_suspended_job_drains_the_queue_like_a_killed_one() {
             )
         );
     }
+}
+
+// -- unreadable prior findings refuse a repo job -----------------------------
+
+/// A repo with a real clone whose only finding of `finding_type` cannot be
+/// decoded: its severity is not one the enum knows. Both whole-list reads a
+/// cold prompt is built from fail on such a row. The playbooks exist, so
+/// nothing but that read stands between the job and its worker.
+async fn repo_with_an_undecodable_finding(
+    dir: &TempDir,
+    finding_type: &str,
+) -> (PathBuf, Store, hunter::types::Repo, hunter::config::Config) {
+    let repo = GitRepo::with_branch(dir, "feature");
+    let (path, pool) = fresh_pool(dir, "hunter").await;
+    let store = rw_store(&path).await;
+    let repos_root = dir.subdir("repos");
+    let rid = store
+        .add_repo(
+            "widget",
+            &repo.origin.to_string_lossy(),
+            &repos_root,
+            &repo.default_branch,
+            ForgeName::Github,
+        )
+        .await
+        .unwrap();
+    std::fs::rename(&repo.work, Store::repo_dir(&repos_root, rid)).unwrap();
+    sqlx::query(
+        "INSERT INTO findings
+            (type, repo_id, fingerprint, severity, confidence, summary, status,
+             created_at, updated_at, fix_attempts, recheck_attempts)
+         VALUES (?1, ?2, 'fp-bad', 'HIGH', 0.9, 'turned down', 'rejected', 1000, 1000, 0, 0)",
+    )
+    .bind(finding_type)
+    .bind(rid)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let playbooks = dir.subdir("playbooks");
+    for name in ["hunt.md", "refactor.md", "test_gap.md"] {
+        std::fs::write(playbooks.join(name), "work in {{REPO_PATH}}\n").unwrap();
+    }
+    let row = store.get_repo_by_id(rid).await.unwrap().unwrap();
+    let mut cfg = hunter::config::Config::load(dir.path()).expect("load config");
+    cfg.work_root = dir.subdir("work_root");
+    (path, store, row, cfg)
+}
+
+/// A hunt whose suppression list cannot be read is refused, not run blind.
+///
+/// Reading that failure as "nothing was ever rejected" would launch a
+/// metered worker told to rediscover what an operator already turned
+/// down. The refusal comes before the budget gate: no job row, no worker.
+#[tokio::test]
+async fn a_hunt_whose_suppressions_cannot_be_read_is_refused() {
+    let dir = TempDir::new("hunt-bad-suppressions");
+    let (_path, store, row, cfg) =
+        repo_with_an_undecodable_finding(&dir, FindingType::Bug.as_str()).await;
+    let backend = ScriptedBackend::noop();
+
+    let err = hunter::scheduler::run_hunt(&store, &cfg, &row, &backend, None)
+        .await
+        .expect_err("an unreadable suppression list must refuse the hunt");
+
+    assert!(
+        format!("{err:#}").contains("hunt widget: loading suppressed bug findings"),
+        "the error must say which read failed for which job: {err:#}"
+    );
+    assert!(
+        backend.runs().is_empty(),
+        "no worker may have been launched"
+    );
+    assert!(
+        store.list_jobs(10).await.unwrap().is_empty(),
+        "no job row may have been written"
+    );
+}
+
+/// The same refusal for the shared repo-level analysis body.
+#[tokio::test]
+async fn an_analysis_job_whose_suppressions_cannot_be_read_is_refused() {
+    let dir = TempDir::new("refactor-bad-suppressions");
+    let (_path, store, row, cfg) =
+        repo_with_an_undecodable_finding(&dir, RepoJobKind::Refactor.as_str()).await;
+    let backend = ScriptedBackend::noop();
+
+    let err = hunter::scheduler::run_refactor(&store, &cfg, &row, &backend, None)
+        .await
+        .expect_err("an unreadable suppression list must refuse the job");
+
+    assert!(
+        format!("{err:#}").contains("refactor widget: loading suppressed refactor findings"),
+        "the error must say which read failed for which job: {err:#}"
+    );
+    assert!(
+        backend.runs().is_empty(),
+        "no worker may have been launched"
+    );
+    assert!(
+        store.list_jobs(10).await.unwrap().is_empty(),
+        "no job row may have been written"
+    );
+}
+
+/// A `test_gap` job also hands its worker the repo's bug findings, since it
+/// may file a bug instead; an unreadable bug list refuses it just the same.
+#[tokio::test]
+async fn a_test_gap_whose_bug_suppressions_cannot_be_read_is_refused() {
+    let dir = TempDir::new("test-gap-bad-bug-suppressions");
+    let (_path, store, row, cfg) =
+        repo_with_an_undecodable_finding(&dir, FindingType::Bug.as_str()).await;
+    let backend = ScriptedBackend::noop();
+
+    let err = hunter::scheduler::run_test_gap(&store, &cfg, &row, &backend, None)
+        .await
+        .expect_err("an unreadable bug suppression list must refuse the job");
+
+    assert!(
+        format!("{err:#}").contains("test_gap widget: loading suppressed bug findings"),
+        "the error must say which read failed for which job: {err:#}"
+    );
+    assert!(
+        backend.runs().is_empty(),
+        "no worker may have been launched"
+    );
+    assert!(
+        store.list_jobs(10).await.unwrap().is_empty(),
+        "no job row may have been written"
+    );
 }
