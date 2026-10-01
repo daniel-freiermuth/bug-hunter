@@ -1361,6 +1361,62 @@ async fn a_resumed_hunt_does_not_sync_the_clone() {
     assert_eq!(summary.state, Some(JobState::Done));
 }
 
+/// A periodic full re-hunt that the cap suspends, and a resume then
+/// finishes, counts as the full re-hunt it was.
+///
+/// The cold attempt cleared the watermark before its worker ran, which is
+/// the state seeded here; the resume is handed none of the cold attempt's
+/// locals. Were `last_full_hunt_at` left at its old value, the next cold
+/// hunt would find the re-hunt still due and re-scope the whole history
+/// again — and a repo big enough to need a resume would never leave
+/// full-history hunts.
+#[tokio::test]
+async fn a_resumed_full_rehunt_refreshes_the_full_hunt_stamp() {
+    let (dir, path, pool) = fresh_db().await;
+    executable_repo(&dir, &pool, 10).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let stale = now - (cfg.hunt_rehunt_days + 1) * 86_400_000;
+    sqlx::query("UPDATE repos SET last_hunt_sha = NULL, last_full_hunt_at = ?1 WHERE id = 1")
+        .bind(stale)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
+    let warm = RecordingBackend::new(
+        cfg.work_root.join("out").join("job10.findings.json"),
+        one_finding(),
+    );
+    let row = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let summary = run_hunt(&store, &cfg, &row, &warm, Some(&plan))
+        .await
+        .unwrap();
+    assert_eq!(summary.state, Some(JobState::Done));
+
+    let after = store.get_repo_by_id(1).await.unwrap().unwrap();
+    assert!(
+        after.last_full_hunt_at.is_some_and(|t| t > stale),
+        "the finished full re-hunt must refresh last_full_hunt_at, got {:?} (stale {stale})",
+        after.last_full_hunt_at
+    );
+
+    let cold = RecordingBackend::new(cfg.work_root.join("out").join("cold.json"), String::new());
+    let next = run_hunt(&store, &cfg, &after, &cold, None).await.unwrap();
+    assert_ne!(
+        next.full_rehunt,
+        Some(true),
+        "the next cold hunt must not start another full re-hunt: {next:?}"
+    );
+}
+
 /// A whole cycle picks the suspension up and runs it as the kind that
 /// was suspended.
 ///
