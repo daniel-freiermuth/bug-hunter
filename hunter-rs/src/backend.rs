@@ -116,8 +116,9 @@ pub trait SpendLedger: Send + Sync {
     ) -> sqlx::Result<()>;
     /// Max tokens hunter ever spent inside one completed window cycle
     /// (NOT p75; `SpendLedger.estimate_capacity` / `Store.estimate_capacity`;
-    /// the Python `_min_delta` param is dead and dropped here). None for unknown
-    /// `limit_ids` or when no cycle had spend.
+    /// the Python `_min_delta` param is dead and dropped here). Some always
+    /// contains a strictly positive capacity; None for unknown `limit_ids`
+    /// or when no cycle had positive spend.
     async fn estimate_capacity(&self, limit_id: &str) -> sqlx::Result<Option<f64>>;
 }
 

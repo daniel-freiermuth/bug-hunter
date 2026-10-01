@@ -50,8 +50,8 @@ fn window(
 struct Case {
     provider: LlmProvider,
     windows: Vec<WindowState>,
-    unaccounted_5h: f64,
-    unaccounted_7d: f64,
+    /// Quota window `limit_id` -> in-flight fraction.
+    unaccounted: BTreeMap<&'static str, f64>,
     capacity: Option<f64>,
 }
 
@@ -60,8 +60,7 @@ impl Case {
         Self {
             provider: LlmProvider::Anthropic,
             windows,
-            unaccounted_5h: 0.0,
-            unaccounted_7d: 0.0,
+            unaccounted: BTreeMap::new(),
             capacity: Some(3_000_000.0),
         }
     }
@@ -77,8 +76,7 @@ impl Case {
             now_ms: NOW,
             provider: self.provider,
             windows: map,
-            unaccounted_5h: self.unaccounted_5h,
-            unaccounted_7d: self.unaccounted_7d,
+            unaccounted: self.unaccounted,
             capacities,
             stale_after_s: 300.0,
         })
@@ -157,7 +155,7 @@ fn unaccounted_spend_in_flight() {
         Some(2 * HOUR),
         45.0,
     )]);
-    case.unaccounted_5h = 0.10;
+    case.unaccounted.insert("anthropic:5h", 0.10);
     insta::assert_snapshot!(case.render());
 }
 
@@ -208,6 +206,23 @@ fn inside_the_headroom_window() {
         )])
         .render()
     );
+}
+
+/// The headroom note counts down the window's first `HEADROOM_MS` and so
+/// never exceeds it. A row whose reset lies further ahead than one
+/// window (clock skew between omp and hunter, a stale row) has negative
+/// elapsed time; it must not render "headroom 90m".
+#[test]
+fn no_headroom_note_for_a_reset_beyond_one_window() {
+    let html = Case::new(vec![window(
+        "anthropic:5h",
+        Some(0.02),
+        "ok",
+        Some(6 * HOUR),
+        20.0,
+    )])
+    .render();
+    assert!(!html.contains("headroom"), "{html}");
 }
 
 /// No `used_fraction` yet: `?` for the percentage and the availability
