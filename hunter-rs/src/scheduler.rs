@@ -2937,15 +2937,20 @@ pub async fn run_standards(
 
 fn extract_pr_url(text: &str) -> Option<String> {
     for word in text.split_whitespace() {
-        if word.starts_with("https://")
-            && let Some(idx) = word.find("/pull/")
-        {
-            let after = &word[idx + 6..];
-            let digit_end = after
-                .find(|c: char| !c.is_ascii_digit())
-                .unwrap_or(after.len());
-            if digit_end > 0 {
-                return Some(word[..idx + 6 + digit_end].to_owned());
+        if !word.starts_with("https://") {
+            continue;
+        }
+        // `gh` reports a PR URL, `GitLabForge::create_pr` an MR URL.
+        for marker in ["/pull/", "/-/merge_requests/"] {
+            if let Some(idx) = word.find(marker) {
+                let end = idx + marker.len();
+                let after = &word[end..];
+                let digit_end = after
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(after.len());
+                if digit_end > 0 {
+                    return Some(word[..end + digit_end].to_owned());
+                }
             }
         }
     }
