@@ -1299,6 +1299,40 @@ impl Forge for GitLabForge {
             300,
         );
         if rc != 0 {
+            // GitLab's 409 names the open MR only as `!N`, and glab wraps
+            // its error box at a fixed width, which can split the phrase
+            // across lines. Look the MR up so the caller can adopt it, as
+            // it adopts the PR URL `gh` prints for the same conflict.
+            let flat = out.split_whitespace().collect::<Vec<_>>().join(" ");
+            if flat.contains("already exists") {
+                let (lrc, listed) = run_cmd_cwd(
+                    &[
+                        "glab",
+                        "mr",
+                        "list",
+                        "--source-branch",
+                        head,
+                        "--target-branch",
+                        base,
+                        "--output",
+                        "json",
+                        "--jq",
+                        ".[].web_url",
+                    ],
+                    repo_path,
+                    60,
+                );
+                if lrc == 0
+                    && let Some(url) = listed
+                        .lines()
+                        .map(str::trim)
+                        .find(|l| l.contains("/-/merge_requests/"))
+                {
+                    anyhow::bail!(
+                        "glab mr create failed (rc={rc}): merge request already exists: {url}\n{out}"
+                    );
+                }
+            }
             anyhow::bail!("glab mr create failed (rc={rc}): {out}");
         }
         // glab prints the MR URL; search for it.

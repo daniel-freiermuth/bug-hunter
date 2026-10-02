@@ -34,6 +34,11 @@ struct Fixture {
 
 /// A repo with a queued bug finding — the state `run_fix` expects.
 async fn fixture(label: &str) -> Fixture {
+    fixture_on(label, REPO_URL, ForgeName::Github).await
+}
+
+/// [`fixture`] for a repo registered under `url` on `forge`.
+async fn fixture_on(label: &str, url: &str, forge: ForgeName) -> Fixture {
     let dir = TempDir::new(label);
     let repo = GitRepo::with_branch(&dir, "some-other-branch");
     let (db, store) = fresh_store(&dir, "fix").await;
@@ -41,13 +46,7 @@ async fn fixture(label: &str) -> Fixture {
     let repos_root = dir.path().join("repos");
     std::fs::create_dir_all(&repos_root).unwrap();
     let rid = store
-        .add_repo(
-            "widget",
-            REPO_URL,
-            &repos_root,
-            &repo.default_branch,
-            ForgeName::Github,
-        )
+        .add_repo("widget", url, &repos_root, &repo.default_branch, forge)
         .await
         .unwrap();
     let repo_dir = hunter::store::Store::repo_dir(&repos_root, rid);
@@ -1507,4 +1506,53 @@ async fn a_different_failure_restarts_the_streak() {
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, hunter::domain::FindingStatus::Queued);
     assert_eq!(after.fix_attempts, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Recovering a PR that already exists
+// ---------------------------------------------------------------------------
+
+const GL_REPO_URL: &str = "https://gitlab.com/group/widget";
+const GL_MR_URL: &str = "https://gitlab.com/group/widget/-/merge_requests/42";
+
+/// What `glab mr create` (1.119) prints when GitLab answers 409 because
+/// the branch already has an open MR. Captured against a stub API, host
+/// rewritten. It carries no MR web URL — only `!42` — and glab wraps it
+/// at a fixed width, which splits "already exists" for some project
+/// paths.
+const GLAB_MR_EXISTS: &str = "\nCreating draft merge request for fix/a-real-bug-1 into main in group/widget\n\nFailed to create merge request. Created recovery file: /tmp/glab/recover/group/widget/mr.json\nRun the command again with the '--recover' option to retry.\n          \n   ERROR  \n          \n  Post https://gitlab.com/api/v4/projects/group%2Fwidget/merge_requests: 409 {message: [Another open merge request already\n  exists for this source branch: !42]}.";
+
+/// A retried fix whose MR is already open on GitLab adopts that MR, as a
+/// GitHub retry adopts its PR. Failing instead repeats the identical
+/// "PR create failed" on every retry until the streak rejects a finding
+/// whose fix is sitting in an open MR.
+#[tokio::test]
+async fn gitlab_retry_adopts_the_mr_that_already_exists() {
+    let bins = support::FakeBins::acquire("fix-gl-exists");
+    let f = fixture_on("fix-gl-exists", GL_REPO_URL, ForgeName::Gitlab).await;
+    // The push goes to git@gitlab.com:group/widget.git; land it on the
+    // local bare origin instead.
+    let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
+    git(
+        &f.repo_dir,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", origin.trim()),
+            "git@gitlab.com:group/widget.git",
+        ],
+    );
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$1 $2\" in\n\"mr create\") cat >&2 <<'__FAKE_EOF__'\n{GLAB_MR_EXISTS}\n__FAKE_EOF__\nexit 1;;\n\"mr list\") echo '{GL_MR_URL}'; exit 0;;\nesac\nexit 1"
+        ),
+    );
+
+    let summary = fix(&f, &committing(true)).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(summary.pr_url.as_deref(), Some(GL_MR_URL));
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status, hunter::domain::FindingStatus::PrOpen);
+    assert_eq!(finding.pr_url.as_deref(), Some(GL_MR_URL));
 }
