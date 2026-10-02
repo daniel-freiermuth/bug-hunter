@@ -1490,3 +1490,19 @@ mod lookup_cache_tests {
         assert_eq!(cache.fresh("github-push:h/o/r:other", t0), None);
     }
 }
+
+#[cfg(test)]
+mod gitlab_norm_state_tests {
+    use super::*;
+
+    /// `locked` is the MR mid-merge, not an MR that ended. Read as closed,
+    /// sync_prs took a merging fix off `pr_open` as closed without merge,
+    /// so the sync that would have seen it merged never came.
+    #[test]
+    fn a_locked_mr_is_still_open() {
+        assert_eq!(gitlab_norm_state("locked"), PrState::Open);
+        assert_eq!(gitlab_norm_state("opened"), PrState::Open);
+        assert_eq!(gitlab_norm_state("merged"), PrState::Merged);
+        assert_eq!(gitlab_norm_state("closed"), PrState::Closed);
+    }
+}
