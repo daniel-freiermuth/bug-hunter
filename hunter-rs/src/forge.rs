@@ -918,10 +918,12 @@ fn gitlab_unified_diff(files: &[GlFileDiff]) -> String {
 // GitLab normalisation helpers (`forge.GitLabForge._norm_*`, `_split_notes`)
 // ---------------------------------------------------------------------------
 
+/// `locked` is GitLab's short-lived state for an MR being merged: it has
+/// not ended yet, so it stays open until it reads `merged`.
 fn gitlab_norm_state(raw: &str) -> PrState {
     match raw.to_ascii_lowercase().as_str() {
         "merged" => PrState::Merged,
-        "closed" | "locked" => PrState::Closed,
+        "closed" => PrState::Closed,
         _ => PrState::Open,
     }
 }
@@ -1616,5 +1618,21 @@ mod lookup_cache_tests {
         assert_eq!(cache.fresh("github-bot-item:h:IC_bot", now), Some(true));
         assert_eq!(cache.fresh("github-bot-item:h:IC_user", now), Some(false));
         assert_eq!(cache.0.len(), 2, "the expired answer is gone");
+    }
+}
+
+#[cfg(test)]
+mod gitlab_norm_state_tests {
+    use super::*;
+
+    /// `locked` is the MR mid-merge, not an MR that ended. Read as closed,
+    /// `sync_prs` took a merging fix off `pr_open` as closed without merge,
+    /// so the sync that would have seen it merged never came.
+    #[test]
+    fn a_locked_mr_is_still_open() {
+        assert_eq!(gitlab_norm_state("locked"), PrState::Open);
+        assert_eq!(gitlab_norm_state("opened"), PrState::Open);
+        assert_eq!(gitlab_norm_state("merged"), PrState::Merged);
+        assert_eq!(gitlab_norm_state("closed"), PrState::Closed);
     }
 }
