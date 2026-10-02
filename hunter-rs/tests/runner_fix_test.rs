@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! `run_fix` — worktree setup.
+//! `run_fix` — worktree setup, and what a run does with what the worker
+//! left behind: ship it (push, draft PR), recover a PR that already
+//! exists, or salvage the attempt (requeue, then give up as stuck).
 //!
 //! The branch a fix job works on is named after the finding, so it is the
 //! same name on every attempt. Any attempt that ends without deleting the
@@ -12,10 +14,12 @@
 
 mod support;
 
+use std::path::Path;
+
 use hunter::config::Config;
-use hunter::domain::ForgeName;
+use hunter::domain::{FindingStatus, ForgeName};
 use hunter::store::FindingInsert;
-use support::{GitRepo, ScriptedBackend, TempDir, fresh_store, git};
+use support::{EnvGuard, FakeBins, GitRepo, ScriptedBackend, TempDir, done, fresh_store, git};
 
 const REPO_URL: &str = "https://github.com/acme/widget";
 /// Matches the slug `run_fix` derives from the finding summary below.
@@ -26,6 +30,8 @@ struct Fixture {
     store: hunter::store::Store,
     fid: i64,
     repo_dir: std::path::PathBuf,
+    /// The bare repository `repo_dir` was cloned from.
+    origin: std::path::PathBuf,
     /// Last, so the directory outlives the Store's SQLite pool. See
     /// `runner_engage_test` for why, and for what it does not fix.
     _dir: TempDir,
@@ -85,6 +91,7 @@ async fn fixture(label: &str) -> Fixture {
         store,
         fid,
         repo_dir,
+        origin: repo.origin,
     }
 }
 
@@ -208,4 +215,308 @@ async fn backend_without_a_ceiling_leaves_the_job_unbounded() {
         jobs[0].job.cap_tokens, None,
         "no headroom bound means no token bound, not the config's"
     );
+}
+
+// ---------------------------------------------------------------------------
+// What the run does with the worker's output
+// ---------------------------------------------------------------------------
+
+/// The finding as the store has it now.
+async fn reload(f: &Fixture) -> hunter::types::Finding {
+    f.store.get_finding(f.fid).await.unwrap().unwrap()
+}
+
+/// Run one fix attempt of the fixture's finding, as the store has it now.
+async fn fix(f: &Fixture, backend: &ScriptedBackend) -> hunter::scheduler::CycleSummary {
+    let finding = reload(f).await;
+    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, backend, None)
+        .await
+        .unwrap()
+}
+
+/// Send `run_fix`'s push, which targets the forge's SSH URL, to `target`
+/// instead: git's own `url.<base>.insteadOf`, scoped through the
+/// environment so real git still does the pushing.
+fn route_push(bins: &FakeBins, target: &Path) -> [EnvGuard; 3] {
+    let key = format!("url.{}.insteadOf", target.display());
+    [
+        bins.env("GIT_CONFIG_COUNT", Path::new("1")),
+        bins.env("GIT_CONFIG_KEY_0", Path::new(&key)),
+        bins.env(
+            "GIT_CONFIG_VALUE_0",
+            Path::new("git@github.com:acme/widget.git"),
+        ),
+    ]
+}
+
+/// A worker that commits a change and, if `describe`, writes the PR body.
+fn committing(describe: bool) -> ScriptedBackend {
+    ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("FIX.md"), "fixed\n").unwrap();
+        git(tree, &["add", "-A"]);
+        git(tree, &["commit", "-m", "fix: the real bug"]);
+        if describe {
+            std::fs::write(tree.join("PR-DESCRIPTION.md"), "the body").unwrap();
+        }
+        done()
+    })
+}
+
+/// A finding that is not queued is skipped before anything is created:
+/// no job row, no workspace, no status change.
+#[tokio::test]
+async fn a_finding_that_is_not_queued_is_skipped() {
+    let f = fixture("fix-not-queued").await;
+    f.store
+        .set_finding_status(f.fid, FindingStatus::New)
+        .await
+        .unwrap();
+
+    let backend = ScriptedBackend::noop();
+    let summary = fix(&f, &backend).await;
+
+    assert!(
+        summary
+            .skipped
+            .as_deref()
+            .is_some_and(|s| s.contains("not queued")),
+        "{summary:?}"
+    );
+    assert!(backend.runs().is_empty(), "no worker may run");
+    assert!(f.store.list_jobs(10).await.unwrap().is_empty());
+    assert!(!f.cfg.work_root.join("jobs").exists(), "no workspace");
+    assert_eq!(reload(&f).await.status, FindingStatus::New);
+}
+
+/// The ship path: commits plus a PR description are pushed to the forge,
+/// a draft PR is opened for the branch, and the finding moves to
+/// `pr_open` with the URL `gh` printed and a clean failure streak.
+#[tokio::test]
+async fn committed_and_described_work_is_pushed_and_opened_as_a_pr() {
+    let bins = FakeBins::acquire("fix-ship");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = fixture("fix-ship").await;
+    let _push = route_push(&bins, &f.origin);
+    f.store
+        .record_fix_attempt(f.fid, "no commits")
+        .await
+        .unwrap();
+
+    let summary = fix(&f, &committing(true)).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(
+        summary.pr_url.as_deref(),
+        Some("https://github.com/acme/widget/pull/42")
+    );
+    let after = reload(&f).await;
+    assert_eq!(after.status, FindingStatus::PrOpen);
+    assert_eq!(
+        after.pr_url.as_deref(),
+        Some("https://github.com/acme/widget/pull/42")
+    );
+    assert_eq!(after.fix_attempts, 0, "a shipped fix ends the streak");
+    assert_eq!(after.last_fix_failure, None);
+
+    let pushed = git(&f.origin, &["log", "-1", "--format=%s", BRANCH]);
+    assert_eq!(
+        pushed.trim(),
+        "fix: the real bug",
+        "the branch reached origin"
+    );
+    let creates = bins.calls_to("gh");
+    assert_eq!(creates.len(), 1, "{creates:?}");
+    let call = &creates[0];
+    assert_eq!(&call[1..4], ["pr", "create", "--draft"], "{call:?}");
+    let after_flag = |flag: &str| {
+        let i = call.iter().position(|a| a == flag).unwrap();
+        call[i + 1].clone()
+    };
+    assert_eq!(after_flag("--head"), BRANCH);
+    assert_eq!(after_flag("--base"), "main");
+    assert_eq!(
+        after_flag("--title"),
+        "fix: the real bug",
+        "last commit subject"
+    );
+    assert_eq!(after_flag("--body"), "the body");
+}
+
+/// `gh pr create` refusing because a PR for the branch already exists is
+/// not a failure: that PR is the fix, recovered from the error text.
+#[tokio::test]
+async fn an_already_existing_pr_is_recovered() {
+    let bins = FakeBins::acquire("fix-pr-exists");
+    bins.fail(
+        "gh",
+        1,
+        "a pull request for branch \"fix/a-real-bug-1\" into branch \"main\" already exists:\nhttps://github.com/acme/widget/pull/7",
+    );
+    let f = fixture("fix-pr-exists").await;
+    let _push = route_push(&bins, &f.origin);
+
+    let summary = fix(&f, &committing(true)).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(
+        summary.pr_url.as_deref(),
+        Some("https://github.com/acme/widget/pull/7")
+    );
+    let after = reload(&f).await;
+    assert_eq!(after.status, FindingStatus::PrOpen);
+    assert_eq!(
+        after.pr_url.as_deref(),
+        Some("https://github.com/acme/widget/pull/7")
+    );
+}
+
+/// A PR-create failure with no PR to recover requeues the finding and
+/// counts toward the streak.
+#[tokio::test]
+async fn a_failed_pr_create_requeues() {
+    let bins = FakeBins::acquire("fix-pr-fails");
+    bins.fail("gh", 1, "HTTP 422: Validation Failed");
+    let f = fixture("fix-pr-fails").await;
+    let _push = route_push(&bins, &f.origin);
+
+    let summary = fix(&f, &committing(true)).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("requeued"), "{summary:?}");
+    let failure = summary.failure.unwrap();
+    assert!(failure.starts_with("PR create failed"), "{failure}");
+    assert!(failure.contains("Validation Failed"), "{failure}");
+    let after = reload(&f).await;
+    assert_eq!(after.status, FindingStatus::Queued);
+    assert_eq!(after.pr_url, None);
+    assert_eq!(after.fix_attempts, 1);
+    assert_eq!(after.last_fix_failure.as_deref(), Some(failure.as_str()));
+}
+
+/// A push that fails requeues the finding, and no PR is attempted for a
+/// branch the forge does not have.
+#[tokio::test]
+async fn a_failed_push_requeues_without_creating_a_pr() {
+    let bins = FakeBins::acquire("fix-push-fails");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    let f = fixture("fix-push-fails").await;
+    let _push = route_push(&bins, &f.origin.with_file_name("no-such-remote.git"));
+
+    let summary = fix(&f, &committing(true)).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("requeued"), "{summary:?}");
+    let failure = summary.failure.unwrap();
+    assert!(failure.starts_with("push failed"), "{failure}");
+    assert!(bins.calls_to("gh").is_empty(), "{:?}", bins.calls());
+    assert_eq!(reload(&f).await.status, FindingStatus::Queued);
+}
+
+/// Work that cannot be shipped is requeued, named by what is missing:
+/// a worker that committed nothing, one that committed but wrote no PR
+/// description, and one that did not finish.
+#[tokio::test]
+async fn unshippable_work_is_requeued_with_the_reason() {
+    let killed = ScriptedBackend::new(|_| hunter::types::RunResult {
+        exit_code: None,
+        killed_reason: Some("wallclock".to_owned()),
+        ..done()
+    });
+    for (label, backend, reason) in [
+        ("fix-no-commits", ScriptedBackend::noop(), "no commits"),
+        (
+            "fix-no-description",
+            committing(false),
+            "no PR-DESCRIPTION.md",
+        ),
+        ("fix-worker-killed", killed, "worker killed"),
+    ] {
+        let f = fixture(label).await;
+
+        let summary = fix(&f, &backend).await;
+
+        assert_eq!(summary.outcome.as_deref(), Some("requeued"), "{summary:?}");
+        assert_eq!(summary.failure.as_deref(), Some(reason), "{label}");
+        let after = reload(&f).await;
+        assert_eq!(after.status, FindingStatus::Queued, "{label}");
+        assert_eq!(after.last_fix_failure.as_deref(), Some(reason), "{label}");
+    }
+}
+
+/// The same failure three times running is a fix that will not converge:
+/// the third attempt rejects the finding as stuck and resets the streak.
+#[tokio::test]
+async fn three_identical_failures_reject_the_finding_as_stuck() {
+    let f = fixture("fix-stuck").await;
+    let backend = ScriptedBackend::noop();
+
+    for attempt in 1..=2 {
+        let summary = fix(&f, &backend).await;
+        assert_eq!(
+            summary.outcome.as_deref(),
+            Some("requeued"),
+            "attempt {attempt}: {summary:?}"
+        );
+        assert_eq!(reload(&f).await.fix_attempts, attempt);
+    }
+    let summary = fix(&f, &backend).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("stuck"), "{summary:?}");
+    assert_eq!(summary.attempts, Some(3));
+    assert_eq!(summary.failure.as_deref(), Some("no commits"));
+    let after = reload(&f).await;
+    assert_eq!(after.status, FindingStatus::Rejected);
+    let verdict = after.verdict_reason.unwrap_or_default();
+    assert!(verdict.starts_with("stuck:"), "{verdict}");
+    assert!(verdict.contains("no commits"), "{verdict}");
+    assert_eq!(after.fix_attempts, 0);
+    assert_eq!(after.last_fix_failure, None);
+}
+
+/// A different failure in between restarts the streak, so alternating
+/// failures are retried rather than declared stuck.
+#[tokio::test]
+async fn a_different_failure_restarts_the_streak() {
+    let f = fixture("fix-streak-reset").await;
+    f.store
+        .record_fix_attempt(f.fid, "no commits")
+        .await
+        .unwrap();
+    f.store
+        .record_fix_attempt(f.fid, "no commits")
+        .await
+        .unwrap();
+
+    let summary = fix(&f, &committing(false)).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("requeued"), "{summary:?}");
+    let after = reload(&f).await;
+    assert_eq!(after.status, FindingStatus::Queued);
+    assert_eq!(after.fix_attempts, 1);
+}
+
+/// Every end of an attempt spends a `once` budget override; an `exempt`
+/// one lasts until a human clears it.
+#[tokio::test]
+async fn only_a_once_override_is_spent_by_a_shipped_or_requeued_fix() {
+    let bins = FakeBins::acquire("fix-override");
+    bins.ok("gh", "https://github.com/acme/widget/pull/42");
+    for (mode, left) in [("once", None), ("exempt", Some("exempt"))] {
+        for (end, describe) in [("pr_open", true), ("requeued", false)] {
+            let f = fixture(&format!("fix-override-{mode}-{end}")).await;
+            let _push = route_push(&bins, &f.origin);
+            f.store
+                .set_budget_override(f.fid, Some(mode))
+                .await
+                .unwrap();
+
+            let summary = fix(&f, &committing(describe)).await;
+
+            assert_eq!(summary.outcome.as_deref(), Some(end), "{mode}: {summary:?}");
+            let after = reload(&f).await;
+            assert_eq!(
+                after.budget_override.as_deref(),
+                left,
+                "{mode} override after {end}"
+            );
+        }
+    }
 }
