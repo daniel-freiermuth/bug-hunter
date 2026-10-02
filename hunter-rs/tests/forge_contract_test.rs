@@ -463,6 +463,86 @@ fn gitlab_create_pr_propagates_a_non_zero_exit() {
     );
 }
 
+/// What `glab mr create` prints when GitLab answers 409 for a branch that
+/// already has an open MR: `!42`, no web URL, and the phrase wrapped
+/// across lines by glab's fixed-width error box.
+const GLAB_MR_EXISTS: &str = "   ERROR  \n          \n  Post https://gitlab.com/api/v4/projects/group%2Fwidget/merge_requests: 409 {message: [Another open merge request already\n  exists for this source branch: !42]}.";
+
+/// `glab` answering `mr create` with the 409 above and `mr list` with
+/// `list_body`/`list_rc`.
+fn glab_mr_exists(bins: &FakeBins, list_rc: i32, list_body: &str) {
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$1 $2\" in\n\"mr create\") cat >&2 <<'__FAKE_EOF__'\n{GLAB_MR_EXISTS}\n__FAKE_EOF__\nexit 1;;\n\"mr list\") echo '{list_body}'; exit {list_rc};;\nesac\nexit 1"
+        ),
+    );
+}
+
+/// glab's conflict names the MR only as `!42`, so the URL a retry needs to
+/// adopt it is looked up — for the same source/target pair GitLab's
+/// uniqueness rule covers — and reported the way `gh` reports its own:
+/// "already exists" plus the URL, in the error.
+#[test]
+fn gitlab_create_pr_names_the_existing_mr_on_conflict() {
+    let bins = FakeBins::acquire("forge-gl-create-exists");
+    let dir = TempDir::new("forge-gl-create-exists-cwd");
+    glab_mr_exists(
+        &bins,
+        0,
+        "https://gitlab.com/group/widget/-/merge_requests/42",
+    );
+
+    let err = forge_for(ForgeName::Gitlab)
+        .create_pr(dir.path(), "fix/x", "main", "t", "b")
+        .expect_err("a conflict is still a failed create");
+    let msg = err.to_string();
+    assert!(msg.contains("already exists"), "{msg}");
+    assert!(
+        msg.contains("https://gitlab.com/group/widget/-/merge_requests/42"),
+        "the existing MR's URL must be in the error: {msg}"
+    );
+
+    let calls = bins.calls();
+    let list = position_of(&calls, "glab", &["mr", "list"]).expect("lookup call");
+    assert_eq!(
+        calls[list],
+        [
+            "glab",
+            "mr",
+            "list",
+            "--source-branch",
+            "fix/x",
+            "--target-branch",
+            "main",
+            "--output",
+            "json",
+            "--jq",
+            ".[].web_url",
+        ]
+    );
+}
+
+/// A lookup that finds nothing leaves the original failure as it was: no
+/// URL to adopt, and glab's diagnostics intact.
+#[test]
+fn gitlab_create_pr_conflict_with_a_failed_lookup_keeps_the_diagnostics() {
+    let bins = FakeBins::acquire("forge-gl-create-exists-nolist");
+    let dir = TempDir::new("forge-gl-create-exists-nolist-cwd");
+    glab_mr_exists(&bins, 1, "glab: 401 Unauthorized");
+
+    let err = forge_for(ForgeName::Gitlab)
+        .create_pr(dir.path(), "fix/x", "main", "t", "b")
+        .expect_err("a conflict is still a failed create");
+    let msg = err.to_string();
+    assert!(msg.contains("rc=1"), "{msg}");
+    assert!(msg.contains("409"), "{msg}");
+    assert!(
+        !msg.contains("/-/merge_requests/"),
+        "no MR was found, so none may be named: {msg}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // push
 // ---------------------------------------------------------------------------

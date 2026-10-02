@@ -15,7 +15,7 @@ mod support;
 use hunter::config::Config;
 use hunter::domain::ForgeName;
 use hunter::store::FindingInsert;
-use support::{GitRepo, ScriptedBackend, TempDir, fresh_store, git};
+use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, done, fresh_store, git};
 
 const REPO_URL: &str = "https://github.com/acme/widget";
 /// Matches the slug `run_fix` derives from the finding summary below.
@@ -26,6 +26,8 @@ struct Fixture {
     store: hunter::store::Store,
     fid: i64,
     repo_dir: std::path::PathBuf,
+    /// The bare remote the repo was cloned from.
+    origin: std::path::PathBuf,
     /// Last, so the directory outlives the Store's SQLite pool. See
     /// `runner_engage_test` for why, and for what it does not fix.
     _dir: TempDir,
@@ -33,6 +35,11 @@ struct Fixture {
 
 /// A repo with a queued bug finding — the state `run_fix` expects.
 async fn fixture(label: &str) -> Fixture {
+    fixture_on(label, REPO_URL, ForgeName::Github).await
+}
+
+/// [`fixture`] for a repo registered under `url` on `forge`.
+async fn fixture_on(label: &str, url: &str, forge: ForgeName) -> Fixture {
     let dir = TempDir::new(label);
     let repo = GitRepo::with_branch(&dir, "some-other-branch");
     let (_db, store) = fresh_store(&dir, "fix").await;
@@ -40,13 +47,7 @@ async fn fixture(label: &str) -> Fixture {
     let repos_root = dir.path().join("repos");
     std::fs::create_dir_all(&repos_root).unwrap();
     let rid = store
-        .add_repo(
-            "widget",
-            REPO_URL,
-            &repos_root,
-            &repo.default_branch,
-            ForgeName::Github,
-        )
+        .add_repo("widget", url, &repos_root, &repo.default_branch, forge)
         .await
         .unwrap();
     let repo_dir = hunter::store::Store::repo_dir(&repos_root, rid);
@@ -85,6 +86,7 @@ async fn fixture(label: &str) -> Fixture {
         store,
         fid,
         repo_dir,
+        origin: repo.origin,
     }
 }
 
@@ -208,4 +210,67 @@ async fn backend_without_a_ceiling_leaves_the_job_unbounded() {
         jobs[0].job.cap_tokens, None,
         "no headroom bound means no token bound, not the config's"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Recovering a PR that already exists
+// ---------------------------------------------------------------------------
+
+const GL_REPO_URL: &str = "https://gitlab.com/group/widget";
+const GL_MR_URL: &str = "https://gitlab.com/group/widget/-/merge_requests/42";
+
+/// What `glab mr create` (1.119) prints when GitLab answers 409 because
+/// the branch already has an open MR. Captured against a stub API, host
+/// rewritten. It carries no MR web URL — only `!42` — and glab wraps it
+/// at a fixed width, which splits "already exists" for some project
+/// paths.
+const GLAB_MR_EXISTS: &str = "\nCreating draft merge request for fix/a-real-bug-1 into main in group/widget\n\nFailed to create merge request. Created recovery file: /tmp/glab/recover/group/widget/mr.json\nRun the command again with the '--recover' option to retry.\n          \n   ERROR  \n          \n  Post https://gitlab.com/api/v4/projects/group%2Fwidget/merge_requests: 409 {message: [Another open merge request already\n  exists for this source branch: !42]}.";
+
+/// A worker that commits a change and leaves a PR description: the run
+/// goes on to push and open the PR.
+fn committing_worker() -> ScriptedBackend {
+    ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("fix.txt"), "fixed\n").expect("stage fix");
+        git(tree, &["add", "fix.txt"]);
+        git(tree, &["commit", "-m", "fix: a real bug"]);
+        std::fs::write(tree.join("PR-DESCRIPTION.md"), "what broke\n").expect("stage PR body");
+        done()
+    })
+}
+
+/// A retried fix whose MR is already open on GitLab adopts that MR, as a
+/// GitHub retry adopts its PR. Failing instead repeats the identical
+/// "PR create failed" on every retry until the streak rejects a finding
+/// whose fix is sitting in an open MR.
+#[tokio::test]
+async fn gitlab_retry_adopts_the_mr_that_already_exists() {
+    let f = fixture_on("fix-gl-exists", GL_REPO_URL, ForgeName::Gitlab).await;
+    let bins = FakeBins::acquire("fix-gl-exists");
+    // The push goes to git@gitlab.com:group/widget.git; land it on the
+    // local bare origin instead.
+    let insteadof = format!("url.{}.insteadOf", f.origin.display());
+    let _count = bins.env("GIT_CONFIG_COUNT", std::path::Path::new("1"));
+    let _key = bins.env("GIT_CONFIG_KEY_0", std::path::Path::new(&insteadof));
+    let _value = bins.env(
+        "GIT_CONFIG_VALUE_0",
+        std::path::Path::new("git@gitlab.com:group/widget.git"),
+    );
+    bins.script(
+        "glab",
+        &format!(
+            "case \"$1 $2\" in\n\"mr create\") cat >&2 <<'__FAKE_EOF__'\n{GLAB_MR_EXISTS}\n__FAKE_EOF__\nexit 1;;\n\"mr list\") echo '{GL_MR_URL}'; exit 0;;\nesac\nexit 1"
+        ),
+    );
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary =
+        hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &committing_worker(), None)
+            .await
+            .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{summary:?}");
+    assert_eq!(summary.pr_url.as_deref(), Some(GL_MR_URL));
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status, hunter::domain::FindingStatus::PrOpen);
+    assert_eq!(finding.pr_url.as_deref(), Some(GL_MR_URL));
 }
