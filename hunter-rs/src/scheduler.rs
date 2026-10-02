@@ -5408,3 +5408,46 @@ async fn run_cycle_inner(
     let _ = store.log_event("cycle", &msg, None, None).await;
     Ok(result)
 }
+
+#[cfg(test)]
+mod extract_pr_url_tests {
+    use super::extract_pr_url;
+
+    #[test]
+    fn stops_at_the_last_digit_of_the_pr_number() {
+        assert_eq!(
+            extract_pr_url("already exists: https://github.com/o/r/pull/12."),
+            Some("https://github.com/o/r/pull/12".to_owned())
+        );
+        assert_eq!(
+            extract_pr_url("https://github.com/o/r/pull/12/files?x=1"),
+            Some("https://github.com/o/r/pull/12".to_owned())
+        );
+    }
+
+    #[test]
+    fn needs_a_number_after_pull() {
+        assert_eq!(extract_pr_url("https://github.com/o/r/pull/abc"), None);
+        assert_eq!(extract_pr_url("https://github.com/o/r/pull/"), None);
+        assert_eq!(
+            extract_pr_url("https://github.com/o/r/pull/new https://github.com/o/r/pull/9"),
+            Some("https://github.com/o/r/pull/9".to_owned()),
+            "a word without a number does not end the search"
+        );
+    }
+
+    #[test]
+    fn only_https_words_count() {
+        assert_eq!(extract_pr_url("http://github.com/o/r/pull/3"), None);
+        assert_eq!(extract_pr_url("github.com/o/r/pull/3"), None);
+        assert_eq!(extract_pr_url("no url here"), None);
+    }
+
+    #[test]
+    fn first_match_wins() {
+        assert_eq!(
+            extract_pr_url("https://github.com/o/r/pull/1 https://github.com/o/r/pull/2"),
+            Some("https://github.com/o/r/pull/1".to_owned())
+        );
+    }
+}
