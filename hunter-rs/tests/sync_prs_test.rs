@@ -53,7 +53,12 @@ impl Fixture {
     }
 
     async fn status(&self) -> FindingStatus {
-        self.store.get_finding(self.fid).await.unwrap().unwrap().status
+        self.store
+            .get_finding(self.fid)
+            .await
+            .unwrap()
+            .unwrap()
+            .status
     }
 
     async fn pr_state(&self) -> PrState {
@@ -190,7 +195,12 @@ async fn a_merged_pr_moves_its_finding_to_merged_and_drops_attention() {
     let result = f.sync().await;
 
     assert_eq!(
-        (result.merged, result.synced, result.attention, result.errors),
+        (
+            result.merged,
+            result.synced,
+            result.attention,
+            result.errors
+        ),
         (1, 0, 0, 0),
         "{result:?}"
     );
@@ -343,8 +353,8 @@ async fn activity_after_the_watermark_is_new_comments() {
 // Static reasons and their fingerprint
 // ---------------------------------------------------------------------------
 
-/// Every static reason at once, with a rollup mixing CheckRun entries
-/// (`name`/`conclusion`) and legacy StatusContext entries
+/// Every static reason at once, with a rollup mixing `CheckRun` entries
+/// (`name`/`conclusion`) and legacy `StatusContext` entries
 /// (`context`/`state`), a check failing twice under one name, and one
 /// still running.
 #[tokio::test]
@@ -603,10 +613,6 @@ async fn forge_timestamps_are_read_as_utc_epoch_ms() {
         bins.ok("gh", &pr(&json!({ "comments": comment_at(stamp) })));
         let result = f.sync().await;
         assert_eq!(result.errors, 0, "{stamp:?}: {result:?}");
-        assert_eq!(
-            f.pr_state().await.last_activity_at,
-            Some(want),
-            "{stamp:?}"
-        );
+        assert_eq!(f.pr_state().await.last_activity_at, Some(want), "{stamp:?}");
     }
 }
