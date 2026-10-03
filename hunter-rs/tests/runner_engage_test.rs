@@ -23,7 +23,7 @@ mod support;
 use hunter::config::Config;
 use hunter::domain::{FindingStatus, ForgeName, RepoJobKind};
 use hunter::store::{FindingInsert, SyncPrData};
-use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, fresh_store};
+use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, fresh_store, git};
 
 const BRANCH: &str = "fix/some-bug";
 const PR_URL: &str = "https://github.com/acme/widget/pull/7";
@@ -955,4 +955,160 @@ async fn an_unrecorded_close_starts_no_harvest_and_waits_for_the_sync() {
     assert_eq!(result.closed, 1, "{result:?}");
     assert_eq!(f.pr_state().await.as_deref(), Some("CLOSED"));
     assert_left_for_the_cold_harvest(&f, &runs[0].tree).await;
+}
+
+// -- a resumed engage and the branch it pushes to ----------------------------
+
+/// Route the clone's pushes to the PR's SSH URL (what `run_engage` pushes
+/// to, and no test can reach) into the fixture's bare origin, and return
+/// that origin.
+async fn pushes_land_in_origin(f: &Fixture) -> std::path::PathBuf {
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let repo = f
+        .store
+        .get_repo_by_id(finding.repo_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let clone = std::path::PathBuf::from(&repo.path);
+    let origin = git(&clone, &["config", "--get", "remote.origin.url"])
+        .trim()
+        .to_owned();
+    git(
+        &clone,
+        &[
+            "config",
+            &format!("url.{origin}.pushInsteadOf"),
+            "git@github.com:acme/widget.git",
+        ],
+    );
+    std::path::PathBuf::from(origin)
+}
+
+/// An engage worker that rewrites the PR's commit, as the playbook lets it,
+/// and is stopped at the cap with a transcript; continued, it finishes.
+fn rewrite_then_suspend() -> ScriptedBackend {
+    ScriptedBackend::staged(|tree, resume_from| match resume_from {
+        None => {
+            std::fs::write(tree.join("CHANGE.md"), "change, as the reviewer asked\n").unwrap();
+            git(
+                tree,
+                &["commit", "-a", "--amend", "-m", "change (reviewed)"],
+            );
+            let session = tree.parent().unwrap().join("session").join("engage.jsonl");
+            std::fs::write(&session, format!("{USAGE}\n")).unwrap();
+            hunter::types::RunResult {
+                exit_code: None,
+                killed_reason: Some("cap".to_owned()),
+                session_file: Some(session.to_string_lossy().into_owned()),
+                ..support::done()
+            }
+        }
+        Some(file) => hunter::types::RunResult {
+            session_file: Some(file.to_string_lossy().into_owned()),
+            ..support::done()
+        },
+    })
+}
+
+/// Run the engage cold until it suspends, then continue it the way the
+/// scheduler would; `meanwhile` runs between the two.
+async fn suspend_and_resume(
+    f: &Fixture,
+    meanwhile: impl FnOnce(),
+) -> hunter::scheduler::CycleSummary {
+    let backend = rewrite_then_suspend();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let first = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        first.state,
+        Some(hunter::domain::JobState::Suspended),
+        "{first:?}"
+    );
+
+    meanwhile();
+
+    let plan = match hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+        .await
+        .unwrap()
+    {
+        Some(hunter::scheduler::Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("expected the suspended engage to be resumed, got {other:?}"),
+    };
+    assert_eq!(plan.predecessor_id, first.job_id.unwrap());
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, Some(&plan))
+        .await
+        .unwrap()
+}
+
+/// A resumed engage never overwrites commits pushed to the PR branch while
+/// it was suspended.
+///
+/// A resume continues in the tree its chain was created in, at the PR head
+/// of that moment, and nothing is fetched for it; a suspension can last
+/// until the budget next admits the job. A reviewer's commit, or GitHub's
+/// "Update branch" merge, pushed in between is not in that tree, so a
+/// force push of it would delete that work from the PR without a trace.
+/// The push is refused instead, and the attention stays unaddressed, so a
+/// cold engage takes it up on the branch as it now is.
+#[tokio::test]
+async fn a_resumed_engage_keeps_commits_pushed_while_it_was_suspended() {
+    let f = fixture("engage-resume-lease").await;
+    let bins = FakeBins::acquire("engage-resume-lease");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = pushes_land_in_origin(&f).await;
+    let reviewer = TempDir::new("engage-resume-lease-reviewer");
+    let checkout = reviewer.join("checkout");
+
+    let summary = suspend_and_resume(&f, || {
+        git(
+            reviewer.path(),
+            &[
+                "clone",
+                "-b",
+                BRANCH,
+                origin.to_string_lossy().as_ref(),
+                checkout.to_string_lossy().as_ref(),
+            ],
+        );
+        std::fs::write(checkout.join("REVIEWER.md"), "a reviewer's commit\n").unwrap();
+        git(&checkout, &["add", "-A"]);
+        git(&checkout, &["commit", "-m", "reviewer's suggestion"]);
+        git(&checkout, &["push", "origin", BRANCH]);
+    })
+    .await;
+
+    let theirs = git(&checkout, &["rev-parse", "HEAD"]).trim().to_owned();
+    let branch = git(&origin, &["rev-list", BRANCH]);
+    assert!(
+        branch.lines().any(|c| c == theirs),
+        "the reviewer's commit {theirs} must still be on {BRANCH}; it now holds:\n{branch}"
+    );
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    assert_eq!(
+        f.addressed_fp().await,
+        None,
+        "an engage that published nothing has not addressed the attention"
+    );
+}
+
+/// The happy path, so the test above is known to be asserting on a
+/// difference rather than on a push that never happens: with nothing
+/// pushed in between, the resumed engage publishes its tree's history,
+/// rewritten commit and all.
+#[tokio::test]
+async fn a_resumed_engage_publishes_its_rewritten_history() {
+    let f = fixture("engage-resume-push").await;
+    let bins = FakeBins::acquire("engage-resume-push");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = pushes_land_in_origin(&f).await;
+
+    let summary = suspend_and_resume(&f, || {}).await;
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    let head = git(&origin, &["log", "-1", "--format=%s", BRANCH]);
+    assert_eq!(head.trim(), "change (reviewed)");
 }
