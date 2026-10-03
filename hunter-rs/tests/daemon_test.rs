@@ -39,8 +39,14 @@ fn free_port() -> u16 {
 
 /// One HTTP/1.1 request with `Connection: close`; `None` if nothing is
 /// listening yet. No client crate: this is the only test that needs one.
-async fn http(port: u16, method: &str, path: &str, body: &str) -> Option<(u16, Value)> {
-    http_at("127.0.0.1", port, method, path, body).await
+async fn http(
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &str,
+    cookie: &str,
+) -> Option<(u16, Value)> {
+    http_at("127.0.0.1", port, method, path, body, cookie).await
 }
 
 /// [`http`] against `ip` rather than 127.0.0.1.
@@ -50,11 +56,12 @@ async fn http_at(
     method: &str,
     path: &str,
     body: &str,
+    cookie: &str,
 ) -> Option<(u16, Value)> {
     let mut stream = tokio::net::TcpStream::connect((ip, port)).await.ok()?;
     let request = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+         Cookie: {cookie}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).await.ok()?;
@@ -77,12 +84,13 @@ async fn http_at(
 async fn wait_for_summary(
     port: u16,
     daemon: &std::thread::JoinHandle<anyhow::Result<()>>,
+    cookie: &str,
     what: &str,
     check: impl Fn(&Value) -> bool,
 ) -> Value {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some((200, summary)) = http(port, "GET", "/api/summary", "").await
+        if let Some((200, summary)) = http(port, "GET", "/api/summary", "", cookie).await
             && check(&summary)
         {
             return summary;
@@ -109,6 +117,13 @@ async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
     )
     .unwrap();
     let cfg = Config::load(root.path()).expect("load scratch config");
+    // The API wants a session; the account goes in before the daemon opens
+    // the database.
+    let cookie = {
+        std::fs::create_dir_all(cfg.db_path.parent().unwrap()).unwrap();
+        let store = hunter::store::Store::connect(&cfg.db_path).await.unwrap();
+        support::auth_cookie(&store).await
+    };
 
     // Its own thread and runtime, as `main` gives it: the daemon future is
     // not `Send`, so it cannot be a task on this test's runtime.
@@ -120,18 +135,35 @@ async fn a_paused_daemon_reports_it_and_stops_on_sigterm() {
             .block_on(hunter::daemon::run_daemon(cfg))
     });
 
-    wait_for_summary(port, &daemon, "the daemon to serve /api/summary", |_| true).await;
+    wait_for_summary(
+        port,
+        &daemon,
+        &cookie,
+        "the daemon to serve /api/summary",
+        |_| true,
+    )
+    .await;
 
-    let (status, body) = http(port, "POST", "/api/scheduler", r#"{"paused": true}"#)
-        .await
-        .expect("POST /api/scheduler");
+    let (status, body) = http(
+        port,
+        "POST",
+        "/api/scheduler",
+        r#"{"paused": true}"#,
+        &cookie,
+    )
+    .await
+    .expect("POST /api/scheduler");
     assert_eq!(status, 200, "body: {body}");
 
     // Only the loop writes this state, so seeing it proves the loop ran
     // and honoured the pause.
-    wait_for_summary(port, &daemon, "the scheduler loop to report paused", |s| {
-        s["scheduler_state"]["state"] == "paused"
-    })
+    wait_for_summary(
+        port,
+        &daemon,
+        &cookie,
+        "the scheduler loop to report paused",
+        |s| s["scheduler_state"]["state"] == "paused",
+    )
     .await;
 
     nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM)
@@ -179,7 +211,11 @@ async fn the_daemon_binds_the_configured_address() {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some((200, _)) = http_at("127.0.0.2", port, "GET", "/api/summary", "").await {
+        // Any answer will do: this is about who listens, not who may read.
+        if http_at("127.0.0.2", port, "GET", "/api/summary", "", "")
+            .await
+            .is_some()
+        {
             break;
         }
         assert!(!daemon.is_finished(), "run_daemon returned before serving");
