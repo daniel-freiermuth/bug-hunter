@@ -1335,7 +1335,11 @@ pub async fn run_hunt(
     // flight, and the no-new-commits skip would abandon a live session.
     let rehunt_due =
         resume.is_none() && last_full.is_some_and(|lf| (now_ms() - lf) > rehunt_interval_ms);
-    let mut full_rehunt_triggered = false;
+    // A resume finishing a full re-hunt has to stamp it like the cold
+    // attempt would have. Only a full re-hunt clears the watermark of a
+    // repo that has been hunted before (`last_full_hunt_at` is only ever
+    // written alongside it), so a resume that finds it cleared is one.
+    let mut full_rehunt_triggered = resume.is_some() && last.is_none() && last_full.is_some();
     let last = if rehunt_due {
         let _ = store.clear_last_hunt_sha(rid).await;
         let _ = store
