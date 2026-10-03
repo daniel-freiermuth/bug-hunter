@@ -760,3 +760,36 @@ async fn reconcile_does_not_suspend_an_orphan_whose_worker_is_still_running() {
     let jobs = store.list_jobs(10).await.unwrap();
     assert_eq!(jobs[0].job.state, hunter::domain::JobState::Killed);
 }
+
+/// A suspension ends a job like a kill or a failure does: the cycle did
+/// work, so with fixes queued the daemon drains at once rather than
+/// sleeping the 15-minute idle interval, and `scheduler_state` names the
+/// job instead of reporting no outcome. A wallclock overrun or a death
+/// after doing work used to end `killed`/`failed` and is now `suspended`.
+#[tokio::test]
+async fn a_suspended_job_drains_the_queue_like_a_killed_one() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo(&pool).await;
+    seed_findings(&pool).await;
+    let store = rw_store(&path).await;
+    for state in [
+        hunter::domain::JobState::Killed,
+        hunter::domain::JobState::Suspended,
+    ] {
+        let summary = hunter::scheduler::CycleSummary {
+            kind: Some(RepoJobKind::TestGap.into()),
+            repo: Some("alpha".into()),
+            state: Some(state),
+            ..Default::default()
+        };
+        let sleep_s = hunter::daemon::compute_sleep_s(&store, &summary).await;
+        assert!(sleep_s.abs() < f64::EPSILON, "{state:?} slept {sleep_s}s");
+        assert_eq!(
+            hunter::daemon::describe_cycle(&summary),
+            (
+                "idle".to_owned(),
+                format!("last: test_gap (alpha) {}", state.as_str())
+            )
+        );
+    }
+}

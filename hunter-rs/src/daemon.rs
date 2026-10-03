@@ -190,7 +190,7 @@ pub fn describe_cycle(summary: &CycleSummary) -> (String, String) {
     let kind = summary.kind.map_or("", super::domain::JobKind::as_str);
     if matches!(
         state,
-        Some(JobState::Done | JobState::Killed | JobState::Failed)
+        Some(JobState::Done | JobState::Killed | JobState::Failed | JobState::Suspended)
     ) && !kind.is_empty()
     {
         let target = if let Some(fid) = summary.finding_id {
@@ -224,7 +224,7 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
     } else if {
         matches!(
             summary.state,
-            Some(JobState::Done | JobState::Killed | JobState::Failed)
+            Some(JobState::Done | JobState::Killed | JobState::Failed | JobState::Suspended)
         )
     } {
         let queued = store.count_queued().await.unwrap_or(0);
