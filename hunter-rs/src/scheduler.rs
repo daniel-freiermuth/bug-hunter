@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use anyhow::Context as _;
+
 use crate::config::Config;
 use crate::domain::{
     BudgetOverride, ClosureClass, FindingJobKind, FindingStatus, FindingType, JobKind, JobState,
@@ -1261,6 +1263,31 @@ async fn retire_concluded(store: &Store, job: i64, outcome: &str) {
         .await;
 }
 
+/// The findings a cold repo-level prompt hands its worker: those of
+/// `finding_type` already rejected or declined, and those still on file.
+///
+/// Either read failing is an error, never an empty list: a worker told
+/// that nothing is settled spends a metered run rediscovering findings an
+/// operator already turned down. Callers load these before the budget
+/// gate so a failed read refuses the job before anything is reserved,
+/// written or spawned.
+async fn prior_findings(
+    store: &Store,
+    rid: i64,
+    finding_type: &str,
+    label: &str,
+) -> anyhow::Result<(Vec<Finding>, Vec<Finding>)> {
+    let suppressions = store
+        .suppressions(rid, finding_type)
+        .await
+        .with_context(|| format!("{label}: loading suppressed {finding_type} findings"))?;
+    let known = store
+        .known_active(rid, finding_type)
+        .await
+        .with_context(|| format!("{label}: loading known {finding_type} findings"))?;
+    Ok((suppressions, known))
+}
+
 /// Run a hunt job (`scheduler.run_hunt`).
 ///
 /// `resume` continues a suspended attempt: no sync, the diff range ending
@@ -1445,6 +1472,21 @@ pub async fn run_hunt(
         }
     };
 
+    // A resume hands its worker a "carry on", not a playbook, so it reads
+    // neither list.
+    let (suppressions, known) = match resume {
+        Some(_) => (Vec::new(), Vec::new()),
+        None => {
+            prior_findings(
+                store,
+                rid,
+                FindingType::Bug.as_str(),
+                &format!("hunt {rname}"),
+            )
+            .await?
+        }
+    };
+
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -1505,14 +1547,6 @@ pub async fn run_hunt(
         .join(format!("job{out_job}.findings.json"));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
-    let suppressions = store
-        .suppressions(rid, FindingType::Bug.as_str())
-        .await
-        .unwrap_or_default();
-    let known = store
-        .known_active(rid, FindingType::Bug.as_str())
-        .await
-        .unwrap_or_default();
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
     let prompt = match resume {
         Some(_) => RESUME_PROMPT.to_owned(),
@@ -2107,6 +2141,12 @@ async fn run_analysis_job(
             .map_err(|e| anyhow::anyhow!("{e}"))?;
     }
 
+    // As in `run_hunt`: read before the budget gate, and only for a cold job.
+    let (suppressions, known) = match resume {
+        Some(_) => (Vec::new(), Vec::new()),
+        None => prior_findings(store, rid, kind.as_str(), &format!("{kind} {rname}")).await?,
+    };
+
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
@@ -2166,14 +2206,6 @@ async fn run_analysis_job(
         .join(format!("job{out_job}.{}.json", spec.out_plural));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
-    let suppressions = store
-        .suppressions(rid, kind.as_str())
-        .await
-        .unwrap_or_default();
-    let known = store
-        .known_active(rid, kind.as_str())
-        .await
-        .unwrap_or_default();
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
     let prompt = match resume {
         Some(_) => RESUME_PROMPT.to_owned(),
