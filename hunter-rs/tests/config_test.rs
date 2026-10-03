@@ -63,6 +63,37 @@ fn renovate_github_token_loads_and_is_redacted() {
 }
 
 // ---------------------------------------------------------------------------
+// feedback.bots
+// ---------------------------------------------------------------------------
+
+/// Bots load in either spelling of their login, and a blank or malformed
+/// entry is refused rather than silently matching nobody -- the operator
+/// would see their bot's reviews ignored with no clue why.
+#[test]
+fn feedback_bots_load_and_reject_non_logins() {
+    let dir = TempDir::new("cfg-feedback-bots");
+    let cfg = load(&dir, r#"{"feedback": {"bots": ["CodeRabbitAI[bot]"]}}"#).unwrap();
+    assert!(cfg.review_bots.contains("coderabbitai"));
+    assert!(!cfg.review_bots.contains("stranger"));
+    assert!(
+        !load(&dir, "{}")
+            .unwrap()
+            .review_bots
+            .contains("coderabbitai")
+    );
+
+    for bad in [
+        r#"[""]"#,
+        r#"["  "]"#,
+        r#"["code rabbit"]"#,
+        r#"["acme/bot"]"#,
+    ] {
+        let msg = err(&dir, &format!(r#"{{"feedback": {{"bots": {bad}}}}}"#));
+        assert!(msg.contains("feedback.bots"), "{bad}: {msg}");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Worker limits: zero is the tightest limit, not "disabled"
 // ---------------------------------------------------------------------------
 

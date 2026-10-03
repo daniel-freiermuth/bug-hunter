@@ -1,7 +1,10 @@
 //! Forge abstraction — GitHub / GitLab PR/MR lifecycle via CLI tools.
 //! Port of hunter/forge.py. Methods shell out to `gh` / `glab`.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
@@ -110,6 +113,9 @@ pub struct GhComment {
     pub body: String,
     #[serde(default)]
     pub created_at: String,
+    /// Set by [`screen_feedback`]; never read from the forge.
+    #[serde(skip)]
+    pub voice: Voice,
 }
 
 /// Review from GitHub's `pr.reviews` array.
@@ -124,6 +130,9 @@ pub struct GhReview {
     pub submitted_at: String,
     #[serde(default)]
     pub state: String,
+    /// Set by [`screen_feedback`]; never read from the forge.
+    #[serde(skip)]
+    pub voice: Voice,
 }
 
 /// Status check / CI check entry.
@@ -143,6 +152,8 @@ pub struct GhCheckRun {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GlAuthor {
+    #[serde(default)]
+    pub id: Option<i64>,
     #[serde(default)]
     pub username: String,
 }
@@ -221,6 +232,9 @@ struct GlFileDiff {
 }
 
 /// PR view data returned by `view_pr_sync` and `view_pr_engage`.
+///
+/// `comments` and `reviews` hold only screened feedback: whatever
+/// [`screen_feedback`] let through, each item tagged with its [`Voice`].
 #[derive(Debug, Clone, Default)]
 pub struct PrView {
     pub state: PrState,
@@ -234,6 +248,341 @@ pub struct PrView {
     pub status_check_rollup: Vec<GhCheckRun>,
     pub comments: Vec<GhComment>,
     pub reviews: Vec<GhReview>,
+}
+
+/// Whose feedback a comment or review is.
+///
+/// Hunter's PRs sit on repos where anyone may comment, and engage acts on
+/// what it reads: it commits, and the scheduler pushes. So the forge drops
+/// every comment and review whose author cannot steer the PR before a
+/// [`PrView`] leaves it ([`screen_feedback`]); what remains carries one
+/// of these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Voice {
+    /// Someone who can push to the repository.
+    #[default]
+    Maintainer,
+    /// A review bot the operator listed in `feedback.bots`: acted on, but
+    /// read critically, and never mistaken for a maintainer's decision.
+    Bot,
+}
+
+/// The review bots whose feedback is let through (`feedback.bots`).
+///
+/// Held normalised -- lowercase, without GitHub's `[bot]` suffix -- since
+/// `gh pr view` names an app `coderabbitai` where the REST API says
+/// `coderabbitai[bot]`, and an operator may copy either.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewBots(Vec<String>);
+
+impl ReviewBots {
+    pub fn new<S: AsRef<str>>(logins: impl IntoIterator<Item = S>) -> Self {
+        Self(
+            logins
+                .into_iter()
+                .map(|l| normalize_login(l.as_ref()))
+                .collect(),
+        )
+    }
+
+    pub fn contains(&self, login: &str) -> bool {
+        let login = normalize_login(login);
+        self.0.contains(&login)
+    }
+}
+
+fn normalize_login(login: &str) -> String {
+    let login = login.trim().to_ascii_lowercase();
+    match login.strip_suffix("[bot]") {
+        Some(bare) => bare.to_owned(),
+        None => login,
+    }
+}
+
+/// Keep only the feedback whose author may steer the PR, tagging each
+/// item with its [`Voice`]: configured bots first (a bot that can push is
+/// still a bot), then whoever `can_push` vouches for. Everything else --
+/// strangers, deleted accounts, items without an author -- is dropped, so
+/// it can neither reach a prompt nor raise a PR's attention.
+///
+/// A login on the bot list counts as a bot only once `is_bot` confirms
+/// the account behind it is one: a login is just a name, and a human who
+/// holds the same name must not be read as the bot. Unconfirmed, it is
+/// screened like anyone else.
+///
+/// Each check is asked at most once per distinct login. An error fails
+/// the whole screen: guessing either way would drop a maintainer's
+/// request or hand a stranger's text to the worker.
+fn screen_feedback(
+    pr: &mut PrView,
+    bots: &ReviewBots,
+    mut is_bot: impl FnMut(&str) -> anyhow::Result<bool>,
+    mut can_push: impl FnMut(&str) -> anyhow::Result<bool>,
+) -> anyhow::Result<()> {
+    let mut voices: HashMap<String, Option<Voice>> = HashMap::new();
+    let mut voice_of = |author: Option<&GhAuthor>| -> anyhow::Result<Option<Voice>> {
+        let Some(login) = author.map(|a| a.login.as_str()).filter(|l| !l.is_empty()) else {
+            return Ok(None);
+        };
+        if let Some(voice) = voices.get(login) {
+            return Ok(*voice);
+        }
+        let voice = if bots.contains(login) && is_bot(login)? {
+            Some(Voice::Bot)
+        } else if can_push(login)? {
+            Some(Voice::Maintainer)
+        } else {
+            None
+        };
+        voices.insert(login.to_owned(), voice);
+        Ok(voice)
+    };
+    let mut comments = Vec::with_capacity(pr.comments.len());
+    for mut c in std::mem::take(&mut pr.comments) {
+        if let Some(voice) = voice_of(c.author.as_ref())? {
+            c.voice = voice;
+            comments.push(c);
+        }
+    }
+    let mut reviews = Vec::with_capacity(pr.reviews.len());
+    for mut r in std::mem::take(&mut pr.reviews) {
+        if let Some(voice) = voice_of(r.author.as_ref())? {
+            r.voice = voice;
+            reviews.push(r);
+        }
+    }
+    pr.comments = comments;
+    pr.reviews = reviews;
+    Ok(())
+}
+
+/// How long a lookup answer is reused. `sync_prs` screens every open PR
+/// on every cycle, which would otherwise cost one API call per commenter
+/// per PR per cycle; the price is that a revoked collaborator is still
+/// believed for up to this long.
+const LOOKUP_TTL: Duration = Duration::from_mins(15);
+
+/// Screening answers by `<question>:<host>/<project>:<user>`, with the
+/// time each was recorded. Time is passed in rather than read, so the
+/// expiry boundary is testable.
+#[derive(Default)]
+struct LookupCache(HashMap<String, (bool, Instant)>);
+
+impl LookupCache {
+    /// The answer for `key` if it was recorded less than [`LOOKUP_TTL`]
+    /// before `now`.
+    fn fresh(&self, key: &str, now: Instant) -> Option<bool> {
+        let &(answer, at) = self.0.get(key)?;
+        (now.saturating_duration_since(at) < LOOKUP_TTL).then_some(answer)
+    }
+
+    fn record(&mut self, key: String, answer: bool, now: Instant) {
+        self.0.insert(key, (answer, now));
+    }
+}
+
+static LOOKUPS: LazyLock<Mutex<LookupCache>> = LazyLock::new(Mutex::default);
+
+/// `look_up`'s answer for `key`, reused for [`LOOKUP_TTL`]. Errors are
+/// not cached, so the next screen asks again. The lock is not held across
+/// `look_up`, a subprocess that may take seconds.
+fn cached_lookup(
+    key: String,
+    look_up: impl FnOnce() -> anyhow::Result<bool>,
+) -> anyhow::Result<bool> {
+    if let Some(answer) = LOOKUPS
+        .lock()
+        .ok()
+        .and_then(|cache| cache.fresh(&key, Instant::now()))
+    {
+        return Ok(answer);
+    }
+    let answer = look_up()?;
+    if let Ok(mut cache) = LOOKUPS.lock() {
+        cache.record(key, answer, Instant::now());
+    }
+    Ok(answer)
+}
+
+/// Whether `login` may go into a GitHub API path: GitHub's own alphabet,
+/// plus the brackets of an app's `name[bot]` and the underscore of
+/// Enterprise managed users. Nothing else can be an account.
+fn github_login_is_wellformed(login: &str) -> bool {
+    login
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'[' | b']'))
+}
+
+/// `gh api <api> [--hostname host] --jq <jq>`, for the repo at `url`.
+fn github_api_jq(url: &str, api: &str, jq: &str) -> anyhow::Result<(i32, String)> {
+    let (host, _) =
+        url_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse host from {url}"))?;
+    let mut argv = vec!["gh", "api", api, "--jq", jq];
+    if !host.eq_ignore_ascii_case("github.com") {
+        argv.extend(["--hostname", host]);
+    }
+    Ok(run_cmd(&argv, 30))
+}
+
+/// Whether the login `gh pr view` reports for a configured bot really is
+/// the bot.
+///
+/// GraphQL names an app by its bare slug (`coderabbitai`, where REST says
+/// `coderabbitai[bot]`), and that bare name is an ordinary account name
+/// too: a user who holds it writes comments that read exactly like the
+/// bot's. Organizations cannot author comments, so only a `User` by that
+/// name makes the login ambiguous -- then it is not taken as the bot. No
+/// account by that name (404) leaves the bot as the only possible author.
+fn github_login_is_bot(url: &str, login: &str) -> anyhow::Result<bool> {
+    if !github_login_is_wellformed(login) {
+        return Ok(false);
+    }
+    let api = format!("users/{login}");
+    let (rc, out) = github_api_jq(url, &api, ".type")?;
+    if rc != 0 {
+        if out.contains("(HTTP 404)") {
+            return Ok(true);
+        }
+        anyhow::bail!("gh api {api} failed (rc={rc}): {out}");
+    }
+    match out.trim() {
+        "User" => {
+            tracing::warn!(
+                "feedback.bots lists {login:?}, but a user account holds that login, so its \
+                 comments cannot be told from the bot's; screening them as a user's"
+            );
+            Ok(false)
+        }
+        "Organization" | "Bot" => Ok(true),
+        other => anyhow::bail!("gh api {api}: unexpected account type {other:?}"),
+    }
+}
+
+/// Whether `login` can push to the GitHub repo at `url`: the collaborator
+/// permission endpoint's `user.permissions.push`, true for write,
+/// maintain and admin and for custom roles built on them. On a public
+/// repo everyone else reads as `read`, and a login GitHub no longer knows
+/// (a deleted account) is a 404 -- a "no", not an error.
+fn github_can_push(url: &str, login: &str) -> anyhow::Result<bool> {
+    if !github_login_is_wellformed(login) {
+        return Ok(false);
+    }
+    let (_, path) =
+        url_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    let api = format!("repos/{path}/collaborators/{login}/permission");
+    let (rc, out) = github_api_jq(url, &api, ".user.permissions.push")?;
+    if rc != 0 {
+        if out.contains("(HTTP 404)") {
+            return Ok(false);
+        }
+        anyhow::bail!("gh api {api} failed (rc={rc}): {out}");
+    }
+    match out.trim() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => anyhow::bail!("gh api {api}: unexpected push permission {other:?}"),
+    }
+}
+
+/// GitLab's Developer role, the lowest that can push to a branch.
+const GITLAB_DEVELOPER: i64 = 30;
+
+/// Whether GitLab user `user_id` can push to `project`: a member, direct
+/// or inherited from a group, at Developer or above. A non-member is a
+/// 404 -- a "no", not an error.
+fn gitlab_can_push(url: &str, project: &str, user_id: i64) -> anyhow::Result<bool> {
+    #[derive(Deserialize)]
+    struct Member {
+        access_level: i64,
+    }
+    let enc = project.replace('/', "%2F");
+    let api = format!("projects/{enc}/members/all/{user_id}");
+    let (rc, out) = gitlab_api(url, &api, None, &[]);
+    if rc != 0 {
+        if out.contains("(HTTP 404)") {
+            return Ok(false);
+        }
+        anyhow::bail!("glab api {api} failed (rc={rc}): {out}");
+    }
+    let member: Member = serde_json::from_str(out.trim())
+        .map_err(|e| anyhow::anyhow!("glab api {api}: unparseable member: {e}"))?;
+    Ok(member.access_level >= GITLAB_DEVELOPER)
+}
+
+/// Screen a GitHub PR view: see [`screen_feedback`].
+fn github_screen(url: &str, pr: &mut PrView, bots: &ReviewBots) -> anyhow::Result<()> {
+    let (host, repo) = url_host_path(url).map_or_else(
+        || (String::new(), url.to_owned()),
+        |(host, path)| {
+            let host = host.to_ascii_lowercase();
+            let repo = format!("{host}/{path}");
+            (host, repo)
+        },
+    );
+    screen_feedback(
+        pr,
+        bots,
+        |login| {
+            cached_lookup(
+                format!("github-bot:{host}:{}", login.to_ascii_lowercase()),
+                || github_login_is_bot(url, login),
+            )
+        },
+        |login| {
+            cached_lookup(
+                format!("github-push:{repo}:{}", normalize_login(login)),
+                || github_can_push(url, login),
+            )
+        },
+    )
+}
+
+/// A GitLab MR's notes as screened (comments, reviews): see
+/// [`screen_feedback`]. Membership is looked up by user id, which the
+/// notes carry and the normalised Gh types do not.
+///
+/// A configured bot needs no further confirmation here: a GitLab username
+/// names exactly one account on its instance -- bots are ordinary user
+/// accounts -- unlike GitHub, where an app's bare slug is also free for a
+/// person to hold.
+fn gitlab_feedback(
+    url: &str,
+    project: &str,
+    notes: &[GlNote],
+    bots: &ReviewBots,
+) -> anyhow::Result<(Vec<GhComment>, Vec<GhReview>)> {
+    let ids: HashMap<&str, i64> = notes
+        .iter()
+        .filter_map(|n| n.author.as_ref())
+        .filter_map(|a| Some((a.username.as_str(), a.id?)))
+        .collect();
+    let (comments, reviews) = gitlab_split_notes(notes);
+    let mut view = PrView {
+        comments,
+        reviews,
+        ..PrView::default()
+    };
+    let host = gitlab_host_path(url)
+        .map_or("", |(h, _)| h)
+        .to_ascii_lowercase();
+    screen_feedback(
+        &mut view,
+        bots,
+        |_| Ok(true),
+        |login| {
+            // Membership is looked up by id; a note that names its author
+            // without one leaves who wrote it unknown, which is not the
+            // same as known to be an outsider.
+            let Some(&id) = ids.get(login) else {
+                anyhow::bail!("GitLab note by {login:?} carries no author id");
+            };
+            cached_lookup(format!("gitlab-push:{host}/{project}:{id}"), || {
+                gitlab_can_push(url, project, id)
+            })
+        },
+    )?;
+    Ok((view.comments, view.reviews))
 }
 
 pub trait Forge: Send + Sync {
@@ -252,10 +601,17 @@ pub trait Forge: Send + Sync {
         title: &str,
         body: &str,
     ) -> anyhow::Result<String>;
-    /// Lightweight PR view for `sync_prs` (state, checks, mergeable).
-    fn view_pr_sync(&self, url: &str, pr_number: i64) -> anyhow::Result<PrView>;
-    /// Heavier PR view for engage (includes comments/reviews).
-    fn view_pr_engage(&self, url: &str, pr_number: i64) -> anyhow::Result<PrView>;
+    /// Lightweight PR view for `sync_prs` (state, checks, mergeable), its
+    /// feedback screened ([`screen_feedback`]).
+    fn view_pr_sync(&self, url: &str, pr_number: i64, bots: &ReviewBots) -> anyhow::Result<PrView>;
+    /// Heavier PR view for engage (includes title/body), its feedback
+    /// screened ([`screen_feedback`]).
+    fn view_pr_engage(
+        &self,
+        url: &str,
+        pr_number: i64,
+        bots: &ReviewBots,
+    ) -> anyhow::Result<PrView>;
     /// The PR/MR's unified diff: what it proposed. A closed PR's changes
     /// never reach the default branch, so this is the only place a worker
     /// reviewing it can read them.
@@ -555,12 +911,14 @@ fn gitlab_split_notes(notes: &[GlNote]) -> (Vec<GhComment>, Vec<GhReview>) {
                 body: n.body.clone(),
                 author,
                 state: String::new(),
+                voice: Voice::default(),
             });
         } else {
             comments.push(GhComment {
                 created_at: ts.clone(),
                 body: n.body.clone(),
                 author,
+                voice: Voice::default(),
             });
         }
     }
@@ -700,28 +1058,37 @@ impl Forge for GitHubForge {
         Ok(url)
     }
 
-    fn view_pr_sync(&self, url: &str, pr_number: i64) -> anyhow::Result<PrView> {
+    fn view_pr_sync(&self, url: &str, pr_number: i64, bots: &ReviewBots) -> anyhow::Result<PrView> {
         let (owner, repo) = self
             .owner_repo(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
         let slug = format!("{owner}/{repo}");
-        gh_pr_view(
+        let mut pr = gh_pr_view(
             &slug,
             pr_number,
             "state,mergedAt,mergeable,reviewDecision,statusCheckRollup,comments,reviews,updatedAt,headRefName,headRefOid",
-        )
+        )?;
+        github_screen(url, &mut pr, bots)?;
+        Ok(pr)
     }
 
-    fn view_pr_engage(&self, url: &str, pr_number: i64) -> anyhow::Result<PrView> {
+    fn view_pr_engage(
+        &self,
+        url: &str,
+        pr_number: i64,
+        bots: &ReviewBots,
+    ) -> anyhow::Result<PrView> {
         let (owner, repo) = self
             .owner_repo(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse owner/repo from {url}"))?;
         let slug = format!("{owner}/{repo}");
-        gh_pr_view(
+        let mut pr = gh_pr_view(
             &slug,
             pr_number,
             "title,body,comments,reviews,statusCheckRollup,headRefName,headRefOid",
-        )
+        )?;
+        github_screen(url, &mut pr, bots)?;
+        Ok(pr)
     }
 
     fn pr_diff(&self, url: &str, pr_number: i64) -> anyhow::Result<String> {
@@ -860,11 +1227,11 @@ impl Forge for GitLabForge {
         Ok(out.trim().lines().last().unwrap_or("").to_owned())
     }
 
-    fn view_pr_sync(&self, url: &str, pr_number: i64) -> anyhow::Result<PrView> {
+    fn view_pr_sync(&self, url: &str, pr_number: i64, bots: &ReviewBots) -> anyhow::Result<PrView> {
         let (_, path) = gitlab_host_path(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
         let (mr, notes) = gitlab_fetch_mr(url, path, pr_number)?;
-        let (comments, reviews) = gitlab_split_notes(&notes);
+        let (comments, reviews) = gitlab_feedback(url, path, &notes, bots)?;
         let state = gitlab_norm_state(&mr.state);
         let mergeable = gitlab_norm_mergeable(&mr);
         let status_check_rollup = gitlab_norm_pipeline(&mr);
@@ -883,11 +1250,16 @@ impl Forge for GitLabForge {
         })
     }
 
-    fn view_pr_engage(&self, url: &str, pr_number: i64) -> anyhow::Result<PrView> {
+    fn view_pr_engage(
+        &self,
+        url: &str,
+        pr_number: i64,
+        bots: &ReviewBots,
+    ) -> anyhow::Result<PrView> {
         let (_, path) = gitlab_host_path(url)
             .ok_or_else(|| anyhow::anyhow!("cannot parse GitLab URL: {url}"))?;
         let (mr, notes) = gitlab_fetch_mr(url, path, pr_number)?;
-        let (comments, reviews) = gitlab_split_notes(&notes);
+        let (comments, reviews) = gitlab_feedback(url, path, &notes, bots)?;
         let state = gitlab_norm_state(&mr.state);
         let mergeable = gitlab_norm_mergeable(&mr);
         let status_check_rollup = gitlab_norm_pipeline(&mr);
@@ -1092,5 +1464,29 @@ mod run_cmd_cwd_tests {
             elapsed < std::time::Duration::from_secs(10),
             "run_cmd_cwd blocked on a descendant holding the pipes: {elapsed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod lookup_cache_tests {
+    use super::*;
+
+    /// An answer is reused for exactly [`LOOKUP_TTL`] and then asked
+    /// again: a collaborator whose access was revoked stops being
+    /// trusted once it runs out, not never.
+    #[test]
+    fn an_answer_is_fresh_until_the_ttl_and_stale_from_it() {
+        let t0 = Instant::now();
+        let mut cache = LookupCache::default();
+        cache.record("github-push:h/o/r:lead".to_owned(), true, t0);
+
+        let just_before = t0 + LOOKUP_TTL.saturating_sub(Duration::from_nanos(1));
+        assert_eq!(cache.fresh("github-push:h/o/r:lead", t0), Some(true));
+        assert_eq!(
+            cache.fresh("github-push:h/o/r:lead", just_before),
+            Some(true)
+        );
+        assert_eq!(cache.fresh("github-push:h/o/r:lead", t0 + LOOKUP_TTL), None);
+        assert_eq!(cache.fresh("github-push:h/o/r:other", t0), None);
     }
 }

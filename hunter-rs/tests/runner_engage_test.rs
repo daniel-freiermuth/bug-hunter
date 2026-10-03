@@ -101,6 +101,22 @@ impl Fixture {
         row.map(|r| r.0)
     }
 
+    /// `pr_state.needs_attention` as `sync_prs` persisted it.
+    async fn attention(&self) -> Option<String> {
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
+        )
+        .await
+        .unwrap();
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT needs_attention FROM pr_state WHERE finding_id = ?1")
+                .bind(self.fid)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        row.and_then(|r| r.0)
+    }
+
     /// Every job row, oldest first: `(id, kind, state, resumed_from,
     /// estimated_tokens, pinned_sha)`.
     async fn jobs(&self) -> Vec<JobRow> {
@@ -401,6 +417,48 @@ async fn a_closure_that_cannot_be_recorded_is_retried_by_the_next_sync() {
     let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(after.status, FindingStatus::Closed);
     assert_eq!(f.pr_state().await.as_deref(), Some("CLOSED"));
+}
+
+/// On a public repo anyone can comment on hunter's PRs, and engage acts on
+/// a comment by committing and pushing. So only a comment by someone who
+/// can push, or by a configured review bot, flags the PR for engage; a
+/// stranger's leaves it alone.
+#[tokio::test]
+async fn only_maintainers_and_configured_bots_flag_new_comments() {
+    for (author, bots, flagged) in [
+        ("stranger", vec![], false),
+        ("maintainer", vec![], true),
+        ("coderabbitai", vec!["coderabbitai"], true),
+    ] {
+        let mut f = fixture(&format!("sync-screen-{author}")).await;
+        f.cfg.review_bots = hunter::forge::ReviewBots::new(bots);
+        let bins = FakeBins::acquire(&format!("sync-screen-{author}"));
+        bins.script(
+            "gh",
+            &format!(
+                "case \"$*\" in\n\
+                 \x20 *users/coderabbitai\\ *) echo Organization; exit 0 ;;\n\
+                 \x20 *collaborators/maintainer/permission*) echo true; exit 0 ;;\n\
+                 \x20 *permission*) echo false; exit 0 ;;\n\
+                 esac\n\
+                 cat <<'__PR_EOF__'\n\
+                 {{\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"reviewDecision\":\"\",\"statusCheckRollup\":[],\
+                 \"updatedAt\":\"2026-01-02T03:04:05Z\",\"headRefName\":\"{BRANCH}\",\"headRefOid\":\"deadbeef\",\
+                 \"reviews\":[],\"comments\":[{{\"author\":{{\"login\":\"{author}\"}},\
+                 \"body\":\"please change this\",\"createdAt\":\"2026-01-02T03:04:05Z\"}}]}}\n\
+                 __PR_EOF__\nexit 0"
+            ),
+        );
+
+        let result = hunter::scheduler::sync_prs(&f.store, &f.cfg).await;
+
+        assert_eq!(result.errors, 0, "{author}: {result:?}");
+        assert_eq!(
+            f.attention().await.as_deref(),
+            flagged.then_some("new_comments"),
+            "{author}"
+        );
+    }
 }
 
 /// A failed withdrawal must not become an unbounded retry.

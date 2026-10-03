@@ -85,6 +85,7 @@ fn test_config(root: &Path) -> Config {
         modernization_interval_days: 30,
         standards_interval_days: 30,
         renovate_github_token: None,
+        review_bots: hunter::forge::ReviewBots::default(),
     }
 }
 

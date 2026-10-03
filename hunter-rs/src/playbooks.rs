@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::path::Path;
 
-use crate::forge::PrView;
+use crate::forge::{PrView, Voice};
 use crate::types::{Finding, PrState, Repo};
 
 /// `PLAYBOOK_DIR` = <`project_root>/playbooks` (types.py `PLAYBOOK_DIR`).
@@ -156,12 +156,13 @@ fn notes_or_default(repo_notes: &str, default: &str) -> String {
     }
 }
 
-/// Chronological comments + reviews; oldest dropped past ~cap chars.
-/// Port of playbooks.py _`feedback_blocks`.
-fn feedback_blocks(pr: &PrView, cap: usize) -> String {
+/// Chronological comments + reviews by `voice`; oldest dropped past ~cap
+/// chars. Port of playbooks.py _`feedback_blocks`, split by [`Voice`] so
+/// bots' reviews reach the worker under their own heading and guidance.
+fn feedback_blocks(pr: &PrView, voice: Voice, cap: usize) -> String {
     let mut items: Vec<(String, String, String)> = Vec::new();
 
-    for c in &pr.comments {
+    for c in pr.comments.iter().filter(|c| c.voice == voice) {
         let ts = c.created_at.clone();
         let who = c
             .author
@@ -172,7 +173,7 @@ fn feedback_blocks(pr: &PrView, cap: usize) -> String {
         items.push((ts, who, body));
     }
 
-    for r in &pr.reviews {
+    for r in pr.reviews.iter().filter(|r| r.voice == voice) {
         let state = &r.state;
         let raw_body = r.body.trim();
         let body = if !state.is_empty() && state != "COMMENTED" {
@@ -207,7 +208,10 @@ fn feedback_blocks(pr: &PrView, cap: usize) -> String {
     }
 
     if blocks.is_empty() {
-        "(no comments or reviews)".to_owned()
+        match voice {
+            Voice::Maintainer => "(no comments or reviews)".to_owned(),
+            Voice::Bot => "(no bot reviews)".to_owned(),
+        }
     } else {
         blocks.join("\n\n")
     }
@@ -369,7 +373,8 @@ pub fn build_engage_prompt(
             pr.body.clone()
         },
     );
-    slots.insert("FEEDBACK", feedback_blocks(pr, 8000));
+    slots.insert("FEEDBACK", feedback_blocks(pr, Voice::Maintainer, 8000));
+    slots.insert("BOT_FEEDBACK", feedback_blocks(pr, Voice::Bot, 6000));
     slots.insert("CHECKS", checks_lines(pr));
     slots.insert("ATTENTION", attention);
     slots.insert(
@@ -409,7 +414,8 @@ pub fn build_harvest_prompt(
             pr.body.clone()
         },
     );
-    slots.insert("FEEDBACK", feedback_blocks(pr, 8000));
+    slots.insert("FEEDBACK", feedback_blocks(pr, Voice::Maintainer, 8000));
+    slots.insert("BOT_FEEDBACK", feedback_blocks(pr, Voice::Bot, 6000));
     slots.insert("REPO_NOTES", notes);
     render(&template, &slots)
 }
@@ -507,7 +513,8 @@ pub fn build_harvest_closed_prompt(
         },
     );
     slots.insert("PR_DIFF", fenced_diff(pr_diff));
-    slots.insert("FEEDBACK", feedback_blocks(pr, 8000));
+    slots.insert("FEEDBACK", feedback_blocks(pr, Voice::Maintainer, 8000));
+    slots.insert("BOT_FEEDBACK", feedback_blocks(pr, Voice::Bot, 6000));
     slots.insert("REPO_NOTES", notes);
     render(&template, &slots)
 }
