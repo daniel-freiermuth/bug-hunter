@@ -156,6 +156,55 @@ async fn clean_repo_runs_the_fix() {
     assert_eq!(summary.outcome.as_deref(), Some("rejected"));
 }
 
+/// A fix whose tree can never be created -- here the repo names a
+/// default branch origin does not have -- is a failed fix attempt like any
+/// other: it stays `queued` for the retry and, after
+/// `MAX_CONSECUTIVE_SAME_FAILURE` (3) of them in a row, is rejected as
+/// stuck. Left `queued` for good, `pick_next` (oldest queued first) would
+/// re-pick it every cycle and no other queued fix would ever run.
+#[tokio::test]
+async fn a_tree_that_can_never_be_made_ends_in_the_stuck_verdict() {
+    use hunter::domain::{FindingStatus, JobState};
+
+    let f = fixture("fix-no-tree").await;
+    let rid = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
+    f.store
+        .update_repo(
+            rid,
+            &hunter::store::RepoUpdate {
+                default_branch: Some("no-such-branch".to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let backend = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
+
+    for attempt in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(
+            finding.status,
+            FindingStatus::Queued,
+            "before attempt {attempt}"
+        );
+        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
+            .await
+            .unwrap();
+        assert_eq!(summary.state, Some(JobState::Failed), "{summary:?}");
+    }
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status, FindingStatus::Rejected);
+    assert!(
+        finding
+            .verdict_reason
+            .as_deref()
+            .is_some_and(|r| r.starts_with("stuck: 3 consecutive") && r.contains("no-such-branch")),
+        "{:?}",
+        finding.verdict_reason
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The cap the job is granted
 // ---------------------------------------------------------------------------
