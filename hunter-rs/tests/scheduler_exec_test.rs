@@ -782,11 +782,8 @@ async fn a_suspended_job_drains_the_queue_like_a_killed_one() {
             state: Some(state),
             ..Default::default()
         };
-        assert_eq!(
-            hunter::daemon::compute_sleep_s(&store, &summary).await,
-            0.0,
-            "{state:?}"
-        );
+        let sleep_s = hunter::daemon::compute_sleep_s(&store, &summary).await;
+        assert!(sleep_s.abs() < f64::EPSILON, "{state:?} slept {sleep_s}s");
         assert_eq!(
             hunter::daemon::describe_cycle(&summary),
             (
