@@ -2277,7 +2277,7 @@ impl Store {
     /// stamped on the sync where the attention reason *changes*, so if the
     /// UPSERT committed the new `attention_fingerprint` and the UPDATE then
     /// failed, every later sync would see an unchanged reason and never
-    /// stamp it — leaving `list_attention` ordering and the displayed
+    /// stamp it — leaving `scheduler::list_attention` ordering and the displayed
     /// attention age permanently wrong.  `clear_addressed` has the same
     /// shape.  A plain (deferred) `begin` suffices: the first statement is
     /// a write, so the lock is taken before anything is read back.
@@ -2452,33 +2452,6 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
-    }
-
-    /// Findings at `pr_open` with `needs_attention` set, sorted by `attention_since`.
-    pub async fn list_attention(&self) -> sqlx::Result<Vec<Finding>> {
-        let pr_open = FindingStatus::PrOpen;
-        sqlx::query_as!(
-            Finding,
-            r#"
-            SELECT f.id, f.type AS "kind: FindingType", f.repo_id, f.fingerprint, f.file, f.symbol, f.line,
-                   f.severity AS "severity: Severity", f.confidence, f.summary, f.detail, f.status AS "status: FindingStatus", f.pr_url,
-                   f.created_at, f.updated_at, f.bug_class AS "bug_class: BugClass", f.evidence_plan,
-                   f.introduced_by, f.rung_achieved, f.verdict_reason,
-                   f.budget_override AS "budget_override: BudgetOverride", f.fix_attempts, f.last_fix_failure,
-                   f.recheck_attempts, f.last_recheck_failure, f.ecosystem, f.package,
-                   f.current_version, f.latest_version, f.update_type,
-                   f.security_advisory, f.missing_tests, f.test_file, f.smell_type,
-                   f.suggested_refactor, f.modernization_class, f.current_approach,
-                   f.proposed_approach, f.standard_section
-            FROM findings f
-            JOIN pr_state p ON p.finding_id = f.id
-            WHERE f.status = ?1 AND p.needs_attention IS NOT NULL
-            ORDER BY COALESCE(p.attention_since, p.synced_at) ASC
-            "#,
-            pr_open
-        )
-        .fetch_all(&self.pool)
-        .await
     }
 
     /// Findings whose pull request awaits its one-time harvest: merged, or
