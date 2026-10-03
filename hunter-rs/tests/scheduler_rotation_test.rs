@@ -260,3 +260,126 @@ async fn an_attempt_that_died_before_doing_any_work_stays_failed() {
     assert_eq!(summary.state, Some(JobState::Failed), "{summary:?}");
     assert!(last_test_gap_at(&store).await > STALE_TEST_GAP);
 }
+
+/// Whether selection has abandoned a chain at the give-up ceiling.
+async fn given_up(pool: &SqlitePool) -> bool {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM jobs WHERE killed_reason = 'give-up'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        > 0
+}
+
+/// A chain the give-up ceiling abandons hands the rotation turn on.
+///
+/// A wallclock kill after metered work is a suspension, so no single
+/// attempt of a runaway bumps the timestamp: each is a pause the resume
+/// tier continues. The chain's end is where its turn is over. Left at its
+/// old value there, the timestamp makes rotation start the same runaway
+/// fresh in the very selection that abandoned it, one whole chain after
+/// another, while every sibling kind waits.
+#[tokio::test]
+async fn an_abandoned_analysis_chain_bumps_the_rotation_timestamp() {
+    let (_dir, path, pool, cfg) = fixture("rotation-given-up").await;
+    let store = Store::connect(&path).await.unwrap();
+    let backend = stopped_worker("wallclock", true);
+
+    // The fresh attempt and every resume the chain is allowed.
+    let mut attempts = 0;
+    let picked = loop {
+        let picked = pick_next(&store, &cfg, None).await.unwrap();
+        if given_up(&pool).await {
+            break picked;
+        }
+        assert!(attempts < 10, "the give-up ceiling never retired the chain");
+        let summary = run_cycle(&store, &cfg, &backend, None).await;
+        assert_eq!(
+            summary.kind.map(|k| k.to_string()),
+            Some("test_gap".to_owned())
+        );
+        assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
+        assert_eq!(last_test_gap_at(&store).await, STALE_TEST_GAP);
+        attempts += 1;
+    };
+
+    assert!(
+        last_test_gap_at(&store).await > STALE_TEST_GAP,
+        "an abandoned chain must bump last_test_gap_at, or rotation restarts \
+         the same runaway as the stalest pick, chain after chain"
+    );
+    assert!(
+        matches!(
+            picked,
+            Some(Candidate::Repo {
+                kind: RepoJobKind::DepUpdate,
+                ..
+            })
+        ),
+        "the selection that abandons test_gap's chain must pass the turn to \
+         the next-stalest kind, got {picked:?}"
+    );
+}
+
+/// A resumed analysis attempt that is killed bumps its rotation
+/// timestamp, exactly like a fresh one.
+///
+/// The kill ends the chain: the killed row is not resumable, so the
+/// resume tier has nothing left to claim and rotation decides the next
+/// pick alone. Skipping the bump because the attempt was a resume rather
+/// than a fresh start would hand `test_gap` the slot again.
+#[tokio::test]
+async fn a_killed_resume_of_an_analysis_chain_bumps_the_rotation_timestamp() {
+    let (_dir, path, _pool, cfg) = fixture("rotation-resume-killed").await;
+    let store = Store::connect(&path).await.unwrap();
+    // Suspends when started, is killed when continued.
+    let backend = ScriptedBackend::staged(|tree, resume_from| {
+        let fresh = resume_from.is_none();
+        let session = fresh.then(|| {
+            let file = tree.parent().unwrap().join("session").join("session.jsonl");
+            std::fs::write(&file, "{}\n").unwrap();
+            file.to_string_lossy().into_owned()
+        });
+        RunResult {
+            exit_code: None,
+            killed_reason: Some(if fresh { "cap" } else { "unmetered" }.to_owned()),
+            tokens_new: 30_000,
+            calls: 4,
+            session_file: session,
+            duration_s: 1.0,
+            stdout_tail: "stopped".to_owned(),
+            usage_delta: None,
+        }
+    });
+
+    let started = run_cycle(&store, &cfg, &backend, None).await;
+    assert_eq!(started.state, Some(JobState::Suspended), "{started:?}");
+    let resumed = run_cycle(&store, &cfg, &backend, None).await;
+    assert_eq!(
+        resumed.kind.map(|k| k.to_string()),
+        Some("test_gap".to_owned())
+    );
+    assert_eq!(resumed.state, Some(JobState::Killed), "{resumed:?}");
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 2);
+    assert!(
+        runs[1].resume_from.is_some(),
+        "the second run must be the resume"
+    );
+
+    assert!(
+        last_test_gap_at(&store).await > STALE_TEST_GAP,
+        "a killed resume must bump last_test_gap_at like a killed fresh attempt"
+    );
+    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    assert!(
+        matches!(
+            picked,
+            Some(Candidate::Repo {
+                kind: RepoJobKind::DepUpdate,
+                ..
+            })
+        ),
+        "after test_gap's chain is killed the next-stalest kind must be \
+         selected, got {picked:?}"
+    );
+}
