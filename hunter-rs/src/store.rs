@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
+use crate::auth::CurrentUser;
 use crate::domain::{
     BudgetOverride, BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState,
     RepoJobKind, Severity,
@@ -261,16 +262,18 @@ async fn insert_event<'e, E: sqlx::SqliteExecutor<'e>>(
     message: &str,
     job_id: Option<i64>,
     finding_id: Option<i64>,
+    user_id: Option<i64>,
 ) -> sqlx::Result<()> {
     let at = now_ms();
     sqlx::query!(
-        "INSERT INTO events (at, kind, message, job_id, finding_id) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO events (at, kind, message, job_id, finding_id, user_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         at,
         kind,
         message,
         job_id,
-        finding_id
+        finding_id,
+        user_id
     )
     .execute(ex)
     .await?;
@@ -800,7 +803,171 @@ impl Store {
         job_id: Option<i64>,
         finding_id: Option<i64>,
     ) -> sqlx::Result<()> {
-        insert_event(&self.pool, kind, message, job_id, finding_id).await
+        insert_event(&self.pool, kind, message, job_id, finding_id, None).await
+    }
+
+    /// [`Store::log_event`] for something a person did through the API,
+    /// recorded as theirs.
+    pub async fn log_user_event(
+        &self,
+        user: &CurrentUser,
+        kind: &str,
+        message: &str,
+        finding_id: Option<i64>,
+    ) -> sqlx::Result<()> {
+        insert_event(&self.pool, kind, message, None, finding_id, Some(user.id)).await
+    }
+
+    // -- users / sessions --------------------------------------------------------
+
+    /// Create an account. A taken username (compared case-insensitively)
+    /// is refused.
+    pub async fn create_user(
+        &self,
+        username: &str,
+        password_hash: &str,
+    ) -> Result<i64, StoreWriteError> {
+        let now = now_ms();
+        let inserted = sqlx::query_scalar!(
+            r#"INSERT INTO users (username, password_hash, created_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(username) DO NOTHING
+               RETURNING id AS "id!: i64""#,
+            username,
+            password_hash,
+            now
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        inserted
+            .ok_or_else(|| StoreWriteError::Refused(format!("user {username:?} already exists")))
+    }
+
+    /// Replace an account's password and end its sessions, so a password
+    /// changed because it leaked also logs out whoever used it. `false`
+    /// when no such account exists.
+    pub async fn set_password(&self, username: &str, password_hash: &str) -> sqlx::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let id = sqlx::query_scalar!(
+            r#"UPDATE users SET password_hash = ?2 WHERE username = ?1
+               RETURNING id AS "id!: i64""#,
+            username,
+            password_hash
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        sqlx::query!("DELETE FROM sessions WHERE user_id = ?1", id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// Disable an account and end its sessions. The row stays, so events
+    /// it authored keep their author. `false` when no such account exists.
+    pub async fn disable_user(&self, username: &str) -> sqlx::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = now_ms();
+        let id = sqlx::query_scalar!(
+            r#"UPDATE users SET disabled_at = COALESCE(disabled_at, ?2) WHERE username = ?1
+               RETURNING id AS "id!: i64""#,
+            username,
+            now
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(id) = id else {
+            return Ok(false);
+        };
+        sqlx::query!("DELETE FROM sessions WHERE user_id = ?1", id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    /// `(user, password hash)` for an account that may log in; `None` for
+    /// an unknown or disabled name.
+    pub async fn login_candidate(
+        &self,
+        username: &str,
+    ) -> sqlx::Result<Option<(CurrentUser, String)>> {
+        let row = sqlx::query!(
+            r#"SELECT id AS "id!: i64", username, password_hash
+               FROM users WHERE username = ?1 AND disabled_at IS NULL"#,
+            username
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            (
+                CurrentUser {
+                    id: r.id,
+                    username: r.username,
+                },
+                r.password_hash,
+            )
+        }))
+    }
+
+    /// Record a session for `user`, valid until `expires_at` (epoch ms).
+    /// Sessions that have already expired are cleared out on the way,
+    /// since nothing else ever deletes them.
+    pub async fn create_session(
+        &self,
+        user: &CurrentUser,
+        token_hash: &[u8],
+        expires_at: i64,
+    ) -> sqlx::Result<()> {
+        let now = now_ms();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query!("DELETE FROM sessions WHERE expires_at <= ?1", now)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query!(
+            "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            token_hash,
+            user.id,
+            now,
+            expires_at
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await
+    }
+
+    /// The account behind a session token hash, if the session exists, has
+    /// not expired at `now` (epoch ms), and its account is not disabled.
+    pub async fn session_user(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+    ) -> sqlx::Result<Option<CurrentUser>> {
+        let row = sqlx::query!(
+            r#"SELECT u.id AS "id!: i64", u.username
+               FROM sessions s JOIN users u ON u.id = s.user_id
+               WHERE s.token_hash = ?1 AND s.expires_at > ?2 AND u.disabled_at IS NULL"#,
+            token_hash,
+            now
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| CurrentUser {
+            id: r.id,
+            username: r.username,
+        }))
+    }
+
+    /// End one session (logout). Unknown tokens are not an error.
+    pub async fn delete_session(&self, token_hash: &[u8]) -> sqlx::Result<()> {
+        sqlx::query!("DELETE FROM sessions WHERE token_hash = ?1", token_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Append to [`Store::notes_path`] (creating dir +
@@ -986,8 +1153,9 @@ impl Store {
             Event,
             r#"
             SELECT e.id AS "id!", e.at AS "at!", e.kind AS "kind!", e.message AS "message!",
-                   e.job_id, e.finding_id
+                   e.job_id, e.finding_id, u.username AS "username?"
             FROM events e
+            LEFT JOIN users u ON u.id = e.user_id
             JOIN json_each(?1) ids ON ids.value = e.finding_id
             "#,
             ids_json
@@ -1490,9 +1658,11 @@ impl Store {
         sqlx::query_as!(
             Event,
             r#"
-            SELECT id, at, kind, message, job_id, finding_id
-            FROM events
-            ORDER BY id DESC
+            SELECT e.id, e.at, e.kind, e.message, e.job_id, e.finding_id,
+                   u.username AS "username?"
+            FROM events e
+            LEFT JOIN users u ON u.id = e.user_id
+            ORDER BY e.id DESC
             LIMIT ?1
             "#,
             limit
@@ -1507,7 +1677,8 @@ impl Store {
         sqlx::query_as!(
             Event,
             r#"
-            SELECT id, at, kind, message, job_id, finding_id
+            SELECT id, at, kind, message, job_id, finding_id,
+                   NULL AS "username?: String"
             FROM events
             WHERE kind = 'cycle'
             ORDER BY id DESC
@@ -1648,7 +1819,7 @@ impl Store {
                     old.repo_name, old.id
                 );
                 retire_job(&mut *tx, old.id, JobState::Killed, Some("superseded"), &msg).await?;
-                insert_event(&mut *tx, "resume", &msg, Some(old.id), finding_id).await?;
+                insert_event(&mut *tx, "resume", &msg, Some(old.id), finding_id, None).await?;
                 retired.push(old.id);
             }
         }

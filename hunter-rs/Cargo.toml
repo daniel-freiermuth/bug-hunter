@@ -31,6 +31,7 @@ cast_possible_wrap = "allow"
 
 [dependencies]
 anyhow = "1"
+argon2 = { version = "0.6", features = ["getrandom"] }
 async-trait = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 axum = "0.8"
@@ -49,7 +50,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tower-http = { version = "0.7", features = ["fs", "set-header", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-nix = { version = "0.31.3", features = ["fs", "signal", "process"] }
+nix = { version = "0.31.3", features = ["fs", "signal", "process", "term"] }
+sha2 = "0.11"
+getrandom = "0.4"
 ts-rs = "12"
 
 [dev-dependencies]

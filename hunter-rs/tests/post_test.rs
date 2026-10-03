@@ -169,7 +169,11 @@ async fn post_raw(
     ctype: Option<&str>,
     body: &str,
 ) -> (StatusCode, Value) {
-    let mut builder = Request::builder().method("POST").uri(path);
+    let cookie = support::auth_cookie(&state.store).await;
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(axum::http::header::COOKIE, cookie.as_str());
     if let Some(ct) = ctype {
         builder = builder.header("content-type", ct);
     }
@@ -1500,9 +1504,11 @@ async fn a_url_that_looks_like_a_git_option_is_refused() {
 // -- /api/scheduler (pause / resume) ---------------------------------------------
 
 async fn summary_paused(state: &AppState) -> bool {
+    let cookie = support::auth_cookie(&state.store).await;
     let response = router(state.clone())
         .oneshot(
             Request::builder()
+                .header(axum::http::header::COOKIE, cookie.as_str())
                 .uri("/api/summary")
                 .body(Body::empty())
                 .unwrap(),
@@ -1585,9 +1591,11 @@ async fn a_non_boolean_pause_request_is_refused() {
 // -- /api/overdrive -----------------------------------------------------------
 
 async fn summary_overdrive(state: &AppState) -> bool {
+    let cookie = support::auth_cookie(&state.store).await;
     let response = router(state.clone())
         .oneshot(
             Request::builder()
+                .header(axum::http::header::COOKIE, cookie.as_str())
                 .uri("/api/summary")
                 .body(Body::empty())
                 .unwrap(),
@@ -1638,4 +1646,352 @@ async fn overdrive_round_trips_and_wakes_the_scheduler() {
     assert_eq!(status, StatusCode::OK, "body: {body}");
     assert_eq!(body, json!({ "overdrive": false }));
     assert!(!summary_overdrive(&state).await);
+}
+
+// -- accounts and sessions -------------------------------------------------------
+
+/// One request with an optional `Cookie`: (status, `Set-Cookie`, body).
+async fn request(
+    state: &AppState,
+    method: &str,
+    path: &str,
+    cookie: Option<&str>,
+    body: Option<Value>,
+) -> (StatusCode, Option<String>, Value) {
+    let mut builder = Request::builder().method(method).uri(path);
+    if let Some(cookie) = cookie {
+        builder = builder.header(axum::http::header::COOKIE, cookie);
+    }
+    let body = match body {
+        Some(json) => {
+            builder = builder.header("content-type", "application/json");
+            Body::from(json.to_string())
+        }
+        None => Body::empty(),
+    };
+    let response = router(state.clone())
+        .oneshot(builder.body(body).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let set_cookie = response
+        .headers()
+        .get(axum::http::header::SET_COOKIE)
+        .map(|v| v.to_str().unwrap().to_owned());
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, set_cookie, value)
+}
+
+/// The `name=value` part of a `Set-Cookie` header, as a browser sends it back.
+fn cookie_pair(set_cookie: &str) -> String {
+    set_cookie.split(';').next().unwrap().to_owned()
+}
+
+/// Log `username` in through the API; the session cookie to send back.
+async fn log_in(state: &AppState, username: &str, password: &str) -> String {
+    let (status, set_cookie, body) = request(
+        state,
+        "POST",
+        "/api/login",
+        None,
+        Some(json!({ "username": username, "password": password })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    cookie_pair(&set_cookie.expect("a login sets the session cookie"))
+}
+
+/// Every API route but `/api/login` answers 401 to a request without a
+/// live session -- no cookie, a made-up token, or the cookie of a session
+/// that ended -- reads and writes alike, before any handler runs.
+#[tokio::test]
+async fn every_api_route_needs_a_session() {
+    let state = test_state().await;
+    let routes = [
+        ("GET", "/api/summary"),
+        ("GET", "/api/findings"),
+        ("GET", "/api/finding?id=1"),
+        ("GET", "/api/jobs"),
+        ("GET", "/api/repos"),
+        ("POST", "/api/repos"),
+        ("POST", "/api/repo"),
+        ("GET", "/api/repo/notes?id=1"),
+        ("POST", "/api/repo/notes"),
+        ("POST", "/api/repo/delete"),
+        ("GET", "/api/events"),
+        ("GET", "/api/stats"),
+        ("POST", "/api/verdict"),
+        ("POST", "/api/cycle"),
+        ("POST", "/api/scheduler"),
+        ("POST", "/api/overdrive"),
+        ("POST", "/api/recheck"),
+        ("POST", "/api/unqueue"),
+        ("POST", "/api/override"),
+        ("GET", "/api/me"),
+        ("POST", "/api/logout"),
+    ];
+    let ended = support::auth_cookie(&state.store).await;
+    let (status, _, _) =
+        request(&state, "POST", "/api/logout", Some(&ended), Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    for cookie in [None, Some("hunter_session=made-up"), Some(ended.as_str())] {
+        for (method, path) in routes {
+            let body = (method == "POST").then(|| json!({ "id": 1 }));
+            let (status, _, body) = request(&state, method, path, cookie, body).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} with {cookie:?}"
+            );
+            assert_eq!(
+                body,
+                json!({ "error": "login required" }),
+                "{method} {path}"
+            );
+        }
+    }
+    let after = state.store.get_finding(1).await.unwrap().unwrap();
+    assert_eq!(
+        after.status,
+        hunter::domain::FindingStatus::New,
+        "nothing was written"
+    );
+}
+
+/// A login sets an `HttpOnly`, `SameSite=Strict` session cookie that
+/// identifies the account; logging out ends that session and clears the
+/// cookie.
+#[tokio::test]
+async fn a_login_session_lasts_until_logout() {
+    let state = test_state().await;
+    hunter::auth::add_user(&state.store, "Alice", "correct horse battery".to_owned())
+        .await
+        .unwrap();
+
+    let (status, set_cookie, body) = request(
+        &state,
+        "POST",
+        "/api/login",
+        None,
+        Some(json!({ "username": "alice", "password": "correct horse battery" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body,
+        json!({ "username": "Alice" }),
+        "names compare case-insensitively"
+    );
+    let set_cookie = set_cookie.unwrap();
+    // Whole attributes, not substrings: `Max-Age=2592000000` must not pass.
+    let attributes: Vec<&str> = set_cookie.split(';').map(str::trim).collect();
+    for attribute in ["HttpOnly", "SameSite=Strict", "Path=/", "Max-Age=2592000"] {
+        assert!(attributes.contains(&attribute), "{set_cookie}");
+    }
+    let cookie = cookie_pair(&set_cookie);
+
+    let (status, _, body) = request(&state, "GET", "/api/me", Some(&cookie), None).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::OK, json!({ "username": "Alice" }))
+    );
+
+    let (status, cleared, _) = request(
+        &state,
+        "POST",
+        "/api/logout",
+        Some(&cookie),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(cleared.unwrap().contains("Max-Age=0"));
+    let (status, _, _) = request(&state, "GET", "/api/me", Some(&cookie), None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the session ended with the logout"
+    );
+}
+
+/// A wrong password, an unknown name and a disabled account get the same
+/// answer, and none of them gets a cookie.
+#[tokio::test]
+async fn failed_logins_look_alike() {
+    let state = test_state().await;
+    hunter::auth::add_user(&state.store, "alice", "correct horse battery".to_owned())
+        .await
+        .unwrap();
+    hunter::auth::add_user(&state.store, "bob", "another long password".to_owned())
+        .await
+        .unwrap();
+    hunter::auth::disable_user(&state.store, "bob")
+        .await
+        .unwrap();
+
+    for (username, password) in [
+        ("alice", "wrong password!!"),
+        ("nobody", "correct horse battery"),
+        ("bob", "another long password"),
+    ] {
+        let (status, set_cookie, body) = request(
+            &state,
+            "POST",
+            "/api/login",
+            None,
+            Some(json!({ "username": username, "password": password })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{username}");
+        assert_eq!(
+            body,
+            json!({ "error": "invalid username or password" }),
+            "{username}"
+        );
+        assert!(set_cookie.is_none(), "{username}");
+    }
+}
+
+/// Changing a password or disabling an account ends every session it
+/// has, so a leaked password stops working everywhere at once; a session
+/// past its expiry is refused too.
+#[tokio::test]
+async fn sessions_end_with_a_password_change_a_disable_or_their_expiry() {
+    let state = test_state().await;
+    hunter::auth::add_user(&state.store, "alice", "correct horse battery".to_owned())
+        .await
+        .unwrap();
+    hunter::auth::add_user(&state.store, "bob", "another long password".to_owned())
+        .await
+        .unwrap();
+
+    let alice = log_in(&state, "alice", "correct horse battery").await;
+    hunter::auth::change_password(&state.store, "alice", "a brand new password".to_owned())
+        .await
+        .unwrap();
+    let (status, _, _) = request(&state, "GET", "/api/me", Some(&alice), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "after passwd");
+    log_in(&state, "alice", "a brand new password").await;
+
+    let bob = log_in(&state, "bob", "another long password").await;
+    hunter::auth::disable_user(&state.store, "bob")
+        .await
+        .unwrap();
+    let (status, _, _) = request(&state, "GET", "/api/me", Some(&bob), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "after disable");
+
+    let (user, _) = state.store.login_candidate("alice").await.unwrap().unwrap();
+    let token = hunter::auth::new_session_token().unwrap();
+    let now = hunter::util::now_ms();
+    state
+        .store
+        .create_session(&user, &hunter::auth::token_hash(&token), now + 60_000)
+        .await
+        .unwrap();
+    let cookie = format!("hunter_session={token}");
+    let (status, _, _) = request(&state, "GET", "/api/me", Some(&cookie), None).await;
+    assert_eq!(status, StatusCode::OK, "a minute before expiry");
+    assert_eq!(
+        state
+            .store
+            .session_user(&hunter::auth::token_hash(&token), now + 60_000)
+            .await
+            .unwrap(),
+        None,
+        "at its expiry"
+    );
+}
+
+/// Accounts are created with a valid name and a long enough password,
+/// once per name regardless of case.
+#[tokio::test]
+async fn accounts_need_a_valid_name_a_long_password_and_a_free_name() {
+    let state = test_state().await;
+    let add = |name: &'static str, password: &'static str| {
+        hunter::auth::add_user(&state.store, name, password.to_owned())
+    };
+    assert!(
+        add("alice", "short")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("at least 12")
+    );
+    assert!(
+        add("al ice", "correct horse battery")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("may only contain")
+    );
+    assert!(add("", "correct horse battery").await.is_err());
+    add("alice", "correct horse battery").await.unwrap();
+    assert!(
+        add("ALICE", "correct horse battery")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already exists")
+    );
+    assert!(
+        hunter::auth::change_password(&state.store, "nobody", "correct horse battery".to_owned())
+            .await
+            .is_err()
+    );
+    assert!(
+        hunter::auth::disable_user(&state.store, "nobody")
+            .await
+            .is_err()
+    );
+}
+
+/// What a person does through the API is recorded as theirs, and the
+/// event feed says who.
+#[tokio::test]
+async fn api_writes_are_attributed_to_the_logged_in_account() {
+    let state = test_state().await;
+    hunter::auth::add_user(&state.store, "alice", "correct horse battery".to_owned())
+        .await
+        .unwrap();
+    let cookie = log_in(&state, "alice", "correct horse battery").await;
+
+    let (status, _, body) = request(
+        &state,
+        "POST",
+        "/api/verdict",
+        Some(&cookie),
+        Some(json!({ "id": 1, "status": "queued" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (_, _, events) = request(&state, "GET", "/api/events", Some(&cookie), None).await;
+    let verdict = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "verdict")
+        .expect("a verdict event");
+    assert_eq!(verdict["username"], "alice");
+
+    // The finding's own timeline says who, too.
+    let (_, _, findings) = request(&state, "GET", "/api/findings", Some(&cookie), None).await;
+    let timeline = &findings
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"] == 1)
+        .expect("finding 1")["timeline"];
+    let entry = timeline
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["kind"] == "verdict")
+        .unwrap_or_else(|| panic!("no verdict in {timeline}"));
+    assert_eq!(entry["username"], "alice");
+    assert_eq!(entry["finding_id"], 1);
 }

@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{Query, State};
+use axum::extract::{Extension, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -26,6 +26,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use tower_http::set_header::SetResponseHeaderLayer;
 
+use crate::auth::{self, CurrentUser};
 use crate::config::{Config, HostAllowList};
 use crate::domain::{BudgetOverride, FindingStatus, FindingType, ForgeName, Severity};
 use crate::store::{FindingFilter, RepoUpdate, Store, StoreWriteError};
@@ -101,6 +102,9 @@ pub enum ApiError {
     /// 403 — a `Host` that is not a loopback name (WRITES contract §0.1).
     #[error("forbidden: non-local origin")]
     Forbidden,
+    /// 401 — no live session, or a failed login.
+    #[error("{0}")]
+    Unauthorized(&'static str),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
     #[error(transparent)]
@@ -122,6 +126,7 @@ impl IntoResponse for ApiError {
                 "Content-Type must be application/json",
             ),
             Self::Forbidden => error_body(StatusCode::FORBIDDEN, "forbidden: non-local origin"),
+            Self::Unauthorized(msg) => error_body(StatusCode::UNAUTHORIZED, msg),
             Self::Db(err) => {
                 tracing::error!(error = %err, "database error");
                 error_body(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
@@ -200,6 +205,35 @@ async fn host_guard(
     }
 }
 
+/// Every `/api` route but `/api/login` needs a live session: the
+/// request's [`CurrentUser`] goes into its extensions for the handler, and
+/// without one the answer is 401 `login required`. Static files stay
+/// public -- the UI bundle carries no data, and it has to load to show
+/// the login form.
+async fn require_session(
+    State(state): State<AppState>,
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let Some(token) = auth::session_token(req.headers()) else {
+        return ApiError::Unauthorized(LOGIN_REQUIRED).into_response();
+    };
+    match state
+        .store
+        .session_user(&auth::token_hash(token), crate::util::now_ms())
+        .await
+    {
+        Ok(Some(user)) => {
+            req.extensions_mut().insert(user);
+            next.run(req).await
+        }
+        Ok(None) => ApiError::Unauthorized(LOGIN_REQUIRED).into_response(),
+        Err(e) => ApiError::Db(e).into_response(),
+    }
+}
+
+const LOGIN_REQUIRED: &str = "login required";
+
 /// Refused -> 400 with the store's exact message (WRITES contract §8:
 /// "repo <id> has <n> finding(s) and <m> job(s) -- cannot delete without
 /// losing history; pause it instead"); Db -> 500 envelope.
@@ -213,7 +247,7 @@ impl From<StoreWriteError> for ApiError {
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api = Router::new()
         .route("/api/summary", get(summary))
         .route("/api/findings", get(findings))
         .route("/api/finding", get(finding_detail))
@@ -231,6 +265,15 @@ pub fn router(state: AppState) -> Router {
         .route("/api/recheck", post(recheck))
         .route("/api/unqueue", post(unqueue))
         .route("/api/override", post(override_))
+        .route("/api/me", get(me))
+        .route("/api/logout", post(logout))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_session,
+        ));
+    Router::new()
+        .merge(api)
+        .route("/api/login", post(login))
         .fallback(static_files)
         // Host check ahead of every handler and the static files, so a
         // rebound hostname cannot read findings either (contract §0.1).
@@ -500,6 +543,87 @@ async fn events(State(state): State<AppState>) -> Result<Json<Vec<Event>>, ApiEr
     Ok(Json(state.store.recent_events(100).await?))
 }
 
+// -- /api/login, /api/logout, /api/me ------------------------------------------
+
+/// Response for a login and for `/api/me`: who the session belongs to.
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct SessionUser {
+    pub username: String,
+}
+
+const BAD_LOGIN: &str = "invalid username or password";
+
+/// POST /api/login `{"username", "password"}`: on success a session
+/// cookie and the username; otherwise 401 with one message for an unknown
+/// name, a disabled account and a wrong password alike.
+async fn login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    post_gate(&headers)?;
+    let body = parse_object(&raw)?;
+    let field = |key: &str| {
+        body.get(key)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| ApiError::BadRequest(format!("{key} must be a string")))
+    };
+    let username = field("username")?;
+    let password = field("password")?;
+    let candidate = state.store.login_candidate(&username).await?;
+    // An unknown name is checked against a decoy hash, so it takes as long
+    // as a wrong password and timing does not reveal which names exist.
+    let hash = candidate
+        .as_ref()
+        .map_or_else(|| auth::DECOY_HASH.to_owned(), |(_, h)| h.clone());
+    let matches = tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
+        .await
+        .map_err(|e| anyhow::anyhow!("password check: {e}"))?;
+    let Some((user, _)) = candidate.filter(|_| matches) else {
+        tracing::info!("failed login for {username:?}");
+        return Err(ApiError::Unauthorized(BAD_LOGIN));
+    };
+    let token = auth::new_session_token()?;
+    state
+        .store
+        .create_session(
+            &user,
+            &auth::token_hash(&token),
+            crate::util::now_ms() + auth::SESSION_TTL_MS,
+        )
+        .await?;
+    tracing::info!("{} logged in", user.username);
+    Ok((
+        [(header::SET_COOKIE, auth::session_cookie(&token)?)],
+        Json(SessionUser {
+            username: user.username,
+        }),
+    )
+        .into_response())
+}
+
+/// POST /api/logout: end this browser's session and drop its cookie.
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, ApiError> {
+    post_gate(&headers)?;
+    if let Some(token) = auth::session_token(&headers) {
+        state.store.delete_session(&auth::token_hash(token)).await?;
+    }
+    Ok((
+        [(header::SET_COOKIE, auth::cleared_session_cookie())],
+        Json(json!({ "ok": true })),
+    )
+        .into_response())
+}
+
+/// GET /api/me: the account this session belongs to.
+async fn me(Extension(user): Extension<CurrentUser>) -> Json<SessionUser> {
+    Json(SessionUser {
+        username: user.username,
+    })
+}
+
 async fn stats(State(state): State<AppState>) -> Result<Json<Stats>, ApiError> {
     Ok(Json(Stats {
         totals: state.store.stats_totals().await?,
@@ -657,6 +781,7 @@ async fn fetch_repo(store: &Store, rid: i64) -> Result<Repo, ApiError> {
 
 async fn verdict(
     State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
@@ -715,7 +840,7 @@ async fn verdict(
     }
     state
         .store
-        .log_event("verdict", &msg, None, Some(fid))
+        .log_user_event(&user, "verdict", &msg, Some(fid))
         .await?;
     let refreshed = fetch_finding(&state.store, fid).await?;
     Ok(Json(json!({ "ok": true, "finding": refreshed })).into_response())
@@ -777,6 +902,7 @@ async fn set_scheduler_overdrive(
 
 async fn recheck(
     State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
@@ -796,10 +922,10 @@ async fn recheck(
         .await?;
     state
         .store
-        .log_event(
+        .log_user_event(
+            &user,
             "recheck",
             &format!("#{fid} queued for recheck"),
-            None,
             Some(fid),
         )
         .await?;
@@ -810,6 +936,7 @@ async fn recheck(
 
 async fn unqueue(
     State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
@@ -829,10 +956,10 @@ async fn unqueue(
         .await?;
     state
         .store
-        .log_event(
+        .log_user_event(
+            &user,
             "unqueue",
             &format!("#{fid} removed from fix queue"),
-            None,
             Some(fid),
         )
         .await?;
@@ -844,6 +971,7 @@ async fn unqueue(
 
 async fn override_(
     State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
@@ -857,10 +985,10 @@ async fn override_(
         let n = state.store.clear_all_overrides().await?;
         state
             .store
-            .log_event(
+            .log_user_event(
+                &user,
                 "override",
                 &format!("cleared all budget overrides ({n} findings)"),
-                None,
                 None,
             )
             .await?;
@@ -886,10 +1014,10 @@ async fn override_(
     let label = mode.map_or("cleared", BudgetOverride::as_str);
     state
         .store
-        .log_event(
+        .log_user_event(
+            &user,
             "override",
             &format!("#{fid} budget override: {label}"),
-            None,
             Some(fid),
         )
         .await?;
@@ -906,6 +1034,7 @@ async fn override_(
 
 async fn update_repo(
     State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
@@ -962,10 +1091,10 @@ async fn update_repo(
     }
     state
         .store
-        .log_event(
+        .log_user_event(
+            &user,
             "repo",
             &format!("updated {}: {}", repo.name, action.join(", ")),
-            None,
             None,
         )
         .await?;
@@ -1098,6 +1227,7 @@ fn valid_repo_name(name: &str) -> bool {
 
 async fn add_repo(
     State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
@@ -1186,10 +1316,10 @@ async fn add_repo(
         .into_owned();
     state
         .store
-        .log_event(
+        .log_user_event(
+            &user,
             "repo",
             &format!("added {name} ({forge}) -> {path_str}"),
-            None,
             None,
         )
         .await?;
@@ -1410,6 +1540,7 @@ pub async fn reap_deleted_repos(
 
 async fn delete_repo(
     State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
@@ -1443,10 +1574,10 @@ async fn delete_repo(
     state.store.soft_delete_repo(rid).await?;
     state
         .store
-        .log_event(
+        .log_user_event(
+            &user,
             "repo",
             &format!("deleted {} (#{rid})", repo.name),
-            None,
             None,
         )
         .await?;
@@ -1475,6 +1606,7 @@ async fn delete_repo(
 
 async fn add_repo_note(
     State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
     headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, ApiError> {
@@ -1515,7 +1647,10 @@ async fn add_repo_note(
         use std::fmt::Write;
         let _ = write!(msg, " [{category}]");
     }
-    state.store.log_event("repo", &msg, None, None).await?;
+    state
+        .store
+        .log_user_event(&user, "repo", &msg, None)
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(json!({ "ok": true, "notes": notes })),

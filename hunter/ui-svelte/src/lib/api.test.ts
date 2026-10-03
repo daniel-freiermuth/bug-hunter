@@ -1,6 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { GET_TIMEOUT_MS, POLL_MS, store } from "./api.svelte";
+import { GET_TIMEOUT_MS, POLL_MS, post, store } from "./api.svelte";
+
+/**
+ * `store` is a module singleton; clear what the previous test wrote so an
+ * assertion can only pass on data the current test landed — and so a test
+ * that ended signed out does not leave every later refresh refused.
+ */
+function resetStore() {
+  store.summary = null;
+  store.findings = [];
+  store.jobs = [];
+  store.events = [];
+  store.stats = null;
+  store.error = null;
+  store.user = null;
+  store.needsLogin = false;
+}
 
 // Bodies shaped like what the daemon serves, trimmed to what the
 // validators in validate.ts require — a refresh that fails validation
@@ -93,14 +109,7 @@ describe("poll scheduling", () => {
   let net: FakeNet;
 
   beforeEach(() => {
-    // `store` is a module singleton; clear what the previous test wrote
-    // so an assertion here can only pass on data this test landed.
-    store.summary = null;
-    store.findings = [];
-    store.jobs = [];
-    store.events = [];
-    store.stats = null;
-    store.error = null;
+    resetStore();
     servedCounts = { new: 1 };
     net = installNet();
     vi.useFakeTimers();
@@ -213,5 +222,290 @@ describe("poll scheduling", () => {
     // overwrite the write's result.
     await net.release(BATCH);
     expect(store.summary?.counts).toEqual({ new: 42 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Session handling
+// ---------------------------------------------------------------------------
+
+/**
+ * A daemon with the session rules of hunter-rs: every route but
+ * /api/login answers 401 without a live session. Answers immediately,
+ * except for paths listed in `held`, which park until released.
+ */
+interface FakeDaemon {
+  /** Request log, `METHOD path`. */
+  calls: string[];
+  /** Bodies of the POSTs, by path. */
+  posted: Map<string, unknown>;
+  session: boolean;
+  /** Who GET /api/me says the session belongs to. */
+  meUser: string;
+  held: Set<string>;
+  releaseHeld(): Promise<void>;
+}
+
+const settle = async () => {
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+};
+
+function installDaemon(): FakeDaemon {
+  const parked: (() => void)[] = [];
+  const daemon: FakeDaemon = {
+    calls: [],
+    posted: new Map(),
+    session: false,
+    meUser: "alice",
+    held: new Set(),
+    async releaseHeld() {
+      for (const answer of parked.splice(0)) answer();
+      await settle();
+    },
+  };
+  const route = (path: string, init?: RequestInit): [number, unknown] => {
+    if (path === "/api/login") {
+      const creds = JSON.parse(String(init?.body)) as { username: string; password: string };
+      if (creds.password !== "hunter2") return [401, { error: "invalid username or password" }];
+      daemon.session = true;
+      return [200, { username: creds.username }];
+    }
+    if (!daemon.session) return [401, { error: "login required" }];
+    if (path === "/api/logout") {
+      daemon.session = false;
+      return [200, { ok: true }];
+    }
+    if (path === "/api/me") return [200, { username: daemon.meUser }];
+    if (path.startsWith("/api/repo/notes")) return [200, { notes: "old notes" }];
+    if (path.startsWith("/api/finding?")) return [200, { jobs: [], pr_state: null }];
+    return [200, bodyFor(path)];
+  };
+  vi.stubGlobal("fetch", (path: string, init?: RequestInit) => {
+    const method = init?.method ?? "GET";
+    daemon.calls.push(`${method} ${path}`);
+    if (method === "POST") daemon.posted.set(path, JSON.parse(String(init?.body)));
+    // Routed when sent, as the cookie is: a held request answers for the
+    // session it carried, whatever happened while it was parked.
+    const [status, body] = route(path, init);
+    const response = {
+      status,
+      ok: status >= 200 && status < 300,
+      json: () => Promise.resolve(body),
+    } as unknown as Response;
+    if (!daemon.held.has(path)) return Promise.resolve(response);
+    return new Promise<Response>((resolve, reject) => {
+      // As a real fetch does: an aborted request rejects with the reason.
+      const signal = init?.signal;
+      if (signal) signal.addEventListener("abort", () => reject(signal.reason));
+      parked.push(() => resolve(response));
+    });
+  });
+  return daemon;
+}
+
+describe("session", () => {
+  let daemon: FakeDaemon;
+
+  beforeEach(() => {
+    resetStore();
+    servedCounts = { new: 1 };
+    daemon = installDaemon();
+    vi.useFakeTimers();
+  });
+
+  afterEach(async () => {
+    store.stopPolling();
+    await daemon.releaseHeld();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  /** Dashboard reads issued so far, leaving out the session check. */
+  const polls = () => daemon.calls.filter((c) => c.startsWith("GET /api/") && c !== "GET /api/me");
+
+  it("shows the login form on a startup 401 and polls nothing", async () => {
+    await store.start();
+
+    expect(store.needsLogin).toBe(true);
+    expect(store.user).toBeNull();
+    expect(store.error).toBeNull();
+
+    await vi.advanceTimersByTimeAsync(POLL_MS * 3);
+    expect(daemon.calls).toEqual(["GET /api/me"]);
+  });
+
+  it("polls straight away when the startup check finds a session", async () => {
+    daemon.session = true;
+    await store.start();
+    await settle();
+
+    expect(store.needsLogin).toBe(false);
+    expect(store.user).toBe("alice");
+    expect(store.summary?.counts).toEqual({ new: 1 });
+  });
+
+  it("switches to the dashboard after a successful login and starts polling", async () => {
+    await store.start();
+
+    expect(await store.login("alice", "hunter2")).toBeNull();
+    expect(daemon.posted.get("/api/login")).toEqual({ username: "alice", password: "hunter2" });
+    expect(store.needsLogin).toBe(false);
+    expect(store.user).toBe("alice");
+
+    // Refreshed at once, not one poll period later.
+    await settle();
+    expect(store.summary?.counts).toEqual({ new: 1 });
+    expect(polls()).toHaveLength(BATCH);
+
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(polls()).toHaveLength(BATCH * 2);
+  });
+
+  it("reports the server's message for a failed login and stays signed out", async () => {
+    await store.start();
+
+    expect(await store.login("alice", "wrong")).toBe("invalid username or password");
+    expect(store.needsLogin).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(POLL_MS * 3);
+    expect(polls()).toHaveLength(0);
+  });
+
+  it("returns to the login form when a poll is refused, and stops polling", async () => {
+    daemon.session = true;
+    await store.start();
+    await settle();
+    expect(store.summary).not.toBeNull();
+
+    // Session expired server-side between two ticks.
+    daemon.session = false;
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+
+    expect(store.needsLogin).toBe(true);
+    expect(store.user).toBeNull();
+    // The refusal is not an outage: no "may be stale" banner, and nothing
+    // from the lost session left behind the form.
+    expect(store.error).toBeNull();
+    expect(store.summary).toBeNull();
+
+    const after = daemon.calls.length;
+    await vi.advanceTimersByTimeAsync(POLL_MS * 3);
+    expect(daemon.calls).toHaveLength(after);
+  });
+
+  it("returns to the login form when a write is refused", async () => {
+    daemon.session = true;
+    await store.start();
+    await settle();
+
+    daemon.session = false;
+    const r = await post("/api/verdict", { id: 1, status: "queued" });
+
+    expect(r.status).toBe(401);
+    expect(store.needsLogin).toBe(true);
+  });
+
+  it("logs out on the server, clears the dashboard and stops polling", async () => {
+    daemon.session = true;
+    await store.start();
+    await settle();
+    expect(store.summary).not.toBeNull();
+
+    expect(await store.logout()).toBeNull();
+
+    expect(daemon.calls).toContain("POST /api/logout");
+    expect(daemon.session).toBe(false);
+    expect(store.needsLogin).toBe(true);
+    expect(store.user).toBeNull();
+    expect(store.summary).toBeNull();
+    expect(store.findings).toEqual([]);
+
+    const after = daemon.calls.length;
+    await vi.advanceTimersByTimeAsync(POLL_MS * 3);
+    expect(daemon.calls).toHaveLength(after);
+  });
+
+  it("ignores a 401 answering a request sent before the current login", async () => {
+    await store.start();
+    // Sent while signed out and still in flight when the user signs in:
+    // its 401 speaks for the old state, not for the new session.
+    daemon.held.add("/api/finding?id=1");
+    const stale = store.fetchFindingDetail(1);
+
+    expect(await store.login("alice", "hunter2")).toBeNull();
+    await daemon.releaseHeld();
+    await stale;
+
+    expect(store.needsLogin).toBe(false);
+    expect(store.user).toBe("alice");
+  });
+
+  it("ignores a startup session check answered after a new login", async () => {
+    daemon.session = true;
+    daemon.held.add("/api/me");
+    const starting = store.start();
+
+    // Someone else signs in on this page while the check is in flight.
+    expect(await store.login("bob", "hunter2")).toBeNull();
+    daemon.held.clear();
+    await daemon.releaseHeld();
+    await starting;
+
+    expect(store.user).toBe("bob");
+  });
+
+  it("gives up on a login the server never answers, so the form can retry", async () => {
+    await store.start();
+    daemon.held.add("/api/login");
+    const attempt = store.login("alice", "hunter2");
+
+    await vi.advanceTimersByTimeAsync(GET_TIMEOUT_MS);
+
+    expect(await attempt).toMatch(/timed out/);
+    expect(store.needsLogin).toBe(true);
+  });
+
+  it("gives up on a logout the server never answers, so it can be retried", async () => {
+    daemon.session = true;
+    await store.start();
+    await settle();
+    daemon.held.add("/api/logout");
+    const attempt = store.logout();
+
+    await vi.advanceTimersByTimeAsync(GET_TIMEOUT_MS);
+
+    expect(await attempt).toMatch(/timed out/);
+  });
+
+  it("does not refill the notes cache from a request of an ended session", async () => {
+    daemon.session = true;
+    await store.start();
+    await settle();
+    daemon.held.add("/api/repo/notes?id=1");
+    const stale = store.fetchRepoNotes(1).catch((err: unknown) => err);
+
+    expect(await store.logout()).toBeNull();
+    daemon.held.clear();
+    await daemon.releaseHeld();
+    expect(await stale).toBeInstanceOf(Error);
+
+    expect(await store.login("alice", "hunter2")).toBeNull();
+    const before = daemon.calls.filter((c) => c.includes("/api/repo/notes")).length;
+    await store.fetchRepoNotes(1);
+    expect(daemon.calls.filter((c) => c.includes("/api/repo/notes"))).toHaveLength(before + 1);
+  });
+
+  it("does not show a finding detail read under an ended session", async () => {
+    daemon.session = true;
+    await store.start();
+    await settle();
+    daemon.held.add("/api/finding?id=1");
+    const stale = store.fetchFindingDetail(1);
+
+    expect(await store.logout()).toBeNull();
+    daemon.held.clear();
+    await daemon.releaseHeld();
+
+    expect(await stale).toBeNull();
   });
 });

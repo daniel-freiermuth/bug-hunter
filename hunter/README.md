@@ -23,6 +23,7 @@ zero token cost and only spends against a budget it never overshoots.
   - [Budget policy](#budget-policy)
   - [PR follow-up loop](#pr-follow-up-loop)
 - [Web UI](#web-ui)
+- [Users](#users)
 - [API](#api)
 - [Architecture](#architecture)
 - [Data model](#data-model)
@@ -42,14 +43,15 @@ cp hunter/config.anthropic.example.json hunter/config.json  # or config.openai-c
 (cd hunter/ui-svelte && npm ci)           # once per checkout, and after a dependency change
 cd hunter-rs
 just build                                # UI bundle (ui-svelte/ -> hunter/ui/) + release binary
+./target/release/hunter --root ../hunter user add <you>  # your login (see § Users)
 ./target/release/hunter --root ../hunter  # run forever: UI (:8377) + scheduler loop
 ```
 
-Then open `http://localhost:8377`, go to **Repos**, and add a repository
-(name, git URL, default branch). Everything else — registration, triage
-verdicts, notes, pausing repos, manual cycle/recheck triggers — happens in
-the UI; the binary itself takes only `--root` and `--port`
-(hunter-rs/src/main.rs:14-15).
+Then open `http://localhost:8377`, log in, go to **Repos**, and add a
+repository (name, git URL, default branch). Everything else — registration,
+triage verdicts, notes, pausing repos, manual cycle/recheck triggers —
+happens in the UI; the binary itself takes only `--root`, `--port` and the
+`user` commands (`USAGE` in hunter-rs/src/main.rs).
 
 ## How it works
 
@@ -290,13 +292,39 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 | **Stats** | Aggregate totals by kind and by finding type |
 | **Log** | Full job and event history |
 
+## Users
+
+The dashboard and every API route need a login. Accounts are local
+(argon2id password hashes in `hunter.db`) and created by the operator;
+there is no sign-up page:
+
+```sh
+cd hunter-rs
+target/release/hunter --root ../hunter user add alice     # asks for the password twice
+target/release/hunter --root ../hunter user passwd alice  # new password; logs alice out everywhere
+target/release/hunter --root ../hunter user disable alice # disables the account; logs it out
+```
+
+The password is read from the terminal without echo, or from the first line
+of stdin when that is not a terminal. Passwords need at least 12
+characters. The commands work next to a running daemon.
+
+A login lasts 30 days, in an `HttpOnly`, `SameSite=Strict` cookie; only a
+hash of its token is stored. Every logged-in user can do everything — there
+is no per-user data yet — but what a person does through the API (verdicts,
+notes, overrides, repo changes) is recorded as theirs in the event log.
+
 ## API
 
 JSON routes — the UI's only client, but usable directly. Served by axum
-(`router` in hunter-rs/src/server.rs).
+(`router` in hunter-rs/src/server.rs). Every route except `/api/login`
+answers `401 {"error": "login required"}` without a live session cookie.
 
 | Method | Path | Purpose |
 |---|---|---|
+| POST | `/api/login` | Log in (`{"username", "password"}`); sets the session cookie |
+| POST | `/api/logout` | End this session |
+| GET | `/api/me` | The logged-in account |
 | GET | `/api/summary` | Budget windows, counts, activity status, "what's next" preview |
 | GET | `/api/findings` | List findings across all types (`status`, `repo`, `severity`, `type` query params) |
 | GET | `/api/finding` | One finding's full job history + PR state |
@@ -431,11 +459,11 @@ quota source for one installation.
     e.g. `["hunter-box", "192.168.1.20"]`. `["*"]` accepts any name and turns
     off the DNS-rebinding guard.
 
-  The API has **no authentication**: anything that can reach the port can
-  read findings and notes and use every write (delete repos, overrides).
-  Widening `serve.host` makes the dashboard reachable; widening
-  `serve.allowedHosts` decides which names it answers to. Only do either on a
-  network you trust.
+  Every API route needs a login (see § Users), but the session cookie
+  travels in clear text over plain HTTP: put TLS in front (e.g. Caddy)
+  before widening `serve.host` beyond a network you trust. Widening
+  `serve.host` makes the dashboard reachable; widening `serve.allowedHosts`
+  decides which names it answers to.
 
 ## Development
 
