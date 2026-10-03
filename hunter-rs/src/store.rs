@@ -1463,11 +1463,13 @@ impl Store {
     /// scheduler's give-up ceiling retires it `failed` / `give-up`; a
     /// suspension whose working directory is gone is retired `killed` /
     /// `workdir-gone`; fresh work at the same key retires it `killed` /
-    /// `superseded` ([`Self::create_job`]); and a resume that found the
-    /// transcript gone retires it `killed`. All are terminal states, so
+    /// `superseded` ([`Self::create_job`]); a resume that found the
+    /// transcript gone retires it `killed`; and so does selection, for a
+    /// fix or recheck whose finding left the status its executor acts
+    /// on. All are terminal states, so
     /// [`Self::list_resumable_jobs`] stops offering the row.
     ///
-    /// `killed_reason` is `Option` so the last case can leave the
+    /// `killed_reason` is `Option` so the last two cases can leave the
     /// original reason alone: that attempt really was killed for `cap`,
     /// and overwriting that with the successor's problem would lose the
     /// only record of why the work stopped. `notes` carries the new fact
