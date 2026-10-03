@@ -62,6 +62,7 @@ fn cfg_with(stale_after_s: f64, omp_bin: &str) -> Config {
         modernization_interval_days: 30,
         standards_interval_days: 30,
         renovate_github_token: None,
+        review_bots: hunter::forge::ReviewBots::default(),
     }
 }
 

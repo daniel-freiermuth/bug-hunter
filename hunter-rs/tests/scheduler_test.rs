@@ -72,6 +72,7 @@ fn test_config(cache_ttl_s: f64) -> Config {
         modernization_interval_days: 30,
         standards_interval_days: 30,
         renovate_github_token: None,
+        review_bots: hunter::forge::ReviewBots::default(),
     }
 }
 

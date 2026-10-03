@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::backends::omp_scavenge::LlmProvider;
+use crate::forge::ReviewBots;
 use anyhow::Context;
 use serde::Deserialize;
 
@@ -43,6 +44,7 @@ struct RawConfig {
     modernization: RawScan,
     standards: RawScan,
     renovate: RawRenovate,
+    feedback: RawFeedback,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -104,6 +106,12 @@ struct RawScan {
 struct RawRenovate {
     #[serde(rename = "githubToken")]
     github_token: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawFeedback {
+    bots: Option<Vec<String>>,
 }
 
 /// A credential read from config.json. `Debug` prints a placeholder, so
@@ -215,6 +223,10 @@ pub struct Config {
     /// for GitHub-hosted repos, in place of the operator's `gh` login
     /// (see `dep_scan::github_token`).
     pub renovate_github_token: Option<Secret>,
+    /// feedback.bots — review bots whose PR comments engage and harvest
+    /// read, besides those of people who can push to the repo. Everyone
+    /// else's are dropped (`forge::screen_feedback`).
+    pub review_bots: ReviewBots,
 }
 
 impl Config {
@@ -357,6 +369,18 @@ impl Config {
                 )
             })?,
         };
+        // A blank entry matches no login and reads as a typo for one; a
+        // login never contains whitespace or a slash.
+        let raw_bots = raw.feedback.bots.unwrap_or_default();
+        anyhow::ensure!(
+            raw_bots.iter().all(|b| {
+                let b = b.trim();
+                !b.is_empty() && !b.contains(|c: char| c.is_whitespace() || c == '/')
+            }),
+            "{}: feedback.bots entries must be account logins such as \"coderabbitai\" (got {raw_bots:?})",
+            cfg_path.display()
+        );
+        let review_bots = ReviewBots::new(&raw_bots);
 
         let serve_host = match raw.serve.host.as_deref() {
             None => std::net::IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
@@ -439,6 +463,7 @@ impl Config {
             modernization_interval_days,
             standards_interval_days,
             renovate_github_token,
+            review_bots,
         })
     }
 }

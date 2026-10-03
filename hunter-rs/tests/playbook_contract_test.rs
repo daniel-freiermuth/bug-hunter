@@ -23,7 +23,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use hunter::domain::FindingType;
-use hunter::forge::{GhAuthor, GhCheckRun, GhComment, GhReview, PrView};
+use hunter::forge::{GhAuthor, GhCheckRun, GhComment, GhReview, PrView, Voice};
 use hunter::playbooks;
 use hunter::types::{Finding, PrState};
 use support::{sample_finding, sample_repo};
@@ -212,9 +212,10 @@ fn recheck_prompt_renders() {
     assert_usable("recheck", &prompt);
 }
 
-/// A `PrView` with every list populated, so `FEEDBACK` and `CHECKS` render
-/// real content rather than their empty-case placeholders — an empty slot
-/// value hides a template that was never given anything to say.
+/// A `PrView` with every list populated, so `FEEDBACK`, `BOT_FEEDBACK`
+/// and `CHECKS` render real content rather than their empty-case
+/// placeholders — an empty slot value hides a template that was never
+/// given anything to say.
 fn sample_pr_view() -> PrView {
     PrView {
         head_ref: "fix/branch".to_owned(),
@@ -228,13 +229,24 @@ fn sample_pr_view() -> PrView {
             conclusion: Some("FAILURE".to_owned()),
             state: None,
         }],
-        comments: vec![GhComment {
-            author: Some(GhAuthor {
-                login: "reviewer".to_owned(),
-            }),
-            body: "please rename this".to_owned(),
-            created_at: "2026-01-02T03:00:00Z".to_owned(),
-        }],
+        comments: vec![
+            GhComment {
+                author: Some(GhAuthor {
+                    login: "reviewer".to_owned(),
+                }),
+                body: "please rename this".to_owned(),
+                created_at: "2026-01-02T03:00:00Z".to_owned(),
+                voice: Voice::Maintainer,
+            },
+            GhComment {
+                author: Some(GhAuthor {
+                    login: "coderabbitai".to_owned(),
+                }),
+                body: "consider extracting a helper".to_owned(),
+                created_at: "2026-01-02T03:02:00Z".to_owned(),
+                voice: Voice::Bot,
+            },
+        ],
         reviews: vec![GhReview {
             author: Some(GhAuthor {
                 login: "reviewer".to_owned(),
@@ -242,6 +254,7 @@ fn sample_pr_view() -> PrView {
             body: "needs a test".to_owned(),
             submitted_at: "2026-01-02T03:01:00Z".to_owned(),
             state: "CHANGES_REQUESTED".to_owned(),
+            voice: Voice::Maintainer,
         }],
         ..PrView::default()
     }

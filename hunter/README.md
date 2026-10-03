@@ -422,6 +422,17 @@ quota source for one installation.
   github.com lookups (Actions, GitHub tags/releases). Only GitHub-hosted
   repos get a token: this one if set, else the `gh auth token --hostname
   github.com` login. Without either, those deps are silently skipped.
+- `feedback.bots` — review bots whose PR comments engage and harvest act on,
+  e.g. `["coderabbitai"]` (either `name` or `name[bot]`). Besides these,
+  only people who can push to the repo count (GitHub: write access or above;
+  GitLab: Developer or above, looked up per author and cached for 15
+  minutes). Everyone else's comments and reviews are dropped before the
+  scheduler or a worker sees them: on a public repo anyone can comment on
+  hunter's PRs, and engage commits and pushes in response. Bot reviews
+  reach the worker in their own section, to verify rather than obey. On
+  GitHub, where `gh` reports an app by its bare name, a listed name that a
+  user account also holds is not taken as the bot (it logs a warning).
+  Default `[]`: no bot is listened to.
 - `serve` controls who can reach the dashboard (Rust daemon only; the Python
   rollback always serves loopback). Defaults keep it local:
   - `serve.host` — address to bind, default `127.0.0.1`. `0.0.0.0` listens

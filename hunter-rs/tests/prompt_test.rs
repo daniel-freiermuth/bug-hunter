@@ -18,8 +18,9 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use hunter::domain::FindingType;
+use hunter::forge::{GhAuthor, GhComment, GhReview, PrView, Voice};
 use hunter::playbooks;
-use hunter::types::{Finding, Repo};
+use hunter::types::{Finding, PrState, Repo};
 use support::{TempDir, sample_finding, sample_repo};
 
 /// Shared shape of the five repo-level analysis prompt builders.
@@ -164,4 +165,122 @@ fn the_recheck_prompt_sends_the_worker_to_the_chains_tree() {
         !prompt.contains(&repo.path),
         "names the shared clone: {prompt}"
     );
+}
+
+/// The text of `<<name ... name>>` in a stub-rendered prompt.
+fn section<'a>(prompt: &'a str, name: &str) -> &'a str {
+    let open = format!("<<{name}\n");
+    let start = prompt.find(&open).map(|i| i + open.len()).unwrap();
+    let len = prompt[start..].find(&format!("\n{name}>>")).unwrap();
+    &prompt[start..start + len]
+}
+
+/// A screened PR thread: one maintainer comment and review, one bot
+/// comment.
+fn screened_thread() -> PrView {
+    let author = |login: &str| {
+        Some(GhAuthor {
+            login: login.to_owned(),
+        })
+    };
+    PrView {
+        comments: vec![
+            GhComment {
+                author: author("lead"),
+                body: "please add a test".to_owned(),
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                voice: Voice::Maintainer,
+            },
+            GhComment {
+                author: author("coderabbitai"),
+                body: "rename everything".to_owned(),
+                created_at: "2026-01-02T00:00:00Z".to_owned(),
+                voice: Voice::Bot,
+            },
+        ],
+        reviews: vec![GhReview {
+            author: author("lead"),
+            body: "and document it".to_owned(),
+            submitted_at: "2026-01-03T00:00:00Z".to_owned(),
+            state: "COMMENTED".to_owned(),
+            voice: Voice::Maintainer,
+        }],
+        ..PrView::default()
+    }
+}
+
+/// Bots' reviews reach the worker under their own heading, where the
+/// playbooks tell it to verify rather than obey them, and never mixed in
+/// with what maintainers asked for -- in every prompt that carries a
+/// PR's discussion.
+#[test]
+fn pr_prompts_keep_bot_reviews_apart_from_maintainer_feedback() {
+    let dir = TempDir::new("prompt-voices");
+    let root = dir.subdir("hunter");
+    let playbooks_dir = dir.subdir("hunter/playbooks");
+    let stub = "<<maint\n{{FEEDBACK}}\nmaint>>\n<<bots\n{{BOT_FEEDBACK}}\nbots>>\n";
+    for name in ["engage.md", "harvest.md", "harvest-closed.md"] {
+        std::fs::write(playbooks_dir.join(name), stub).unwrap();
+    }
+    let repo = sample_repo();
+    let finding = sample_finding(FindingType::Bug);
+    let tree = Path::new("/tmp/tree");
+    let pr = screened_thread();
+    let ps = PrState {
+        finding_id: finding.id,
+        pr_number: Some(7),
+        state: Some("open".to_owned()),
+        mergeable: None,
+        checks: None,
+        head_ref: Some("fix/x".to_owned()),
+        last_activity_at: None,
+        last_engaged_activity_at: None,
+        needs_attention: Some("new_comments".to_owned()),
+        attention_since: None,
+        attention_fingerprint: None,
+        addressed_fingerprint: None,
+        head_sha: None,
+        addressed_head_sha: None,
+        synced_at: None,
+        harvested_at: None,
+        harvest_attempts: 0,
+        last_harvest_failure: None,
+    };
+
+    for (name, prompt) in [
+        (
+            "engage",
+            playbooks::build_engage_prompt(&root, &finding, tree, "fix/x", &repo, &pr, &ps, "")
+                .unwrap(),
+        ),
+        (
+            "harvest",
+            playbooks::build_harvest_prompt(&root, &finding, tree, "fix/x", &repo, &pr, 7, "")
+                .unwrap(),
+        ),
+        (
+            "harvest-closed",
+            playbooks::build_harvest_closed_prompt(
+                &root,
+                &finding,
+                tree,
+                &repo,
+                &pr,
+                7,
+                "",
+                playbooks::ClosedTree::DefaultBranch,
+                "",
+            )
+            .unwrap(),
+        ),
+    ] {
+        let maint = section(&prompt, "maint");
+        let bots = section(&prompt, "bots");
+        assert!(maint.contains("please add a test"), "{name}: {prompt}");
+        assert!(maint.contains("and document it"), "{name}: {prompt}");
+        assert!(!maint.contains("rename everything"), "{name}: {prompt}");
+        assert!(bots.contains("### coderabbitai"), "{name}: {prompt}");
+        assert!(bots.contains("rename everything"), "{name}: {prompt}");
+        assert!(!bots.contains("lead"), "{name}: {prompt}");
+    }
 }

@@ -3014,6 +3014,10 @@ fn civil_to_days(y: i64, m: u32, d: u32) -> i64 {
 }
 
 /// Max of createdAt from comments + submittedAt from reviews -> epoch ms.
+///
+/// Over screened feedback only (`forge::screen_feedback`): a comment from
+/// someone who cannot push, and is not a configured bot, never raises
+/// `new_comments`, so it cannot start an engage run.
 fn latest_activity_ms(pr: &PrView) -> i64 {
     let comment_stamps = pr.comments.iter().map(|c| iso_ms(&c.created_at));
     let review_stamps = pr.reviews.iter().map(|r| iso_ms(&r.submitted_at));
@@ -3090,7 +3094,7 @@ fn attention_fingerprint(pr: &PrView, failing_names: &[String]) -> Option<String
               state (merged, closed, review comments, checks); the arms \
               read as a table only while they sit together"
 )]
-pub async fn sync_prs(store: &Store, _cfg: &Config) -> SyncResult {
+pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
     let mut summary = SyncResult::default();
     let findings = store
         .list_findings(&FindingFilter {
@@ -3144,7 +3148,7 @@ pub async fn sync_prs(store: &Store, _cfg: &Config) -> SyncResult {
             summary.errors += 1;
             continue;
         };
-        let pr = match fg.view_pr_sync(&repo.url, pr_number) {
+        let pr = match fg.view_pr_sync(&repo.url, pr_number, &cfg.review_bots) {
             Ok(pr) => pr,
             Err(e) => {
                 let _ = store
@@ -3452,7 +3456,7 @@ pub async fn run_engage(
     };
 
     let fg = forge::forge_for(repo.forge);
-    let pr = match fg.view_pr_engage(&repo.url, pr_number) {
+    let pr = match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
         Ok(p) => p,
         Err(e) => {
             let _ = store
@@ -4122,7 +4126,7 @@ pub async fn run_harvest(
 
     let fg = forge::forge_for(repo.forge);
     let handoff = resume.is_some_and(|p| p.handoff);
-    let pr = match fg.view_pr_engage(&repo.url, pr_number) {
+    let pr = match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
         Ok(p) => p,
         Err(e) => {
             harvest_prefetch_failed(store, fid, handoff, "pr view failed", "view", &e).await;
