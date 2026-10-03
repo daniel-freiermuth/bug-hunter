@@ -252,6 +252,9 @@ pub struct Event {
     pub message: String,
     pub job_id: Option<i64>,
     pub finding_id: Option<i64>,
+    /// The account that caused it through the API; `None` for the
+    /// scheduler's own events and for anything older than accounts.
+    pub username: Option<String>,
 }
 
 /// `pr_state` row, all 18 columns the code creates (the live DB may carry

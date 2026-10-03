@@ -48,10 +48,31 @@ state rolls forward to head, converging on identical schema with its rows
 intact.
 
 ### Phase 3 — Service-ification
-Auth (GitHub OAuth), tenancy (user ownership everywhere), per-user Claude
+Auth (local accounts), tenancy (user ownership everywhere), per-user Claude
 accounts + budgets, sandboxed workers, per-account scheduler queues. Exit
 criterion: a second real user (not the operator) onboards themselves, connects
 a repo + subscription, and gets a merged fix PR without operator intervention.
+
+Milestones, each its own PR series, in order:
+- **Feedback screening (PR #53).** engage/harvest act only on PR
+  comments from people who can push and from configured bots.
+- **M0 Sandbox.** bwrap around the worker (§5.3): it sees its worktree, a
+  private omp home and the per-repo caches; no `HOME`, ssh agent, gh/glab
+  config or database. Then **M0b**: network egress through an allowlisting
+  proxy.
+- **M1 Login.** Local accounts (argon2id; `hunter user add|passwd|disable`),
+  30-day session cookie, every API route behind it, operator actions
+  attributed in the event log. All users share one workspace.
+- **M2 Data separation.** `repo_members(repo, user, role)`; every read and
+  write scoped by membership (404, not 403, for others' ids). Sharing a repo
+  is an owner's invite, never "add the same URL".
+- **M3 Users' own repos.** Per-user forge credentials (encrypted at rest),
+  explicit env for gh/glab/git instead of the operator's ambient logins,
+  finding dedup per repo instead of global. Needs M0.
+- **M4 Users' own LLM accounts.** One `Backend` per account with its own
+  omp home; per-account scheduler loops under a global concurrency cap.
+- **M5 Full separation.** Kernel-level isolation for untrusted code (gVisor
+  or microVMs), GitHub App tokens, pooled funding of shared repos.
 
 ### Phase 4 — Open doors (invite-only)
 Small invited group. Webhooks replace polling where volume warrants.
@@ -67,7 +88,10 @@ The product target: a hosted web service. "Operator" = whoever runs the
 instance; "user" = anyone with an account.
 
 ### Identity & onboarding
-- As a user, I sign in with GitHub (OAuth). No separate password system.
+- As a user, I sign in with a local account the operator created for me
+  (decided 2026-10-03: local username/password over GitHub OAuth -- no
+  OAuth app, callback URL or client secret to run, and it works for GitLab
+  users and offline).
 - As a user, I connect repos via a GitHub App installation — the service gets
   scoped, revocable, per-repo credentials. Never a personal global token.
 - As a user, I connect my own Claude subscription (BYO tokens — see §5.1) or
@@ -172,11 +196,11 @@ still needs tests and review in any language.
 | Layer | Choice | Notes |
 |---|---|---|
 | Language | Rust | see §3 |
-| HTTP | axum + tower | tower-sessions for session auth |
+| HTTP | axum + tower | sessions are a small table of our own (`sessions`), not tower-sessions: its SQLite store pins sqlx 0.8, and two sqlx versions cannot link one libsqlite3 |
 | Async runtime | tokio | per-account queues are tasks, not threads |
 | DB | SQLite via sqlx | same file, same schema lineage; compile-time-checked queries |
 | Serialization | serde | typed structs for worker JSONL, forge responses, config |
-| Auth | GitHub OAuth (`oauth2` crate) | login = the identity users already have here |
+| Auth | local accounts, argon2id (`argon2` crate) | operator-created via the CLI; no OAuth app to register |
 | Repo access | GitHub App installation tokens | kills the global `gh` credential model |
 | TLS / edge | Caddy reverse proxy | the binary stays plain HTTP on localhost |
 | UI v1 | Svelte SPA against a clean JSON API | novelty budget goes to the backend; one unknown at a time |
@@ -207,8 +231,8 @@ not a default. Rationale against the field:
   criterion, not a tiebreaker.
 
 Supporting crates: `tower-http` (static files, compression, trace),
-`tower-sessions` with a SQLite-backed store in the same DB file (Phase 3),
-`oauth2` (Phase 3), `tracing`/`tracing-subscriber`, `rust-embed` later for
+`argon2` + `sha2` + `getrandom` for accounts and session tokens (Phase 3),
+`tracing`/`tracing-subscriber`, `rust-embed` later for
 single-file deploy. The daemon shape survives unchanged: axum is a tower
 service on tokio, so "UI server + scheduler loop in one process" becomes
 "axum router + scheduler task in one binary" — same systemd unit model.

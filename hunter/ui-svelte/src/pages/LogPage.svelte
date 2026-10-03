@@ -81,6 +81,9 @@
               <tr>
                 <th class="th-ts">Time</th>
                 <th class="th-kind">Kind</th>
+                <!-- The operator account behind the event; blank for the
+                     scheduler's own. -->
+                <th class="th-by">By</th>
                 <th>Message</th>
                 <th class="th-links right">Links</th>
               </tr>
@@ -94,6 +97,7 @@
                       {ev.kind}
                     </span>
                   </td>
+                  <td class="dim">{ev.username ?? ""}</td>
                   <td class="cell-msg" title={ev.message}>{ev.message}</td>
                   <td class="cell-links">
                     {#if ev.finding_id != null}
@@ -296,6 +300,7 @@
     font-size: 0.6875rem;
   }
   .th-kind { width: 6rem; }
+  .th-by { width: 6rem; }
 
   .cell-msg {
     font-size: 0.75rem;

@@ -637,3 +637,64 @@ pub fn sample_finding(kind: hunter::domain::FindingType) -> hunter::types::Findi
         standard_section: Some("Type safety / Domain types over primitives".to_owned()),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Logged-in requests
+// ---------------------------------------------------------------------------
+
+/// A `Cookie` header value carrying a live session for the test account
+/// `tester`, created on first use. Every `/api` route but `/api/login`
+/// needs one.
+///
+/// The account's password hash is a placeholder: nothing here logs in
+/// through `/api/login`, and hashing for real would cost each test an
+/// argon2 run.
+pub async fn auth_cookie(store: &Store) -> String {
+    let user = if let Some((user, _)) = store.login_candidate("tester").await.unwrap() {
+        user
+    } else {
+        let id = store.create_user("tester", "unused").await.unwrap();
+        hunter::auth::CurrentUser {
+            id,
+            username: "tester".to_owned(),
+        }
+    };
+    let token = hunter::auth::new_session_token().unwrap();
+    store
+        .create_session(
+            &user,
+            &hunter::auth::token_hash(&token),
+            hunter::util::now_ms() + hunter::auth::SESSION_TTL_MS,
+        )
+        .await
+        .unwrap();
+    format!("{}={token}", hunter::auth::SESSION_COOKIE)
+}
+
+/// Session token [`seed_session`] stores; [`TEST_COOKIE`] carries it.
+const TEST_TOKEN: &str = "test-session";
+
+/// `Cookie` header value for the session [`seed_session`] creates, for
+/// tests whose `Store` is read-only and so cannot use [`auth_cookie`].
+pub const TEST_COOKIE: &str = "hunter_session=test-session";
+
+/// Insert the `tester` account and the session [`TEST_COOKIE`] names,
+/// through a writable pool on a database a test later opens read-only.
+pub async fn seed_session(pool: &SqlitePool) {
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, created_at) \
+         VALUES (1000, 'tester', 'unused', 0)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) \
+         VALUES (?1, 1000, 0, ?2)",
+    )
+    .bind(hunter::auth::token_hash(TEST_TOKEN))
+    .bind(i64::MAX)
+    .execute(pool)
+    .await
+    .unwrap();
+}

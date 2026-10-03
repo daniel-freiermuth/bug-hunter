@@ -17,6 +17,7 @@ Parity bar: the Svelte UI (`hunter/ui-svelte/src/`) must work unchanged. Nothing
   - `Content-Length: <len>`  (always set; enables keep-alive)
   - `Cache-Control: no-store`  (**on every response, including static files**)
   - plus stdlib defaults `Server: hunter/1 Python/x.y` and `Date`.
+- **Rust: every `/api` route except `POST /api/login` needs a session** -> `401 {"error": "login required"}` without one (API-CONTRACT-WRITES.md §0.1, §10). Static files are public.
 - **No CORS headers anywhere.** Same-origin only. (POST additionally requires `Content-Type: application/json`, server.py:409-412 — CSRF mitigation; out of scope here.)
 - JSON responses: `_json` = `json.dumps(obj)` with default separators (`, ` / `: `), `Content-Type: application/json` — **no charset parameter** (server.py:170-171).
 - Error envelope: `_error(status, message)` -> body `{"error": "<message>"}` as JSON (server.py:173-174).
@@ -219,7 +220,7 @@ Notes are **not in the DB**: read from `<work_root>/notes/repo-<id>.md` (`repo_n
 
 Handler: server.py:238-240.
 Store: `recent_events(limit=100)` (store.py:1368-1373): `SELECT * FROM events ORDER BY id DESC LIMIT 100`.
-Response: `200`, JSON array of `{id:int, at:int (epoch ms), kind:str, message:str, job_id:int|null, finding_id:int|null}` (schema.sql:152-159; types.py:161-169).
+Response: `200`, JSON array of `{id:int, at:int (epoch ms), kind:str, message:str, job_id:int|null, finding_id:int|null}` (schema.sql:152-159; types.py:161-169). Rust adds `username:str|null`: the account an operator event was recorded for (API-CONTRACT-WRITES.md §10), null for the scheduler's own events.
 
 ---
 

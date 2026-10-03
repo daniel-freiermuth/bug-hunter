@@ -26,6 +26,10 @@ Shared conventions (error envelope `{"error": "<msg>"}`, `_send` headers, Row sh
 - The gate applies to **every POST route including `/api/cycle`**, which never reads a body.
 - **Every UI POST clears the gate**: the Svelte UI routes all of them through one `post()` helper that sets `Content-Type: application/json` and a JSON body (`ui-svelte/src/lib/api.svelte.ts:104-110`); the bare `api()` wrapper sets no headers (`api.svelte.ts:32-45`) and is never called directly by a read either — every GET goes through `get()` (`:76-87`), which adds the abort deadline. The body-less `/api/cycle` call is `post("/api/cycle", {})` (`ui-svelte/src/pages/StatusPage.svelte:12`), i.e. it sends `{}` and passes. (This supersedes the old vanilla-`app.ts` discrepancy where `runCycle` sent no header and got a 415.)
 
+**Session gate (Rust only).** Every `/api` route except `POST /api/login` — reads and writes, `/api/me` and `/api/logout` included — requires a live session: a `hunter_session` cookie whose token's SHA-256 is in `sessions`, not past `expires_at`, for an account whose `disabled_at` is NULL. Otherwise `401 {"error": "login required"}`, before any handler runs (`server::require_session`, a `route_layer` on the API sub-router). Order: Host gate, then session gate, then the handler (Content-Type gate, body parse). Static files and unknown paths are not gated: the bundle carries no data and has to load to show the login form. Pinned: `every_api_route_needs_a_session` (`hunter-rs/tests/post_test.rs`). Python has no accounts.
+
+The cookie is `HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000` (30 days, no renewal), without `Secure` because the default listener is plain HTTP on loopback. `SameSite=Strict` stops other sites from sending it, so together with the Content-Type gate no cross-site request reaches a handler.
+
 ### 0.2 Route dispatch and error taxonomy
 
 Dispatch is exact-path string equality on `urlparse(self.path).path` (server.py:422-450); unknown path -> `404 {"error": "not found"}` (server.py:451). The whole dispatch runs inside:
@@ -343,6 +347,17 @@ Handler `_add_repo_note` (server.py:701-725).
 **UI** (`ReposPage.addNote`, `pages/ReposPage.svelte:199-246`; the read side is `fetchRepoNotes`, `api.svelte.ts:262-273`): requires non-blank note text client-side (`toast("Note text is required", false)`, :201-205), sends `{id, note}` plus `category` only when non-empty (:210-214), and guards re-entry with a `notesSaving` set. Branches on `r.ok`, not on `201`: failure -> `console.error` + `toast("Failed to add note", false)`; success -> `toast("Note added", true)`, clear the form, **discard the response body**, `store.repoNotesCache.delete(id)` and re-`GET /api/repo/notes?id=N` via `store.fetchRepoNotes` (`lib/api.svelte.ts:262-273`), with its own failure toasted as `"Note saved, but reloading notes failed"` (:232-242). So the `notes` string in the 201 body has **no consumer in the shipped UI** — an earlier revision of this bullet called it the one success body that is read, which was true of the vanilla `app.ts` and is not true now. The GET side (`/api/repo/notes?id=N`, server.py:335-345) returns the same bounded string, which is what the panel actually renders.
 
 ---
+
+## 10. POST /api/login, POST /api/logout, GET /api/me — sessions (Rust only)
+
+Accounts are created by the operator (`hunter user add|passwd|disable <name>`, `main.rs`), never through the API.
+
+- **`POST /api/login`** — not behind the session gate; behind the Host and Content-Type gates. Body `{"username": str, "password": str}`; a missing or non-string field -> `400 {"error": "<field> must be a string"}`. Usernames match case-insensitively (`users.username COLLATE NOCASE`). Success -> `200 {"username": "<stored spelling>"}` plus `Set-Cookie: hunter_session=<64 hex>; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000`, and a `sessions` row (expired rows are deleted on the way). A wrong password, an unknown name and a disabled account all -> `401 {"error": "invalid username or password"}` with no cookie; an unknown name is verified against a decoy argon2id hash so it takes as long as a wrong password (`auth::decoy_hash`).
+- **`POST /api/logout`** — behind every gate. Deletes this session's row; `200 {"ok": true}` plus `Set-Cookie: hunter_session=; ...; Max-Age=0`.
+- **`GET /api/me`** — `200 {"username": str}` (`SessionUser`).
+- `hunter user passwd` and `hunter user disable` delete every session of the account in the same transaction.
+
+**Attribution.** The handlers that log an event for an operator action (§1 verdict, §3 recheck, §4 unqueue, §5 override, §6–§9 repo writes) record the session's account in `events.user_id` (`Store::log_user_event`); `/api/events` and finding timelines expose it as `username` (null for scheduler events).
 
 ## Appendix A. CSRF & concurrency guards
 
