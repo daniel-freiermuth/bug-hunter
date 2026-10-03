@@ -1826,7 +1826,10 @@ async fn a_recheck_that_keeps_overrunning_ends_stuck_instead_of_restarting_forev
         "cycles: {kinds:?}, next: {next:?}"
     );
     assert!(
-        !matches!(next, Some(Candidate::Finding { .. } | Candidate::Resume { .. })),
+        !matches!(
+            next,
+            Some(Candidate::Finding { .. } | Candidate::Resume { .. })
+        ),
         "the finding must stop taking the cycle, got {next:?}"
     );
 }
@@ -1889,7 +1892,10 @@ async fn give_up_three_chains(kind: &str, status: &str) -> Vec<(i64, FindingStat
         seed_finding_chain(&pool, &dir, kind, 1, first).await;
         pick_next(&store, &cfg, None).await.unwrap();
         let (state, reason, _) = job_row(&pool, first + 3).await;
-        assert_eq!((state.as_str(), reason.as_deref()), ("failed", Some("give-up")));
+        assert_eq!(
+            (state.as_str(), reason.as_deref()),
+            ("failed", Some("give-up"))
+        );
         let f = store.get_finding(1).await.unwrap().unwrap();
         let ps = store.get_pr_state(1).await.unwrap().unwrap();
         let streak = match kind {

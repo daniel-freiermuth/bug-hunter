@@ -176,7 +176,10 @@ kind of job typically costs. Whichever fires, the suspension is marked
 that has never been resumed is never retired: one attempt's spend is by
 definition at least its own cap, and the largest attempt is discounted
 because one enormous attempt says the job is big, not that the chain is
-stuck.
+stuck. For fix, recheck and harvest a given-up chain is one failed
+attempt in that finding's streak, so three given-up chains in a row end
+the work like three identical failures; otherwise a worker that suspends
+on every attempt would have its finding's tier start it fresh forever.
 
 Two more things end a suspension, because after either one it can never
 usefully be continued, and a suspension nobody ends stays `suspended`
