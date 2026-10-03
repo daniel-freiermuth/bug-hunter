@@ -655,6 +655,21 @@ async fn resume_plan(store: &Store, cfg: &Config, job: Job) -> anyhow::Result<Op
             "resume {} {}: giving up after {chain_spent} tok across the chain ({why})",
             job.kind, repo.name
         );
+        // The chain's turn is over. Every attempt in it was a suspension,
+        // which the cycle's starvation bump leaves alone, so an analysis
+        // kind's timestamp is still as old as before the chain started:
+        // rotation would pick the same work fresh in this very selection
+        // and repeat the whole chain, while its siblings never ran.
+        //
+        // Bumped before the retirement: once retired, the chain is no
+        // longer resumable and nothing would retry a bump that failed,
+        // whereas a retirement that fails after a bump leaves the row
+        // suspended and the next selection runs both writes again.
+        if let JobKind::Repo(kind) = job.kind
+            && kind.is_analysis()
+        {
+            let _ = store.set_last_kind_at(job.repo_id, kind).await;
+        }
         // Best-effort: the summary preview runs this same function
         // over a read-only handle. Either way the candidate is
         // skipped, so a failed write only defers the record.
@@ -5081,13 +5096,18 @@ async fn run_cycle_inner(
     // the resume tier claims it by id at a priority above rotation. Were
     // it bumped here it would be counted as a turn taken, while the work
     // itself had not started. A chain that never finishes is retired by
-    // the give-up ceiling, and the still-old timestamp is then the honest
-    // record that this scan has not run.
+    // the give-up ceiling, which bumps the timestamp itself (`resume_plan`):
+    // that is where the chain's turn ends.
+    //
+    // A resumed attempt counts exactly like a fresh one. When it ends
+    // killed or failed the chain is over and the resume tier has nothing
+    // left to claim, so without the bump rotation would start the same
+    // work fresh.
     //
     // `is_analysis()` covers standards here where the Python twin's list
     // does not, because standards exists only in this daemon — the twin
     // has no such kind to starve.
-    if let Candidate::Repo { kind, repo_id, .. } = &candidate
+    if let JobKind::Repo(kind) = candidate.job_kind()
         && kind.is_analysis()
     {
         let failed = matches!(result.state, Some(JobState::Killed | JobState::Failed))
@@ -5098,7 +5118,7 @@ async fn run_cycle_inner(
                 .as_ref()
                 .is_some_and(|i| i.inserted == 0 && i.invalid > 0);
         if failed {
-            let _ = store.set_last_kind_at(*repo_id, *kind).await;
+            let _ = store.set_last_kind_at(candidate.repo_id(), kind).await;
         }
     }
 
