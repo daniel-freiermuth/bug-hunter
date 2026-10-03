@@ -235,6 +235,7 @@
                 <span class="tl-dot"></span>
                 <span class="tl-time">{datetime(ev.at)}</span>
                 <span class="tl-kind">{ev.kind}</span>
+                {#if ev.username}<span class="tl-by">by {ev.username}</span>{/if}
                 <span class="tl-msg">{ev.message}</span>
               </div>
             {/each}
@@ -582,6 +583,11 @@
     color: var(--text);
     width: 4rem;
     flex-shrink: 0;
+  }
+
+  .tl-by {
+    flex-shrink: 0;
+    white-space: nowrap;
   }
 
   .tl-msg {

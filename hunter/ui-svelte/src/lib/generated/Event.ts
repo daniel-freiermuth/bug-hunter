@@ -3,4 +3,9 @@
 /**
  * events row.
  */
-export type Event = { id: number, at: number, kind: string, message: string, job_id: number | null, finding_id: number | null, };
+export type Event = { id: number, at: number, kind: string, message: string, job_id: number | null, finding_id: number | null, 
+/**
+ * The account that caused it through the API; `None` for the
+ * scheduler's own events and for anything older than accounts.
+ */
+username: string | null, };

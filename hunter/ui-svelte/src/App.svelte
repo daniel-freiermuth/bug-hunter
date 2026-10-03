@@ -8,6 +8,7 @@
   import ReposPage from "./pages/ReposPage.svelte";
   import StatsPage from "./pages/StatsPage.svelte";
   import LogPage from "./pages/LogPage.svelte";
+  import Login from "./components/Login.svelte";
   import "./app.css";
 
   const NAV = [
@@ -49,8 +50,20 @@
     focusId = h.focusId;
   }
 
+  let loggingOut = $state(false);
+  let logoutError = $state<string | null>(null);
+
+  async function logout() {
+    loggingOut = true;
+    try {
+      logoutError = await store.logout();
+    } finally {
+      loggingOut = false;
+    }
+  }
+
   onMount(() => {
-    store.startPolling();
+    store.start();
     window.addEventListener("hashchange", onHashChange);
   });
 
@@ -60,6 +73,9 @@
   });
 </script>
 
+{#if store.needsLogin}
+<Login />
+{:else}
 <!-- Mobile top bar -->
 <header class="topbar">
   <button
@@ -130,6 +146,17 @@
         </button>
       {/each}
     </div>
+    <div class="sidebar-user">
+      {#if store.user}
+        <span class="user-name" title="Signed in as {store.user}">{store.user}</span>
+      {/if}
+      <button class="logout-btn" onclick={logout} disabled={loggingOut}>
+        {loggingOut ? "logging out…" : "log out"}
+      </button>
+      {#if logoutError}
+        <span class="logout-error" role="alert">{logoutError}</span>
+      {/if}
+    </div>
   </nav>
 
   <!-- Main content -->
@@ -163,6 +190,7 @@
     {/key}
   </main>
 </div>
+{/if}
 
 <style>
   /* ── Mobile top bar ──────────────────────────────────────────── */
@@ -290,6 +318,43 @@
   }
   .nav-btn.active .nav-icon {
     opacity: 1;
+  }
+
+  /* ── Signed-in user (sidebar foot) ──────────────────────────── */
+  .sidebar-user {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.75rem 0.875rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.6875rem;
+  }
+
+  .user-name {
+    color: var(--text);
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .logout-btn {
+    align-self: flex-start;
+    color: var(--text-dim);
+    font-size: 0.6875rem;
+    letter-spacing: 0.04em;
+    padding: 0;
+  }
+  .logout-btn:hover:not(:disabled) {
+    color: var(--accent);
+  }
+  .logout-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+
+  .logout-error {
+    color: var(--bad);
   }
 
   /* ── Main content ────────────────────────────────────────────── */

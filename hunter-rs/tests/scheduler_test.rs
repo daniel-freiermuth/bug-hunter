@@ -347,6 +347,7 @@ async fn summary_over_queued_fix(overdrive: bool) -> Value {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, 1, "alpha", 1, "/nonexistent/alpha").await;
     seed_finding(&pool, 5, 1, "queued", "queued bug").await;
+    support::seed_session(&pool).await;
     let store = open_store(pool, &path).await;
 
     let mut config = test_config(3600.0);
@@ -368,9 +369,11 @@ async fn summary_over_queued_fix(overdrive: bool) -> Value {
         },
     };
 
+    let cookie = support::TEST_COOKIE;
     let response = router(state)
         .oneshot(
             Request::builder()
+                .header(axum::http::header::COOKIE, cookie)
                 .uri("/api/summary")
                 .body(Body::empty())
                 .unwrap(),

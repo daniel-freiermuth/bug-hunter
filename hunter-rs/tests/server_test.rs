@@ -67,6 +67,17 @@ async fn seeded_store(dir: &Path) -> Store {
     .execute(&pool)
     .await
     .unwrap();
+    // Two cycles and a later non-cycle event: the summary's `last_cycle`
+    // is the newest *cycle*, not the newest event.
+    sqlx::query(
+        "INSERT INTO events (id, at, kind, message) VALUES \
+         (2, 2000, 'cycle', 'first cycle'), (3, 3000, 'cycle', 'second cycle'), \
+         (4, 4000, 'hunt', 'after the cycles')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    support::seed_session(&pool).await;
     pool.close().await;
     Store::connect_read_only(&db).await.unwrap()
 }
@@ -125,8 +136,15 @@ async fn test_state() -> TestState {
 }
 
 async fn get(state: &AppState, uri: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let cookie = support::TEST_COOKIE;
     let response = router(state.clone())
-        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .header(axum::http::header::COOKIE, cookie)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = response.status();
@@ -140,6 +158,19 @@ async fn get(state: &AppState, uri: &str) -> (StatusCode, HeaderMap, Vec<u8>) {
 
 fn as_json(body: &[u8]) -> Value {
     serde_json::from_slice(body).unwrap()
+}
+
+/// The status page's "last cycle" is the newest cycle event, whatever
+/// was logged after it.
+#[tokio::test]
+async fn summary_reports_the_newest_cycle() {
+    let state = test_state().await;
+    let (status, _, body) = get(&state, "/api/summary").await;
+    assert_eq!(status, StatusCode::OK);
+    let last = &as_json(&body)["last_cycle"];
+    assert_eq!(last["id"], 3, "{last}");
+    assert_eq!(last["message"], "second cycle");
+    assert_eq!(last["username"], Value::Null);
 }
 
 #[tokio::test]
@@ -280,9 +311,11 @@ async fn a_foreign_host_header_cannot_read_findings() {
         "/api/repo/notes?id=1",
         "/",
     ] {
+        let cookie = support::TEST_COOKIE;
         let response = router(state.clone())
             .oneshot(
                 Request::builder()
+                    .header(axum::http::header::COOKIE, cookie)
                     .uri(uri)
                     .header(header::HOST, "rebound.attacker.example")
                     .body(Body::empty())
@@ -308,9 +341,11 @@ async fn a_foreign_host_header_cannot_read_findings() {
     // Names the old `split(':')` parser read as empty -- the absent-header
     // case -- and therefore let through.
     for host in [":8377", ":rebound.attacker.example", "::2", "[::2]:8377"] {
+        let cookie = support::TEST_COOKIE;
         let response = router(state.clone())
             .oneshot(
                 Request::builder()
+                    .header(axum::http::header::COOKIE, cookie)
                     .uri("/api/findings")
                     .header(header::HOST, host)
                     .body(Body::empty())
@@ -336,9 +371,11 @@ async fn a_foreign_host_header_cannot_read_findings() {
         "[::1]",
         "[::1]:8377",
     ] {
+        let cookie = support::TEST_COOKIE;
         let response = router(state.clone())
             .oneshot(
                 Request::builder()
+                    .header(axum::http::header::COOKIE, cookie)
                     .uri("/api/findings")
                     .header(header::HOST, host)
                     .body(Body::empty())
@@ -377,9 +414,11 @@ async fn the_scratch_dir_is_removed_with_the_state() {
 }
 
 async fn status_for_host(state: &AppState, host: &str) -> StatusCode {
+    let cookie = support::TEST_COOKIE;
     router(state.clone())
         .oneshot(
             Request::builder()
+                .header(axum::http::header::COOKIE, cookie)
                 .uri("/api/findings")
                 .header(header::HOST, host)
                 .body(Body::empty())

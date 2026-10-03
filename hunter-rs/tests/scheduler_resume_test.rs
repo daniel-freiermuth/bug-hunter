@@ -1504,9 +1504,11 @@ async fn previewed_reservation(store: &Arc<Store>, root: &Path) -> Option<i64> {
             wake: Arc::new(tokio::sync::Notify::new()),
         },
     };
+    let cookie = support::auth_cookie(&state.store).await;
     let response = router(state)
         .oneshot(
             Request::builder()
+                .header(axum::http::header::COOKIE, cookie.as_str())
                 .uri("/api/summary")
                 .body(Body::empty())
                 .unwrap(),

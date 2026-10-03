@@ -2,7 +2,7 @@
 // via a singleton store object.
 
 import type {
-  Event, FindingDetail, FindingOut, JobListEntry, RepoNotesResponse, Stats, Summary,
+  Event, FindingDetail, FindingOut, JobListEntry, RepoNotesResponse, SessionUser, Stats, Summary,
 } from "./types";
 import {
   isEventList, isFindingDetail, isFindingList, isJobList, isStats, isSummary,
@@ -29,8 +29,22 @@ interface ApiResult<T> {
   body: T | null;
 }
 
+/**
+ * The one endpoint that answers 401 for a reason other than "no session":
+ * there it means wrong credentials, and `login()` reports it.
+ */
+const LOGIN_PATH = "/api/login";
+
 async function api<T>(path: string, opts?: RequestInit): Promise<ApiResult<T>> {
+  // Captured before the request leaves: a 401 answers for the session the
+  // request was sent under, and must not end one established since.
+  const epoch = store.sessionEpoch;
   const r = await fetch(path, opts);
+  // Every route but login requires the session cookie, so a 401 from any
+  // of them — poll, detail fetch or write — means the session is gone
+  // (expired, logged out in another tab, user removed). Handled here once
+  // rather than in each of the components that call `post`.
+  if (r.status === 401 && path !== LOGIN_PATH) store.sessionLost(epoch);
   let body: T | null = null;
   try {
     body = (await r.json()) as T;
@@ -109,9 +123,42 @@ export async function post<T>(path: string, body: Record<string, unknown>): Prom
   });
 }
 
+/**
+ * `post` with `get`'s deadline, for login and logout only. The reasons
+ * `post` has none do not hold for them: their buttons stay disabled while
+ * the request is pending, so a hang is not retryable but a dead end; and
+ * an abandoned attempt is harmless either way -- an unused session row
+ * expires, and a logout the client gave up on is retried by clicking
+ * again, or settled by the next poll's 401.
+ */
+async function postWithDeadline<T>(path: string, body: Record<string, unknown>): Promise<ApiResult<T>> {
+  const deadline = new AbortController();
+  const timer = setTimeout(
+    () => deadline.abort(new Error(`POST ${path} timed out after ${GET_TIMEOUT_MS}ms`)),
+    GET_TIMEOUT_MS,
+  );
+  try {
+    return await api<T>(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: deadline.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Store singleton (Svelte 5 runes inside a class)
 // ---------------------------------------------------------------------------
+
+/** The `{"error": "..."}` body every failing endpoint answers with, if it is one. */
+function errorMessage(body: unknown): string | null {
+  if (typeof body !== "object" || body === null) return null;
+  const msg = (body as Record<string, unknown>).error;
+  return typeof msg === "string" ? msg : null;
+}
 
 class HunterStore {
   summary = $state<Summary | null>(null);
@@ -120,6 +167,22 @@ class HunterStore {
   events = $state<Event[]>([]);
   stats = $state<Stats | null>(null);
   error = $state<string | null>(null);
+
+  /** Account the session belongs to; null while not (yet) known. */
+  user = $state<string | null>(null);
+  /**
+   * The daemon refused the session (or there never was one): App.svelte
+   * shows the login form instead of the dashboard, and nothing polls.
+   */
+  needsLogin = $state(false);
+
+  // Bumped whenever the session changes hands (login, session end). See
+  // `api()`: a 401 is only believed for the epoch its request was sent in.
+  #sessionEpoch = 0;
+
+  // Pending retry of start()'s session check after a failure that was not
+  // a 401 (daemon down, 5xx).
+  #startRetry: ReturnType<typeof setTimeout> | null = null;
 
   // Lazy caches (not reactive — components re-fetch on demand). Detail
   // responses are tagged with the data revision they were read in, see
@@ -152,6 +215,8 @@ class HunterStore {
   #revision = $state(0);
 
   async refresh() {
+    // Every request would answer 401; the login form is up already.
+    if (this.needsLogin) return;
     const gen = ++this.#refreshGeneration;
     try {
       const [s, f, j, e, st] = await Promise.all([
@@ -214,6 +279,10 @@ class HunterStore {
 
   startPolling() {
     this.#poll();
+    this.#ensureInterval();
+  }
+
+  #ensureInterval() {
     if (!this.#interval) {
       this.#interval = setInterval(() => this.#poll(), POLL_MS);
     }
@@ -224,6 +293,109 @@ class HunterStore {
       clearInterval(this.#interval);
       this.#interval = null;
     }
+    if (this.#startRetry) {
+      clearTimeout(this.#startRetry);
+      this.#startRetry = null;
+    }
+  }
+
+  get sessionEpoch(): number {
+    return this.#sessionEpoch;
+  }
+
+  /**
+   * Entry point for App.svelte: find out whether the browser holds a live
+   * session before polling anything. A 401 raises the login form (via
+   * `api()`); any other failure is shown like a failed poll and retried on
+   * the poll period, so a daemon that was down at page load is picked up
+   * once it is back, as polling used to.
+   */
+  async start() {
+    this.stopPolling();
+    // A login or logout while this is in flight makes its answer about a
+    // session that no longer exists.
+    const epoch = this.#sessionEpoch;
+    try {
+      const r = await get<SessionUser>("/api/me");
+      if (this.needsLogin || epoch !== this.#sessionEpoch) return;
+      if (r.ok) {
+        this.user = typeof r.body?.username === "string" ? r.body.username : null;
+        this.startPolling();
+        return;
+      }
+      this.error = `API error (GET /api/me: status ${r.status})`;
+    } catch (err) {
+      this.error = String(err);
+    }
+    this.#startRetry = setTimeout(() => this.start(), POLL_MS);
+  }
+
+  /**
+   * Sign in. Resolves to null on success — the dashboard then polls again
+   * and refreshes at once — or to the message to show under the form.
+   */
+  async login(username: string, password: string): Promise<string | null> {
+    let r: ApiResult<SessionUser>;
+    try {
+      r = await postWithDeadline<SessionUser>(LOGIN_PATH, { username, password });
+    } catch (err) {
+      return `Cannot reach the server (${String(err)})`;
+    }
+    if (!r.ok) return errorMessage(r.body) ?? `Login failed (status ${r.status})`;
+    this.#sessionEpoch++;
+    this.user = typeof r.body?.username === "string" ? r.body.username : username;
+    this.needsLogin = false;
+    this.error = null;
+    // refresh() rather than startPolling(): a poll left over from the
+    // previous session may still hold the gate, and the first data must
+    // not wait for it.
+    this.#ensureInterval();
+    void this.refresh();
+    return null;
+  }
+
+  /**
+   * End the session on the server, then locally. Resolves to null, or to
+   * a message when the server could not be told — the session cookie is
+   * still live then, so the dashboard stays rather than pretending.
+   */
+  async logout(): Promise<string | null> {
+    let r: ApiResult<unknown>;
+    try {
+      r = await postWithDeadline<unknown>("/api/logout", {});
+    } catch (err) {
+      return `Logout failed (${String(err)})`;
+    }
+    // A 401 means the session was already gone; api() has handled it.
+    if (r.ok) this.#endSession();
+    else if (r.status !== 401) return errorMessage(r.body) ?? `Logout failed (status ${r.status})`;
+    return null;
+  }
+
+  /** Called by `api()` on a 401 from a request sent in session `epoch`. */
+  sessionLost(epoch: number) {
+    if (epoch !== this.#sessionEpoch || this.needsLogin) return;
+    this.#endSession();
+  }
+
+  #endSession() {
+    this.stopPolling();
+    this.#sessionEpoch++;
+    // Discards any refresh still in flight: its answer belongs to the
+    // session that just ended.
+    this.#refreshGeneration++;
+    this.user = null;
+    this.needsLogin = true;
+    // Nothing read under the old session may outlive it on screen — the
+    // next login may be someone else's.
+    this.summary = null;
+    this.findings = [];
+    this.jobs = [];
+    this.events = [];
+    this.stats = null;
+    this.error = null;
+    this.findingDetailCache.clear();
+    this.repoNotesCache.clear();
   }
 
   /**
@@ -247,7 +419,10 @@ class HunterStore {
     // it were the new one — the refresh-triggered reload would then be
     // served this stale body from cache and never see the change.
     const requestedAt = this.#revision;
+    const epoch = this.#sessionEpoch;
     const r = await get<FindingDetail>(`/api/finding?id=${id}`);
+    // Read under a session that has since ended: neither shown nor cached.
+    if (epoch !== this.#sessionEpoch) return null;
     // Same reasoning as refresh(): a truthy body is not a usable one, and
     // an unusable one must not reach the cache, where it would be served
     // to every reopen until the next poll.
@@ -261,7 +436,13 @@ class HunterStore {
 
   async fetchRepoNotes(id: number): Promise<string> {
     if (this.repoNotesCache.has(id)) return this.repoNotesCache.get(id)!;
+    const epoch = this.#sessionEpoch;
     const r = await get<RepoNotesResponse>(`/api/repo/notes?id=${id}`);
+    // Read under a session that has since ended: the cache was cleared
+    // with it, and must not be refilled from the old one.
+    if (epoch !== this.#sessionEpoch) {
+      throw new Error(`GET /api/repo/notes?id=${id}: the session ended meanwhile`);
+    }
     // An error body carries no `notes`; coercing that to "" and caching it
     // would show "No notes yet" forever with no retry, so fail instead and
     // let the caller's failure path handle it.
