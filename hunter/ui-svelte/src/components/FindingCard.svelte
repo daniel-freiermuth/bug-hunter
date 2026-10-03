@@ -2,6 +2,7 @@
   import { store, post } from "../lib/api.svelte";
   import type { FindingOut } from "../lib/types";
   import { isHttpUrl, pct, datetime, typeLabel } from "../lib/format";
+  import { nearViewport } from "../lib/nearViewport";
   import FindingDetail from "./FindingDetail.svelte";
 
   let { finding, actions = false }: { finding: FindingOut; actions?: boolean } = $props();
@@ -12,6 +13,28 @@
   let reasonText = $state("");
   let showReasonPrompt = $state<string | null>(null); // "rejected" | "wontfix" | null
   let busy = $state(false);
+  let timelineOpen = $state(false);
+
+  // Only cards on or near screen are mounted: the findings list runs to
+  // thousands of cards, and mounting all of them — then re-rendering all of
+  // them on every 5s poll — froze the page for seconds. An off-screen card
+  // keeps its place with an empty box of its last rendered height (an
+  // estimate until it has rendered once).
+  const ESTIMATED_HEIGHT_PX = 180;
+  let near = $state(false);
+  let lastHeight = $state<number | null>(null);
+  // Mid-interaction cards stay mounted off screen: unmounting would close an
+  // open panel or drop a half-typed reason.
+  const live = $derived(near || expanded || timelineOpen || showReasonPrompt !== null || busy);
+
+  function onVisibility(entry: IntersectionObserverEntry) {
+    if (entry.isIntersecting) {
+      near = true;
+      return;
+    }
+    if (near) lastHeight = entry.boundingClientRect.height;
+    near = false;
+  }
 
   // "PR #7" where the URL ends in a number, both forges' shape
   // (/pull/7, /merge_requests/7). Anything else keeps the generic label
@@ -116,193 +139,204 @@
   }
 </script>
 
-<div class="card {sevClass(finding.severity)}" id="finding-{finding.id}">
-  <!-- Header row: id + type pill + severity dot/text + confidence + category + status pill (right) -->
-  <div class="card-header">
-    <span class="fid">F#{finding.id}</span>
-    <span class="type-pill" title={finding.type}>{typeLabel(finding.type)}</span>
-    <span class="sev-indicator {sevClass(finding.severity)}">
-      <span class="sev-dot"></span>
-      {finding.severity}
-    </span>
-    <span class="confidence">{pct(finding.confidence)}</span>
-    {#if finding.category}
-      <span class="cat-label">{finding.category}</span>
-    {/if}
-    {#if finding.budget_override}
-      <span class="override-badge" title="Budget override">⚡ {finding.budget_override}</span>
-    {/if}
-    {#if finding.needs_attention}
-      <span class="attn-badge" title="Needs attention">⚠ {finding.needs_attention}</span>
-    {/if}
-    <!-- In the header, not just in the detail panel: once a finding has a
-         PR, that PR is the thing you want -- open ones to review, merged
-         ones to see what shipped -- and needing to expand the card made
-         the most common next step the least reachable.
-         Only linked when it parses as http(s) -- the URL is scraped from
-         `gh`/`glab` stdout, so the detail panel still shows anything else
-         as plain text rather than making it clickable. -->
-    {#if finding.pr_url && isHttpUrl(finding.pr_url)}
-      <a
-        class="pr-chip"
-        class:pr-chip-live={finding.status === "pr_open" || finding.status === "merged"}
-        href={finding.pr_url}
-        target="_blank"
-        rel="noopener"
-        title={finding.pr_url}
-      >
-        {prLabel(finding.pr_url)} ↗
-      </a>
-    {/if}
-    <span class="status-pill {statusBadgeClass(finding.status)}">
-      {finding.status}
-    </span>
-  </div>
-
-  <!-- Summary -->
-  <p class="summary">{finding.summary}</p>
-
-  <!-- Subtitle: fingerprint + file:line -->
-  <div class="meta-line">
-    <span class="fingerprint" title={finding.fingerprint}>{finding.fingerprint}</span>
-    {#if finding.file}
-      <span class="file-loc">
-        {finding.file}{#if finding.line}:{finding.line}{/if}
+<div
+  class="card {sevClass(finding.severity)}"
+  id="finding-{finding.id}"
+  style:height={live ? null : `${lastHeight ?? ESTIMATED_HEIGHT_PX}px`}
+  {@attach nearViewport(onVisibility)}
+>
+  {#if live}
+    <!-- Header row: id + type pill + severity dot/text + confidence + category + status pill (right) -->
+    <div class="card-header">
+      <span class="fid">F#{finding.id}</span>
+      <span class="type-pill" title={finding.type}>{typeLabel(finding.type)}</span>
+      <span class="sev-indicator {sevClass(finding.severity)}">
+        <span class="sev-dot"></span>
+        {finding.severity}
       </span>
-    {/if}
-  </div>
-
-  <!-- Lineage: an engage/harvest job that files FOLLOW-UPS.json leaves the
-       new findings under new fingerprints, so this is the only path between
-       a withdrawn finding and what replaced it. -->
-  {#if finding.follow_up_of != null || followUps.length > 0}
-    <div class="lineage">
-      {#if finding.follow_up_of != null}
-        <span>follow-up of <a href="#findings:{finding.follow_up_of}">F#{finding.follow_up_of}</a></span>
+      <span class="confidence">{pct(finding.confidence)}</span>
+      {#if finding.category}
+        <span class="cat-label">{finding.category}</span>
       {/if}
-      {#if followUps.length > 0}
-        <span>
-          follow-ups:
-          {#each followUps as fid (fid)}
-            <a href="#findings:{fid}">F#{fid}</a>
-          {/each}
+      {#if finding.budget_override}
+        <span class="override-badge" title="Budget override">⚡ {finding.budget_override}</span>
+      {/if}
+      {#if finding.needs_attention}
+        <span class="attn-badge" title="Needs attention">⚠ {finding.needs_attention}</span>
+      {/if}
+      <!-- In the header, not just in the detail panel: once a finding has a
+           PR, that PR is the thing you want -- open ones to review, merged
+           ones to see what shipped -- and needing to expand the card made
+           the most common next step the least reachable.
+           Only linked when it parses as http(s) -- the URL is scraped from
+           `gh`/`glab` stdout, so the detail panel still shows anything else
+           as plain text rather than making it clickable. -->
+      {#if finding.pr_url && isHttpUrl(finding.pr_url)}
+        <a
+          class="pr-chip"
+          class:pr-chip-live={finding.status === "pr_open" || finding.status === "merged"}
+          href={finding.pr_url}
+          target="_blank"
+          rel="noopener"
+          title={finding.pr_url}
+        >
+          {prLabel(finding.pr_url)} ↗
+        </a>
+      {/if}
+      <span class="status-pill {statusBadgeClass(finding.status)}">
+        {finding.status}
+      </span>
+    </div>
+
+    <!-- Summary -->
+    <p class="summary">{finding.summary}</p>
+
+    <!-- Subtitle: fingerprint + file:line -->
+    <div class="meta-line">
+      <span class="fingerprint" title={finding.fingerprint}>{finding.fingerprint}</span>
+      {#if finding.file}
+        <span class="file-loc">
+          {finding.file}{#if finding.line}:{finding.line}{/if}
         </span>
       {/if}
     </div>
-  {/if}
 
-  <!-- Timeline (collapsible) -->
-  {#if finding.timeline && finding.timeline.length > 0}
-    <details class="timeline">
-      <summary class="timeline-toggle">
-        Timeline ({finding.timeline.length})
-      </summary>
-      <div class="timeline-items">
-        {#each finding.timeline as ev (ev.id)}
-          <div class="tl-row">
-            <span class="tl-dot"></span>
-            <span class="tl-time">{datetime(ev.at)}</span>
-            <span class="tl-kind">{ev.kind}</span>
-            <span class="tl-msg">{ev.message}</span>
-          </div>
-        {/each}
+    <!-- Lineage: an engage/harvest job that files FOLLOW-UPS.json leaves the
+         new findings under new fingerprints, so this is the only path between
+         a withdrawn finding and what replaced it. -->
+    {#if finding.follow_up_of != null || followUps.length > 0}
+      <div class="lineage">
+        {#if finding.follow_up_of != null}
+          <span>follow-up of <a href="#findings:{finding.follow_up_of}">F#{finding.follow_up_of}</a></span>
+        {/if}
+        {#if followUps.length > 0}
+          <span>
+            follow-ups:
+            {#each followUps as fid (fid)}
+              <a href="#findings:{fid}">F#{fid}</a>
+            {/each}
+          </span>
+        {/if}
       </div>
-    </details>
-  {/if}
+    {/if}
 
-  <!-- Actions (verdict / recheck / override) -->
-  {#if actions}
-    <div class="actions">
-      {#if showReasonPrompt}
-        <!-- Reason input for rejected/wontfix -->
-        <div class="reason-row">
-          <input
-            type="text"
-            class="reason-input"
-            placeholder="Reason for {showReasonPrompt}…"
-            bind:value={reasonText}
-            onkeydown={(e: KeyboardEvent) => { if (e.key === "Enter" && !busy && reasonText.trim()) doVerdict(showReasonPrompt!, reasonText.trim()); }}
-          />
-          <button
-            class="btn btn-confirm"
-            disabled={busy || !reasonText.trim()}
-            onclick={() => doVerdict(showReasonPrompt!, reasonText.trim())}
-          >Confirm</button>
-          <button
-            class="btn btn-muted"
-            onclick={() => { showReasonPrompt = null; reasonText = ""; }}
-          >Cancel</button>
-        </div>
-      {:else}
-        <div class="btn-row">
-          <button class="btn btn-queue" disabled={busy} onclick={() => doVerdict("queued")} title="Queue for fix">Queue</button>
-          <button class="btn btn-reject" disabled={busy} onclick={() => { showReasonPrompt = "rejected"; }} title="Reject">Reject</button>
-          <button class="btn btn-muted" disabled={busy} onclick={() => { showReasonPrompt = "wontfix"; }} title="Won't fix">Wontfix</button>
-          <button class="btn btn-muted" disabled={busy} onclick={() => doVerdict("note")} title="Mark as note">Note</button>
-          <button class="btn btn-queue" disabled={busy} onclick={() => doVerdict("merged")} title="Mark as merged">Merged</button>
+    <!-- Timeline (collapsible) -->
+    {#if finding.timeline && finding.timeline.length > 0}
+      <details class="timeline" bind:open={timelineOpen}>
+        <summary class="timeline-toggle">
+          Timeline ({finding.timeline.length})
+        </summary>
+        <!-- Rows are built on open only: a closed <details> hides its
+             content but Svelte still creates and updates all of it. -->
+        {#if timelineOpen}
+          <div class="timeline-items">
+            {#each finding.timeline as ev (ev.id)}
+              <div class="tl-row">
+                <span class="tl-dot"></span>
+                <span class="tl-time">{datetime(ev.at)}</span>
+                <span class="tl-kind">{ev.kind}</span>
+                <span class="tl-msg">{ev.message}</span>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </details>
+    {/if}
 
-          {#if finding.status === "new"}
+    <!-- Actions (verdict / recheck / override) -->
+    {#if actions}
+      <div class="actions">
+        {#if showReasonPrompt}
+          <!-- Reason input for rejected/wontfix -->
+          <div class="reason-row">
+            <input
+              type="text"
+              class="reason-input"
+              placeholder="Reason for {showReasonPrompt}…"
+              bind:value={reasonText}
+              onkeydown={(e: KeyboardEvent) => { if (e.key === "Enter" && !busy && reasonText.trim()) doVerdict(showReasonPrompt!, reasonText.trim()); }}
+            />
+            <button
+              class="btn btn-confirm"
+              disabled={busy || !reasonText.trim()}
+              onclick={() => doVerdict(showReasonPrompt!, reasonText.trim())}
+            >Confirm</button>
+            <button
+              class="btn btn-muted"
+              onclick={() => { showReasonPrompt = null; reasonText = ""; }}
+            >Cancel</button>
+          </div>
+        {:else}
+          <div class="btn-row">
+            <button class="btn btn-queue" disabled={busy} onclick={() => doVerdict("queued")} title="Queue for fix">Queue</button>
+            <button class="btn btn-reject" disabled={busy} onclick={() => { showReasonPrompt = "rejected"; }} title="Reject">Reject</button>
+            <button class="btn btn-muted" disabled={busy} onclick={() => { showReasonPrompt = "wontfix"; }} title="Won't fix">Wontfix</button>
+            <button class="btn btn-muted" disabled={busy} onclick={() => doVerdict("note")} title="Mark as note">Note</button>
+            <button class="btn btn-queue" disabled={busy} onclick={() => doVerdict("merged")} title="Mark as merged">Merged</button>
+
+            {#if finding.status === "new"}
+              <span class="sep"></span>
+              <button class="btn btn-accent" disabled={busy} onclick={doRecheck} title="Queue for adversarial recheck">Recheck</button>
+            {/if}
+
+            {#if finding.status === "queued"}
+              <span class="sep"></span>
+              <button class="btn btn-warn" disabled={busy} onclick={doUnqueue} title="Remove from fix queue">Unqueue</button>
+            {/if}
+
             <span class="sep"></span>
-            <button class="btn btn-accent" disabled={busy} onclick={doRecheck} title="Queue for adversarial recheck">Recheck</button>
-          {/if}
+            {#if finding.budget_override}
+              <button class="btn btn-muted" disabled={busy} onclick={() => doOverride(null)} title="Clear budget override">Clear override</button>
+            {:else}
+              <button class="btn btn-accent" disabled={busy} onclick={() => doOverride("once")} title="Budget override: once">⚡ Once</button>
+              <button class="btn btn-accent" disabled={busy} onclick={() => doOverride("exempt")} title="Budget override: exempt">⚡ Exempt</button>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    {/if}
 
-          {#if finding.status === "queued"}
-            <span class="sep"></span>
-            <button class="btn btn-warn" disabled={busy} onclick={doUnqueue} title="Remove from fix queue">Unqueue</button>
-          {/if}
-
-          <span class="sep"></span>
-          {#if finding.budget_override}
-            <button class="btn btn-muted" disabled={busy} onclick={() => doOverride(null)} title="Clear budget override">Clear override</button>
-          {:else}
-            <button class="btn btn-accent" disabled={busy} onclick={() => doOverride("once")} title="Budget override: once">⚡ Once</button>
-            <button class="btn btn-accent" disabled={busy} onclick={() => doOverride("exempt")} title="Budget override: exempt">⚡ Exempt</button>
-          {/if}
-        </div>
-      {/if}
-    </div>
-  {/if}
-
-  <!-- Expandable detail panel -->
-  <button
-    class="detail-toggle"
-    onclick={() => { expanded = !expanded; }}
-  >
-    {expanded ? "▾ Hide detail" : "▸ Show detail"}
-  </button>
-  {#if expanded}
-    <div class="detail-panel">
-      {#if finding.detail}
-        <p class="detail-text">{finding.detail}</p>
-      {/if}
-      {#if finding.evidence_plan}
-        <div class="detail-section">
-          <span class="detail-label">Evidence plan:</span>
-          <p class="detail-text" style="margin-top:0.125rem">{finding.evidence_plan}</p>
-        </div>
-      {/if}
-      {#if finding.pr_url}
-        <div class="detail-section">
-          <span class="detail-label">PR:</span>
-          {#if isHttpUrl(finding.pr_url)}
-            <a href={finding.pr_url} target="_blank" rel="noopener" class="detail-link"
-              >{finding.pr_url}</a
-            >
-          {:else}
-            <!-- Parsed out of `gh`/`glab` stdout, so not ours to trust as a
-                 navigable URL. Shown, not linked. -->
-            <span class="detail-link">{finding.pr_url}</span>
-          {/if}
-        </div>
-      {/if}
-      {#if finding.verdict_reason}
-        <div class="detail-section">
-          <span class="detail-label">Verdict reason:</span>
-          <span class="detail-value">{finding.verdict_reason}</span>
-        </div>
-      {/if}
-      <FindingDetail findingId={finding.id} />
-    </div>
+    <!-- Expandable detail panel -->
+    <button
+      class="detail-toggle"
+      onclick={() => { expanded = !expanded; }}
+    >
+      {expanded ? "▾ Hide detail" : "▸ Show detail"}
+    </button>
+    {#if expanded}
+      <div class="detail-panel">
+        {#if finding.detail}
+          <p class="detail-text">{finding.detail}</p>
+        {/if}
+        {#if finding.evidence_plan}
+          <div class="detail-section">
+            <span class="detail-label">Evidence plan:</span>
+            <p class="detail-text" style="margin-top:0.125rem">{finding.evidence_plan}</p>
+          </div>
+        {/if}
+        {#if finding.pr_url}
+          <div class="detail-section">
+            <span class="detail-label">PR:</span>
+            {#if isHttpUrl(finding.pr_url)}
+              <a href={finding.pr_url} target="_blank" rel="noopener" class="detail-link"
+                >{finding.pr_url}</a
+              >
+            {:else}
+              <!-- Parsed out of `gh`/`glab` stdout, so not ours to trust as a
+                   navigable URL. Shown, not linked. -->
+              <span class="detail-link">{finding.pr_url}</span>
+            {/if}
+          </div>
+        {/if}
+        {#if finding.verdict_reason}
+          <div class="detail-section">
+            <span class="detail-label">Verdict reason:</span>
+            <span class="detail-value">{finding.verdict_reason}</span>
+          </div>
+        {/if}
+        <FindingDetail findingId={finding.id} />
+      </div>
+    {/if}
   {/if}
 </div>
 

@@ -8,24 +8,22 @@ export function ktok(n: number | null): string {
   return String(n);
 }
 
+// Built once: `toLocale*String` with an options object constructs a fresh
+// Intl.DateTimeFormat on every call (~65µs in Chromium), and a findings page
+// formats one date per timeline row — 13k rows cost 1.7s per render.
+const TIME_FMT = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit" });
+const DAY_FMT = new Intl.DateTimeFormat([], { month: "short", day: "numeric" });
+
 /** Epoch ms → local time string "2:05 PM" */
 export function ts(ms: number | null): string {
   if (!ms) return "\u2013";
-  return new Date(ms).toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+  return TIME_FMT.format(ms);
 }
 
 /** Epoch ms → "Sep 14 2:05 PM" */
 export function datetime(ms: number | null): string {
   if (!ms) return "\u2013";
-  const d = new Date(ms);
-  return (
-    d.toLocaleDateString([], { month: "short", day: "numeric" }) +
-    " " +
-    d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-  );
+  return DAY_FMT.format(ms) + " " + TIME_FMT.format(ms);
 }
 
 /** Epoch ms → countdown "2h05m" / "45m" / "-3m" */
