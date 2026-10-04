@@ -133,6 +133,21 @@ impl Fixture {
         .await
         .unwrap()
     }
+
+    /// `(state, killed_reason, notes)` of one job, straight from the
+    /// database: what a retirement rewrote and what it kept.
+    async fn job_row(&self, id: i64) -> (String, Option<String>, Option<String>) {
+        let pool = sqlx::SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new().filename(&self.db),
+        )
+        .await
+        .unwrap();
+        sqlx::query_as("SELECT state, killed_reason, notes FROM jobs WHERE id = ?1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    }
 }
 
 type JobRow = (
@@ -1447,4 +1462,215 @@ async fn a_resumed_engage_publishes_its_rewritten_history() {
     assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
     let head = support::git(&origin, &["log", "-1", "--format=%s", BRANCH]);
     assert_eq!(head.trim(), "change (reviewed)");
+}
+// -- a suspended engage ------------------------------------------------------
+
+/// A worker stopped by `killed_reason` after doing work, its transcript
+/// in the chain's session directory: what `job_state` records as
+/// `suspended` for both a cap kill and a wallclock kill that did work.
+fn suspended_by(tree: &std::path::Path, killed_reason: &str) -> hunter::types::RunResult {
+    let session = tree.parent().unwrap().join("session").join("engage.jsonl");
+    std::fs::write(&session, format!("{USAGE}\n")).unwrap();
+    hunter::types::RunResult {
+        exit_code: None,
+        killed_reason: Some(killed_reason.to_owned()),
+        tokens_new: 30_000,
+        calls: 3,
+        session_file: Some(session.to_string_lossy().into_owned()),
+        duration_s: 1.0,
+        stdout_tail: "stopped".to_owned(),
+        usage_delta: None,
+    }
+}
+
+/// A wallclock-killed engage that had already withdrawn the PR concluded
+/// its work: the finding is no longer `pr_open`, so no resume could ever
+/// continue it. It is retired `killed` -- keeping `wallclock` as the
+/// record of why it stopped -- rather than left `suspended` for the
+/// resume tier to offer every cycle, and it still hands off into the
+/// closed PR's harvest in its own session before the tree is released.
+#[tokio::test]
+async fn a_suspended_engage_that_withdrew_is_retired_and_continues_into_its_harvest() {
+    let f = fixture("engage-suspended-withdrew").await;
+    let bins = FakeBins::acquire("engage-suspended-withdrew");
+    gh_for_handoff(&bins);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::staged(|tree, resume_from| match resume_from {
+        None => {
+            std::fs::write(tree.join("WITHDRAW.md"), "superseded by #9").unwrap();
+            suspended_by(tree, "wallclock")
+        }
+        Some(file) => {
+            std::fs::write(
+                tree.join("CLOSE-REASON.json"),
+                r#"{"classification":"superseded","reason":"landed in #9","evidence":"abc1234"}"#,
+            )
+            .unwrap();
+            hunter::types::RunResult {
+                session_file: Some(file.to_string_lossy().into_owned()),
+                ..support::done()
+            }
+        }
+    });
+
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"), "{summary:?}");
+    assert_eq!(summary.state, Some(hunter::domain::JobState::Suspended));
+    assert!(bins.called_with("gh", "close"), "{:?}", bins.calls());
+    let engage_job = summary.job_id.unwrap();
+    let (state, killed_reason, notes) = f.job_row(engage_job).await;
+    assert_eq!(state, "killed", "a concluded suspension is retired");
+    assert_eq!(
+        killed_reason.as_deref(),
+        Some("wallclock"),
+        "the reason the attempt stopped is kept"
+    );
+    assert!(
+        notes.as_deref().is_some_and(|n| n.contains("(withdrawn)")),
+        "{notes:?}"
+    );
+
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 2, "the harvest continues the engage: {runs:?}");
+    let transcript = runs[0]
+        .tree
+        .parent()
+        .unwrap()
+        .join("session")
+        .join("engage.jsonl");
+    assert_eq!(runs[1].resume_from.as_deref(), Some(transcript.as_path()));
+    let jobs = f.jobs().await;
+    assert_eq!(jobs.len(), 2, "{jobs:?}");
+    assert_eq!(
+        (jobs[1].1.as_str(), jobs[1].2.as_str(), jobs[1].3),
+        ("harvest", "done", Some(engage_job))
+    );
+
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Superseded);
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert!(ps.harvested_at.is_some());
+    assert!(
+        f.store.list_resumable_jobs().await.unwrap().is_empty(),
+        "nothing of the chain is left to resume"
+    );
+    assert!(!runs[0].tree.exists(), "the chain's tree must be released");
+}
+
+/// A cap-killed engage whose withdrawal the forge refused is retired just
+/// the same. `withdraw-failed` marks the attention addressed, so the
+/// finding waits for new PR activity; a suspension left behind would be
+/// resumed every cycle meanwhile, re-running a worker that already
+/// decided, and would pin its tree.
+#[tokio::test]
+async fn a_suspended_engage_whose_withdrawal_failed_is_retired_and_released() {
+    let f = fixture("engage-suspended-withdraw-failed").await;
+    let bins = FakeBins::acquire("engage-suspended-withdraw-failed");
+    bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("WITHDRAW.md"), "not worth pursuing").unwrap();
+        suspended_by(tree, "cap")
+    });
+
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        summary.outcome.as_deref(),
+        Some("withdraw-failed"),
+        "{summary:?}"
+    );
+    let job = summary.job_id.unwrap();
+    let (state, killed_reason, notes) = f.job_row(job).await;
+    assert_eq!(state, "killed", "a concluded suspension is retired");
+    assert_eq!(killed_reason.as_deref(), Some("cap"));
+    assert!(
+        notes
+            .as_deref()
+            .is_some_and(|n| n.contains("(withdraw-failed)")),
+        "{notes:?}"
+    );
+    assert!(f.store.list_resumable_jobs().await.unwrap().is_empty());
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 1, "no harvest without a close: {runs:?}");
+    assert_eq!(f.jobs().await.len(), 1);
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::PrOpen);
+    assert!(!runs[0].tree.exists(), "the chain's tree must be released");
+}
+
+/// A cap-killed engage that neither withdrew nor finished is a pause.
+/// It committed and left a reply, but a suspended attempt's output is
+/// unfinished: nothing is pushed (the failure is the suspension, not a
+/// push error), no reply is posted, and the attention watermark is left
+/// alone so the resume -- or the next cycle -- still acts on it. The job
+/// stays `suspended` and resumable, not failed, and keeps its tree.
+#[tokio::test]
+async fn a_suspended_engage_that_did_not_withdraw_keeps_its_tree_for_the_resume() {
+    let f = fixture("engage-suspended-retry").await;
+    let bins = FakeBins::acquire("engage-suspended-retry");
+    bins.ok("gh", PR_VIEW_JSON);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::new(|tree| {
+        support::git(tree, &["commit", "--allow-empty", "-m", "half done"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "working on it").unwrap();
+        suspended_by(tree, "cap")
+    });
+
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    assert_eq!(
+        summary.failure.as_deref(),
+        Some("worker suspended"),
+        "a suspended attempt must not reach the push"
+    );
+    assert!(
+        !bins.called_with("gh", "comment"),
+        "a suspended attempt must not post its reply: {:?}",
+        bins.calls()
+    );
+    let job = summary.job_id.unwrap();
+    let (state, killed_reason, _) = f.job_row(job).await;
+    assert_eq!(state, "suspended", "a pause is not failed");
+    assert_eq!(killed_reason.as_deref(), Some("cap"));
+    assert_eq!(
+        f.store
+            .list_resumable_jobs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|j| j.id)
+            .collect::<Vec<_>>(),
+        vec![job]
+    );
+
+    assert_eq!(
+        f.addressed_fp().await,
+        None,
+        "the attention stays unaddressed"
+    );
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    assert_eq!(ps.last_engaged_activity_at, Some(0));
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::PrOpen);
+
+    let tree = &backend.runs()[0].tree;
+    assert!(tree.is_dir(), "the suspended engage's tree is its resume");
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events.iter().any(|e| e.kind == "engage"
+            && e.message.contains(&format!(
+                "worktree kept at {} for the resume",
+                tree.display()
+            ))),
+        "{events:?}"
+    );
 }
