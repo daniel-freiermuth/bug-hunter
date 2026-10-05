@@ -260,3 +260,62 @@ async fn an_attempt_that_died_before_doing_any_work_stays_failed() {
     assert_eq!(summary.state, Some(JobState::Failed), "{summary:?}");
     assert!(last_test_gap_at(&store).await > STALE_TEST_GAP);
 }
+
+/// A finished attempt whose batch mixes valid and invalid entries bumps
+/// its rotation timestamp, the same as an all-invalid one.
+///
+/// `run_analysis_job` stamps only a clean batch, so the cycle's fallback
+/// is the only thing that moves `last_test_gap_at` here. Left at its old
+/// value, test_gap stays the stalest kind and `pick_next` hands the same
+/// repo the same scan every cycle until a worker happens to emit a
+/// perfectly valid file.
+#[tokio::test]
+async fn a_mixed_valid_and_invalid_batch_bumps_the_rotation_timestamp() {
+    let (_dir, path, _pool, cfg) = fixture("rotation-mixed").await;
+    let store = Store::connect(&path).await.unwrap();
+    // A fresh database: the attempt is job 1, so this is the path its
+    // prompt names (`run_analysis_job`'s `out_path`).
+    let out = cfg.work_root.join("out").join("job1.test_gaps.json");
+    let backend = ScriptedBackend::new(move |_| {
+        let batch = serde_json::json!([
+            {
+                "fingerprint": "tg-valid",
+                "severity": "medium",
+                "summary": "Missing tests for module A",
+                "missing_tests": ["test_a"],
+                "test_file": "tests/test_a.rs",
+            },
+            {
+                "fingerprint": "tg-invalid",
+                "severity": "low",
+                "summary": "Missing tests but no test_file",
+                "missing_tests": ["test_b"],
+            },
+        ]);
+        std::fs::write(&out, batch.to_string()).unwrap();
+        support::done()
+    });
+
+    let summary = run_cycle(&store, &cfg, &backend, None).await;
+
+    assert_eq!(summary.job_id, Some(1), "{summary:?}");
+    assert_eq!(summary.state, Some(JobState::Done), "{summary:?}");
+    let ingest = summary.ingest.as_ref().expect("the batch was ingested");
+    assert_eq!((ingest.inserted, ingest.invalid), (1, 1), "{summary:?}");
+    assert!(
+        last_test_gap_at(&store).await > STALE_TEST_GAP,
+        "a batch with any invalid entry must still bump last_test_gap_at, \
+         or this kind keeps winning the oldest-first rotation forever"
+    );
+    let picked = pick_next(&store, &cfg, None).await.unwrap();
+    assert!(
+        matches!(
+            picked,
+            Some(Candidate::Repo {
+                kind: RepoJobKind::DepUpdate,
+                ..
+            })
+        ),
+        "after test_gap's turn the next-stalest kind must be selected, got {picked:?}"
+    );
+}
