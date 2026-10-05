@@ -1240,9 +1240,16 @@ async fn sync_repo(
         // Deletion now removes the directory, so reaching here means
         // something outside the daemon put it there: refuse rather than
         // guess.
+        // The configured URL, not `remote get-url`: that one is rewritten
+        // through `url.<base>.insteadOf`, while `git clone -- <url>` stored
+        // `repo_url` as given, so a matching rule in the user's gitconfig
+        // would make the daemon's own clone look like somebody else's.
         let rp = rpath.to_string_lossy().to_string();
         let (rc, out) = tokio::task::spawn_blocking(move || {
-            run_cmd_sync(&["git", "-C", &rp, "remote", "get-url", "origin"], 60)
+            run_cmd_sync(
+                &["git", "-C", &rp, "config", "--get", "remote.origin.url"],
+                60,
+            )
         })
         .await
         .unwrap_or((127, "spawn error".to_owned()));
