@@ -266,7 +266,7 @@ async fn an_attempt_that_died_before_doing_any_work_stays_failed() {
 ///
 /// `run_analysis_job` stamps only a clean batch, so the cycle's fallback
 /// is the only thing that moves `last_test_gap_at` here. Left at its old
-/// value, test_gap stays the stalest kind and `pick_next` hands the same
+/// value, `test_gap` stays the stalest kind and `pick_next` hands the same
 /// repo the same scan every cycle until a worker happens to emit a
 /// perfectly valid file.
 #[tokio::test]
