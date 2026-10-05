@@ -4723,7 +4723,7 @@ async fn run_cycle_inner(
     };
 
     // Starvation prevention for rotation kinds: bump the timestamp on
-    // failed/killed/done-without-output/done-with-all-invalid so this
+    // failed/killed/done-without-output/done-with-any-invalid so this
     // kind doesn't monopolise the rotation forever. This is SEPARATE from
     // run_analysis_job's success-gated timestamp (which governs this kind's
     // own retry cadence) — this block ensures OTHER kinds get a turn.
@@ -4745,10 +4745,7 @@ async fn run_cycle_inner(
         let failed = matches!(result.state, Some(JobState::Killed | JobState::Failed))
             || result.error.is_some()
             || (result.state == Some(JobState::Done) && result.ingest.is_none())
-            || result
-                .ingest
-                .as_ref()
-                .is_some_and(|i| i.inserted == 0 && i.invalid > 0);
+            || result.ingest.as_ref().is_some_and(|i| i.invalid > 0);
         if failed {
             let _ = store.set_last_kind_at(*repo_id, *kind).await;
         }
