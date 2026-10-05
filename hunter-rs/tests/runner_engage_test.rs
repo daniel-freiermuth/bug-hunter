@@ -587,7 +587,11 @@ async fn an_insteadof_rewrite_of_the_origin_is_not_refused() {
 
     let row = store.get_repo_by_id(rid).await.unwrap().unwrap();
     let playbooks = dir.subdir("playbooks");
-    std::fs::write(playbooks.join("hunt.md"), "hunt {{WORKTREE}}\n").unwrap();
+    std::fs::write(
+        playbooks.join("hunt.md"),
+        "hunt {{REPO_PATH}} {{DIFF_RANGE}} -> {{OUT_PATH}}\n",
+    )
+    .unwrap();
     let mut cfg = Config::load(dir.path()).expect("load config");
     cfg.work_root = dir.subdir("work_root");
     let backend = ScriptedBackend::writing("findings.json", "[]");
