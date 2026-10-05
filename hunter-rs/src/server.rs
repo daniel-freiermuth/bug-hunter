@@ -1181,10 +1181,16 @@ async fn repoint_clone_origin(rid: i64, dir: &Path, old_url: &str, new_url: &str
         return;
     }
     let dir_s = dir.to_string_lossy().into_owned();
+    // The configured URL, as `sync_repo` reads it: `remote get-url` is
+    // rewritten through `url.<base>.insteadOf` and would never match the
+    // raw `old_url` under such a rule.
     let (rc, out) = {
         let d = dir_s.clone();
         tokio::task::spawn_blocking(move || {
-            crate::util::run_cmd(&["git", "-C", &d, "remote", "get-url", "origin"], 30)
+            crate::util::run_cmd(
+                &["git", "-C", &d, "config", "--get", "remote.origin.url"],
+                30,
+            )
         })
         .await
         .unwrap_or((127, "spawn error".to_owned()))
