@@ -1365,6 +1365,77 @@ async fn changing_the_url_repoints_the_existing_clone() {
     );
 }
 
+/// The repoint reads the origin the way `sync_repo` does, so an insteadOf
+/// rule in the user's gitconfig does not stop it.
+///
+/// `remote get-url` prints the URL after `url.<base>.insteadOf`
+/// rewriting, which never equals the stored old URL under such a rule;
+/// the clone was left on the old origin and `sync_repo` then refused it
+/// on every job. The rule sits in the clone's own config here so the
+/// test touches no global git config; git applies it identically.
+#[tokio::test]
+async fn changing_the_url_repoints_a_clone_under_an_insteadof_rule() {
+    let state = test_state().await;
+    let (status, body) = post(
+        &state,
+        "/api/repos",
+        json!({ "name": "aliased", "url": "https://example.com/old.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body: {body}");
+    let rid = body["repo"]["id"].as_i64().expect("new repo id");
+
+    let dir = state
+        .config
+        .work_root
+        .join("repos")
+        .join(format!("repo-{rid}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let d = dir.to_string_lossy().to_string();
+    for argv in [
+        vec!["git", "-C", &d, "init", "-q"],
+        vec![
+            "git",
+            "-C",
+            &d,
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/old.git",
+        ],
+        vec![
+            "git",
+            "-C",
+            &d,
+            "config",
+            "url.git@example.com:.insteadOf",
+            "https://example.com/",
+        ],
+    ] {
+        let (rc, out) = hunter::util::run_cmd(&argv, 30);
+        assert_eq!(rc, 0, "fixture: {argv:?} failed: {out}");
+    }
+
+    let (status, body) = post(
+        &state,
+        "/api/repo",
+        json!({ "id": rid, "url": "https://example.com/new.git" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (rc, out) = hunter::util::run_cmd(
+        &["git", "-C", &d, "config", "--get", "remote.origin.url"],
+        30,
+    );
+    assert_eq!(rc, 0);
+    assert_eq!(
+        out.trim(),
+        "https://example.com/new.git",
+        "the clone must follow the repo to its new url"
+    );
+}
+
 /// A clone belonging to something else is left alone to trip the check.
 #[tokio::test]
 async fn changing_the_url_leaves_an_unrelated_clone_untouched() {
