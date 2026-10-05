@@ -543,6 +543,63 @@ async fn a_clone_of_a_different_repository_is_refused() {
     );
 }
 
+/// A clone whose origin is the repo's URL is not refused because a
+/// `url.<base>.insteadOf` rule rewrites that URL.
+///
+/// `git clone -- <url>` stores the URL as given, but `git remote get-url`
+/// prints it after insteadOf rewriting, so a rule in the daemon user's
+/// gitconfig (`url."git@github.com:".insteadOf https://github.com/` is
+/// the common one) made the clone the daemon itself had just made look
+/// like somebody else's: every later job for the repo was refused. The
+/// rule sits in the clone's own config here so the test touches no global
+/// git config; git applies it identically.
+#[tokio::test]
+async fn an_insteadof_rewrite_of_the_origin_is_not_refused() {
+    let dir = TempDir::new("insteadof-origin");
+    let repo = GitRepo::with_branch(&dir, BRANCH);
+    let (_db, store) = fresh_store(&dir, "insteadof").await;
+
+    let repos_root = dir.path().join("repos");
+    std::fs::create_dir_all(&repos_root).unwrap();
+    let rid = store
+        .add_repo(
+            "widget",
+            REPO_URL,
+            &repos_root,
+            &repo.default_branch,
+            ForgeName::Github,
+        )
+        .await
+        .unwrap();
+    let repo_dir = hunter::store::Store::repo_dir(&repos_root, rid);
+    std::fs::rename(&repo.work, &repo_dir).unwrap();
+    // Origin is the registered URL, exactly as `git clone -- <url>`
+    // records it; the rule resolves it to the local bare origin.
+    support::git(&repo_dir, &["remote", "set-url", "origin", REPO_URL]);
+    support::git(
+        &repo_dir,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", repo.origin.display()),
+            REPO_URL,
+        ],
+    );
+
+    let row = store.get_repo_by_id(rid).await.unwrap().unwrap();
+    let playbooks = dir.subdir("playbooks");
+    std::fs::write(playbooks.join("hunt.md"), "hunt {{WORKTREE}}\n").unwrap();
+    let mut cfg = Config::load(dir.path()).expect("load config");
+    cfg.work_root = dir.subdir("work_root");
+    let backend = ScriptedBackend::writing("findings.json", "[]");
+    let summary = hunter::scheduler::run_hunt(&store, &cfg, &row, &backend, None)
+        .await
+        .expect("the daemon's own clone must not be refused over an insteadOf rewrite");
+    assert!(
+        summary.job_id.is_some(),
+        "the hunt must get past the sync and run: {summary:?}"
+    );
+}
+
 /// A hunt whose repo was deleted between the pick and the job insert
 /// reports which kind and which repo it skipped.
 ///
