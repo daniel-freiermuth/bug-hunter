@@ -10,16 +10,45 @@
   let filterBar: { clearFilters: () => void } | undefined = $state();
   const repoNames = $derived(new Map((store.summary?.repos ?? []).map((r) => [r.id, r.name])));
 
+  // Frames the focused card must hold still before the jump counts as done,
+  // and the most frames spent getting there.
+  const SETTLED_FRAMES = 3;
+  const MAX_SETTLE_FRAMES = 120;
+
   $effect(() => {
     if (focusId == null) return;
     const target = `finding-${focusId}`;
     let clearedFilters = false;
     let highlighted: HTMLElement | null = null;
+    let frame = 0;
+
+    // Off-screen cards are empty boxes of an estimated height
+    // (FindingCard), and every card near the viewport mounts and takes its
+    // real one. So one scroll lands wherever the estimate put the target --
+    // a smooth one also mounts every card it passes and lands thousands of
+    // pixels off. Jump instantly instead, and re-centre each frame until
+    // the cards around the target have mounted and it stops moving.
+    function settleOn(el: HTMLElement) {
+      let lastTop = Number.NaN;
+      let still = 0;
+      let frames = 0;
+      const step = () => {
+        el.scrollIntoView({ behavior: "instant", block: "center" });
+        const top = el.getBoundingClientRect().top;
+        still = Math.abs(top - lastTop) < 1 ? still + 1 : 0;
+        lastTop = top;
+        if (still < SETTLED_FRAMES && ++frames < MAX_SETTLE_FRAMES) {
+          frame = requestAnimationFrame(step);
+        }
+      };
+      frame = requestAnimationFrame(step);
+    }
+
     const interval = setInterval(() => {
       const el = document.getElementById(target);
       if (el) {
         clearInterval(interval);
-        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        settleOn(el);
         el.classList.add("highlight-focus");
         highlighted = el;
         return;
@@ -34,6 +63,7 @@
     return () => {
       clearInterval(interval);
       clearTimeout(giveUp);
+      cancelAnimationFrame(frame);
       highlighted?.classList.remove("highlight-focus");
     };
   });
