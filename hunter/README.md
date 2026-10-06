@@ -86,13 +86,18 @@ new ──recheck──> new / wontfix / rejected
 
 - **`new`** — freshly ingested, awaiting triage (or a `bug` fresh from a
   hunt; other types can also be queued directly for `apply_*` playbooks).
-- **`queued` → `fixing` → `pr_open`** — a fix/apply worker checks out a
-  fresh worktree, verifies the finding against current code (never trusts
-  its own prior analysis), and either ships a draft PR, declines
-  (`NOT-A-BUG.md`/`DECLINED.md`/`BLOCKED.md`), or gets requeued. `fixing` is
-  structurally impossible to strand: a context-manager guard resets it to
-  `queued` on ANY exit path, including an unhandled exception or a process
-  kill.
+- **`queued` → `fixing` → `pr_open`** — a fix/apply worker verifies the
+  finding and ships a draft PR, declines (`NOT-A-BUG.md`/`DECLINED.md`),
+  or pauses. A requeued checkpoint continues in its original worktree and
+  transcript instead of recreating the branch.
+- **`blocked`** — valid work waiting on a verification prerequisite,
+  dependency, or human decision. The full reason is stored with the job;
+  the fix job becomes a suspended checkpoint, keeping committed work,
+  uncommitted reports, and its transcript. It is NOT suppressed and cannot
+  resume automatically. Resolve the prerequisite and select **Resume fix**
+  in Kanban; this queues the retained checkpoint under normal budget rules.
+  Repeated unsuccessful fix attempts become blocked, not rejected. Only
+  the scheduler sets `blocked`; it is not a verdict.
 - **`pr_open`** — tracked via `sync_prs` (free — `gh pr view`, no worker)
   every cycle: merged → `merged`; closed unmerged → `closed`; new
   comments/reviews, `CHANGES_REQUESTED`, merge conflicts, or failing checks
@@ -204,10 +209,11 @@ forever:
 - **Finding moved on.** A finding suspension resumes only at its kind's
   actionable status (fix: `queued`, recheck: `rechecking`, engage:
   `pr_open`, harvest: `merged`/`closed`). One whose finding is anywhere
-  else — a suspended fix the operator rejected, a fix unqueued back to
+  else — a blocked fix the operator rejected, a fix unqueued back to
   `new` — is marked `killed` (reason `finding-moved`) by the sweep before
-  each cycle, so its tree is released. A fix at `fixing`, which `run_fix`
-  is about to continue, is kept.
+  each cycle, so its tree is released. A fix at `blocked` is the
+  exception, held until the operator resumes or discards it, as is one at
+  `fixing`, which `run_fix` is about to continue.
 
 ### Budget policy
 
@@ -293,7 +299,7 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 |---|---|
 | **Status** | Budget bars (used + available, per window), Run/Pause and Overdrive controls, what the scheduler is doing right now / why it isn't, and the recent event log |
 | **Inbox** | New findings awaiting triage, with per-type filters |
-| **Kanban / Pipeline** | Findings in flight (queued → fixing → pr\_open), suppressed (rejected/wontfix) and informational (note) findings |
+| **Kanban / Pipeline** | Findings in flight, a separate Blocked section with prerequisite reports and Resume fix controls, suppressed (rejected/wontfix), and informational (note) findings |
 | **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand |
 | **Repos** | Add/remove/pause repos; per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
 | **Stats** | Aggregate totals by kind and by finding type |

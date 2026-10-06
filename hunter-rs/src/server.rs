@@ -473,6 +473,7 @@ async fn findings(
     let ids: Vec<i64> = rows.iter().map(|f| f.id).collect();
     let mut timelines = store.events_by_finding(&ids).await?;
     let attention = store.pr_attention().await?;
+    let mut blockers = store.held_fix_blockers().await?;
     let mut follow_up_of: HashMap<i64, i64> = HashMap::new();
     let mut follow_ups: HashMap<i64, Vec<i64>> = HashMap::new();
     for (source, follow_up) in store.follow_up_pairs(&ids).await? {
@@ -494,6 +495,7 @@ async fn findings(
                 None
             };
             FindingOut {
+                blocker: blockers.remove(&finding.id),
                 follow_up_of: follow_up_of.get(&finding.id).copied(),
                 follow_ups: follow_ups.remove(&finding.id).unwrap_or_default(),
                 finding,

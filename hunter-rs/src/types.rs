@@ -182,6 +182,11 @@ pub struct FindingOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub needs_attention: Option<Option<String>>,
+    /// Present ONLY for status == "blocked" rows whose held fix checkpoint
+    /// carries a report (`jobs.blocker`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub blocker: Option<String>,
     /// The finding whose engage/harvest job filed this one as a follow-up;
     /// null for everything a hunt or analysis job found. Always present.
     pub follow_up_of: Option<i64>,

@@ -50,6 +50,7 @@
       case "queued": return "status-queued";
       case "rechecking": return "status-rechecking";
       case "fixing": return "status-fixing";
+      case "blocked": return "status-blocked";
       case "pr_open": return "status-pr-open";
       case "merged": return "status-merged";
       case "closed": return "status-closed";
@@ -191,6 +192,13 @@
     <!-- Summary -->
     <p class="summary">{finding.summary}</p>
 
+    {#if finding.status === "blocked"}
+      <div class="blocker-reason">
+        <strong>Blocked:</strong>
+        {finding.blocker ?? "(no reason recorded)"}
+      </div>
+    {/if}
+
     <!-- Subtitle: fingerprint + file:line -->
     <div class="meta-line">
       <span class="fingerprint" title={finding.fingerprint}>{finding.fingerprint}</span>
@@ -269,7 +277,12 @@
           </div>
         {:else}
           <div class="btn-row">
-            <button class="btn btn-queue" disabled={busy} onclick={() => doVerdict("queued")} title="Queue for fix">Queue</button>
+            <button
+              class="btn btn-queue"
+              disabled={busy}
+              onclick={() => doVerdict("queued")}
+              title={finding.status === "blocked" ? "Resume retained fix work after resolving the prerequisite" : "Queue for fix"}
+            >{finding.status === "blocked" ? "Resume fix" : "Queue"}</button>
             <button class="btn btn-reject" disabled={busy} onclick={() => { showReasonPrompt = "rejected"; }} title="Reject">Reject</button>
             <button class="btn btn-muted" disabled={busy} onclick={() => { showReasonPrompt = "wontfix"; }} title="Won't fix">Wontfix</button>
             <button class="btn btn-muted" disabled={busy} onclick={() => doVerdict("note")} title="Mark as note">Note</button>
@@ -476,6 +489,7 @@
   }
   .status-new, .status-rechecking { background: rgba(78, 168, 222, 0.12); color: var(--accent); }
   .status-queued, .status-fixing  { background: rgba(255, 153, 0, 0.12); color: var(--sev-medium); }
+  .status-blocked                 { background: rgba(255, 153, 0, 0.18); color: var(--sev-medium); border: 1px solid var(--sev-medium); }
   .status-pr-open                 { background: rgba(68, 238, 136, 0.12); color: var(--ok); }
   .status-merged                  { background: rgba(68, 238, 136, 0.18); color: var(--ok); }
   /* Closed unmerged, awaiting its harvest: not a failure (and not suppressed),
@@ -493,6 +507,17 @@
     line-height: 1.5;
     overflow-wrap: break-word;
     word-break: break-word;
+  }
+
+  .blocker-reason {
+    margin-top: 0.5rem;
+    padding: 0.5rem 0.625rem;
+    border-left: 2px solid var(--sev-medium);
+    background: rgba(255, 153, 0, 0.06);
+    font-size: 0.8125rem;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
   }
 
   /* ── Meta (fingerprint + location) ──────────────────────────── */

@@ -22,6 +22,12 @@ pub enum FindingStatus {
     Rechecking,
     Queued,
     Fixing,
+    /// Valid work retained until an operator resolves a verification or
+    /// environment blocker and explicitly queues the fix to continue.
+    /// Not suppressed: inability to finish is not evidence of invalidity.
+    /// Set only by the scheduler (a worker's `BLOCKED.md`, or repeated
+    /// identical failures), never by a verdict: a hold needs a checkpoint.
+    Blocked,
     PrOpen,
     Merged,
     /// The PR was closed without merging and has not been harvested yet.
@@ -41,11 +47,12 @@ pub enum FindingStatus {
 }
 
 impl FindingStatus {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::New,
         Self::Rechecking,
         Self::Queued,
         Self::Fixing,
+        Self::Blocked,
         Self::PrOpen,
         Self::Merged,
         Self::Closed,
@@ -61,6 +68,7 @@ impl FindingStatus {
             Self::Rechecking => "rechecking",
             Self::Queued => "queued",
             Self::Fixing => "fixing",
+            Self::Blocked => "blocked",
             Self::PrOpen => "pr_open",
             Self::Merged => "merged",
             Self::Closed => "closed",
@@ -84,8 +92,8 @@ impl FindingStatus {
         matches!(self, Self::Rejected | Self::Wontfix)
     }
 
-    /// Suppressed statuses (feed the suppression corpus). `Closed` and
-    /// `Superseded` are left out on purpose: see their variants.
+    /// Suppressed statuses (feed the suppression corpus). `Blocked`,
+    /// `Closed`, and `Superseded` are left out on purpose: see their variants.
     pub fn is_suppressed(self) -> bool {
         matches!(self, Self::Rejected | Self::Wontfix)
     }
@@ -227,8 +235,9 @@ pub enum JobState {
     /// started over. Either the worker hit the token bound, or it died
     /// after doing metered work (a provider error, a dead connection, the
     /// daemon going down under it), or a wallclock kill after doing
-    /// metered work. Resume chains are bounded by the give-up ceiling.
-    /// See `scheduler::job_state`.
+    /// metered work. Completed fixes awaiting operator resolution of a
+    /// verification or environment blocker also retain their checkpoint here.
+    /// Resume chains are bounded by the give-up ceiling. See `scheduler::job_state`.
     Suspended,
     Denied,
 }
