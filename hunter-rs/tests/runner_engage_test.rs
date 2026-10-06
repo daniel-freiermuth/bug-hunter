@@ -21,7 +21,7 @@
 mod support;
 
 use hunter::config::Config;
-use hunter::domain::{FindingStatus, ForgeName, RepoJobKind};
+use hunter::domain::{BudgetOverride, FindingStatus, ForgeName, RepoJobKind};
 use hunter::store::{FindingInsert, SyncPrData};
 use support::{FakeBins, GitRepo, ScriptedBackend, TempDir, fresh_store};
 
@@ -492,6 +492,63 @@ async fn failed_close_marks_the_attention_addressed_so_it_stops_being_repicked()
         Some("af-1"),
         "the attention reason must be marked addressed, or the next cycle picks it straight back up"
     );
+}
+
+/// A withdrawing engage is an attempt like any other: it spends a `once`
+/// override and keeps an `exempt` one, whether the close lands or not.
+/// A `once` left behind would hand the closed PR's harvest the
+/// prioritized budget and put it at the head of the queue, so a single
+/// override would pay for a second job.
+#[tokio::test]
+async fn a_withdrawal_spends_only_a_once_override() {
+    let bins = FakeBins::acquire("engage-withdraw-override");
+    for close_fails in [false, true] {
+        for (mode, left) in [
+            (BudgetOverride::Once, None),
+            (BudgetOverride::Exempt, Some(BudgetOverride::Exempt)),
+        ] {
+            let f = fixture(&format!("engage-withdraw-override-{close_fails}-{mode}")).await;
+            if close_fails {
+                bins.ok_unless_action("gh", "pr comment", PR_VIEW_JSON);
+            } else {
+                bins.ok("gh", PR_VIEW_JSON);
+            }
+            f.store
+                .set_budget_override(f.fid, Some(mode))
+                .await
+                .unwrap();
+
+            let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+            let backend = ScriptedBackend::writing("WITHDRAW.md", "superseded by #9");
+            let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+                .await
+                .unwrap();
+
+            let outcome = if close_fails {
+                "withdraw-failed"
+            } else {
+                "withdrawn"
+            };
+            assert_eq!(
+                summary.outcome.as_deref(),
+                Some(outcome),
+                "{mode}: {summary:?}"
+            );
+            let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+            assert_eq!(after.budget_override, left, "{outcome}, {mode} override");
+            if !close_fails {
+                let next = hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+                    .await
+                    .unwrap()
+                    .expect("the closed PR's harvest is pending");
+                assert_eq!(
+                    next.budget_override(),
+                    left,
+                    "the cold harvest must not run under a spent override"
+                );
+            }
+        }
+    }
 }
 
 /// A clone directory belonging to a different repository is refused.
