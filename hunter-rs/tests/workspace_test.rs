@@ -84,6 +84,33 @@ async fn fixture(label: &str, default_branch: &str) -> Fixture {
     }
 }
 
+/// Git changes directory to the clone before adding a worktree. A relative
+/// project root must not relocate that tree away from the worker's cwd.
+#[tokio::test]
+async fn relative_project_root_creates_tree_at_worker_cwd() {
+    let _bins = FakeBins::acquire("ws-relative-root");
+    let f = fixture("ws-relative-root", "main").await;
+    let project = f.dir.subdir("hunter");
+    // nextest gives this test its own process, so the cwd cannot race others.
+    std::env::set_current_dir(f.dir.path()).unwrap();
+    let cfg = Config::load(Path::new("hunter")).unwrap();
+    let ws = Workspace::for_chain(&cfg.work_root, &f.clone, 1);
+    let pinned = workspace::create(
+        &ws,
+        &TreeSpec::Branch {
+            name: "fix/relative-root".to_owned(),
+            at: "origin/main".to_owned(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(git(&ws.tree, &["rev-parse", "HEAD"]).trim(), pinned);
+    assert_eq!(
+        std::fs::read_to_string(project.join("data/jobs/1/tree/README.md")).unwrap(),
+        "seed\n",
+    );
+}
+
 async fn job_state(pool: &SqlitePool, id: i64) -> (String, Option<String>, Option<String>) {
     sqlx::query_as("SELECT state, killed_reason, notes FROM jobs WHERE id = ?1")
         .bind(id)
