@@ -180,14 +180,19 @@ A repeatedly-failing item (same failure reason, consecutive attempts) gives
 up after a bounded streak rather than looping forever — this applies
 uniformly to fix retries, recheck retries, and harvest retries. A resume
 chain has the same kind of ceiling, on either of two counts: once it has
-made four attempts, or once — after at least one resume — everything it
-spent *besides its single largest attempt* is past three times what that
-kind of job typically costs. Whichever fires, the suspension is marked
-`failed` (reason `give-up`) instead of being continued again. A chain
+made four useful-work attempts, or once — after at least one resume —
+everything it spent *besides its single largest attempt* is past three
+times what that kind of job typically costs. Whichever fires, the
+suspension is marked `failed` (reason `give-up`) instead of being
+continued again. A chain
 that has never been resumed is never retired: one attempt's spend is by
 definition at least its own cap, and the largest attempt is discounted
 because one enormous attempt says the job is big, not that the chain is
 stuck.
+
+The initial attempt and every cap-killed attempt always count; any other
+resumed handoff with zero or unknown metered spend (e.g. a provider failure
+before the first response) does not use this allowance.
 
 Two more things end a suspension, because after either one it can never
 usefully be continued, and a suspension nobody ends stays `suspended`

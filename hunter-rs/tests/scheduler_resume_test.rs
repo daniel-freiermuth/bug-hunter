@@ -488,6 +488,65 @@ async fn resume_falls_back_to_the_per_kind_estimate_when_every_call_was_killed()
 
 // -- the give-up ceiling -----------------------------------------------------
 
+/// Resumed links that spent nothing — zero or unrecorded spend, as a
+/// provider failure before the first response leaves — consume no work
+/// retry; later progress can still continue the chain.
+#[tokio::test]
+async fn zero_progress_handoffs_do_not_exhaust_the_useful_work_retry_limit() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    let session = seed_session(&dir);
+    let newest = seed_chain(&pool, &session, &[120_000, 0, 0, 110_000]).await;
+    // The handoffs failed before any response, so they were not cap kills;
+    // one recorded no spend at all, as a failed backend leaves it.
+    sqlx::query(
+        "UPDATE jobs SET killed_reason = NULL, \
+         tokens_new = CASE id WHEN ?1 THEN NULL ELSE tokens_new END \
+         WHERE id IN (?1, ?2)",
+    )
+    .bind(newest - 1)
+    .bind(newest - 2)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    let stats = store.resume_chain_stats(newest).await.unwrap();
+    assert_eq!(stats.attempts, 2);
+    assert_eq!(stats.total, 230_000);
+    let picked = pick_next(&store, &test_config(dir.path()), None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(picked, Some(Candidate::Resume { plan, .. }) if plan.predecessor_id == newest)
+    );
+}
+
+/// Cap kills re-suspend on their own, so they count as attempts even when
+/// they recorded no spend: otherwise nothing would ever end such a chain.
+#[tokio::test]
+async fn zero_spend_cap_kills_still_exhaust_the_attempt_limit() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    let session = seed_session(&dir);
+    let newest = seed_chain(&pool, &session, &[120_000, 0, 0, 0]).await;
+    let store = rw_store(&path).await;
+    assert_eq!(store.resume_chain_stats(newest).await.unwrap().attempts, 4);
+
+    let picked = pick_next(&store, &test_config(dir.path()), None)
+        .await
+        .unwrap();
+
+    assert!(
+        !matches!(picked, Some(Candidate::Resume { .. })),
+        "a chain of four cap kills must not be resumed again, got {picked:?}"
+    );
+    let (state, reason, _) = job_row(&pool, newest).await;
+    assert_eq!(state, JobState::Failed.as_str());
+    assert_eq!(reason.as_deref(), Some("give-up"));
+}
+
 /// A chain that has been tried too many times is abandoned, however
 /// cheap each attempt was.
 ///
