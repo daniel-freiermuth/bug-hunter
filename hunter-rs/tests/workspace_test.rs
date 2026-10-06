@@ -430,6 +430,141 @@ async fn the_sweep_releases_only_finished_chains_and_ages_out_their_sessions() {
     );
 }
 
+/// A link of the chain rooted at `made_workspace`'s job: a row that
+/// continues `resumed_from` and owns no workspace of its own.
+async fn resumed_link(
+    f: &Fixture,
+    id: i64,
+    resumed_from: i64,
+    state: &str,
+    finished_at: Option<i64>,
+) {
+    sqlx::query(
+        "INSERT INTO jobs (id, kind, repo_id, state, started_at, finished_at, resumed_from) \
+         VALUES (?1, 'hunt', 1, ?2, 1000, ?3, ?4)",
+    )
+    .bind(id)
+    .bind(state)
+    .bind(finished_at)
+    .bind(resumed_from)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+}
+
+/// A resume never changes the attempt it continues: that row stays
+/// `suspended` for good, superseded by its successor. So once the
+/// successor finishes, the chain is finished, and its tree is released
+/// by the executor that recorded the outcome.
+#[tokio::test]
+async fn a_resumed_chain_that_finished_releases_its_tree() {
+    let f = fixture("ws-resumed-done", "main").await;
+
+    let (_, _, cold, _, origin_id) = suspend_then_resume_a_hunt(&f).await;
+
+    let (origin_state, _, _) = job_state(&f.pool, origin_id).await;
+    assert_eq!(
+        origin_state, "suspended",
+        "the resumed attempt is untouched"
+    );
+    let status = f.store.chain_status(origin_id).await.unwrap();
+    assert_eq!((status.attempts, status.live), (2, 0), "{status:?}");
+    assert!(
+        !cold.tree.exists(),
+        "a finished resumed chain's tree is released"
+    );
+    assert!(
+        !git(&f.clone, &["worktree", "list", "--porcelain"])
+            .contains(cold.tree.to_string_lossy().as_ref()),
+        "and unregistered from the clone"
+    );
+    assert!(
+        cold.session.join("session.jsonl").is_file(),
+        "the transcript outlives the tree"
+    );
+}
+
+/// The sweep reads a multi-attempt chain as a whole: kept while its newest
+/// attempt runs, released once that attempt finished, and aged out by the
+/// newest attempt's finish, not the origin's.
+#[tokio::test]
+async fn the_sweep_ages_a_resumed_chain_by_its_newest_attempt() {
+    let f = fixture("ws-sweep-resumed", "main").await;
+    let now = hunter::util::now_ms();
+    let origin_finished = now - SESSION_RETENTION_MS - 60_000;
+    let ws = made_workspace(&f, 10, "suspended", origin_finished).await;
+    resumed_link(&f, 11, 10, "running", None).await;
+
+    let report = workspace::sweep(&f.store, &f.cfg.work_root, now)
+        .await
+        .unwrap();
+    assert_eq!(report.trees_released, 0);
+    assert!(ws.tree.is_dir(), "a chain whose resume runs keeps its tree");
+
+    sqlx::query("UPDATE jobs SET state = 'done', finished_at = ?1 WHERE id = 11")
+        .bind(now)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let status = f.store.chain_status(10).await.unwrap();
+    assert_eq!(status.live, 0, "{status:?}");
+    assert_eq!(
+        status.last_finished_at,
+        Some(now),
+        "the newest attempt's finish"
+    );
+
+    let report = workspace::sweep(&f.store, &f.cfg.work_root, now)
+        .await
+        .unwrap();
+    assert_eq!(report.trees_released, 1);
+    assert!(
+        !ws.tree.exists(),
+        "a finished resumed chain's tree is released"
+    );
+    assert!(
+        ws.root.is_dir(),
+        "the origin's old finish does not age out a chain that just ended"
+    );
+
+    let report = workspace::sweep(&f.store, &f.cfg.work_root, now + SESSION_RETENTION_MS + 1)
+        .await
+        .unwrap();
+    assert_eq!(report.workspaces_removed, 1);
+    assert!(!ws.root.exists(), "past retention the workspace goes");
+}
+
+/// The give-up ceiling retires only the newest link of a chain; every
+/// earlier link stays `suspended`, each continued by the next. The chain
+/// is still over, and its tree is released.
+#[tokio::test]
+async fn a_chain_given_up_after_several_attempts_releases_its_tree() {
+    let f = fixture("ws-giveup", "main").await;
+    let now = hunter::util::now_ms();
+    let ws = made_workspace(&f, 10, "suspended", now - 4_000).await;
+    resumed_link(&f, 11, 10, "suspended", Some(now - 3_000)).await;
+    resumed_link(&f, 12, 11, "suspended", Some(now - 2_000)).await;
+    resumed_link(&f, 13, 12, "suspended", Some(now - 1_000)).await;
+
+    let report = workspace::sweep(&f.store, &f.cfg.work_root, now)
+        .await
+        .unwrap();
+    assert_eq!(report.trees_released, 0);
+    assert!(ws.tree.is_dir(), "the newest suspension is still resumable");
+
+    f.store
+        .retire_suspended_job(13, JobState::Failed, Some("give-up"), "gave up")
+        .await
+        .unwrap();
+    let status = f.store.chain_status(10).await.unwrap();
+    assert_eq!((status.attempts, status.live), (4, 0), "{status:?}");
+    assert!(
+        workspace::release_if_idle(&f.store, &ws).await.unwrap(),
+        "a given-up chain is released"
+    );
+    assert!(!ws.tree.exists());
+}
+
 /// A daemon killed during `git worktree add` leaves the registration
 /// locked (`initializing`) with its directory gone. Plain prune skips a
 /// locked worktree, so the sweep must unlock it first -- but only one
