@@ -4386,6 +4386,13 @@ pub async fn run_engage(
     let withdraw = start.ws.tree.join("WITHDRAW.md");
     let closed_on_forge = if withdraw.exists() {
         let reason = std::fs::read_to_string(&withdraw).unwrap_or_default();
+        // The withdrawal is this attempt's end, whatever the forge does
+        // with it, so it spends a `once` override here, before the handoff
+        // reloads the finding: left set, the closed PR's harvest would run
+        // prioritized and jump the queue on it.
+        if finding.budget_override == Some(BudgetOverride::Once) {
+            let _ = store.set_budget_override(fid, None).await;
+        }
         withdraw_pr(store, fid, &start, &reason, &mut summary).await
     } else {
         let published = push_and_reply(&start, state).await;
