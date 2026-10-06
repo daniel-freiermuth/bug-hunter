@@ -895,6 +895,51 @@ async fn an_unavailable_transcript_leaves_the_finding_closed_and_releases_the_tr
     assert_left_for_the_cold_harvest(&f, &runs[0].tree).await;
 }
 
+/// The handoff's worker finishes but says nothing about why the PR
+/// closed, so the handoff fails and the cold harvest reviews the PR again
+/// from scratch, follow-ups included. The failed handoff's own follow-ups
+/// must not be filed: the cold review re-derives them under slugs of its
+/// own choosing, and the same open work would be filed twice.
+#[tokio::test]
+async fn a_failed_handoff_files_no_follow_ups() {
+    let f = fixture("handoff-followups").await;
+    let bins = FakeBins::acquire("handoff-followups");
+    gh_for_handoff(&bins);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::staged(move |tree, resume_from| {
+        let session = tree.parent().unwrap().join("session").join("engage.jsonl");
+        if resume_from.is_none() {
+            std::fs::write(tree.join("WITHDRAW.md"), "superseded by #9").unwrap();
+            std::fs::write(&session, format!("{USAGE}\n")).unwrap();
+        } else {
+            std::fs::write(tree.join("FOLLOW-UPS.json"), FOLLOW_UP).unwrap();
+        }
+        hunter::types::RunResult {
+            session_file: Some(session.to_string_lossy().into_owned()),
+            ..support::done()
+        }
+    });
+
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("withdrawn"));
+    let runs = backend.runs();
+    assert_eq!(runs.len(), 2, "the handoff must have run: {runs:?}");
+    let all = f
+        .store
+        .list_findings(&hunter::store::FindingFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        all.len(),
+        1,
+        "a failed handoff's FOLLOW-UPS.json must not be filed: {all:?}"
+    );
+    assert_left_for_the_cold_harvest(&f, &runs[0].tree).await;
+}
+
 /// The closed PR's diff will not load for the handoff. That fails the
 /// handoff before any harvest job exists, but it is still no harvest
 /// failure: the cold harvest keeps its full budget of attempts, so no
