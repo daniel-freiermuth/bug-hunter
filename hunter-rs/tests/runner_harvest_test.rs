@@ -528,6 +528,110 @@ async fn an_invalid_close_reason_counts_toward_the_streak() {
     );
 }
 
+/// How many findings carry `fingerprint`.
+async fn filed(f: &Fixture, fingerprint: &str) -> usize {
+    f.store
+        .list_findings(&hunter::store::FindingFilter::default())
+        .await
+        .unwrap()
+        .iter()
+        .filter(|x| x.fingerprint == fingerprint)
+        .count()
+}
+
+/// A worker that leaves `close` as `CLOSE-REASON.json` and the
+/// `FOLLOW_UP` entry, filed under `fingerprint`, as `FOLLOW-UPS.json`.
+fn classifying_with_follow_up(close: String, fingerprint: &'static str) -> ScriptedBackend {
+    let followups = FOLLOW_UP.replace("widget:src/lib.rs:left-open", fingerprint);
+    ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("CLOSE-REASON.json"), &close).unwrap();
+        std::fs::write(tree.join("FOLLOW-UPS.json"), &followups).unwrap();
+        support::done()
+    })
+}
+
+/// A harvest that will be retried is reviewed again from scratch,
+/// follow-ups included, and the retry picks its own slugs: filing the
+/// failed attempt's follow-ups would file the same open work twice. Only
+/// the attempt that lands files them.
+#[tokio::test]
+async fn a_retried_harvest_files_no_follow_ups() {
+    let bins = FakeBins::acquire("harvest-retry-followups");
+    gh_default(&bins);
+    let f = fixture("harvest-retry-followups", FindingStatus::Closed).await;
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let first = run_harvest(
+        &f.store,
+        &f.cfg,
+        &finding,
+        &classifying_with_follow_up(close_reason("maybe"), "widget:src/lib.rs:left-open"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.outcome.as_deref(), Some("retry"), "{first:?}");
+    assert_eq!(
+        filed(&f, "widget:src/lib.rs:left-open").await,
+        0,
+        "a retried attempt files nothing: {first:?}"
+    );
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let second = run_harvest(
+        &f.store,
+        &f.cfg,
+        &finding,
+        &classifying_with_follow_up(close_reason("superseded"), "widget:src/lib.rs:still-open"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.outcome.as_deref(), Some("harvested"), "{second:?}");
+    assert_eq!(filed(&f, "widget:src/lib.rs:still-open").await, 1);
+    assert_eq!(
+        filed(&f, "widget:src/lib.rs:left-open").await,
+        0,
+        "the same work must be filed once"
+    );
+}
+
+/// A harvest given up on is not reviewed again, so its last attempt's
+/// follow-ups are the only ones the PR will ever get: they are filed.
+#[tokio::test]
+async fn a_harvest_given_up_on_files_its_last_follow_ups() {
+    let bins = FakeBins::acquire("harvest-stuck-followups");
+    gh_default(&bins);
+    let f = fixture("harvest-stuck-followups", FindingStatus::Closed).await;
+
+    let mut outcomes = Vec::new();
+    for _ in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = run_harvest(
+            &f.store,
+            &f.cfg,
+            &finding,
+            &classifying_with_follow_up(close_reason("maybe"), "widget:src/lib.rs:left-open"),
+            None,
+        )
+        .await
+        .unwrap();
+        outcomes.push((
+            summary.outcome,
+            filed(&f, "widget:src/lib.rs:left-open").await,
+        ));
+    }
+
+    assert_eq!(
+        outcomes,
+        [
+            (Some("retry".into()), 0),
+            (Some("retry".into()), 0),
+            (Some("stuck".into()), 1)
+        ]
+    );
+}
+
 /// A classification the database refuses to record leaves the finding
 /// `closed` and pending for the next cycle. It is not the worker's
 /// failure, so it records no attempt toward the streak; once the database
