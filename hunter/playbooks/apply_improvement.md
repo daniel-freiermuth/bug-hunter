@@ -17,6 +17,11 @@ For bugs, see fix.md.
 
 ## 1. Assess value and feasibility
 
+On continuation, inspect existing commits and reports first. Preserve the
+implemented improvement and its proof; resume from the retained checkpoint
+and resolve the recorded blocker rather than rewriting or discarding work.
+An improvement already implemented on this branch is not a reason to decline.
+
 Read the finding and determine if the improvement is:
 - **Valuable**: Does it add real value (security, performance, coverage, maintainability)?
 - **Safe**: Low risk of breaking existing functionality?
@@ -41,19 +46,26 @@ memory or training data, which goes stale and hallucinates specifics:
   (`package.json`/`Cargo.toml`/`pyproject.toml`) of the blocking package at
   its latest version — not a docs page, which may be stale or aspirational.
 
-If you cannot verify a claim this way (network unavailable, private
-registry), say so explicitly in BLOCKED.md rather than asserting it as fact.
+If you cannot verify a claim required to assess or prove this improvement
+(network unavailable, private registry), record the missing prerequisite in
+BLOCKED.md rather than asserting the claim as fact. An inaccessible source
+unrelated to the affected proof is a documented limitation, not a blocker.
 
 If NOT valuable or safe (verified), STOP: write DECLINED.md explaining why,
 citing the verification performed (e.g., "dependency pinned for
 compatibility — confirmed via `<command>`: `<relevant output>`").
 
-If blocked by external factors you can't resolve (conflicting patches, a
-VERIFIED incompatibility, requires architectural decisions), STOP: write
-BLOCKED.md with exactly what's missing and the verification evidence for the
-blocking claim.
+If an external factor prevents the actual improvement or its affected-path
+proof (conflicting patches, a VERIFIED incompatibility, required architectural
+decision), write BLOCKED.md with exactly what's missing and the verification
+evidence for the blocking claim. Missing proof is not a verified reason to
+decline. Before ending, also write PR-DESCRIPTION.md documenting any completed
+work and the remaining blocker; keep both reports and all completed commits.
 
 ## 2. Apply the improvement
+
+Before applying changes, establish the verification baseline using the
+supported environment and commands required by step 3.
 
 ### For `type = 'dep_update'`:
 
@@ -77,7 +89,7 @@ a. **Verify the gap** - confirm the contract/edge case is untested
 b. **Add tests** covering the missing scenario
    - Use existing test harness and conventions
    - NEVER introduce new test frameworks as a side effect
-c. **Run tests** - verify new tests pass and existing tests still pass
+c. **Run tests** - verify new tests pass and no affected regressions are added
 d. **Commit**: "test: add coverage for {contract/edge-case}"
 
 ### For `type = 'refactor'`:
@@ -91,12 +103,29 @@ d. **Commit**: "refactor: {what} in {where}"
 
 ## 3. Verify
 
-Run the affected package's tests/checks. For dependency updates, also:
+Establish the pre-change baseline BEFORE applying changes, then run the
+patched checks AFTER, using the SAME supported toolchain, real dependency
+versions, configuration, and commands. On resume, recover missing baseline
+evidence from the original revision in a separate worktree without resetting
+the implementation. Run affected package checks and exercise the changed
+path, including new tests; attempt the full affected-toolchain suite and
+compare baseline/patched results. For dependency updates, also:
 - Check that lockfiles updated correctly
-- Verify no new deprecation warnings
-- Spot-check one usage of the upgraded dependency
+- Verify no new deprecation warnings attributable to the upgrade
+- Exercise one actual usage of the upgraded dependency
 
-All green, or the improvement does not ship.
+Affected-path proof is required. An affected regression, unverified change,
+inaccessible dependency required for that proof, or required human decision
+means BLOCKED. Unrelated failures reproduced on the baseline (including
+GCC16/header/build failures) or unavailable external/multi-host prerequisites
+for unrelated full-suite checks do not automatically block a verified
+improvement. Record precise commands, versions, baseline/patched outcomes,
+missing prerequisites, and unavailable coverage in PR-DESCRIPTION.md. If those
+failures prevent affected-path proof, they are genuine blockers.
+
+NEVER fake green with forced includes, logging shims, disabled/hidden/weaker
+tests, or other verification bypasses. Use the actual supported dependencies.
+Do not infer permission to fix unrelated bugs to make the suite pass.
 
 ## 4. Commit discipline
 
@@ -151,6 +180,14 @@ OR if not actionable:
   a verified incompatibility needing human review) with exactly what is
   needed to unblock, and the verification command + output for the claim
 
+Before ending a blocked attempt, write BOTH BLOCKED.md and PR-DESCRIPTION.md
+with completed commits, observed verification, limitations, and the precise
+prerequisite/decision needed to continue. Do not delete the reports or undo
+valid implementation. On continuation, update them and clear BLOCKED.md only
+once its prerequisite is resolved; a stale or scheduler-cleared report does
+not prove resolution. An optional draft PR must explicitly disclose remaining
+limitations/blockers and must not claim to be merge-ready or shipping-ready.
+
 # Improvement-specific guidance
 
 ## Dependency updates with patches
@@ -196,7 +233,8 @@ NOT:
 
 The improvement is:
 - **Applied correctly** (upgraded, tested, refactored)
-- **Verified working** (tests pass, no regressions)
+- **Verified working** (affected checks pass, no affected regressions; unrelated
+  baseline failures and unavailable wider checks explicitly documented)
 - **Well-documented** (clear PR description)
 - **Minimal** (only what the finding suggests, no scope creep)
 

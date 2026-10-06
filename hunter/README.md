@@ -263,6 +263,14 @@ are gated against two linear ramps:
 - Stale or missing usage data → conservative denial, never an optimistic
   guess.
 
+Fix playbooks require passing affected-path proof and before/after baseline
+comparison in the same supported environment. Unrelated full-suite failures
+reproduced on the baseline, or missing external checks unrelated to the
+change, are documented in the draft PR rather than automatically blocking
+the fix. Added regressions, unverified affected behavior, and prerequisites
+required for that proof still block. No forced includes, disabled tests,
+logging shims, or unrelated fixes are permitted to manufacture green checks.
+
 ### PR follow-up loop
 
 `sync_prs` runs first in every cycle (free — no worker) and refreshes every

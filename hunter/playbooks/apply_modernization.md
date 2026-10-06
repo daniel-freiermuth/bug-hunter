@@ -18,6 +18,12 @@ here, not a reason to decline.
 
 ## 1. Re-verify before doing anything
 
+On continuation, inspect existing commits and reports first. Preserve the
+committed plan/spike/migration and its proof; continue from the retained
+checkpoint to resolve the blocker rather than rewriting or discarding work.
+An implementation already present on this branch does not invalidate the
+original proposal.
+
 The hunt-time claims (deprecation, staleness, EOL, "X is mature now") may be stale by the time
 this runs — training data and even a recent hunt pass can be wrong. Re-check with real
 commands or sources: registry/repo activity, actual deprecation notices, actual published EOL
@@ -26,6 +32,9 @@ the format never gained real adoption, the EOL date moved), STOP: write DECLINED
 with the re-verification evidence.
 
 ## 2. Decide the right deliverable for THIS proposal's actual scope
+
+Before any code change in the chosen deliverable, establish the verification
+baseline using the supported environment and commands required by step 3.
 
 There is no single correct shape here — pick the one that is honest about how far a single
 pass can responsibly go, and what is still a judgment call for a human:
@@ -81,9 +90,34 @@ least one commit; a PR needs a diff to open.
 
 ## 3. Verify whatever you actually changed
 
-If you changed code: run the affected tests. If you only wrote a plan: there is nothing to
-run, but every factual claim the plan relies on must still be the re-verified evidence from
-step 1, not the original hunt-time claim restated.
+Before changing code, establish the pre-change baseline. After the change,
+run affected checks and exercise the changed path, including added regressions,
+with the SAME supported toolchain, actual dependencies, configuration, and
+commands. On resume, obtain missing baseline evidence from the original
+revision in a separate worktree, never by resetting the retained implementation.
+Attempt the full affected-toolchain suite and compare baseline/patched results.
+
+Affected-path proof is mandatory for the chosen deliverable: a spike must
+demonstrate its promised representative slice, and a full migration must prove
+its affected behavior (including explicitly intended breaking changes).
+Unintended affected regressions, unverified affected changes, inaccessible
+dependencies required for that proof, or decisions required to proceed mean
+BLOCKED. Do not call a blocked implementation a completed spike or full migration.
+
+Unrelated failures reproduced on the baseline (including GCC16/header/build
+failures) or unavailable external/multi-host prerequisites for unrelated
+full-suite checks are not automatic blockers. Record exact commands, toolchain
+and dependency versions, baseline/patched outcomes, missing prerequisites,
+and unavailable coverage in PR-DESCRIPTION.md. If these failures prevent the
+affected-path proof, they ARE blockers. For CI/CD work, the exact new workflow
+commands are affected checks and must be verified as required in step 2.
+
+NEVER fake green with forced includes, logging shims, disabled/hidden/weaker
+tests, or other verification bypasses. Use actual supported dependencies and
+do not infer permission to fix unrelated bugs merely to make the suite pass.
+If you only wrote a plan, there is no code to run, but every factual claim must
+still have re-verified evidence, not merely restate the hunt-time claim. A plan
+that explicitly requests a decision is not proof of a completed migration.
 
 # Deliverables
 
@@ -98,6 +132,19 @@ OR if re-verification showed the premise no longer holds:
 
 - **DECLINED.md**: what you re-verified and why it is no longer worth pursuing, with the
   verification command/output backing the claim
+
+OR if a required prerequisite/decision or affected-path proof is missing:
+
+- **BLOCKED.md AND PR-DESCRIPTION.md**: write both before ending, recording
+  completed commits, observed verification, limitations, the precise blocker,
+  and what resolves it. Preserve valid committed work, the worktree, and both
+  reports; do not delete reports or undo implementation. On continuation,
+  update them and clear BLOCKED.md only once the prerequisite is resolved.
+  A stale or scheduler-cleared report does not prove resolution.
+- Missing proof is not a verified reason to decline the proposal. DECLINED.md
+  requires evidence that the actual premise is invalid or unwanted, as above.
+- An optional draft PR must disclose limitations and remaining blockers;
+  draft status is NOT merge-ready or shipping-ready evidence.
 
 # What this is not
 
