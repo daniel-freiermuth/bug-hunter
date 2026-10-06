@@ -201,6 +201,13 @@ forever:
   pinned commit — so the suspension is marked `killed` (reason
   `workdir-gone`) when selection reaches it, and selection moves on to
   the next candidate the same cycle.
+- **Finding moved on.** A finding suspension resumes only at its kind's
+  actionable status (fix: `queued`, recheck: `rechecking`, engage:
+  `pr_open`, harvest: `merged`/`closed`). One whose finding is anywhere
+  else — a suspended fix the operator rejected, a fix unqueued back to
+  `new` — is marked `killed` (reason `finding-moved`) by the sweep before
+  each cycle, so its tree is released. A fix at `fixing`, which `run_fix`
+  is about to continue, is kept.
 
 ### Budget policy
 

@@ -1584,3 +1584,136 @@ async fn resume_chain_stats_terminate_on_a_cyclic_link() {
         "every attempt counted exactly once"
     );
 }
+
+/// Every suspended finding job ends up in exactly one place: resumable at
+/// its kind's actionable status, held (a fix at `fixing`, between
+/// `run_fix`'s claim and its job), or retired. Before retirement existed,
+/// a suspension whose finding moved on (a suspended fix the operator then
+/// rejected) was neither listed nor retired, so it stayed
+/// `suspended` forever and the sweep kept its whole tree on disk.
+#[tokio::test]
+async fn every_finding_suspension_is_resumable_held_or_retired() {
+    for status in FindingStatus::ALL {
+        let (_dir, path, pool) = fresh_db().await;
+        seed_repo_and_findings(&pool).await;
+        for (id, kind) in [
+            (11, "fix"),
+            (12, "recheck"),
+            (13, "engage"),
+            (14, "harvest"),
+        ] {
+            sqlx::query(
+                "INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, started_at) \
+                 VALUES (?1, ?2, 1, 1, 'suspended', '/s/finding/session.jsonl', 1000)",
+            )
+            .bind(id)
+            .bind(kind)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // A repo job and a suspension already continued are not this rule's.
+        insert_suspended_job(&pool, 20, 1, Some("/s/20/session.jsonl")).await;
+        sqlx::query(
+            "INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, started_at) \
+             VALUES (21, 'fix', 1, 1, 'suspended', '/s/21/session.jsonl', 1000), \
+                    (22, 'fix', 1, 1, 'running', '/s/21/session.jsonl', 1000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET resumed_from = 21 WHERE id = 22")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let store = rw_store(&path).await;
+        store.set_finding_status(1, status).await.unwrap();
+
+        let resumable: Vec<i64> = store
+            .list_resumable_jobs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|j| j.id)
+            .filter(|id| (11..=14).contains(id))
+            .collect();
+        let mut retired = store.retire_stranded_suspensions().await.unwrap();
+        retired.sort_unstable();
+        let held: Vec<i64> = if status == FindingStatus::Fixing {
+            vec![11]
+        } else {
+            Vec::new()
+        };
+        let mut kept = [resumable.clone(), held.clone()].concat();
+        kept.sort_unstable();
+        let all: Vec<i64> = (11..=14).filter(|id| !kept.contains(id)).collect();
+        assert_eq!(retired, all, "finding status {status}");
+
+        for id in 11..=22 {
+            let (state, reason): (String, Option<String>) =
+                sqlx::query_as("SELECT state, killed_reason FROM jobs WHERE id = ?1")
+                    .bind(id)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|| ("absent".to_owned(), None));
+            if retired.contains(&id) {
+                assert_eq!(state, "killed", "{status} job {id}");
+                assert_eq!(reason.as_deref(), Some("finding-moved"));
+            } else if [11, 12, 13, 14, 20, 21].contains(&id) {
+                assert_eq!(state, "suspended", "{status} job {id}");
+            }
+        }
+        assert!(
+            store
+                .retire_stranded_suspensions()
+                .await
+                .unwrap()
+                .is_empty(),
+            "retiring is idempotent"
+        );
+    }
+}
+
+#[tokio::test]
+async fn finding_checkpoints_resume_only_at_their_actionable_status() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    insert_suspended_job(&pool, 10, 1, Some("/s/10/session.jsonl")).await;
+    for (id, kind) in [
+        (11, "fix"),
+        (12, "recheck"),
+        (13, "engage"),
+        (14, "harvest"),
+    ] {
+        sqlx::query(
+            "INSERT INTO jobs (id, kind, repo_id, finding_id, state, session_file, started_at) \
+             VALUES (?1, ?2, 1, 1, 'suspended', '/s/finding/session.jsonl', 1000)",
+        )
+        .bind(id)
+        .bind(kind)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let store = rw_store(&path).await;
+    for status in FindingStatus::ALL {
+        store.set_finding_status(1, status).await.unwrap();
+        let actual = store
+            .list_resumable_jobs()
+            .await
+            .unwrap()
+            .iter()
+            .map(|j| j.id)
+            .collect::<Vec<_>>();
+        let mut expected = match status {
+            FindingStatus::Queued => vec![11],
+            FindingStatus::Rechecking => vec![12],
+            FindingStatus::PrOpen => vec![13],
+            FindingStatus::Merged | FindingStatus::Closed => vec![14],
+            _ => Vec::new(),
+        };
+        expected.push(10);
+        assert_eq!(actual, expected, "finding status {status}");
+    }
+}

@@ -1779,6 +1779,61 @@ async fn repeated_suspensions_of_a_harvest_are_not_a_stuck_streak() {
     assert!(outcomes.iter().all(|o| o.as_deref() == Some("suspended")));
 }
 
+/// A recheck, engage or harvest suspension is continued only while its
+/// finding is at that kind's status. Once the finding moves on — the
+/// operator rejects a finding mid-recheck, the PR an engage was answering
+/// merges, a closed PR awaiting harvest is reopened — the work no longer
+/// applies: selection stops offering it, and the next sweep retires it
+/// `finding-moved` and releases its tree instead of keeping both forever.
+#[tokio::test]
+async fn a_suspension_whose_finding_moved_on_is_retired_by_the_sweep() {
+    for (kind, at, moved_to) in [
+        ("recheck", "rechecking", "rejected"),
+        ("engage", "pr_open", "merged"),
+        ("harvest", "closed", "pr_open"),
+    ] {
+        let (dir, path, pool) = fresh_db().await;
+        seed_repo(&pool, &dir).await;
+        seed_history(&pool).await;
+        seed_quiet_finding(&pool, 5).await;
+        let session = seed_session_in(&dir, 20, CTX);
+        seed_finding_suspension(&pool, 20, kind, 5, &session).await;
+        let set_status = |status: &'static str| {
+            sqlx::query("UPDATE findings SET status = ?1 WHERE id = 5")
+                .bind(status)
+                .execute(&pool)
+        };
+        set_status(at).await.unwrap();
+        let cfg = test_config(dir.path());
+        let tree = cfg.work_root.join("jobs").join("20").join("tree");
+        let store = rw_store(&path).await;
+
+        let picked = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
+        assert_eq!(picked.predecessor_id, 20, "{kind} resumes at {at}");
+        hunter::workspace::sweep(&store, &cfg.work_root, hunter::util::now_ms())
+            .await
+            .unwrap();
+        assert!(tree.is_dir(), "{kind} at {at} keeps its tree");
+
+        set_status(moved_to).await.unwrap();
+        let picked = pick_next(&store, &cfg, None).await.unwrap();
+        assert!(
+            !matches!(picked, Some(Candidate::Resume { .. })),
+            "{kind} at {moved_to} must not resume, got {picked:?}"
+        );
+        hunter::workspace::sweep(&store, &cfg.work_root, hunter::util::now_ms())
+            .await
+            .unwrap();
+        let (state, reason, notes) = job_row(&pool, 20).await;
+        assert_eq!(state, JobState::Killed.as_str(), "{kind}");
+        assert_eq!(reason.as_deref(), Some("finding-moved"), "{kind}");
+        let msg = format!("resume {kind} alpha: job 20 retired, finding #5 is {moved_to}");
+        assert_eq!(notes.as_deref(), Some(msg.as_str()));
+        assert_eq!(resume_events(&pool, 20).await, vec![(msg, Some(5))]);
+        assert!(!tree.exists(), "{kind} at {moved_to} releases its tree");
+    }
+}
+
 /// A hunt with no new commits records its watermark and skips; a skipped
 /// cycle restarts at once. If that write fails, the hunt must fail rather
 /// than skip, or the daemon would re-pick the same repo in a tight loop.
