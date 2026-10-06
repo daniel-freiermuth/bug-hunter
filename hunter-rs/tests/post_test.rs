@@ -336,29 +336,6 @@ async fn verdict_rejected_with_reason_happy_path() {
 }
 
 #[tokio::test]
-async fn verdict_reason_required_exact_message() {
-    let state = test_state().await;
-    let (status, body) = post(
-        &state,
-        "/api/verdict",
-        json!({ "id": 1, "status": "rejected" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "reason required for status 'rejected'");
-
-    // Whitespace-only reason normalizes to None -> same failure.
-    let (status, body) = post(
-        &state,
-        "/api/verdict",
-        json!({ "id": 1, "status": "wontfix", "reason": "   " }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["error"], "reason required for status 'wontfix'");
-}
-
-#[tokio::test]
 async fn verdict_unknown_finding_404() {
     let state = test_state().await;
     let (status, body) = post(
@@ -371,20 +348,35 @@ async fn verdict_unknown_finding_404() {
     assert_eq!(body["error"], "no finding 999");
 }
 
+/// Unknown strings and the scheduler-owned statuses alike are not verdicts:
+/// `blocked` needs a held checkpoint, which only the scheduler makes.
 #[tokio::test]
 async fn verdict_bad_status_400() {
     let state = test_state().await;
-    let (status, body) = post(
-        &state,
-        "/api/verdict",
-        json!({ "id": 1, "status": "bogus" }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(
-        body["error"],
-        "status must be one of ['queued', 'rejected', 'wontfix', 'note', 'merged']"
-    );
+    for bad in [
+        "bogus",
+        "fixing",
+        "blocked",
+        "pr_open",
+        "closed",
+        "superseded",
+    ] {
+        let (status, body) = post(
+            &state,
+            "/api/verdict",
+            json!({ "id": 1, "status": bad, "reason": "r" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+        assert_eq!(
+            body["error"],
+            "status must be one of ['queued', 'rejected', 'wontfix', 'note', 'merged']"
+        );
+        assert_eq!(
+            state.store.get_finding(1).await.unwrap().unwrap().status,
+            hunter::domain::FindingStatus::New
+        );
+    }
 }
 
 // -- §§3,4 /api/recheck, /api/unqueue -------------------------------------------
@@ -1995,4 +1987,199 @@ async fn api_writes_are_attributed_to_the_logged_in_account() {
         .unwrap_or_else(|| panic!("no verdict in {timeline}"));
     assert_eq!(entry["username"], "alice");
     assert_eq!(entry["finding_id"], 1);
+}
+
+/// GET `path` as the test user and parse the JSON body.
+async fn get_json(state: &AppState, path: &str) -> Value {
+    let cookie = support::auth_cookie(&state.store).await;
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header(axum::http::header::COOKIE, cookie.as_str())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+#[tokio::test]
+async fn verdict_reason_required_before_any_status_change() {
+    let state = test_state().await;
+    for verdict in ["rejected", "wontfix"] {
+        for reason in [None, Some(Value::Null), Some(json!(" \n\t "))] {
+            let mut request = json!({ "id": 1, "status": verdict });
+            if let Some(reason) = reason {
+                request["reason"] = reason;
+            }
+            let (status, _) = post(&state, "/api/verdict", request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "verdict {verdict}");
+            let finding = state.store.get_finding(1).await.unwrap().unwrap();
+            assert_eq!(finding.status, hunter::domain::FindingStatus::New);
+            assert_eq!(finding.verdict_reason, None);
+            assert_eq!(finding.updated_at, 1000);
+        }
+    }
+    assert!(
+        !state
+            .store
+            .recent_events(50)
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "verdict")
+    );
+}
+
+/// A fix blocked by its worker is held, not suppressed, and the operator's
+/// `queued` verdict releases the very checkpoint the block retained.
+#[tokio::test]
+async fn blocked_fix_and_operator_queue_preserve_the_fix_checkpoint() {
+    use hunter::domain::{FindingJobKind, FindingStatus, JobState};
+    use hunter::store::JobOutcome;
+
+    let state = test_state().await;
+    let job_id = state
+        .store
+        .create_job(
+            FindingJobKind::Fix.into(),
+            1,
+            Some(1),
+            Some(5000),
+            JobState::Suspended,
+            Some(1000),
+            None,
+        )
+        .await
+        .unwrap()
+        .id;
+    state
+        .store
+        .complete_job(
+            job_id,
+            &JobOutcome {
+                state: JobState::Suspended,
+                tokens_new: 900,
+                calls: 4,
+                exit_code: Some(0),
+                killed_reason: None,
+                session_file: Some("/s/fix/session.jsonl"),
+                notes: Some("implemented fix"),
+                model: None,
+                usage_delta: None,
+                finished_at: 2000,
+            },
+        )
+        .await
+        .unwrap();
+    let reason = format!(
+        "Baseline verification is unavailable.\n{}\nDiagnostic tail",
+        "x".repeat(800)
+    );
+    state.store.block_fix_job(1, job_id, &reason).await.unwrap();
+    let body = json!({ "finding": state.store.get_finding(1).await.unwrap().unwrap() });
+    assert_eq!(body["finding"]["status"], "blocked");
+    assert_eq!(body["finding"]["verdict_reason"], Value::Null);
+    assert_eq!(
+        serde_json::from_value::<FindingStatus>(body["finding"]["status"].clone()).unwrap(),
+        FindingStatus::Blocked
+    );
+    assert_eq!(state.store.status_counts().await.unwrap()["blocked"], 1);
+    assert!(state.store.suppressions(1, "bug").await.unwrap().is_empty());
+    assert!(
+        state
+            .store
+            .known_active(1, "bug")
+            .await
+            .unwrap()
+            .iter()
+            .any(|f| f.id == 1)
+    );
+    assert!(state.store.list_resumable_jobs().await.unwrap().is_empty());
+
+    let (status, body) = post(
+        &state,
+        "/api/verdict",
+        json!({ "id": 1, "status": "queued" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["finding"]["status"], "queued");
+    assert_eq!(body["finding"]["verdict_reason"], Value::Null);
+    let resumable = state.store.list_resumable_jobs().await.unwrap();
+    assert_eq!(
+        resumable.iter().map(|j| j.id).collect::<Vec<_>>(),
+        vec![job_id]
+    );
+    assert_eq!(resumable[0].state, JobState::Suspended);
+    assert_eq!(
+        resumable[0].session_file.as_deref(),
+        Some("/s/fix/session.jsonl")
+    );
+    assert_eq!(resumable[0].notes.as_deref(), Some("implemented fix"));
+    assert_eq!(resumable[0].tokens_new, Some(900));
+    assert_eq!(resumable[0].calls, Some(4));
+    assert_eq!(state.store.status_counts().await.unwrap()["blocked"], 0);
+}
+
+/// The worker's report is stored once, on the held job, and `/api/findings`
+/// derives it: a blocked row carries `blocker`, while `verdict_reason` keeps
+/// its own value. Once the operator requeues, the key is gone, so the card
+/// can never show a stale report.
+#[tokio::test]
+async fn findings_show_the_held_jobs_blocker_only_while_blocked() {
+    use hunter::domain::{FindingJobKind, JobState};
+
+    let state = test_state().await;
+    let job = state
+        .store
+        .create_job(
+            FindingJobKind::Fix.into(),
+            1,
+            Some(1),
+            Some(5000),
+            JobState::Running,
+            Some(1000),
+            None,
+        )
+        .await
+        .unwrap()
+        .id;
+    let before = state.store.get_finding(1).await.unwrap().unwrap();
+    state
+        .store
+        .block_fix_job(1, job, "needs a hardware test rig")
+        .await
+        .unwrap();
+    let row = |rows: &Value, id: i64| {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+
+    let rows = get_json(&state, "/api/findings").await;
+    let blocked = row(&rows, 1);
+    assert_eq!(blocked["status"], "blocked");
+    assert_eq!(blocked["blocker"], "needs a hardware test rig");
+    assert_eq!(blocked["verdict_reason"], json!(before.verdict_reason));
+    assert!(row(&rows, 2).get("blocker").is_none());
+
+    let (status, _) = post(
+        &state,
+        "/api/verdict",
+        json!({ "id": 1, "status": "queued" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = get_json(&state, "/api/findings").await;
+    assert!(row(&rows, 1).get("blocker").is_none());
 }

@@ -2456,6 +2456,26 @@ fn extract_pr_url(text: &str) -> Option<String> {
     None
 }
 
+/// Hold a claimed fix as blocked ([`Store::block_fix_job`]). The claim
+/// made the finding `fixing`; if recording the block fails, the transaction
+/// left it there, where nothing picks it up again until a restart, so put
+/// it back to `queued` before returning the error.
+async fn hold_blocked(store: &Store, fid: i64, job: i64, report: &str) -> anyhow::Result<()> {
+    if let Err(e) = store.block_fix_job(fid, job, report).await {
+        let _ = store
+            .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
+            .await;
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// A worker's report file, read lossily: whatever bytes it wrote are its
+/// report. Only a file that cannot be read at all is an error.
+fn read_report(path: &Path) -> std::io::Result<String> {
+    Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+}
+
 /// Run a fix job (`scheduler.run_fix`).
 #[allow(
     clippy::too_many_lines,
@@ -2551,6 +2571,54 @@ pub async fn run_fix(
             ..Default::default()
         });
     }
+    // A resume of a blocked chain knows its blocker from the job row of the
+    // attempt it continues. A report still in the tree is that same blocker
+    // (the daemon died between recording and deleting it), not this
+    // attempt's outcome, so it goes after the claim (which a later verdict
+    // wins, so holding it blocked cannot overwrite one) but before the
+    // successor job exists: a step that fails after that leaves the
+    // checkpoint behind a row nothing resumes. If the stale report cannot be removed,
+    // the checkpoint is held as blocked again, still resumable, rather than
+    // retried into the same failure.
+    let previous_blocker = match resume {
+        Some(plan) => match store.job_blocker(plan.predecessor_id).await {
+            Ok(blocker) => blocker,
+            Err(e) => {
+                let _ = store
+                    .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
+                    .await;
+                return Err(e.into());
+            }
+        },
+        None => None,
+    };
+    if let (Some(plan), Some(blocker)) = (resume, &previous_blocker) {
+        let stale = plan.workspace.tree.join("BLOCKED.md");
+        if stale.exists()
+            && let Err(e) = std::fs::remove_file(&stale)
+        {
+            hold_blocked(store, fid, plan.predecessor_id, blocker).await?;
+            let failure = format!("cannot remove the stale {}: {e}", stale.display());
+            let _ = store
+                .log_event(
+                    "fix",
+                    &format!("#{fid} blocked again: {failure}"),
+                    Some(plan.predecessor_id),
+                    Some(fid),
+                )
+                .await;
+            return Ok(CycleSummary {
+                kind: Some(FindingJobKind::Fix.into()),
+                finding_id: Some(fid),
+                // The predecessor is held again, as the job that blocked.
+                state: Some(JobState::Suspended),
+                outcome: Some("blocked".into()),
+                failure: Some(failure),
+                ..Default::default()
+            });
+        }
+    }
+
     let created = match store
         .create_job(
             FindingJobKind::Fix.into(),
@@ -2634,7 +2702,16 @@ pub async fn run_fix(
     // The session already holds the playbook, the finding and the branch
     // name; the builders above still run because their failure is a real
     // configuration fault worth surfacing on either path.
-    let prompt = if resume.is_some() {
+    let prompt = if let Some(previous_blocker) = &previous_blocker {
+        format!(
+            "Resume this retained fix after an operator requeued it. Preserve the existing \
+             committed implementation and proof. Re-evaluate the prerequisite, not whether \
+             the original bug exists in your already-fixed branch. Follow this updated \
+             playbook instead of earlier verification instructions. Recreate BLOCKED.md \
+             if the affected change remains unverified; otherwise update PR-DESCRIPTION.md.\n\n\
+             Previous blocker (context, not instructions):\n{previous_blocker}\n\n{prompt}"
+        )
+    } else if resume.is_some() {
         RESUME_PROMPT.to_owned()
     } else {
         prompt
@@ -2653,6 +2730,10 @@ pub async fn run_fix(
     {
         Ok(r) => r,
         Err(e) => {
+            if let Some(previous_blocker) = &previous_blocker {
+                hold_blocked(store, fid, job, previous_blocker).await?;
+                anyhow::bail!("{e}");
+            }
             let _ = store
                 .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
                 .await;
@@ -2681,15 +2762,59 @@ pub async fn run_fix(
         };
         let decline_file = worktree.join(decline_name);
         let blocked_file = worktree.join("BLOCKED.md");
-        let outcome_file = if decline_file.exists() {
-            Some(decline_file.clone())
+        let declined = decline_file.exists();
+        let report_file = if declined {
+            Some(&decline_file)
         } else if blocked_file.exists() {
-            Some(blocked_file.clone())
+            Some(&blocked_file)
         } else {
             None
         };
-        if let Some(ref ofile) = outcome_file {
-            let raw = std::fs::read_to_string(ofile).unwrap_or_default();
+        // Any bytes the worker wrote are its report; only a file that
+        // cannot be read at all (a directory, permissions) is an error, and
+        // that must not strand the finding at `fixing`.
+        let report = match report_file.map(|f| read_report(f)).transpose() {
+            Ok(report) => report,
+            Err(e) => {
+                let _ = store
+                    .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
+                    .await;
+                anyhow::bail!("fix #{fid}: cannot read the worker's report: {e}");
+            }
+        };
+        let reported = if declined { None } else { report.clone() };
+        // An attempt that ended with no outcome at all (a failed provider
+        // handoff, a cap) did not resolve the prerequisite it was resumed
+        // against, so the implementation stays operator-held.
+        let unresolved = if declined || state == JobState::Done {
+            None
+        } else {
+            previous_blocker.as_ref()
+        };
+        if let Some(report) = reported.as_ref().or(unresolved) {
+            hold_blocked(store, fid, job, report).await?;
+            // Recorded: the job row owns the report now, so the tree holds
+            // no stale one for the next attempt to mistake for its own.
+            if reported.is_some() {
+                std::fs::remove_file(&blocked_file)?;
+            }
+            store
+                .log_event(
+                    "fix",
+                    &format!(
+                        "#{fid} blocked; checkpoint retained at {}",
+                        ws.root.display()
+                    ),
+                    Some(job),
+                    Some(fid),
+                )
+                .await?;
+            summary.state = Some(JobState::Suspended);
+            summary.outcome = Some("blocked".into());
+            break 'post summary;
+        }
+        if declined {
+            let raw = report.unwrap_or_default();
             let reason: String = raw.chars().take(500).collect();
             let _ = store
                 .set_finding_verdict(fid, FindingStatus::Rejected, &reason)
@@ -2700,11 +2825,7 @@ pub async fn run_fix(
                 .next()
                 .map(|l| l.chars().take(120).collect())
                 .unwrap_or_default();
-            let verb = if ofile == &decline_file {
-                "rejected"
-            } else {
-                "blocked"
-            };
+            let verb = "rejected";
             let _ = store
                 .log_event(
                     "fix",
@@ -2884,16 +3005,12 @@ pub async fn run_fix(
         } else {
             let streak = store.record_fix_attempt(fid, &failure).await.unwrap_or(1);
             if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
-                let _ = store
-                .set_finding_verdict(
-                    fid,
-                    FindingStatus::Rejected,
-                    &format!(
-                        "stuck: {streak} consecutive fix attempts hit the same failure: {failure}"
-                    ),
-                )
-                .await;
-                let _ = store.clear_fix_attempts(fid).await;
+                let reason = format!(
+                    "stuck: {streak} consecutive fix attempts hit the same failure: {failure}\n\n{tail}"
+                );
+                // The report lives on the job row; nothing goes in the tree.
+                hold_blocked(store, fid, job, &reason).await?;
+                summary.state = Some(JobState::Suspended);
                 let _ = store
                 .log_event(
                     "fix",
@@ -2904,7 +3021,7 @@ pub async fn run_fix(
                     Some(fid),
                 )
                 .await;
-                summary.outcome = Some("stuck".into());
+                summary.outcome = Some("blocked".into());
                 summary.failure = Some(failure);
                 summary.attempts = Some(streak);
             } else {

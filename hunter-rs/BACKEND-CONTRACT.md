@@ -207,7 +207,33 @@ A cap kill that left a transcript is a **pause**: the worker ran out of window h
 
 **What the scheduler does with a suspension.** Selection (`pick_next`) continues suspended work in two places. Each finding-driven tier — override, flagged PR, pending harvest, recheck, queued fix; all a human waiting on a PR — first looks for a resumable suspension at its own `(finding_id, kind)` and, when there is one, returns a resume of it in the tier's own position, with the tier's label and budget override (`finding_pick`). Those tiers outrank the resume tier, so without that check they started the same work fresh: production engage job 4359 redid suspended engage 4358 for 92 294 tokens where resuming would have re-cached ~75 000, and its worktree handling removed the directory 4358's transcript refers to. The resume tier proper sits after every finding-driven tier and before repo rotation, since a resume is background work already paid for. `Store::list_resumable_jobs` supplies the candidates for both: `state = 'suspended'`, repo live, `session_file` non-NULL, and `NOT EXISTS` a row whose `resumed_from` names it (the successor row IS the record that the work was picked up, which is why there is no `resumed` state). The scheduler additionally requires the chain's workspace (see *Where a job runs* below) to still hold its tree, the job's `session_file` to lie inside that workspace's `session/`, and the job to carry a `pinned_sha`, because a resumed worker continues a conversation, not a filesystem. A suspension failing any of these — including every suspension from before per-chain workspaces, whose tree and transcript are in the old layout — can never be continued, so it is retired `killed` with `killed_reason = "workdir-gone"` and a `resume` event (`resume {kind} {repo}: job {id} retired, workspace {path} is gone`) rather than skipped: a skip left it `suspended` forever. The retirement happens during the walk, so it is not offered and the walk moves on in the same cycle. Both places run one eligibility-and-plan function (`resume_plan`), which also applies the give-up ceiling below.
 
-**A finding suspension resumes only at its kind's status:** fix=queued, recheck=rechecking, engage=pr_open, harvest=merged/closed (`Store::list_resumable_jobs`). Repo-job suspensions retain their existing selection. Any other finding suspension, except a fix at `fixing` (claimed by `run_fix`), is retired `killed` / `finding-moved` by `Store::retire_stranded_suspensions` at the start of every workspace sweep; otherwise nothing would ever end it and the sweep would keep its tree forever.
+**Blocked fix checkpoints (Rust):** `BLOCKED.md` is not a false-finding
+verdict. `Store::block_fix_job` atomically sets the finding to `blocked`
+and the fix job to `suspended`, preserving spend, transcript, committed
+candidate, notes, and the original `killed_reason`; the full report goes to the
+job's `blocker` column (migration 019) and nowhere else (`/api/findings`
+derives the card's `blocker` from it), and `BLOCKED.md` is then deleted
+from the tree, so the job row is the only owner of the report. Blocked is neither suppression
+nor automatic retry: a blocked fix is not at its kind's status, so it is not
+resumed, and the stranded-suspension sweep (below) holds it rather than
+retiring it. Manual requeue continues the same worktree and transcript. `create_job`
+copies `blocker` into every resume of the chain, as it copies
+`pinned_sha`, so each attempt knows the prerequisite it works against
+(`Store::job_blocker`). The continuation receives that report and the
+updated playbook, preserves its implementation, and writes a new
+`BLOCKED.md` if affected proof is still missing. An attempt that ends
+without any outcome (failed provider handoff, cap) blocks the finding
+again with the inherited report. A daemon death mid-resume loses nothing:
+startup reconciliation suspends the orphan and the next resume inherits
+the same `blocker`. A `BLOCKED.md` still in the tree when a blocked chain
+resumes (the daemon died between recording and deleting it) is removed
+after the finding is claimed (so a verdict given since selection still
+wins) but before a successor job exists; if it cannot be,
+the checkpoint is held `blocked` again, still resumable, instead of being
+retried into the same failure.
+Repeated identical fix failures become blocked, not rejected.
+
+**A finding suspension resumes only at its kind's status:** fix=queued, recheck=rechecking, engage=pr_open, harvest=merged/closed (`Store::list_resumable_jobs`). Repo-job suspensions retain their existing selection. Any other finding suspension, except a fix at `blocked` (held for the operator) or `fixing` (claimed by `run_fix`), is retired `killed` / `finding-moved` by `Store::retire_stranded_suspensions` at the start of every workspace sweep; otherwise nothing would ever end it and the sweep would keep its tree forever.
 
 **Fresh work supersedes a suspension.** `Store::create_job` with `resumed_from = NULL` retires, in the same `BEGIN IMMEDIATE` transaction as its insert, every suspended job with no successor at the same key — `(finding_id, kind)` for fix/engage/harvest/recheck, `(repo_id, kind)` for hunt and the analysis kinds — as `killed` with `killed_reason = "superseded"`, plus a `resume` event `resume {kind} {repo}: job {old} superseded by fresh job {new}` whose `job_id` is the old job. It lives at job creation rather than in selection so that every path which starts fresh work is covered: the fresh attempt now owns the work, and a suspension left behind would be neither resumed nor retired, ever. `create_job` returns the retired ids (`CreatedJob::superseded`) so the executor releases those chains' trees before it builds its own: a fix chain holds its per-finding branch checked out, and git refuses one branch in two worktrees. A resume (`resumed_from` set) supersedes nothing.
 

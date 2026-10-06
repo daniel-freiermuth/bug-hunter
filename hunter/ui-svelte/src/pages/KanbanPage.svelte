@@ -19,9 +19,9 @@
     { key: "closed", label: "Closed", filter: (f: FindingOut) => f.status === "closed" },
   ];
 
-  // All findings in pipeline statuses
+  // Active pipeline and blocked work share the same filters.
   const pipelineFindings = $derived(
-    store.findings.filter((f) => COLUMNS.some((c) => c.filter(f)))
+    store.findings.filter((f) => f.status === "blocked" || COLUMNS.some((c) => c.filter(f)))
   );
 
   let filtered = $state<FindingOut[]>([]);
@@ -36,6 +36,9 @@
         : 0,
     }))
   );
+
+  const blocked = $derived(filtered.filter((f) => f.status === "blocked"));
+  const hasBlocked = $derived(store.findings.some((f) => f.status === "blocked"));
 
   // Suppressed (rejected + wontfix) and notes — below the pipeline
   const suppressed = $derived(
@@ -116,6 +119,25 @@
       </div>
     {/each}
   </div>
+
+  {#if hasBlocked}
+    <section class="blocked-section" aria-labelledby="blocked-heading">
+      <h3 id="blocked-heading" class="blocked-heading">
+        Blocked
+        <span class="section-count">{blocked.length}</span>
+      </h3>
+      <p class="blocked-help">Fix work is retained. Resolve the prerequisite below, then resume the fix; normal budget limits still apply.</p>
+      {#if blocked.length === 0}
+        <p class="blocked-help">No blocked findings match the current filters.</p>
+      {:else}
+        <div class="section-body">
+          {#each blocked as finding (finding.id)}
+            <FindingCard {finding} actions={true} />
+          {/each}
+        </div>
+      {/if}
+    </section>
+  {/if}
 
   <!-- Suppressed (rejected / wontfix) — collapsible -->
   {#if suppressed.length > 0}
@@ -296,6 +318,29 @@
   }
   .col-cards > :global(.card) {
     margin-bottom: 0;
+  }
+
+  .blocked-section {
+    margin-top: 1.25rem;
+    padding: 0.75rem;
+    border: 1px solid var(--sev-medium);
+    border-radius: var(--radius-md);
+    background: var(--bg-panel);
+  }
+
+  .blocked-heading {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+    margin: 0;
+    color: var(--sev-medium);
+    font-size: 0.875rem;
+  }
+
+  .blocked-help {
+    margin: 0.375rem 0 0.625rem;
+    color: var(--text-dim);
+    font-size: 0.75rem;
   }
 
   /* ── Collapsible sections ───────────────────────────────────── */

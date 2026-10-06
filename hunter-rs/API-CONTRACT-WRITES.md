@@ -63,9 +63,10 @@ A non-string `name` on `/api/repos` used to belong in that row and no longer doe
 
 ### 0.4 Status vocabulary (types.py)
 
-- `FINDING_STATUSES` = all of `Status` (types.py:66): `new, rechecking, queued, fixing, pr_open, merged, rejected, wontfix, note` (types.py:23-32). Rust (`FindingStatus::ALL`) adds `closed` and `superseded`, which only the scheduler sets; neither is a verdict status, so this endpoint still refuses both.
-- `VERDICT_STATUSES` = `queued, rejected, wontfix, note, merged` (types.py:78-84).
-- `REASON_REQUIRED` = `rejected, wontfix` (types.py:85).
+- `FINDING_STATUSES` = all of `Status` (types.py:66): `new, rechecking, queued, fixing, pr_open, merged, rejected, wontfix, note` (types.py:23-32). Rust (`FindingStatus::ALL`) also includes `closed`, `superseded`, and `blocked`.
+- Rust `VERDICT_STATUSES`: `queued, rejected, wontfix, note, merged` (`blocked`, `closed` and `superseded` are scheduler-only).
+- Rust `REASON_REQUIRED`: `rejected, wontfix`.
+- `blocked` is a held prerequisite, not suppression, and only the scheduler sets it: a worker `BLOCKED.md` (or repeated identical failures) atomically changes its finding to blocked and its fix job to suspended, preserving the checkpoint and storing the whole report once, in `jobs.blocker` (shown as `/api/findings` `blocker`). `POST /api/verdict` with `queued` enables that original fix transcript for continuation; budget denial leaves reports untouched. While blocked it is excluded from automatic resume selection.
 - `run_fix` claims `queued` → `fixing` with one conditional UPDATE before creating its job, so a status change that lands after selection (an unqueue, a verdict) stops the fix before it can overwrite that status or continue/supersede a checkpoint; the cycle reports it `skipped`, and the daemon starts the next cycle at once instead of idling. A refused job or a workspace that cannot be made puts the finding back to `queued`.
 
 Transition legality as enforced by the server:

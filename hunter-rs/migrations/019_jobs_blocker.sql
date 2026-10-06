@@ -1,0 +1,16 @@
+-- The prerequisite report a fix chain is blocked on.
+--
+-- Set by Store::block_fix_job on the attempt that stopped at a blocker
+-- (a worker's BLOCKED.md, or repeated identical failures). A resumed
+-- attempt copies it from the attempt it continues at INSERT, as with
+-- pinned_sha, so every later link of the chain knows the blocker it works
+-- against: the requeued continuation is prompted with it, and an attempt
+-- that ends without an outcome restores the finding to blocked with it.
+-- An attempt that blocks again overwrites its own copy.
+--
+-- It lives here rather than in killed_reason, which keeps the real reason
+-- the attempt stopped (cap, wallclock), or in notes, which is free text.
+--
+-- NULL for every job not in a blocked fix chain, and for every row
+-- written before this column existed.
+ALTER TABLE jobs ADD COLUMN blocker TEXT;

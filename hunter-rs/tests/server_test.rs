@@ -200,6 +200,7 @@ async fn summary_has_every_top_level_key() {
         "rechecking",
         "queued",
         "fixing",
+        "blocked",
         "pr_open",
         "merged",
         "closed",
@@ -214,6 +215,7 @@ async fn summary_has_every_top_level_key() {
         );
     }
     assert_eq!(counts["new"], 1);
+    assert_eq!(counts["blocked"], 0);
     // Seeded 'new' finding + NullBackend denies -> pick_next finds it,
     // decide returns Denied -> activity_status = paused (round 2).
     let kind = v["activity_status"]["kind"].as_str().unwrap();

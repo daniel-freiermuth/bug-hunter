@@ -90,6 +90,7 @@ async fn status_counts_zero_fills_all_statuses() {
     assert_eq!(counts["queued"], 0);
     assert_eq!(counts["rechecking"], 0);
     assert_eq!(counts["fixing"], 0);
+    assert_eq!(counts["blocked"], 0);
     assert_eq!(counts["rejected"], 0);
     assert_eq!(counts["wontfix"], 0);
     assert_eq!(counts["note"], 0);

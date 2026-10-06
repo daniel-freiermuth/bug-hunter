@@ -340,6 +340,9 @@ pub struct ScriptedBackend {
     run: RunFn,
     cap_tokens: Option<i64>,
     deny_above: Option<i64>,
+    /// `run` returns `Err` instead of a result: the harness itself failed
+    /// (a panicked blocking task), not the worker.
+    fails: bool,
     runs: Mutex<Vec<Run>>,
 }
 
@@ -356,6 +359,7 @@ impl ScriptedBackend {
             run: Box::new(run),
             cap_tokens: None,
             deny_above: None,
+            fails: false,
             runs: Mutex::new(Vec::new()),
         }
     }
@@ -386,6 +390,14 @@ impl ScriptedBackend {
     /// A worker that does nothing and exits 0.
     pub fn noop() -> Self {
         Self::new(|_| done())
+    }
+
+    /// A backend whose `run` fails outright: no worker, no transcript.
+    pub fn failing() -> Self {
+        Self {
+            fails: true,
+            ..Self::noop()
+        }
     }
 
     /// Every run so far, oldest first.
@@ -453,6 +465,9 @@ impl Backend for ScriptedBackend {
             prompt: prompt.to_owned(),
             resume_from: resume_from.map(Path::to_path_buf),
         });
+        if self.fails {
+            anyhow::bail!("test: the backend failed before the worker ran");
+        }
         Ok((self.run)(&ws.tree, resume_from))
     }
 }

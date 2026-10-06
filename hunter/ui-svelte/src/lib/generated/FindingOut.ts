@@ -26,6 +26,11 @@ timeline: Array<Event>,
  */
 needs_attention?: string | null, 
 /**
+ * Present ONLY for status == "blocked" rows whose held fix checkpoint
+ * carries a report (`jobs.blocker`).
+ */
+blocker?: string, 
+/**
  * The finding whose engage/harvest job filed this one as a follow-up;
  * null for everything a hunt or analysis job found. Always present.
  */

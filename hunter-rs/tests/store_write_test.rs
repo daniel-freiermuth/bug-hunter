@@ -1586,10 +1586,10 @@ async fn resume_chain_stats_terminate_on_a_cyclic_link() {
 }
 
 /// Every suspended finding job ends up in exactly one place: resumable at
-/// its kind's actionable status, held (a fix at `fixing`, between
-/// `run_fix`'s claim and its job), or retired. Before retirement existed,
-/// a suspension whose finding moved on (a suspended fix the operator then
-/// rejected) was neither listed nor retired, so it stayed
+/// its kind's actionable status, held (a fix at `blocked`, or at `fixing`
+/// between `run_fix`'s claim and its job), or retired. Before
+/// retirement existed, a suspension whose finding moved on (a blocked fix
+/// the operator then rejected) was neither listed nor retired, so it stayed
 /// `suspended` forever and the sweep kept its whole tree on disk.
 #[tokio::test]
 async fn every_finding_suspension_is_resumable_held_or_retired() {
@@ -1639,7 +1639,7 @@ async fn every_finding_suspension_is_resumable_held_or_retired() {
             .collect();
         let mut retired = store.retire_stranded_suspensions().await.unwrap();
         retired.sort_unstable();
-        let held: Vec<i64> = if status == FindingStatus::Fixing {
+        let held: Vec<i64> = if matches!(status, FindingStatus::Blocked | FindingStatus::Fixing) {
             vec![11]
         } else {
             Vec::new()
@@ -1715,5 +1715,227 @@ async fn finding_checkpoints_resume_only_at_their_actionable_status() {
         };
         expected.push(10);
         assert_eq!(actual, expected, "finding status {status}");
+    }
+}
+
+async fn blocked_store_fixture() -> (TempDir, hunter::store::Store, String) {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    sqlx::raw_sql(
+        "UPDATE findings SET fix_attempts = 3, last_fix_failure = 'old failure' WHERE id IN (1, 2); \
+         INSERT INTO jobs (id, kind, repo_id, finding_id, state, pid, session_file, \
+                           tokens_new, calls, usage_delta, cap_tokens, exit_code, killed_reason, \
+                           model, started_at, finished_at, pinned_sha) VALUES \
+         (10, 'fix', 1, 1, 'done', NULL, '/s/10/session.jsonl', 900, 7, 0.25, \
+          2000, 0, NULL, 'model-a', 1000, 2000, 'original-sha'), \
+         (11, 'fix', 1, 2, 'running', 123, '/s/11/session.jsonl', 1200, 9, 0.5, \
+          3000, 1, 'cap', 'model-b', 1100, NULL, 'original-sha');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    let reason = format!(
+        "Verification blocker\n{}\nFull diagnostic tail",
+        "λ".repeat(800)
+    );
+    (dir, store, reason)
+}
+
+#[tokio::test]
+async fn blocked_fix_retains_checkpoint_without_suppressing_the_finding() {
+    let (_dir, store, reason) = blocked_store_fixture().await;
+
+    for (finding_id, job_id) in [(1, 10), (2, 11)] {
+        let before = store.jobs_by_finding(finding_id).await.unwrap().remove(0);
+        let before_reason = store
+            .get_finding(finding_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .verdict_reason;
+        store
+            .block_fix_job(finding_id, job_id, &reason)
+            .await
+            .unwrap();
+        let finding = store.get_finding(finding_id).await.unwrap().unwrap();
+        assert_eq!(finding.status, FindingStatus::Blocked);
+        assert_eq!(
+            finding.verdict_reason, before_reason,
+            "the report is not copied"
+        );
+        assert_eq!(
+            store.held_fix_blockers().await.unwrap().get(&finding_id),
+            Some(&reason)
+        );
+        assert_eq!(finding.fix_attempts, 0);
+        assert_eq!(finding.last_fix_failure, None);
+        assert!(finding.updated_at > 1000);
+        let job = store.jobs_by_finding(finding_id).await.unwrap().remove(0);
+        assert_eq!(job.state, JobState::Suspended);
+        assert_eq!(job.pid, None);
+        assert_eq!(job.notes, before.notes);
+        assert_eq!(job.session_file, before.session_file);
+        assert_eq!(job.tokens_new, before.tokens_new);
+        assert_eq!(job.calls, before.calls);
+        assert_eq!(job.usage_delta, before.usage_delta);
+        assert_eq!(job.cap_tokens, before.cap_tokens);
+        assert_eq!(job.exit_code, before.exit_code);
+        assert_eq!(job.killed_reason, before.killed_reason);
+        assert_eq!(job.model, before.model);
+        assert_eq!(job.started_at, before.started_at);
+        if before.finished_at.is_some() {
+            assert_eq!(job.finished_at, before.finished_at);
+        } else {
+            assert!(job.finished_at.unwrap() > 1000);
+        }
+        assert_eq!(
+            store.pinned_sha(job_id).await.unwrap().as_deref(),
+            Some("original-sha")
+        );
+        assert_eq!(
+            store.job_blocker(job_id).await.unwrap().as_deref(),
+            Some(reason.as_str())
+        );
+    }
+    assert!(store.list_resumable_jobs().await.unwrap().is_empty());
+    assert_eq!(store.status_counts().await.unwrap()["blocked"], 2);
+    assert!(store.suppressions(1, "bug").await.unwrap().is_empty());
+    assert_eq!(
+        store
+            .known_active(1, "bug")
+            .await
+            .unwrap()
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+    store
+        .set_finding_verdict(3, FindingStatus::Rejected, "not a defect")
+        .await
+        .unwrap();
+    assert_eq!(store.suppressions(1, "bug").await.unwrap()[0].id, 3);
+    assert_eq!(
+        store
+            .known_active(1, "bug")
+            .await
+            .unwrap()
+            .iter()
+            .map(|f| f.id)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 4]
+    );
+}
+
+#[tokio::test]
+async fn queued_blocked_fix_continues_the_original_checkpoint() {
+    let (_dir, store, reason) = blocked_store_fixture().await;
+    for (finding_id, job_id) in [(1, 10), (2, 11)] {
+        store
+            .block_fix_job(finding_id, job_id, &reason)
+            .await
+            .unwrap();
+    }
+    store
+        .set_finding_status(1, FindingStatus::Queued)
+        .await
+        .unwrap();
+    let resumed = store.list_resumable_jobs().await.unwrap();
+    assert_eq!(resumed.iter().map(|j| j.id).collect::<Vec<_>>(), vec![10]);
+    assert_eq!(
+        resumed[0].session_file.as_deref(),
+        Some("/s/10/session.jsonl")
+    );
+    let shown = store.held_fix_blockers().await.unwrap();
+    assert_eq!(shown.get(&1), None, "a requeued finding shows no blocker");
+    assert_eq!(shown.get(&2), Some(&reason), "the other is still held");
+    assert_eq!(store.resume_chain_stats(10).await.unwrap().total, 900);
+    let continued = store
+        .create_job(
+            hunter::domain::FindingJobKind::Fix.into(),
+            1,
+            Some(1),
+            None,
+            JobState::Running,
+            Some(100),
+            Some(10),
+        )
+        .await
+        .unwrap();
+    assert_eq!(continued.superseded, [] as [i64; 0]);
+    assert_eq!(store.resume_origin_job(continued.id).await.unwrap(), 10);
+    assert_eq!(
+        store.pinned_sha(continued.id).await.unwrap().as_deref(),
+        Some("original-sha")
+    );
+    assert_eq!(
+        store.job_blocker(continued.id).await.unwrap().as_deref(),
+        Some(reason.as_str()),
+        "a resume inherits the blocker it works against"
+    );
+    let fresh = store
+        .create_job(
+            hunter::domain::FindingJobKind::Recheck.into(),
+            1,
+            Some(3),
+            None,
+            JobState::Running,
+            Some(100),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.job_blocker(fresh.id).await.unwrap(), None);
+    assert_eq!(
+        store.jobs_by_finding(1).await.unwrap()[1].state,
+        JobState::Suspended
+    );
+    assert!(store.list_resumable_jobs().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn block_fix_job_guards_identity_and_rolls_back_both_rows_on_error() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    sqlx::raw_sql(
+        "INSERT INTO jobs (id, kind, repo_id, finding_id, state, notes, started_at) VALUES \
+         (10, 'fix', 1, 1, 'done', 'original', 1000), \
+         (11, 'recheck', 1, 1, 'done', 'original', 1000);",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    for (finding_id, job_id) in [(2, 10), (1, 11), (1, 99)] {
+        assert!(matches!(
+            store.block_fix_job(finding_id, job_id, "blocked").await,
+            Err(sqlx::Error::RowNotFound)
+        ));
+    }
+    sqlx::raw_sql(
+        "CREATE TRIGGER reject_blocked BEFORE UPDATE ON findings \
+         WHEN NEW.status = 'blocked' BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(store.block_fix_job(1, 10, "blocked").await.is_err());
+    for finding_id in [1, 2] {
+        let finding = store.get_finding(finding_id).await.unwrap().unwrap();
+        assert_eq!(
+            finding.status,
+            if finding_id == 1 {
+                FindingStatus::New
+            } else {
+                FindingStatus::Queued
+            }
+        );
+        assert_eq!(finding.updated_at, 1000);
+    }
+    for job in store.jobs_by_finding(1).await.unwrap() {
+        assert_eq!(job.state, JobState::Done);
+        assert_eq!(job.notes.as_deref(), Some("original"));
+        assert_eq!(job.finished_at, None);
     }
 }

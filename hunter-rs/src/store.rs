@@ -538,6 +538,62 @@ impl Store {
         Ok(())
     }
 
+    /// Retain a fix checkpoint without treating its blocker as a rejection.
+    /// Both rows change atomically; a mismatched finding or non-fix job is an
+    /// error and leaves them untouched. Spend, transcript, notes, and the
+    /// original kill reason survive. The report is stored once, as the job's
+    /// `blocker`, which every resume of this chain inherits
+    /// ([`Self::create_job`]) and reads ([`Self::job_blocker`]), and the API
+    /// shows ([`Self::held_fix_blockers`]).
+    ///
+    /// An attempt whose worker never ran (`Backend::run` failed) has no
+    /// transcript of its own; it takes over its predecessor's, which a
+    /// successor row makes unresumable. Otherwise neither link of the chain
+    /// would be resumable and the next requeue would start the fix cold.
+    pub async fn block_fix_job(
+        &self,
+        finding_id: i64,
+        job_id: i64,
+        reason: &str,
+    ) -> sqlx::Result<()> {
+        let now = now_ms();
+        let suspended = JobState::Suspended;
+        let fix = JobKind::Finding(FindingJobKind::Fix);
+        let blocked = FindingStatus::Blocked;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let job = sqlx::query!(
+            "UPDATE jobs SET state = ?1, pid = NULL, blocker = ?2, \
+             finished_at = COALESCE(finished_at, ?3), \
+             session_file = COALESCE(session_file, \
+                 (SELECT p.session_file FROM jobs p WHERE p.id = jobs.resumed_from)) \
+             WHERE id = ?4 AND finding_id = ?5 AND kind = ?6",
+            suspended,
+            reason,
+            now,
+            job_id,
+            finding_id,
+            fix
+        )
+        .execute(&mut *tx)
+        .await?;
+        if job.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        let finding = sqlx::query!(
+            "UPDATE findings SET status = ?1, updated_at = ?2, \
+             fix_attempts = 0, last_fix_failure = NULL WHERE id = ?3",
+            blocked,
+            now,
+            finding_id
+        )
+        .execute(&mut *tx)
+        .await?;
+        if finding.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+        tx.commit().await
+    }
+
     /// Set finding status to `pr_open` with PR URL.
     pub async fn set_finding_pr_open(&self, finding_id: i64, pr_url: &str) -> sqlx::Result<()> {
         let now = now_ms();
@@ -1251,6 +1307,36 @@ impl Store {
             .collect())
     }
 
+    /// The worker report each `blocked` finding's held fix checkpoint is
+    /// blocked on (`jobs.blocker`, newest chain link without a successor):
+    /// `finding_id` -> report. The job row is the only store of that
+    /// report; this is how the API shows it.
+    pub async fn held_fix_blockers(&self) -> sqlx::Result<BTreeMap<i64, String>> {
+        let blocked = FindingStatus::Blocked;
+        let suspended = JobState::Suspended;
+        let fix = JobKind::Finding(FindingJobKind::Fix);
+        let rows = sqlx::query!(
+            r#"
+            SELECT j.finding_id AS "finding_id!: i64", j.blocker AS "blocker!: String"
+            FROM jobs j
+            JOIN findings f ON f.id = j.finding_id
+            WHERE f.status = ?1 AND j.state = ?2 AND j.kind = ?3
+              AND j.blocker IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
+            ORDER BY j.id
+            "#,
+            blocked,
+            suspended,
+            fix
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.finding_id, r.blocker))
+            .collect())
+    }
+
     /// All `FindingStatus` keys zero-filled, then GROUP BY status counts.
     pub async fn status_counts(&self) -> sqlx::Result<BTreeMap<String, i64>> {
         let mut counts: BTreeMap<String, i64> = FindingStatus::ALL
@@ -1448,8 +1534,9 @@ impl Store {
     ///   nothing to continue and would silently become a fresh run —
     ///   the implicit-resume behaviour that once re-cached an unrelated
     ///   290-call transcript for 508,709 tokens on a single call;
-    /// - finding jobs require an actionable status for that kind; a
-    ///   suspension this filter hides is retired by
+    /// - finding jobs require an actionable status for that kind. A blocked
+    ///   fix retains its checkpoint but waits for an operator to queue it;
+    ///   any other suspension this filter hides is retired by
     ///   [`Self::retire_stranded_suspensions`];
     /// - nothing may already continue it. A successor row IS the record
     ///   that this suspension has been picked up, which is why no
@@ -1513,16 +1600,17 @@ impl Store {
 
     /// Retire suspended finding jobs whose finding has moved on, so
     /// [`Self::list_resumable_jobs`] will never offer them again: anything
-    /// not at its kind's actionable status, except a fix at `fixing`.
-    /// `fixing` with no successor yet is `run_fix` between its claim and
-    /// `create_job`, or a daemon that died there; startup sweeps before
-    /// reconciliation requeues the finding, so retiring it then would throw
-    /// away the checkpoint being resumed. Returns the retired ids.
+    /// not at its kind's actionable status, except a fix at `blocked` (held
+    /// for the operator) or `fixing`. `fixing` with no successor yet is
+    /// `run_fix` between its claim and `create_job`, or a daemon that died
+    /// there; startup sweeps before reconciliation requeues the finding, so
+    /// retiring it then would throw away the checkpoint being resumed.
+    /// Returns the retired ids.
     ///
     /// Without this such a row stayed `suspended` forever — no resume
     /// reaches it, so neither the give-up ceiling nor the `workdir-gone`
     /// check ever runs — and the sweep, which keeps every suspended chain,
-    /// held its whole tree on disk (a suspended fix the operator rejected).
+    /// held its whole tree on disk (a blocked fix the operator rejected).
     /// The actionable mapping must match [`Self::list_resumable_jobs`];
     /// `every_finding_suspension_is_resumable_held_or_retired` pins the two
     /// together.
@@ -1537,6 +1625,7 @@ impl Store {
         let harvest = JobKind::Finding(FindingJobKind::Harvest);
         let merged = FindingStatus::Merged;
         let closed = FindingStatus::Closed;
+        let blocked = FindingStatus::Blocked;
         let fixing = FindingStatus::Fixing;
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let stranded = sqlx::query!(
@@ -1549,7 +1638,7 @@ impl Store {
             WHERE j.state = ?1
               AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
               AND NOT (
-                  (j.kind = ?2 AND f.status IN (?3, ?11))
+                  (j.kind = ?2 AND f.status IN (?3, ?11, ?12))
                   OR (j.kind = ?4 AND f.status = ?5)
                   OR (j.kind = ?6 AND f.status = ?7)
                   OR (j.kind = ?8 AND f.status IN (?9, ?10))
@@ -1566,6 +1655,7 @@ impl Store {
             harvest,
             merged,
             closed,
+            blocked,
             fixing
         )
         .fetch_all(&mut *tx)
@@ -1865,9 +1955,10 @@ impl Store {
     /// holds its branch checked out, and git refuses to check one branch
     /// out in two worktrees.
     ///
-    /// A resumed attempt copies `pinned_sha` from the attempt it
-    /// continues, here in the INSERT, so every link of a chain names the
-    /// commit its shared tree was created at.
+    /// A resumed attempt copies `pinned_sha` and `blocker` from the attempt
+    /// it continues, here in the INSERT, so every link of a chain names the
+    /// commit its shared tree was created at and the prerequisite, if any,
+    /// it was blocked on.
     pub async fn create_job(
         &self,
         kind: JobKind,
@@ -1885,9 +1976,10 @@ impl Store {
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha) \
+              resumed_from, pinned_sha, blocker) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
-                    (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8) \
+                    (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
+                    (SELECT p.blocker FROM jobs p WHERE p.id = ?8) \
              WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
             kind,
             repo_id,
@@ -1982,6 +2074,17 @@ impl Store {
     pub async fn pinned_sha(&self, job_id: i64) -> sqlx::Result<Option<String>> {
         Ok(
             sqlx::query_scalar!("SELECT pinned_sha FROM jobs WHERE id = ?1", job_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
+    }
+
+    /// The prerequisite report `job_id`'s fix chain is blocked on: set by
+    /// [`Self::block_fix_job`], inherited by every resume of the chain.
+    pub async fn job_blocker(&self, job_id: i64) -> sqlx::Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar!("SELECT blocker FROM jobs WHERE id = ?1", job_id)
                 .fetch_optional(&self.pool)
                 .await?
                 .flatten(),
@@ -2367,13 +2470,9 @@ impl Store {
 
     /// Non-suppressed findings for a repo+type (novelty comparison).
     ///
-    /// Python selected `status IN ACTIVE_STATUSES` (`types.ACTIVE_STATUSES`), which
-    /// is seven statuses — the five in-flight ones *plus* `merged` and
-    /// `note`. Excluding the two suppressed statuses from the nine is the
-    /// same set, stated as its complement: a finding already merged or
-    /// noted is still knowledge a hunt should not rediscover as novel.
-    /// Read it as "everything except the verdicts that mean forget this",
-    /// not as "everything still in flight".
+    /// Everything except the verdicts that mean forget this. A blocked fix,
+    /// merged work, or a noted finding remains knowledge a hunt should not
+    /// rediscover as novel; "known" does not mean "still in flight".
     pub async fn known_active(
         &self,
         repo_id: i64,

@@ -26,6 +26,7 @@ struct Fixture {
     store: hunter::store::Store,
     fid: i64,
     repo_dir: std::path::PathBuf,
+    db: std::path::PathBuf,
     /// Last, so the directory outlives the Store's SQLite pool. See
     /// `runner_engage_test` for why, and for what it does not fix.
     _dir: TempDir,
@@ -35,7 +36,7 @@ struct Fixture {
 async fn fixture(label: &str) -> Fixture {
     let dir = TempDir::new(label);
     let repo = GitRepo::with_branch(&dir, "some-other-branch");
-    let (_db, store) = fresh_store(&dir, "fix").await;
+    let (db, store) = fresh_store(&dir, "fix").await;
 
     let repos_root = dir.path().join("repos");
     std::fs::create_dir_all(&repos_root).unwrap();
@@ -85,6 +86,7 @@ async fn fixture(label: &str) -> Fixture {
         store,
         fid,
         repo_dir,
+        db,
     }
 }
 
@@ -343,4 +345,648 @@ async fn verdict_after_selection_stops_the_fix_before_its_job() {
         panic!("the checkpoint must still resume");
     };
     assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
+}
+
+/// Stage an implemented fix plus durable reports and its metered transcript.
+async fn blocked_fixture() -> (
+    Fixture,
+    ScriptedBackend,
+    hunter::scheduler::CycleSummary,
+    String,
+) {
+    let f = fixture("fix-blocked-checkpoint").await;
+    let reason = format!(
+        "Missing supported compiler\n{}",
+        "Build prerequisite detail\n".repeat(40)
+    );
+    let expected_reason = reason.clone();
+    let blocked = ScriptedBackend::new(move |tree| {
+        std::fs::write(tree.join("candidate.txt"), "implemented fix\n").unwrap();
+        git(tree, &["add", "candidate.txt"]);
+        git(tree, &["commit", "-m", "implemented candidate"]);
+        std::fs::write(tree.join("BLOCKED.md"), &reason).unwrap();
+        std::fs::write(
+            tree.join("PR-DESCRIPTION.md"),
+            "verified candidate; awaiting prerequisite",
+        )
+        .unwrap();
+        let session = tree.parent().unwrap().join("session/session.jsonl");
+        std::fs::write(
+            &session,
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+        )
+        .unwrap();
+        let mut result = support::done();
+        result.session_file = Some(session.to_string_lossy().into_owned());
+        result
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &blocked, None)
+        .await
+        .unwrap();
+    (f, blocked, summary, expected_reason)
+}
+
+/// Blocked is not suppressed or automatically retried, and a sweep preserves
+/// its committed implementation and uncommitted verification reports. The
+/// report moves to the job row, so the tree holds no stale `BLOCKED.md`.
+#[tokio::test]
+async fn blocked_fix_keeps_checkpoint_and_requeues_without_losing_commits() {
+    let (f, blocked, summary, expected_reason) = blocked_fixture().await;
+    assert_eq!(summary.outcome.as_deref(), Some("blocked"));
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "blocked");
+    assert_eq!(shown_blocker(&f).await, Some(expected_reason.clone()));
+    assert_eq!(finding.verdict_reason, None, "the report is not copied");
+    let tree = blocked.runs()[0].tree.clone();
+    assert_eq!(
+        std::fs::read_to_string(tree.join("candidate.txt")).unwrap(),
+        "implemented fix\n"
+    );
+    assert!(!tree.join("BLOCKED.md").exists());
+    assert_eq!(
+        f.store
+            .job_blocker(summary.job_id.unwrap())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(expected_reason.as_str())
+    );
+    assert!(tree.join("PR-DESCRIPTION.md").is_file());
+    assert!(f.store.suppressions(1, "bug").await.unwrap().is_empty());
+    assert!(!matches!(
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap(),
+        Some(hunter::scheduler::Candidate::Resume { .. })
+    ));
+    hunter::workspace::sweep(&f.store, &f.cfg.work_root, hunter::util::now_ms())
+        .await
+        .unwrap();
+    assert!(tree.is_dir(), "blocked checkpoint must survive a sweep");
+}
+
+/// Requeue continues the original commits. Neither a budget denial nor a
+/// provider failure can erase the checkpoint or turn it into a rejection.
+#[tokio::test]
+async fn requeued_blocked_fix_preserves_work_across_provider_failures() {
+    let (f, blocked, summary, expected_reason) = blocked_fixture().await;
+    let tree = blocked.runs()[0].tree.clone();
+    let original_head = git(&tree, &["rev-parse", "HEAD"]);
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("requeued blocked work must resume, not start cold");
+    };
+    assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let denied = ScriptedBackend::noop().denying_above(0);
+    let result = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &denied, Some(&plan))
+        .await
+        .unwrap();
+    assert!(result.denied.is_some());
+    assert_eq!(
+        blocker_of(&f, Some(plan.predecessor_id)).await,
+        Some(expected_reason.clone()),
+        "budget denial must leave the blocker untouched"
+    );
+    // A report left in the tree by a daemon that died between recording it
+    // and deleting it is the old blocker, not this attempt's outcome.
+    std::fs::write(tree.join("BLOCKED.md"), &expected_reason).unwrap();
+
+    let provider_failure = ScriptedBackend::staged(|tree, session| {
+        assert!(
+            !tree.join("BLOCKED.md").exists(),
+            "the stale report must not read as this attempt's outcome"
+        );
+        let mut result = support::done();
+        result.exit_code = Some(1);
+        result.tokens_new = 0;
+        result.stdout_tail = "provider access denied".to_owned();
+        result.session_file = session.map(|path| path.to_string_lossy().into_owned());
+        result
+    });
+    let failed =
+        hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &provider_failure, Some(&plan))
+            .await
+            .unwrap();
+    assert_eq!(failed.outcome.as_deref(), Some("blocked"));
+    assert_eq!(
+        blocker_of(&f, failed.job_id).await,
+        Some(expected_reason.clone())
+    );
+    assert_eq!(shown_blocker(&f).await, Some(expected_reason.clone()));
+    assert_eq!(git(&tree, &["rev-parse", "HEAD"]), original_head);
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("a failed provider handoff must preserve the requeued checkpoint");
+    };
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    let unblocked = ScriptedBackend::staged(move |tree, session| {
+        assert!(
+            session.is_some(),
+            "unblocked worker needs the paid-for transcript"
+        );
+        assert_eq!(git(tree, &["rev-parse", "HEAD"]), original_head);
+        assert_eq!(
+            std::fs::read_to_string(tree.join("candidate.txt")).unwrap(),
+            "implemented fix\n"
+        );
+        assert!(
+            !tree.join("BLOCKED.md").exists(),
+            "stale blocker must not override a new result"
+        );
+        // A new prerequisite is a new block, not a rejection or cold retry.
+        std::fs::write(tree.join("BLOCKED.md"), "External peer still missing").unwrap();
+        let mut result = support::done();
+        result.session_file = session.map(|path| path.to_string_lossy().into_owned());
+        result
+    });
+    let result = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &unblocked, Some(&plan))
+        .await
+        .unwrap();
+    assert_eq!(result.outcome.as_deref(), Some("blocked"));
+    assert_eq!(
+        shown_blocker(&f).await.as_deref(),
+        Some("External peer still missing")
+    );
+    assert!(tree.is_dir());
+}
+
+/// A daemon that dies mid-resume must not lose the blocker: once startup
+/// reconciliation suspends the orphan, the next resume inherits it from the
+/// job row, and an attempt that fails without resolving the prerequisite
+/// holds the finding with the original report again.
+#[tokio::test]
+async fn interrupted_blocked_resume_keeps_the_report_for_the_next_resume() {
+    let (f, blocked, _, expected_reason) = blocked_fixture().await;
+    let tree = blocked.runs()[0].tree.clone();
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("requeued blocked work must resume");
+    };
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+
+    // The process dies after the worker has metered work of its own.
+    let crashing = ScriptedBackend::staged(|_, session| {
+        let session = session.unwrap();
+        let mut ledger = std::fs::read_to_string(session).unwrap();
+        ledger.push_str(
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":500,\"output\":50}}}\n",
+        );
+        std::fs::write(session, ledger).unwrap();
+        panic!("daemon killed mid-attempt");
+    });
+    let (store, cfg) = (f.store.clone(), f.cfg.clone());
+    let crashed = tokio::spawn(async move {
+        hunter::scheduler::run_fix(&store, &cfg, &finding, &crashing, Some(&plan)).await
+    })
+    .await;
+    assert!(crashed.unwrap_err().is_panic());
+
+    hunter::daemon::reconcile_and_log(&f.store, &f.cfg.work_root)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the interrupted attempt must resume");
+    };
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let provider_failure = ScriptedBackend::staged(|_, session| {
+        let mut result = support::done();
+        result.exit_code = Some(1);
+        result.tokens_new = 0;
+        result.session_file = session.map(|path| path.to_string_lossy().into_owned());
+        result
+    });
+    let failed =
+        hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &provider_failure, Some(&plan))
+            .await
+            .unwrap();
+    assert_eq!(failed.outcome.as_deref(), Some("blocked"));
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "blocked");
+    assert_eq!(shown_blocker(&f).await, Some(expected_reason.clone()));
+    assert_eq!(
+        blocker_of(&f, failed.job_id).await,
+        Some(expected_reason.clone())
+    );
+    assert!(
+        !tree.join("BLOCKED.md").exists(),
+        "the restored report lives on the job row"
+    );
+}
+
+/// The blocker recorded on `job`'s row.
+async fn blocker_of(f: &Fixture, job: Option<i64>) -> Option<String> {
+    f.store.job_blocker(job.unwrap()).await.unwrap()
+}
+
+/// The report the API shows on the fixture finding's Blocked card.
+async fn shown_blocker(f: &Fixture) -> Option<String> {
+    f.store.held_fix_blockers().await.unwrap().remove(&f.fid)
+}
+
+/// The inherited blocker is restored only for an attempt that ended with
+/// no outcome. A worker that finished (here without a PR description), or
+/// one that declined the finding even while failing, concluded something,
+/// and the old blocker must not override it.
+#[tokio::test]
+async fn a_blocked_resume_that_concludes_is_not_blocked_again() {
+    for (case, expected) in [("finished", "requeued"), ("declined", "rejected")] {
+        let (f, _blocked, _, _) = blocked_fixture().await;
+        f.store
+            .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+            .await
+            .unwrap();
+        let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+            hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+                .await
+                .unwrap()
+        else {
+            panic!("requeued blocked work must resume");
+        };
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let worker = ScriptedBackend::staged(move |tree, session| {
+            let mut result = support::done();
+            if case == "finished" {
+                std::fs::remove_file(tree.join("PR-DESCRIPTION.md")).unwrap();
+            } else {
+                std::fs::write(tree.join("NOT-A-BUG.md"), "intended behaviour").unwrap();
+                result.exit_code = Some(1);
+            }
+            result.session_file = session.map(|path| path.to_string_lossy().into_owned());
+            result
+        });
+        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, Some(&plan))
+            .await
+            .unwrap();
+        assert_eq!(summary.outcome.as_deref(), Some(expected), "{case}");
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_ne!(finding.status.as_str(), "blocked", "{case}");
+    }
+}
+
+/// Identical failures are retried until the streak limit, then the work
+/// is held as blocked with its tree, rather than rejected.
+#[tokio::test]
+async fn repeated_identical_fix_failures_become_blocked_at_the_limit() {
+    let f = fixture("fix-stuck").await;
+    let empty = ScriptedBackend::noop();
+    let mut outcomes = Vec::new();
+    let mut last_job = None;
+    for _ in 0..3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &empty, None)
+            .await
+            .unwrap();
+        outcomes.push(summary.outcome.unwrap());
+        last_job = summary.job_id;
+    }
+    assert_eq!(outcomes, ["requeued", "requeued", "blocked"]);
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "blocked");
+    let tree = empty.runs()[2].tree.clone();
+    assert!(
+        !tree.join("BLOCKED.md").exists(),
+        "the report lives on the job row"
+    );
+    let shown = shown_blocker(&f).await;
+    assert!(
+        shown
+            .as_deref()
+            .is_some_and(|r| r.contains("3 consecutive fix attempts hit the same failure"))
+    );
+    assert_eq!(f.store.job_blocker(last_job.unwrap()).await.unwrap(), shown);
+}
+
+/// A resume of a chain that was never blocked (a cap suspension) is the
+/// plain continuation, and ending without an outcome is a plain requeue.
+#[tokio::test]
+async fn fix_resume_without_a_blocker_runs_the_plain_continuation() {
+    let f = fixture("fix-cap-resume").await;
+    let capped = ScriptedBackend::staged(|tree, _| {
+        let session = tree.parent().unwrap().join("session/session.jsonl");
+        std::fs::write(
+            &session,
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+        )
+        .unwrap();
+        let mut result = support::done();
+        result.exit_code = None;
+        result.killed_reason = Some("cap".to_owned());
+        result.session_file = Some(session.to_string_lossy().into_owned());
+        result
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &capped, None)
+        .await
+        .unwrap();
+    assert_eq!(summary.outcome.as_deref(), Some("suspended"));
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("a cap suspension must resume");
+    };
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let resumed = ScriptedBackend::staged(|_, session| {
+        let mut result = support::done();
+        result.session_file = session.map(|path| path.to_string_lossy().into_owned());
+        result
+    });
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &resumed, Some(&plan))
+        .await
+        .unwrap();
+    assert_eq!(resumed.runs().len(), 1);
+    assert_eq!(summary.outcome.as_deref(), Some("requeued"));
+}
+
+/// A stale report in the tree that cannot be removed stops the resume
+/// before any successor exists (running on would let it read as this
+/// attempt's outcome), and holds the checkpoint blocked again: still the
+/// chain's resumable tip once the operator clears the obstacle.
+#[tokio::test]
+async fn unremovable_stale_report_holds_the_checkpoint_blocked() {
+    let (f, blocked, _, _) = blocked_fixture().await;
+    let tree = blocked.runs()[0].tree.clone();
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("requeued blocked work must resume");
+    };
+    let jobs_before = f.store.jobs_by_finding(f.fid).await.unwrap().len();
+    std::fs::create_dir(tree.join("BLOCKED.md")).unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let never = ScriptedBackend::new(|_| panic!("must not run beside a stale report"));
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &never, Some(&plan))
+        .await
+        .unwrap();
+    assert_eq!(summary.outcome.as_deref(), Some("blocked"), "{summary:?}");
+    assert_eq!(
+        summary.kind,
+        Some(hunter::domain::FindingJobKind::Fix.into())
+    );
+    assert_eq!(summary.finding_id, Some(f.fid));
+    assert_eq!(summary.state, Some(hunter::domain::JobState::Suspended));
+    assert!(
+        summary
+            .failure
+            .as_deref()
+            .is_some_and(|m| m.starts_with("cannot remove the stale ")),
+        "{summary:?}"
+    );
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "blocked");
+    assert_eq!(
+        f.store.jobs_by_finding(f.fid).await.unwrap().len(),
+        jobs_before,
+        "no successor was created"
+    );
+
+    std::fs::remove_dir(tree.join("BLOCKED.md")).unwrap();
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan: again, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the held checkpoint must still resume");
+    };
+    assert_eq!(again.predecessor_id, plan.predecessor_id);
+}
+
+/// Rejecting a blocked fix ends its checkpoint: the next sweep retires the
+/// suspension and releases its tree, instead of holding both forever.
+#[tokio::test]
+async fn rejecting_a_blocked_fix_lets_the_sweep_release_its_checkpoint() {
+    let (f, blocked, summary, _) = blocked_fixture().await;
+    let tree = blocked.runs()[0].tree.clone();
+    let job = summary.job_id.unwrap();
+
+    hunter::workspace::sweep(&f.store, &f.cfg.work_root, hunter::util::now_ms())
+        .await
+        .unwrap();
+    assert!(tree.is_dir(), "a blocked checkpoint is held");
+
+    f.store
+        .set_finding_verdict(
+            f.fid,
+            hunter::domain::FindingStatus::Rejected,
+            "not worth it",
+        )
+        .await
+        .unwrap();
+    hunter::workspace::sweep(&f.store, &f.cfg.work_root, hunter::util::now_ms())
+        .await
+        .unwrap();
+    assert!(!tree.exists(), "the rejected checkpoint's tree is released");
+    let jobs = f.store.jobs_by_finding(f.fid).await.unwrap();
+    let retired = jobs.iter().find(|j| j.id == job).unwrap();
+    assert_eq!(retired.state, hunter::domain::JobState::Killed);
+    assert_eq!(retired.killed_reason.as_deref(), Some("finding-moved"));
+}
+
+/// A blocked resume whose backend fails before any worker runs leaves no
+/// transcript of its own. The checkpoint must still resume on the next
+/// requeue, continuing the predecessor's transcript, not start the fix cold.
+#[tokio::test]
+async fn a_blocked_resume_whose_backend_fails_stays_resumable() {
+    let (f, blocked, summary, expected_reason) = blocked_fixture().await;
+    let tree = blocked.runs()[0].tree.clone();
+    let transcript = tree.parent().unwrap().join("session/session.jsonl");
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("requeued blocked work must resume");
+    };
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let failing = ScriptedBackend::failing();
+    let err = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &failing, Some(&plan))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("backend failed"), "{err}");
+    let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(after.status.as_str(), "blocked");
+    assert_eq!(shown_blocker(&f).await, Some(expected_reason));
+
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the checkpoint must still resume after a failed backend");
+    };
+    assert_ne!(
+        plan.predecessor_id,
+        summary.job_id.unwrap(),
+        "the failed attempt is the link"
+    );
+    assert_eq!(plan.session_file, transcript);
+    assert_eq!(
+        git(&tree, &["log", "-1", "--format=%s"]).trim(),
+        "implemented candidate"
+    );
+}
+
+/// Whatever bytes a worker writes into its report are the report: a
+/// `BLOCKED.md` or `NOT-A-BUG.md` that is not valid UTF-8 still blocks or
+/// declines, its text read lossily.
+#[tokio::test]
+async fn a_report_that_is_not_utf8_still_counts() {
+    for (file, expected, status) in [
+        ("BLOCKED.md", "blocked", "blocked"),
+        ("NOT-A-BUG.md", "rejected", "rejected"),
+    ] {
+        let f = fixture("fix-non-utf8").await;
+        let worker = ScriptedBackend::new(move |tree| {
+            std::fs::write(tree.join(file), b"needs a rig \xff\xfe").unwrap();
+            support::done()
+        });
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
+            .await
+            .unwrap();
+        assert_eq!(summary.outcome.as_deref(), Some(expected), "{file}");
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(finding.status.as_str(), status, "{file}");
+        let report = if file == "BLOCKED.md" {
+            f.store.job_blocker(summary.job_id.unwrap()).await.unwrap()
+        } else {
+            finding.verdict_reason
+        };
+        assert_eq!(
+            report.as_deref(),
+            Some("needs a rig \u{fffd}\u{fffd}"),
+            "{file}"
+        );
+    }
+}
+
+/// A report that cannot be read at all is an error, but it does not leave
+/// the finding stranded at `fixing`.
+#[tokio::test]
+async fn an_unreadable_report_returns_the_finding_to_queued() {
+    let f = fixture("fix-unreadable-report").await;
+    let worker = ScriptedBackend::new(|tree| {
+        std::fs::create_dir(tree.join("BLOCKED.md")).unwrap();
+        support::done()
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let err = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("cannot read the worker's report"),
+        "{err}"
+    );
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "queued");
+}
+
+/// A verdict given after `pick_next` wins over the stale-report hold too:
+/// the resume is skipped at the claim, and the finding keeps the
+/// operator's status instead of being forced back to `blocked`.
+#[tokio::test]
+async fn a_verdict_after_selection_wins_over_the_stale_report_hold() {
+    let (f, blocked, _, _) = blocked_fixture().await;
+    let tree = blocked.runs()[0].tree.clone();
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("requeued blocked work must resume");
+    };
+    let picked = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    std::fs::create_dir(tree.join("BLOCKED.md")).unwrap();
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Rejected)
+        .await
+        .unwrap();
+    let never = ScriptedBackend::new(|_| panic!("a rejected finding must not run"));
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &picked, &never, Some(&plan))
+        .await
+        .unwrap();
+    assert!(summary.skipped.is_some(), "{summary:?}");
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "rejected");
+}
+
+/// Recording a block can fail (a busy database); the transaction then
+/// leaves the finding at `fixing`, where nothing would pick it up again
+/// before a restart. The fix puts it back to `queued` instead.
+#[tokio::test]
+async fn a_block_that_cannot_be_recorded_returns_the_finding_to_queued() {
+    let f = fixture("fix-block-not-recorded").await;
+    let pool =
+        sqlx::SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&f.db))
+            .await
+            .unwrap();
+    sqlx::raw_sql(
+        "CREATE TRIGGER refuse_block BEFORE UPDATE OF blocker ON jobs \
+         WHEN NEW.blocker IS NOT NULL BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let worker = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("BLOCKED.md"), "needs a rig").unwrap();
+        support::done()
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let err = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("injected"), "{err}");
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "queued");
 }
