@@ -1728,6 +1728,13 @@ impl Store {
     /// continued even once, and one enormous attempt is evidence about
     /// the job's size rather than about the chain being stuck.
     ///
+    /// `attempts` counts the initial attempt always, a cap-killed one
+    /// always, and any other resumed one only when it has positive
+    /// metered spend: a handoff that spent nothing or recorded no spend
+    /// (a provider failure before the first response) was not a try at
+    /// the work. Cap kills count regardless because they re-suspend
+    /// automatically, so the count must bound them on its own.
+    ///
     /// Walks BOTH ways — to predecessors via `resumed_from` and to
     /// successors via the rows that name this one — because `job_id`
     /// can be any link, not just the newest.
@@ -1769,7 +1776,7 @@ impl Store {
                   AND (j.id = c.resumed_from OR j.resumed_from = c.id)
             )
             SELECT COALESCE(SUM(tokens_new), 0) AS "total!: i64",
-                   COUNT(*) AS "attempts!: i64",
+                   COALESCE(SUM(resumed_from IS NULL OR killed_reason = 'cap' OR COALESCE(tokens_new, 0) > 0), 0) AS "attempts!: i64",
                    COALESCE(MAX(tokens_new), 0) AS "max_single!: i64"
             FROM jobs WHERE id IN (SELECT id FROM chain)
             "#,
