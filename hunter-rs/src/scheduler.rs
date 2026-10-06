@@ -5357,12 +5357,46 @@ pub async fn run_harvest(
     )
     .unwrap_or(JobState::Failed);
 
+    // A closed PR's review must say why it closed. Without that the
+    // finding would sit `closed` for good, so a missing or unusable
+    // CLOSE-REASON.json is a failed harvest like a failed worker, and runs
+    // into the same streak limit. A suspension is no failure: see below.
+    let closure = closed.then(|| read_close_reason(&worktree));
+    let failure = match state {
+        JobState::Suspended => None,
+        JobState::Done => match &closure {
+            Some(Err(why)) => Some(why.clone()),
+            _ => None,
+        },
+        _ => Some(CloseFailure {
+            streak_key: format!("worker {state}"),
+            detail: format!("worker {state}"),
+        }),
+    };
+    // A failed handoff is no attempt of the harvest's own: its streak is
+    // left alone (see below).
+    let gave_up = match &failure {
+        Some(failure) if !handoff => Some(
+            record_harvest_failure(store, fid, Some(job), &failure.streak_key, &failure.detail)
+                .await,
+        ),
+        _ => None,
+    };
+    // A failed attempt that will be tried again -- a failed handoff by the
+    // cold harvest, any other the harvest did not give up on by the retry
+    // -- is reviewed again from scratch, follow-ups included, and the next
+    // worker files the same open work under slugs of its own. So only an
+    // attempt nothing will redo files its follow-ups.
+    let redone = failure.is_some() && gave_up != Some(true);
     // Follow-ups and the closure verdict are read from the tree, so before
     // it is released. The release itself is state-checked: a suspended
     // harvest keeps its tree for the resume, where this used to drop it
     // after every run.
-    let followups = ingest_followups(store, repo.id, &worktree, fid, job, "harvest").await;
-    let closure = closed.then(|| read_close_reason(&worktree));
+    let followups = if redone {
+        None
+    } else {
+        ingest_followups(store, repo.id, &worktree, fid, job, "harvest").await
+    };
     close_workspace(store, &ws).await;
 
     let mut summary = CycleSummary {
@@ -5401,23 +5435,8 @@ pub async fn run_harvest(
         }
         return Ok(summary);
     }
-    // A closed PR's review must say why it closed. Without that the
-    // finding would sit `closed` for good, so a missing or unusable
-    // CLOSE-REASON.json is a failed harvest like a failed worker, and runs
-    // into the same streak limit.
-    let failure = if state == JobState::Done {
-        match &closure {
-            Some(Err(why)) => Some(why.clone()),
-            _ => None,
-        }
-    } else {
-        Some(CloseFailure {
-            streak_key: format!("worker {state}"),
-            detail: format!("worker {state}"),
-        })
-    };
     if let Some(failure) = &failure
-        && resume.is_some_and(|p| p.handoff)
+        && handoff
     {
         // The handoff was an extra chance, not the harvest's own attempt:
         // the finding stays `closed` and the harvest tier reviews it cold,
@@ -5438,10 +5457,8 @@ pub async fn run_harvest(
         summary.failure = Some(failure.detail.clone());
         return Ok(summary);
     }
-    if let Some(failure) = failure {
+    if let (Some(failure), Some(gave_up)) = (failure, gave_up) {
         let detail = &failure.detail;
-        let gave_up =
-            record_harvest_failure(store, fid, Some(job), &failure.streak_key, detail).await;
         summary.outcome = Some(if gave_up { "stuck" } else { "retry" }.into());
         summary.failure = Some(detail.clone());
         if override_mode == Some(BudgetOverride::Once) {
