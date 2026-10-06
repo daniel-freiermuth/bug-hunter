@@ -255,6 +255,10 @@ impl Config {
     )]
     pub fn load(root: &Path) -> anyhow::Result<Self> {
         const MS_PER_DAY: i64 = 86_400_000;
+        // Git resolves worktree destinations from its clone, while workers
+        // resolve their cwd from the daemon. Both must receive absolute paths.
+        let root = std::path::absolute(root)
+            .with_context(|| format!("resolving hunter root {}", root.display()))?;
         let cfg_path = root.join("config.json");
         let raw = match std::fs::read_to_string(&cfg_path) {
             Ok(text) => serde_json::from_str::<RawConfig>(&text)
@@ -433,13 +437,13 @@ impl Config {
         };
 
         Ok(Self {
-            root: root.to_owned(),
             work_root: resolve(raw.work_root.as_deref().unwrap_or("data")),
             db_path: resolve(raw.db_path.as_deref().unwrap_or("data/hunter.db")),
             serve_port: raw.serve.port.unwrap_or(8377),
             serve_host,
             allowed_hosts,
             ui_dir: root.join("ui"),
+            root,
             omp_bin: raw.omp_bin.unwrap_or_else(|| "omp".to_owned()),
             stale_after_s,
             cache_ttl_s: raw.budget.cache_ttl_s.unwrap_or(3600.0),

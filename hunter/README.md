@@ -450,6 +450,9 @@ The templates share operational settings but pair the provider with compatible
 worker models. Do not commit `config.json`; it selects the credentials and
 quota source for one installation.
 
+- `--root` may be relative. The loader resolves it to an absolute path
+  before resolving `workRoot`, `dbPath`, playbooks, and UI paths, so Git's
+  clone-relative working directory cannot relocate worker worktrees.
 - `hunt`/`fix` settings apply to their whole job family (hunt also covers
   test\_gap/dep\_update/refactor/modernization/recheck; fix also covers
   engage/harvest/apply\_\*).
