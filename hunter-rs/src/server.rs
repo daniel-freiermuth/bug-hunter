@@ -868,6 +868,9 @@ async fn verdict(
         .log_user_event(&user, "verdict", &msg, Some(fid))
         .await?;
     let refreshed = fetch_finding(&state.store, fid).await?;
+    // A verdict changes the queue (a queued or resumed fix, a finding taken
+    // out of it): act on it now, not at the loop's next natural wake.
+    state.scheduler.wake.notify_one();
     Ok(Json(json!({ "ok": true, "finding": refreshed })).into_response())
 }
 
@@ -962,6 +965,9 @@ async fn recheck(
         )
         .await?;
     let refreshed = fetch_finding(&state.store, fid).await?;
+    // The recheck tier has work now; start it without waiting for the
+    // loop's next natural wake.
+    state.scheduler.wake.notify_one();
     // NB: success key is `queued`, not `ok` (contract §3).
     Ok(Json(json!({ "queued": true, "finding": refreshed })).into_response())
 }
@@ -1003,6 +1009,9 @@ async fn unqueue(
         )
         .await?;
     let refreshed = fetch_finding(&state.store, fid).await?;
+    // The queue changed; the next pick should see it now, not at the
+    // loop's next natural wake.
+    state.scheduler.wake.notify_one();
     Ok(Json(json!({ "ok": true, "finding": refreshed })).into_response())
 }
 

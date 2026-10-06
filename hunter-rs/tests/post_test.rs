@@ -2298,3 +2298,23 @@ async fn operator_writes_lose_to_a_status_change_after_their_check() {
         assert_eq!(after.verdict_reason, None, "{path} {reason:?}");
     }
 }
+
+/// A verdict, a recheck request and an unqueue all change what the
+/// scheduler should pick next, so each wakes the loop instead of waiting
+/// for its next natural wake (up to 15 minutes when idle).
+#[tokio::test]
+async fn queue_changes_wake_the_scheduler_loop() {
+    for (path, body) in [
+        ("/api/verdict", json!({ "id": 1, "status": "queued" })),
+        ("/api/recheck", json!({ "id": 3 })),
+        ("/api/unqueue", json!({ "id": 2 })),
+    ] {
+        let state = test_state().await;
+        let wake = Arc::clone(&state.scheduler.wake);
+        let (status, body) = post(&state, path, body).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .unwrap_or_else(|_| panic!("{path} must wake the scheduler loop"));
+    }
+}
