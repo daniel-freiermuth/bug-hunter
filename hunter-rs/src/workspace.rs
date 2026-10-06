@@ -401,7 +401,9 @@ pub struct SweepReport {
 /// disk. Runs at daemon startup and before every cycle, never during one.
 ///
 /// Nothing is removed without first reading from the job table that no
-/// `running` or `suspended` job needs it:
+/// `running` or `suspended` job needs it. First, suspensions whose finding
+/// has moved on are retired ([`Store::retire_stranded_suspensions`]), so a
+/// checkpoint nothing will ever resume does not hold its tree forever:
 ///
 /// (a) `<work_root>/jobs/<id>/`: a chain with no live attempt has its tree
 ///     released (normally the executor already did; this catches a job
@@ -428,6 +430,7 @@ pub struct SweepReport {
 /// `session/` while its workspace is inside retention.
 pub async fn sweep(store: &Store, work_root: &Path, now_ms: i64) -> anyhow::Result<SweepReport> {
     let mut report = SweepReport::default();
+    store.retire_stranded_suspensions().await?;
     sweep_chains(store, work_root, now_ms, &mut report).await?;
     sweep_legacy_trees(store, work_root, &mut report).await?;
     sweep_legacy_sessions(store, work_root, now_ms, &mut report).await?;

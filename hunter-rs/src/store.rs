@@ -27,8 +27,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 
 use crate::auth::CurrentUser;
 use crate::domain::{
-    BudgetOverride, BugClass, FindingStatus, FindingType, ForgeName, JobKind, JobState,
-    RepoJobKind, Severity,
+    BudgetOverride, BugClass, FindingJobKind, FindingStatus, FindingType, ForgeName, JobKind,
+    JobState, RepoJobKind, Severity,
 };
 use crate::types::{
     Event, Finding, Job, JobListEntry, PrState, Repo, SchedulerState, StatsByFinding, StatsByKind,
@@ -1439,7 +1439,7 @@ impl Store {
     /// defect — a suspension nothing has come back to for many cycles is
     /// stale work, and the scheduler's give-up ceiling ends it.
     ///
-    /// Three filters make "could be picked up again" true rather than
+    /// Four filters make "could be picked up again" true rather than
     /// merely claimed:
     /// - the repo must still be live, since a soft-deleted repo's clone
     ///   is being reaped and `create_job` would refuse the successor;
@@ -1448,6 +1448,9 @@ impl Store {
     ///   nothing to continue and would silently become a fresh run —
     ///   the implicit-resume behaviour that once re-cached an unrelated
     ///   290-call transcript for 508,709 tokens on a single call;
+    /// - finding jobs require an actionable status for that kind; a
+    ///   suspension this filter hides is retired by
+    ///   [`Self::retire_stranded_suspensions`];
     /// - nothing may already continue it. A successor row IS the record
     ///   that this suspension has been picked up, which is why no
     ///   `resumed` state exists: the link carries the fact, and a state
@@ -1458,6 +1461,15 @@ impl Store {
     ///   one level up.
     pub async fn list_resumable_jobs(&self) -> sqlx::Result<Vec<Job>> {
         let suspended = JobState::Suspended;
+        let fix = JobKind::Finding(FindingJobKind::Fix);
+        let queued = FindingStatus::Queued;
+        let recheck = JobKind::Finding(FindingJobKind::Recheck);
+        let rechecking = FindingStatus::Rechecking;
+        let engage = JobKind::Finding(FindingJobKind::Engage);
+        let pr_open = FindingStatus::PrOpen;
+        let harvest = JobKind::Finding(FindingJobKind::Harvest);
+        let merged = FindingStatus::Merged;
+        let closed = FindingStatus::Closed;
         sqlx::query_as!(
             Job,
             r#"
@@ -1474,12 +1486,117 @@ impl Store {
               AND r.deleted_at IS NULL
               AND j.session_file IS NOT NULL
               AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
+              AND (j.kind NOT IN (?2, ?4, ?6, ?8) OR EXISTS (
+                  SELECT 1 FROM findings f WHERE f.id = j.finding_id AND (
+                      (j.kind = ?2 AND f.status = ?3)
+                      OR (j.kind = ?4 AND f.status = ?5)
+                      OR (j.kind = ?6 AND f.status = ?7)
+                      OR (j.kind = ?8 AND f.status IN (?9, ?10))
+                  )
+              ))
             ORDER BY j.id DESC
             "#,
-            suspended
+            suspended,
+            fix,
+            queued,
+            recheck,
+            rechecking,
+            engage,
+            pr_open,
+            harvest,
+            merged,
+            closed
         )
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Retire suspended finding jobs whose finding has moved on, so
+    /// [`Self::list_resumable_jobs`] will never offer them again: anything
+    /// not at its kind's actionable status, except a fix at `fixing`.
+    /// `fixing` with no successor yet is `run_fix` between its claim and
+    /// `create_job`, or a daemon that died there; startup sweeps before
+    /// reconciliation requeues the finding, so retiring it then would throw
+    /// away the checkpoint being resumed. Returns the retired ids.
+    ///
+    /// Without this such a row stayed `suspended` forever — no resume
+    /// reaches it, so neither the give-up ceiling nor the `workdir-gone`
+    /// check ever runs — and the sweep, which keeps every suspended chain,
+    /// held its whole tree on disk (a suspended fix the operator rejected).
+    /// The actionable mapping must match [`Self::list_resumable_jobs`];
+    /// `every_finding_suspension_is_resumable_held_or_retired` pins the two
+    /// together.
+    pub async fn retire_stranded_suspensions(&self) -> sqlx::Result<Vec<i64>> {
+        let suspended = JobState::Suspended;
+        let fix = JobKind::Finding(FindingJobKind::Fix);
+        let queued = FindingStatus::Queued;
+        let recheck = JobKind::Finding(FindingJobKind::Recheck);
+        let rechecking = FindingStatus::Rechecking;
+        let engage = JobKind::Finding(FindingJobKind::Engage);
+        let pr_open = FindingStatus::PrOpen;
+        let harvest = JobKind::Finding(FindingJobKind::Harvest);
+        let merged = FindingStatus::Merged;
+        let closed = FindingStatus::Closed;
+        let fixing = FindingStatus::Fixing;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let stranded = sqlx::query!(
+            r#"
+            SELECT j.id AS "id!", j.kind AS "kind!: JobKind", j.finding_id AS "finding_id!",
+                   f.status AS "status!: FindingStatus", r.name AS "repo_name!"
+            FROM jobs j
+            JOIN findings f ON f.id = j.finding_id
+            JOIN repos r ON r.id = j.repo_id
+            WHERE j.state = ?1
+              AND NOT EXISTS (SELECT 1 FROM jobs s WHERE s.resumed_from = j.id)
+              AND NOT (
+                  (j.kind = ?2 AND f.status IN (?3, ?11))
+                  OR (j.kind = ?4 AND f.status = ?5)
+                  OR (j.kind = ?6 AND f.status = ?7)
+                  OR (j.kind = ?8 AND f.status IN (?9, ?10))
+              )
+            ORDER BY j.id
+            "#,
+            suspended,
+            fix,
+            queued,
+            recheck,
+            rechecking,
+            engage,
+            pr_open,
+            harvest,
+            merged,
+            closed,
+            fixing
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut retired = Vec::with_capacity(stranded.len());
+        for row in stranded {
+            let msg = format!(
+                "resume {} {}: job {} retired, finding #{} is {}",
+                row.kind, row.repo_name, row.id, row.finding_id, row.status
+            );
+            retire_job(
+                &mut *tx,
+                row.id,
+                JobState::Killed,
+                Some("finding-moved"),
+                &msg,
+            )
+            .await?;
+            insert_event(
+                &mut *tx,
+                "resume",
+                &msg,
+                Some(row.id),
+                Some(row.finding_id),
+                None,
+            )
+            .await?;
+            retired.push(row.id);
+        }
+        tx.commit().await?;
+        Ok(retired)
     }
 
     /// What the chain containing `job_id` has cost, how many attempts
@@ -1632,9 +1749,11 @@ impl Store {
     /// scheduler's give-up ceiling retires it `failed` / `give-up`; a
     /// suspension whose working directory is gone is retired `killed` /
     /// `workdir-gone`; fresh work at the same key retires it `killed` /
-    /// `superseded` ([`Self::create_job`]); and a resume that found the
-    /// transcript gone retires it `killed`. All are terminal states, so
-    /// [`Self::list_resumable_jobs`] stops offering the row.
+    /// `superseded` ([`Self::create_job`]); a finding that moved on retires
+    /// it `killed` / `finding-moved` ([`Self::retire_stranded_suspensions`]);
+    /// and a resume that found the transcript gone retires it `killed`.
+    /// All are terminal states, so [`Self::list_resumable_jobs`] stops
+    /// offering the row.
     ///
     /// `killed_reason` is `Option` so the last case can leave the
     /// original reason alone: that attempt really was killed for `cap`,
