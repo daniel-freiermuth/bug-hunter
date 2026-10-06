@@ -295,7 +295,9 @@ fn release_tree(ws: &Workspace) {
 }
 
 /// Release a chain's tree if, according to the job table, no attempt of the
-/// chain is `running` or `suspended`. Returns whether it released.
+/// chain is `running` or `suspended` awaiting resume (a suspension a later
+/// attempt continues does not count; see [`Store::chain_status`]). Returns
+/// whether it released.
 ///
 /// The executors call this after recording a job's outcome, and for every
 /// chain a fresh job superseded; both are the moment a chain becomes
