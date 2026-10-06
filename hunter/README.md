@@ -172,6 +172,10 @@ Each of 1-5 picks a (finding, kind). When that finding has a suspended
 attempt of that same kind that can still be continued, the tier continues
 it, at the tier's own position, instead of starting the work fresh.
 
+The cost ceiling applies only when the historical typical estimate is
+positive. An absent or zero estimate is not a zero-token allowance;
+the attempt ceiling and provider budget still bound the run.
+
 A repeatedly-failing item (same failure reason, consecutive attempts) gives
 up after a bounded streak rather than looping forever — this applies
 uniformly to fix retries, recheck retries, and harvest retries. A resume

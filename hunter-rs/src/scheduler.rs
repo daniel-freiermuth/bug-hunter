@@ -644,7 +644,7 @@ async fn resume_plan(store: &Store, cfg: &Config, job: Job) -> anyhow::Result<Op
     // this feature is for.
     let excess = chain_spent - chain.max_single;
     let too_many = chain.attempts >= MAX_RESUME_ATTEMPTS;
-    let too_costly = chain.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
+    let too_costly = z > 0 && chain.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
     if too_many || too_costly {
         let why = if too_many {
             format!("{} attempts, the limit", chain.attempts)
