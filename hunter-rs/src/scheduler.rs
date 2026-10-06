@@ -1355,7 +1355,10 @@ pub async fn run_hunt(
         last
     };
     if resume.is_none() && last.as_deref() == Some(&head) {
-        let _ = store.set_last_hunt(rid, &head).await;
+        // The watermark is what makes the next pick move on; a skip that
+        // failed to record it would be re-picked at once (a skipped cycle
+        // restarts immediately), so the failure goes to the error path.
+        store.set_last_hunt(rid, &head).await?;
         let _ = store
             .log_event(
                 "hunt",
@@ -2534,6 +2537,20 @@ pub async fn run_fix(
         BudgetDecision::Denied(d) => return Ok(*d),
     };
 
+    // Claim before the job exists. A verdict that landed since `pick_next`
+    // read the row must win: a job created first would overwrite it with
+    // `fixing` and continue or supersede the checkpoint of a finding the
+    // operator has just rejected.
+    if !store
+        .claim_in_progress(fid, FindingStatus::Queued, FindingStatus::Fixing)
+        .await?
+    {
+        return Ok(CycleSummary {
+            kind: Some(FindingJobKind::Fix.into()),
+            skipped: Some(format!("finding #{fid} is no longer queued")),
+            ..Default::default()
+        });
+    }
     let created = match store
         .create_job(
             FindingJobKind::Fix.into(),
@@ -2547,13 +2564,18 @@ pub async fn run_fix(
         .await
     {
         Ok(j) => j,
-        Err(e) => return job_refused(FindingJobKind::Fix.into(), Some(&repo.name), Some(fid), e),
+        Err(e) => {
+            let _ = store
+                .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
+                .await;
+            return job_refused(FindingJobKind::Fix.into(), Some(&repo.name), Some(fid), e);
+        }
     };
     let job = created.id;
     // The branch is per finding, so a superseded fix chain of this finding
     // holds it checked out; `open_workspace` releases that chain's tree
     // before adding this one.
-    let (ws, _pinned) = match open_workspace(
+    let opened = open_workspace(
         store,
         cfg,
         &repo,
@@ -2567,15 +2589,17 @@ pub async fn run_fix(
         &format!("fix #{fid}"),
         Some(fid),
     )
-    .await?
-    {
+    .await;
+    if !matches!(opened, Ok(Ok(_))) {
+        let _ = store
+            .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
+            .await;
+    }
+    let (ws, _pinned) = match opened? {
         Ok(opened) => opened,
         Err(failed) => return Ok(failed),
     };
     let worktree = ws.tree.clone();
-
-    // set_in_progress: fixing -> fallback queued
-    let _ = store.set_in_progress(fid, FindingStatus::Fixing).await;
 
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
     let prompt = match if is_bug {
@@ -2844,7 +2868,6 @@ pub async fn run_fix(
             // its tree and transcript are kept for the resume. Counting it toward the streak would turn
             // three pauses of one healthy fix into "stuck" and reject the
             // finding. Back to queued, where the fix tier continues it.
-            let _ = store.set_finding_status(fid, FindingStatus::Queued).await;
             let _ = store
                 .log_event(
                     "fix",
@@ -2885,7 +2908,6 @@ pub async fn run_fix(
                 summary.failure = Some(failure);
                 summary.attempts = Some(streak);
             } else {
-                let _ = store.set_finding_status(fid, FindingStatus::Queued).await;
                 let _ = store
                     .log_event(
                         "fix",

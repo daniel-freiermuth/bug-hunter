@@ -209,3 +209,138 @@ async fn backend_without_a_ceiling_leaves_the_job_unbounded() {
         "no headroom bound means no token bound, not the config's"
     );
 }
+
+/// A fix whose tree cannot be made goes back to `queued`, not stranded
+/// in `fixing` until the next daemon restart.
+#[tokio::test]
+async fn fix_whose_tree_cannot_be_made_returns_the_finding_to_queued() {
+    let f = fixture("fix-no-tree").await;
+    // The first job's workspace is already taken, so creating it is refused.
+    let taken = f.cfg.work_root.join("jobs").join("1").join("session");
+    std::fs::create_dir_all(&taken).unwrap();
+    std::fs::write(taken.join("other.jsonl"), "someone else's\n").unwrap();
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let never = ScriptedBackend::new(|_| panic!("nothing may run without a tree"));
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &never, None)
+        .await
+        .unwrap();
+    assert_eq!(summary.state, Some(hunter::domain::JobState::Failed));
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "queued");
+}
+
+/// The shipping path: a finished fix is pushed and its draft PR recorded,
+/// both for a new PR and for the "already exists" recovery.
+#[tokio::test]
+async fn a_finished_fix_ships_and_records_its_draft_pr() {
+    const URL: &str = "https://github.com/acme/widget/pull/42";
+    for case in ["created", "exists"] {
+        let bins = support::FakeBins::acquire("fix-ship");
+        let f = fixture("fix-ship").await;
+        // Push to the fixture's bare origin instead of the forge.
+        let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
+        git(
+            &f.repo_dir,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", origin.trim()),
+                "git@github.com:acme/widget.git",
+            ],
+        );
+        if case == "created" {
+            bins.ok("gh", URL);
+        } else {
+            bins.fail("gh", 1, &format!("a pull request already exists: {URL}"));
+        }
+        let worker = ScriptedBackend::new(|tree| {
+            std::fs::write(tree.join("fix.txt"), "fixed\n").unwrap();
+            git(tree, &["add", "fix.txt"]);
+            git(tree, &["commit", "-m", "fix it"]);
+            std::fs::write(tree.join("PR-DESCRIPTION.md"), "the fix").unwrap();
+            support::done()
+        });
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{case}");
+        assert_eq!(summary.pr_url.as_deref(), Some(URL), "{case}");
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(finding.status.as_str(), "pr_open", "{case}");
+        assert_eq!(finding.pr_url.as_deref(), Some(URL), "{case}");
+        drop(bins);
+    }
+}
+
+/// A verdict that lands after `pick_next` read the finding wins: the stale
+/// fix creates no job, so it neither overwrites the operator's rejection
+/// with `fixing` nor continues the checkpoint, which stays resumable if the
+/// operator changes their mind.
+#[tokio::test]
+async fn verdict_after_selection_stops_the_fix_before_its_job() {
+    let f = fixture("fix-stale-selection").await;
+    let capped = ScriptedBackend::staged(|tree, _| {
+        let session = tree.parent().unwrap().join("session/session.jsonl");
+        std::fs::write(
+            &session,
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+        )
+        .unwrap();
+        let mut result = support::done();
+        result.exit_code = None;
+        result.killed_reason = Some("cap".to_owned());
+        result.session_file = Some(session.to_string_lossy().into_owned());
+        result
+    });
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &capped, None)
+        .await
+        .unwrap();
+    assert_eq!(summary.outcome.as_deref(), Some("suspended"));
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("a cap suspension must resume");
+    };
+    let stale = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    f.store
+        .set_finding_verdict(
+            f.fid,
+            hunter::domain::FindingStatus::Rejected,
+            "not worth it",
+        )
+        .await
+        .unwrap();
+
+    let never = ScriptedBackend::new(|_| panic!("a rejected finding must not run"));
+    let result = hunter::scheduler::run_fix(&f.store, &f.cfg, &stale, &never, Some(&plan))
+        .await
+        .unwrap();
+    assert!(result.skipped.is_some());
+    assert!(result.job_id.is_none());
+    assert_eq!(
+        result.kind,
+        Some(hunter::domain::FindingJobKind::Fix.into()),
+        "the cycle status line names the skipped kind"
+    );
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.status.as_str(), "rejected");
+    assert_eq!(finding.verdict_reason.as_deref(), Some("not worth it"));
+
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("the checkpoint must still resume");
+    };
+    assert_eq!(plan.predecessor_id, summary.job_id.unwrap());
+}
