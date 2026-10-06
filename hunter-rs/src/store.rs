@@ -105,8 +105,9 @@ pub struct CreatedJob {
 pub struct ChainStatus {
     /// Rows found in the chain. 0 means no job owns the workspace at all.
     pub attempts: i64,
-    /// Attempts that are `running` or `suspended`. Nonzero means the tree
-    /// is in use or will be resumed, and must not be touched.
+    /// Attempts that are `running`, or `suspended` and not yet continued.
+    /// Nonzero means the tree is in use or will be resumed, and must not
+    /// be touched.
     pub live: i64,
     /// When the chain's latest attempt finished, if any has.
     pub last_finished_at: Option<i64>,
@@ -2356,6 +2357,13 @@ impl Store {
     /// Walks successors from the origin, because a workspace is keyed by
     /// its chain's FIRST job and every later attempt links back to it.
     /// Depth-capped for the same reason [`Self::resume_chain_stats`] is.
+    ///
+    /// A `suspended` attempt counts as live only while nothing continues
+    /// it. A resume inserts its successor and never updates the attempt
+    /// it continues, so every link but the newest of a resumed chain stays
+    /// `suspended` for good; [`Self::list_resumable_jobs`] already hides
+    /// those for the same reason. Counting them would keep the tree of
+    /// every chain that was ever resumed forever.
     pub async fn chain_status(&self, origin_id: i64) -> sqlx::Result<ChainStatus> {
         let running = JobState::Running;
         let suspended = JobState::Suspended;
@@ -2370,7 +2378,9 @@ impl Store {
                 WHERE c.depth < ?2 AND j.resumed_from = c.id
             )
             SELECT COUNT(*) AS "attempts!: i64",
-                   COALESCE(SUM(state IN (?3, ?4)), 0) AS "live!: i64",
+                   COALESCE(SUM(state = ?3 OR (state = ?4 AND NOT EXISTS
+                       (SELECT 1 FROM jobs s WHERE s.resumed_from = jobs.id))), 0)
+                       AS "live!: i64",
                    MAX(finished_at) AS "last_finished_at?: i64",
                    (SELECT r.path FROM jobs o JOIN repos r ON r.id = o.repo_id
                     WHERE o.id = ?1) AS "clone?: String"
