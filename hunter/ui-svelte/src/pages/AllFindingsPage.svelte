@@ -93,7 +93,7 @@
   {:else}
     <div class="card-list">
       {#each displayed as finding (finding.id)}
-        <FindingCard {finding} actions={false} />
+        <FindingCard {finding} actions={true} />
       {/each}
     </div>
   {/if}

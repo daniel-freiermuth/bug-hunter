@@ -300,7 +300,7 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 | **Status** | Budget bars (used + available, per window), Run/Pause and Overdrive controls, what the scheduler is doing right now / why it isn't, and the recent event log |
 | **Inbox** | New findings awaiting triage, with per-type filters |
 | **Kanban / Pipeline** | Findings in flight, a separate Blocked section with prerequisite reports and Resume fix controls, suppressed (rejected/wontfix), and informational (note) findings |
-| **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand |
+| **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand, and the actions its status allows (verdicts on new/blocked/note/closed, Recheck on new, Unqueue on queued, budget override while something will still pick it) |
 | **Repos** | Add/remove/pause repos; per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
 | **Stats** | Aggregate totals by kind and by finding type |
 | **Log** | Full job and event history |

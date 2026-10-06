@@ -27,6 +27,25 @@
   // open panel or drop a half-typed reason.
   const live = $derived(near || expanded || timelineOpen || showReasonPrompt !== null || busy);
 
+  // Which actions the finding's status allows, mirroring the server's state
+  // machine (`FindingStatus::awaits_verdict` and the /api/recheck and
+  // /api/unqueue preconditions), so a card never offers a button the API
+  // would refuse. `actions` only says whether the page shows them at all.
+  const awaitsVerdict = $derived(["new", "blocked", "note", "closed"].includes(finding.status));
+  const canRecheck = $derived(finding.status === "new");
+  const canUnqueue = $derived(finding.status === "queued");
+  // An override is honoured by the tiers that pick queued, rechecking,
+  // pr_open and closed/merged-awaiting-harvest findings, and can be set
+  // ahead on one still waiting for the operator. A running fix, or a
+  // finding nothing will pick again, has no use for one; clearing an
+  // existing one is always allowed.
+  const canOverride = $derived(
+    !["fixing", "rejected", "wontfix", "superseded"].includes(finding.status),
+  );
+  const hasActions = $derived(
+    actions && (awaitsVerdict || canRecheck || canUnqueue || canOverride || !!finding.budget_override),
+  );
+
   function onVisibility(entry: IntersectionObserverEntry) {
     if (entry.isIntersecting) {
       near = true;
@@ -253,7 +272,7 @@
     {/if}
 
     <!-- Actions (verdict / recheck / override) -->
-    {#if actions}
+    {#if hasActions}
       <div class="actions">
         {#if showReasonPrompt}
           <!-- Reason input for rejected/wontfix -->
@@ -277,33 +296,38 @@
           </div>
         {:else}
           <div class="btn-row">
-            <button
-              class="btn btn-queue"
-              disabled={busy}
-              onclick={() => doVerdict("queued")}
-              title={finding.status === "blocked" ? "Resume retained fix work after resolving the prerequisite" : "Queue for fix"}
-            >{finding.status === "blocked" ? "Resume fix" : "Queue"}</button>
-            <button class="btn btn-reject" disabled={busy} onclick={() => { showReasonPrompt = "rejected"; }} title="Reject">Reject</button>
-            <button class="btn btn-muted" disabled={busy} onclick={() => { showReasonPrompt = "wontfix"; }} title="Won't fix">Wontfix</button>
-            <button class="btn btn-muted" disabled={busy} onclick={() => doVerdict("note")} title="Mark as note">Note</button>
-            <button class="btn btn-queue" disabled={busy} onclick={() => doVerdict("merged")} title="Mark as merged">Merged</button>
+            {#if awaitsVerdict}
+              <button
+                class="btn btn-queue"
+                disabled={busy}
+                onclick={() => doVerdict("queued")}
+                title={finding.status === "blocked" ? "Resume retained fix work after resolving the prerequisite" : "Queue for fix"}
+              >{finding.status === "blocked" ? "Resume fix" : "Queue"}</button>
+              <button class="btn btn-reject" disabled={busy} onclick={() => { showReasonPrompt = "rejected"; }} title="Reject">Reject</button>
+              <button class="btn btn-muted" disabled={busy} onclick={() => { showReasonPrompt = "wontfix"; }} title="Won't fix">Wontfix</button>
+              {#if finding.status !== "note"}
+                <button class="btn btn-muted" disabled={busy} onclick={() => doVerdict("note")} title="Mark as note">Note</button>
+              {/if}
+              <button class="btn btn-queue" disabled={busy} onclick={() => doVerdict("merged")} title="Mark as merged">Merged</button>
+            {/if}
 
-            {#if finding.status === "new"}
+            {#if canRecheck}
               <span class="sep"></span>
               <button class="btn btn-accent" disabled={busy} onclick={doRecheck} title="Queue for adversarial recheck">Recheck</button>
             {/if}
 
-            {#if finding.status === "queued"}
-              <span class="sep"></span>
+            {#if canUnqueue}
               <button class="btn btn-warn" disabled={busy} onclick={doUnqueue} title="Remove from fix queue">Unqueue</button>
             {/if}
 
-            <span class="sep"></span>
-            {#if finding.budget_override}
-              <button class="btn btn-muted" disabled={busy} onclick={() => doOverride(null)} title="Clear budget override">Clear override</button>
-            {:else}
-              <button class="btn btn-accent" disabled={busy} onclick={() => doOverride("once")} title="Budget override: once">⚡ Once</button>
-              <button class="btn btn-accent" disabled={busy} onclick={() => doOverride("exempt")} title="Budget override: exempt">⚡ Exempt</button>
+            {#if finding.budget_override || canOverride}
+              {#if awaitsVerdict || canUnqueue}<span class="sep"></span>{/if}
+              {#if finding.budget_override}
+                <button class="btn btn-muted" disabled={busy} onclick={() => doOverride(null)} title="Clear budget override">Clear override</button>
+              {:else}
+                <button class="btn btn-accent" disabled={busy} onclick={() => doOverride("once")} title="Budget override: once">⚡ Once</button>
+                <button class="btn btn-accent" disabled={busy} onclick={() => doOverride("exempt")} title="Budget override: exempt">⚡ Exempt</button>
+              {/if}
             {/if}
           </div>
         {/if}
