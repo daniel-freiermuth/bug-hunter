@@ -1864,3 +1864,42 @@ async fn a_no_commit_hunt_whose_watermark_cannot_be_written_fails() {
         .unwrap_err();
     assert!(err.to_string().contains("injected write failure"), "{err}");
 }
+
+/// Sparse history dominated by failed handoffs is no cost allowance.
+#[tokio::test]
+async fn resume_with_a_zero_cost_estimate_uses_the_attempt_limit_not_a_zero_cost_limit() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    let session = seed_session(&dir);
+    let newest = seed_chain(&pool, &session, &[120_000, 110_000]).await;
+    for id in [12, 13, 14] {
+        sqlx::query("INSERT INTO jobs (id, kind, repo_id, state, tokens_new, started_at, finished_at) VALUES (?1, 'hunt', 1, 'failed', 0, 1000, 2000)")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE jobs SET finished_at = ?1")
+        .bind(hunter::util::now_ms())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = rw_store(&path).await;
+    assert_eq!(
+        hunter::scheduler::anticipated_tokens(
+            &store,
+            &test_config(dir.path()),
+            1,
+            JobKind::Repo(RepoJobKind::Hunt)
+        )
+        .await
+        .unwrap(),
+        0
+    );
+    let picked = pick_next(&store, &test_config(dir.path()), None)
+        .await
+        .unwrap();
+    assert!(
+        matches!(picked, Some(Candidate::Resume { plan, .. }) if plan.predecessor_id == newest)
+    );
+}
