@@ -5,10 +5,12 @@
     label,
     options,
     filter,
+    onChange,
   }: {
     label: string;
     options: string[];
     filter: Filter;
+    onChange: () => void;
   } = $props();
 
   let open = $state(false);
@@ -64,7 +66,7 @@
           type="checkbox"
           checked={allSelected}
           indeterminate={!allSelected && !noneSelected}
-          onchange={() => filter.toggleAll(options)}
+          onchange={() => { filter.toggleAll(options); onChange(); }}
         />
         All
       </label>
@@ -74,7 +76,7 @@
           <input
             type="checkbox"
             checked={filter.accepts(opt)}
-            onchange={() => filter.toggle(opt, options)}
+            onchange={() => { filter.toggle(opt, options); onChange(); }}
           />
           {opt}
         </label>

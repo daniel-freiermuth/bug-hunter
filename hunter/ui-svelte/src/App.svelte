@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { store } from "./lib/api.svelte";
+  import { navigation } from "./lib/navigation.svelte";
   import StatusPage from "./pages/StatusPage.svelte";
   import InboxPage from "./pages/InboxPage.svelte";
   import KanbanPage from "./pages/KanbanPage.svelte";
@@ -21,33 +22,17 @@
     { id: "log", label: "LOG", icon: "≡" },
   ] as const;
 
-  function parseHash(hash: string): { page: string; focusId: number | null } {
-    const raw = hash.slice(1) || "inbox";
-    const colon = raw.indexOf(":");
-    if (colon >= 0) {
-      const id = parseInt(raw.slice(colon + 1), 10);
-      return { page: raw.slice(0, colon), focusId: Number.isNaN(id) ? null : id };
-    }
-    return { page: raw, focusId: null };
-  }
-
-  const initial = parseHash(location.hash);
-  let page = $state(initial.page);
-  let focusId = $state<number | null>(initial.focusId);
+  const page = $derived(navigation.route.page);
+  const focusId = $derived(navigation.route.focusId);
   let sidebarOpen = $state(false);
 
   function navigate(id: string) {
-    location.hash = id;
-    const h = parseHash(`#${id}`);
-    page = h.page;
-    focusId = h.focusId;
+    navigation.navigate(id);
     sidebarOpen = false;
   }
 
   function onHashChange() {
-    const h = parseHash(location.hash);
-    page = h.page;
-    focusId = h.focusId;
+    navigation.sync();
   }
 
   let loggingOut = $state(false);
@@ -65,11 +50,13 @@
   onMount(() => {
     store.start();
     window.addEventListener("hashchange", onHashChange);
+    window.addEventListener("popstate", onHashChange);
   });
 
   onDestroy(() => {
     store.stopPolling();
     window.removeEventListener("hashchange", onHashChange);
+    window.removeEventListener("popstate", onHashChange);
   });
 </script>
 

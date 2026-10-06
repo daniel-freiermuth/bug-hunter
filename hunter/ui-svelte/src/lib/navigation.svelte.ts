@@ -1,0 +1,55 @@
+import { SvelteURLSearchParams } from "svelte/reactivity";
+
+/** Split the hash route, optional finding id, and independently encoded filter parameters. */
+export function parseHash(hash: string): { page: string; focusId: number | null; params: URLSearchParams } {
+  const raw = hash.replace(/^#/, "");
+  const question = raw.indexOf("?");
+  const target = (question < 0 ? raw : raw.slice(0, question)) || "inbox";
+  const params = new SvelteURLSearchParams(question < 0 ? "" : raw.slice(question + 1));
+  const colon = target.indexOf(":");
+  const id = colon < 0 ? NaN : Number(target.slice(colon + 1));
+  return {
+    page: colon < 0 ? target : target.slice(0, colon),
+    focusId: Number.isSafeInteger(id) && id > 0 ? id : null,
+    params,
+  };
+}
+
+/** Hash routes remain the source of truth, including same-page Back/Forward. */
+class Navigation {
+  hash = $state(typeof window === "undefined" ? "" : window.location.hash);
+
+  get route() {
+    return parseHash(this.hash);
+  }
+
+  /** Restore the current browser entry after hash navigation or Back/Forward. */
+  sync(): void {
+    this.hash = window.location.hash;
+  }
+
+  /** Open a page as a new history entry, clearing filters belonging to the old page. */
+  navigate(target: string): void {
+    this.commit(`#${target}`, false);
+  }
+
+  /** Edit filter parameters without losing the page or focused finding; replace coalesces slider input. */
+  updateParams(update: (params: URLSearchParams) => void, replace = false): void {
+    const question = this.hash.indexOf("?");
+    const target = (question < 0 ? this.hash : this.hash.slice(0, question)) || "#inbox";
+    const params = this.route.params;
+    update(params);
+    const query = params.toString();
+    this.commit(query ? `${target}?${query}` : target, replace);
+  }
+
+  /** Update URL and reactive state together; pushState does not emit hashchange. */
+  private commit(hash: string, replace: boolean): void {
+    if (window.location.hash === hash) return;
+    if (replace) window.history.replaceState(null, "", hash);
+    else window.history.pushState(null, "", hash);
+    this.hash = window.location.hash;
+  }
+}
+
+export const navigation = new Navigation();
