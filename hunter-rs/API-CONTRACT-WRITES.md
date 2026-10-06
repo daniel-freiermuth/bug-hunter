@@ -67,15 +67,15 @@ A non-string `name` on `/api/repos` used to belong in that row and no longer doe
 - Rust `VERDICT_STATUSES`: `queued, rejected, wontfix, note, merged` (`blocked`, `closed` and `superseded` are scheduler-only).
 - Rust `REASON_REQUIRED`: `rejected, wontfix`.
 - `blocked` is a held prerequisite, not suppression, and only the scheduler sets it: a worker `BLOCKED.md` (or repeated identical failures) atomically changes its finding to blocked and its fix job to suspended, preserving the checkpoint and storing the whole report once, in `jobs.blocker` (shown as `/api/findings` `blocker`). `POST /api/verdict` with `queued` enables that original fix transcript for continuation; budget denial leaves reports untouched. While blocked it is excluded from automatic resume selection.
-- `run_fix` claims `queued` → `fixing` with one conditional UPDATE before creating its job, so a status change that lands after selection (an unqueue, a verdict) stops the fix before it can overwrite that status or continue/supersede a checkpoint; the cycle reports it `skipped`, and the daemon starts the next cycle at once instead of idling. A refused job or a workspace that cannot be made puts the finding back to `queued`.
+- **Who owns a finding.** A finding at `new`, `blocked`, `note` or `closed` waits for the operator; every other status belongs to a job (`queued`/`fixing`: fix, `rechecking`: recheck, `pr_open`: engage) or the forge. Operator writes only start from the statuses that ask for them (`/api/verdict`: `new`/`blocked`/`note`/`closed`, `/api/recheck`: `new`, `/api/unqueue`: `queued`), and each is a single UPDATE conditional on the status it just checked, so a job that claims the finding in between keeps it (409). `run_fix` claims `queued` → `fixing` the same way before creating its job; if the operator unqueued the finding after it was picked, the claim fails, the cycle is `skipped`, and the daemon starts the next cycle at once. So nothing changes a finding's status while its job runs, and the jobs' completion writes need no guard of their own.
 
 Transition legality as enforced by the server:
 
 | Endpoint | Precondition on current status | New status | Reason |
 |---|---|---|---|
-| `/api/verdict` | **none** — any current status, including `fixing`/`pr_open` | any of `VERDICT_STATUSES` | mandatory iff new status in `rejected, wontfix`; optional otherwise |
-| `/api/recheck` | exactly `new` | `rechecking` | n/a |
-| `/api/unqueue` | exactly `queued` | `new` | n/a |
+| `/api/verdict` | Rust: `new`, `blocked`, `note` or `closed`, and different from the new status (Python: none — any current status, including `fixing`/`pr_open`) | any of `VERDICT_STATUSES` | mandatory iff new status in `rejected, wontfix`; optional otherwise |
+| `/api/recheck` | exactly `new` (Rust: conditional write, 409 if it changed after the check) | `rechecking` | n/a |
+| `/api/unqueue` | exactly `queued` (Rust: conditional write, 409 if it changed after the check) | `new` | n/a |
 
 `store.set_status` additionally validates membership in `FINDING_STATUSES` and raises `ValueError(f"invalid status: {status}")` (store.py:921-923) — unreachable from these handlers since `VERDICT_STATUSES ⊂ FINDING_STATUSES`.
 
@@ -92,6 +92,7 @@ Handler `_verdict` (server.py:458-487).
 2. `status not in VERDICT_STATUSES` -> `400` with `f"status must be one of {list(VERDICT_STATUSES)}"` (server.py:466-471). Because `Status` is a `StrEnum`, the f-string renders **enum reprs**, byte-exact: `status must be one of [<Status.QUEUED: 'queued'>, <Status.REJECTED: 'rejected'>, <Status.WONTFIX: 'wontfix'>, <Status.NOTE: 'note'>, <Status.MERGED: 'merged'>]` `[INFERENCE from CPython StrEnum repr; UI only displays the string]`. String comparison works because StrEnum members `==` their values.
 3. `status in REASON_REQUIRED and not reason` -> `400 {"error": "reason required for status 'rejected'"}` (repr-quoted status, server.py:472-474).
 4. `get_finding(fid)` is None -> `404 {"error": "no finding <fid>"}` (server.py:476-479). `get_finding` = `SELECT * FROM findings WHERE id = ?` (store.py:859-861).
+5. **Rust only (deliberate break from Python):** the current status is not one that asks the operator for a verdict (`new`, `blocked`, `note`, `closed`; `FindingStatus::awaits_verdict`), or equals the new status -> `400 {"error": "finding #<id> is '<status>'; a verdict applies only to new, blocked, note or closed findings, and must change its status"}`. `closed` is included because a closed-PR harvest that gives up leaves the finding `closed` and never revisits it, so only a verdict can settle it; a harvest still running keeps the verdict (`record_closed_harvest` only replaces `closed`). Everywhere else a job (`fixing`, `rechecking`, `pr_open`) or the forge (`merged`) owns the finding. The write is conditional on the status just read, so a job that claims the finding in between keeps it: `409 {"error": "finding #<id> changed while the verdict was being applied; reload and retry"}`.
 
 **Writes** (server.py:480-486):
 1. `set_status(fid, status, verdict_reason=reason)` -> `UPDATE findings SET status = ?, updated_at = ?[, verdict_reason = ?] WHERE id = ?` + commit (store.py:913-937). `verdict_reason` is only included when reason is non-None — **a verdict without reason does NOT clear a previously stored verdict_reason**.

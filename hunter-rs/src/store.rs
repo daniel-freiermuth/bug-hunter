@@ -538,6 +538,32 @@ impl Store {
         Ok(())
     }
 
+    /// [`Self::set_finding_verdict`], applied only while the finding is
+    /// still at `from` (the status the caller just checked). `false` when
+    /// something else moved it in between: the operator's verdict loses to
+    /// a job that claimed the finding meanwhile.
+    pub async fn set_verdict_if(
+        &self,
+        finding_id: i64,
+        from: FindingStatus,
+        status: FindingStatus,
+        reason: &str,
+    ) -> sqlx::Result<bool> {
+        let now = now_ms();
+        let set = sqlx::query!(
+            "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND status = ?5",
+            status,
+            reason,
+            now,
+            finding_id,
+            from
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(set.rows_affected() > 0)
+    }
+
     /// Retain a fix checkpoint without treating its blocker as a rejection.
     /// Both rows change atomically; a mismatched finding or non-fix job is an
     /// error and leaves them untouched. Spend, transcript, notes, and the

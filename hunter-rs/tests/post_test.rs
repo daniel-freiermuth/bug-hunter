@@ -21,13 +21,13 @@ mod support;
 ///
 /// Field order is the contract: Rust drops fields in declaration order,
 /// so `state` — and with it the `Store`'s open SQLite pool — is gone
-/// before `_dir` removes the database out from under it.
+/// before `dir` removes the database out from under it.
 ///
 /// `Deref` keeps every call site writing `&state`, and means the guard
 /// can only be dropped by dropping the state it came with.
 struct TestState {
     state: AppState,
-    _dir: support::TempDir,
+    dir: support::TempDir,
 }
 
 impl std::ops::Deref for TestState {
@@ -160,7 +160,7 @@ async fn test_state() -> TestState {
                 wake: Arc::new(tokio::sync::Notify::new()),
             },
         },
-        _dir: dir,
+        dir,
     }
 }
 
@@ -2182,4 +2182,119 @@ async fn findings_show_the_held_jobs_blocker_only_while_blocked() {
     assert_eq!(status, StatusCode::OK);
     let rows = get_json(&state, "/api/findings").await;
     assert!(row(&rows, 1).get("blocker").is_none());
+}
+
+/// The operator gives a verdict only where the finding asks for one: on a
+/// `new`, `blocked`, `note` or `closed` finding, and only to change its
+/// status.
+/// Everywhere else a job or the forge owns the finding (`fixing`,
+/// `rechecking`, `pr_open`, ...), so the verdict is refused and the row is
+/// left exactly as it was.
+#[tokio::test]
+async fn verdicts_follow_the_finding_state_machine() {
+    use hunter::domain::FindingStatus;
+
+    let state = test_state().await;
+    let verdicts = FindingStatus::ALL.into_iter().filter(|s| s.is_verdict());
+    for to in verdicts {
+        for from in FindingStatus::ALL {
+            state.store.set_finding_status(1, from).await.unwrap();
+            let before = state.store.get_finding(1).await.unwrap().unwrap();
+            let (status, body) = post(
+                &state,
+                "/api/verdict",
+                json!({ "id": 1, "status": to.as_str(), "reason": "operator reason" }),
+            )
+            .await;
+            let after = state.store.get_finding(1).await.unwrap().unwrap();
+            let asks = matches!(
+                from,
+                FindingStatus::New
+                    | FindingStatus::Blocked
+                    | FindingStatus::Note
+                    | FindingStatus::Closed
+            );
+            if asks && from != to {
+                assert_eq!(status, StatusCode::OK, "{from} -> {to}: {body}");
+                assert_eq!(after.status, to, "{from} -> {to}");
+            } else {
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{from} -> {to}: {body}");
+                assert_eq!(
+                    body["error"],
+                    format!(
+                        "finding #1 is '{from}'; a verdict applies only to new, blocked, note or \
+                         closed findings, and must change its status"
+                    ),
+                    "{from} -> {to}"
+                );
+                assert_eq!(after.status, before.status, "{from} -> {to}");
+                assert_eq!(
+                    after.verdict_reason, before.verdict_reason,
+                    "{from} -> {to}"
+                );
+                assert_eq!(after.updated_at, before.updated_at, "{from} -> {to}");
+            }
+        }
+    }
+}
+
+/// Every operator write is conditional on the status it just checked, so
+/// a job that claims the finding in between keeps it. The race is staged
+/// with a trigger: the operator's UPDATE first moves the row the way the
+/// job would (here to `fixing` / `rejected`) and is then skipped, exactly
+/// as if the job's write had landed between the endpoint's read and its
+/// write. The answer is 409 and the job's status stands.
+#[tokio::test]
+async fn operator_writes_lose_to_a_status_change_after_their_check() {
+    let state = test_state().await;
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new().filename(state.dir.join("hunter.db")),
+    )
+    .await
+    .unwrap();
+    // A verdict with a reason and one without take different writes
+    // (set_verdict_if / claim_in_progress), so both are staged.
+    for (path, id, operator_to, reason, job_to) in [
+        ("/api/unqueue", 2, "new", None, "fixing"),
+        ("/api/recheck", 1, "rechecking", None, "rejected"),
+        ("/api/verdict", 3, "note", None, "rechecking"),
+        (
+            "/api/verdict",
+            3,
+            "rejected",
+            Some("duplicate"),
+            "rechecking",
+        ),
+    ] {
+        sqlx::query("UPDATE findings SET status = 'new' WHERE id = 3")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Test-only DDL built from the fixed table above.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "DROP TRIGGER IF EXISTS job_first; \
+             CREATE TRIGGER job_first BEFORE UPDATE OF status ON findings \
+             WHEN OLD.id = {id} AND NEW.status = '{operator_to}' BEGIN \
+               UPDATE findings SET status = '{job_to}' WHERE id = {id}; \
+               SELECT RAISE(IGNORE); \
+             END;"
+        )))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let body = if path == "/api/verdict" {
+            json!({ "id": id, "status": operator_to, "reason": reason })
+        } else {
+            json!({ "id": id })
+        };
+        let (status, body) = post(&state, path, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}: {body}");
+        assert!(
+            body["error"].as_str().unwrap().contains("reload and retry"),
+            "{path}: {body}"
+        );
+        let after = state.store.get_finding(id).await.unwrap().unwrap();
+        assert_eq!(after.status.as_str(), job_to, "{path} {reason:?}");
+        assert_eq!(after.verdict_reason, None, "{path} {reason:?}");
+    }
 }

@@ -87,6 +87,17 @@ impl FindingStatus {
         )
     }
 
+    /// Statuses at which a finding asks the operator for a verdict: `new`
+    /// (triage), `blocked` (resume or discard the held fix), `note` (act on
+    /// it after all) and `closed` (classify a closed PR, which the harvest
+    /// may give up on and then never revisits; a harvest still running
+    /// keeps the operator's verdict, see `Store::record_closed_harvest`).
+    /// Everywhere else a job or the forge owns the finding, and a verdict
+    /// would race it, so `/api/verdict` refuses.
+    pub fn awaits_verdict(self) -> bool {
+        matches!(self, Self::New | Self::Blocked | Self::Note | Self::Closed)
+    }
+
     /// Statuses that require a reason when set via verdict.
     pub fn reason_required(self) -> bool {
         matches!(self, Self::Rejected | Self::Wontfix)
