@@ -44,6 +44,23 @@ export class Filter {
   // reactive value, so replacing it would cost every holder its
   // subscription.
   readonly #values = new SvelteSet<string>();
+  // A restored list describes future options too; checking the last visible
+  // option must not turn that explicit promise into an unrestricted filter.
+  #explicitSelection = false;
+
+  /** Restore an explicit list (including none), or accept all present and future values for null. */
+  constructor(values: readonly string[] | null = null) {
+    if (values !== null) {
+      this.#mode = "only";
+      this.#explicitSelection = true;
+      for (const value of values) this.#values.add(value);
+    }
+  }
+
+  /** null means all; an empty list means explicitly none, even before data loads. */
+  get selection(): string[] | null {
+    return this.#mode === "all" ? null : [...this.#values].sort();
+  }
 
   /** Whether `value` passes this filter. */
   accepts(value: string): boolean {
@@ -92,13 +109,9 @@ export class Filter {
       return;
     }
     this.#values.add(option);
-    // Undoing the last exclusion undoes the narrowing. Staying in `only`
-    // would leave the UI looking unfiltered -- the All box checked, the
-    // trigger showing no filter -- while a type or repo arriving on a
-    // later poll was still silently hidden, because it is not in the
-    // set. The user has taken back the one thing they excluded, so they
-    // have not "said otherwise" about anything.
-    if (options.every((o) => this.#values.has(o))) this.reset();
+    // Only undo a narrowing originally made from implicit All. A restored
+    // explicit list stays explicit, including values absent from options.
+    if (!this.#explicitSelection && options.every((o) => this.#values.has(o))) this.reset();
   }
 
   /** Flip the All checkbox: everything, or nothing. */
@@ -116,6 +129,7 @@ export class Filter {
   /** Back to unfiltered, forgetting every remembered value. */
   reset(): void {
     this.#mode = "all";
+    this.#explicitSelection = false;
     this.#values.clear();
   }
 }

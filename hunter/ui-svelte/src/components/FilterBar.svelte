@@ -2,6 +2,8 @@
   import type { FindingOut } from "../lib/types";
   import { SEV_RANK } from "../lib/format";
   import { Filter, needsSelector } from "../lib/filter.svelte";
+  import { navigation } from "../lib/navigation.svelte";
+  import { FILTER_KEYS, readConfidence, readSelection, readSort, writeSelection, type FilterKey } from "../lib/filterUrl";
   import MultiSelect from "./MultiSelect.svelte";
 
   let {
@@ -25,26 +27,39 @@
   const severities = $derived([...new Set(findings.map((f) => f.severity))].sort((a, b) => (SEV_RANK[b] ?? 0) - (SEV_RANK[a] ?? 0)));
   const statuses = $derived([...new Set(findings.map((f) => f.status))].sort());
 
-  // -- Filter selections -----------------------------------------------------
-  // `const`, mutated in place: a Filter is itself the reactive value, so it
-  // needs no `$state` wrapper and must never be reassigned. Each starts
-  // unfiltered, which is what makes a dimension show new options as they
-  // arrive without any bookkeeping of what has been seen before.
-  const repoFilter = new Filter();
-  const typeFilter = new Filter();
-  const categoryFilter = new Filter();
-  const severityFilter = new Filter();
-  const statusFilter = new Filter();
-  let minConfidence = $state(0);
-  let sortBy = $state("severity");
+  // Rebuild from the URL, never from the current options: filters survive
+  // loading, polling, refreshes, and same-page browser history navigation.
+  const repoFilter = $derived(new Filter(readSelection(navigation.route.params, "repo")));
+  const typeFilter = $derived(new Filter(readSelection(navigation.route.params, "type")));
+  const categoryFilter = $derived(new Filter(readSelection(navigation.route.params, "class")));
+  const severityFilter = $derived(new Filter(readSelection(navigation.route.params, "severity")));
+  const statusFilter = $derived(new Filter(readSelection(navigation.route.params, "status")));
+  const minConfidence = $derived(readConfidence(navigation.route.params));
+  const sortBy = $derived(readSort(navigation.route.params));
+
+  function selectFilter(key: FilterKey, filter: Filter) {
+    navigation.updateParams((params) => writeSelection(params, key, filter.selection));
+  }
+
+  function selectConfidence(value: number, replace: boolean) {
+    navigation.updateParams((params) => {
+      if (value === 0) params.delete("confidence");
+      else params.set("confidence", String(value));
+    }, replace);
+  }
+
+  // A slider drag is one history step, not one for every input event.
+  let sliding = false;
+  function changeConfidence(value: number) {
+    selectConfidence(value, sliding);
+    sliding = true;
+  }
 
   export function clearFilters() {
-    repoFilter.reset();
-    typeFilter.reset();
-    categoryFilter.reset();
-    severityFilter.reset();
-    statusFilter.reset();
-    minConfidence = 0;
+    navigation.updateParams((params) => {
+      for (const key of FILTER_KEYS) params.delete(key);
+      params.delete("confidence");
+    });
   }
 
   // -- Derived filtered + sorted output -------------------------------------
@@ -98,23 +113,23 @@
 
 <div class="filter-bar">
   {#if needsSelector(repos, repoFilter)}
-    <MultiSelect label="Repo" options={repos} filter={repoFilter} />
+    <MultiSelect label="Repo" options={repos} filter={repoFilter} onChange={() => selectFilter("repo", repoFilter)} />
   {/if}
 
   {#if needsSelector(types, typeFilter)}
-    <MultiSelect label="Type" options={types} filter={typeFilter} />
+    <MultiSelect label="Type" options={types} filter={typeFilter} onChange={() => selectFilter("type", typeFilter)} />
   {/if}
 
   {#if needsSelector(categories, categoryFilter)}
-    <MultiSelect label="Class" options={categories} filter={categoryFilter} />
+    <MultiSelect label="Class" options={categories} filter={categoryFilter} onChange={() => selectFilter("class", categoryFilter)} />
   {/if}
 
   {#if needsSelector(severities, severityFilter)}
-    <MultiSelect label="Severity" options={severities} filter={severityFilter} />
+    <MultiSelect label="Severity" options={severities} filter={severityFilter} onChange={() => selectFilter("severity", severityFilter)} />
   {/if}
 
   {#if showStatus && needsSelector(statuses, statusFilter)}
-    <MultiSelect label="Status" options={statuses} filter={statusFilter} />
+    <MultiSelect label="Status" options={statuses} filter={statusFilter} onChange={() => selectFilter("status", statusFilter)} />
   {/if}
 
   <div class="control">
@@ -123,7 +138,9 @@
       id="{prefix}-conf"
       type="range"
       min="0" max="100" step="5"
-      bind:value={minConfidence}
+      value={minConfidence}
+      oninput={(event) => changeConfidence(Number(event.currentTarget.value))}
+      onchange={() => { sliding = false; }}
       class="slider"
     />
     <span class="slider-value">{minConfidence}%</span>
@@ -133,7 +150,12 @@
     <label for="{prefix}-sort" class="control-label">Sort</label>
     <select
       id="{prefix}-sort"
-      bind:value={sortBy}
+      value={sortBy}
+      onchange={(event) => navigation.updateParams((params) => {
+        const value = event.currentTarget.value;
+        if (value === "severity") params.delete("sort");
+        else params.set("sort", value);
+      })}
       class="sort-select"
     >
       <option value="severity">Severity × Confidence</option>

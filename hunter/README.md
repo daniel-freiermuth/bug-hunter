@@ -292,6 +292,26 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 | **Stats** | Aggregate totals by kind and by finding type |
 | **Log** | Full job and event history |
 
+Inbox, Kanban, and All Findings store their filters and sort order in the
+URL, so copied links, reloads, and browser Back/Forward restore the view:
+
+```text
+#findings?type=bug&severity=high&confidence=80&sort=newest
+#inbox?type=bug&type=test_gap
+#findings:123?status=pr_open
+```
+
+Parameters: `repo` (repository name), `type`, `class`, `severity`, `status`
+(All Findings only), `confidence` (0–100, in steps of 5), and `sort`
+(`severity`, `newest`, `updated`, `oldest`). Repeat a selection parameter
+for multiple values; omit it for all, or use an empty value (`type=`) for
+none. Explicit choices remain selected even while their options are absent
+from the current data. Selecting the last currently offered option keeps a
+deep-linked list explicit; future options are not silently admitted. Use
+the All control to return to an unrestricted selection. Defaults are omitted
+when controls update the URL.
+
+
 ## Users
 
 The dashboard and every API route need a login. Accounts are local
