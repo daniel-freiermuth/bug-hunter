@@ -1778,3 +1778,34 @@ async fn repeated_suspensions_of_a_harvest_are_not_a_stuck_streak() {
     assert_eq!(ps.harvest_attempts, 0);
     assert!(outcomes.iter().all(|o| o.as_deref() == Some("suspended")));
 }
+
+/// A hunt with no new commits records its watermark and skips; a skipped
+/// cycle restarts at once. If that write fails, the hunt must fail rather
+/// than skip, or the daemon would re-pick the same repo in a tight loop.
+#[tokio::test]
+async fn a_no_commit_hunt_whose_watermark_cannot_be_written_fails() {
+    let (dir, path, pool) = fresh_db().await;
+    let repo = cloned_repo(&dir, &pool).await;
+    let tip = git(&repo.work, &["rev-parse", "main"]);
+    sqlx::query("UPDATE repos SET last_hunt_sha = ?1 WHERE id = 1")
+        .bind(tip.trim())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "CREATE TRIGGER no_watermark BEFORE UPDATE OF last_hunt_at ON repos \
+         BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+    let row = store.get_repo_by_id(1).await.unwrap().unwrap();
+    let never = ScriptedBackend::new(|_| panic!("no new commits: nothing may run"));
+
+    let err = run_hunt(&store, &cfg, &row, &never, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("injected write failure"), "{err}");
+}

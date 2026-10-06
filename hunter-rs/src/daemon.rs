@@ -254,6 +254,12 @@ pub async fn compute_sleep_s(store: &Store, summary: &CycleSummary) -> f64 {
         } else {
             sleep_s = 30.0 * 60.0;
         }
+    } else if summary.skipped.is_some() {
+        // The pick did no work: it was stale (the finding left `queued` or
+        // `rechecking`, its repo was deleted) or had nothing to do (a hunt
+        // with no new commits). Every skip changes what the next pick sees,
+        // so start the next cycle now instead of idling a slot away.
+        sleep_s = 0.0;
     } else {
         sleep_s = 15.0 * 60.0;
     }

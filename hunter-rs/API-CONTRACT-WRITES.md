@@ -66,6 +66,7 @@ A non-string `name` on `/api/repos` used to belong in that row and no longer doe
 - `FINDING_STATUSES` = all of `Status` (types.py:66): `new, rechecking, queued, fixing, pr_open, merged, rejected, wontfix, note` (types.py:23-32). Rust (`FindingStatus::ALL`) adds `closed` and `superseded`, which only the scheduler sets; neither is a verdict status, so this endpoint still refuses both.
 - `VERDICT_STATUSES` = `queued, rejected, wontfix, note, merged` (types.py:78-84).
 - `REASON_REQUIRED` = `rejected, wontfix` (types.py:85).
+- `run_fix` claims `queued` → `fixing` with one conditional UPDATE before creating its job, so a status change that lands after selection (an unqueue, a verdict) stops the fix before it can overwrite that status or continue/supersede a checkpoint; the cycle reports it `skipped`, and the daemon starts the next cycle at once instead of idling. A refused job or a workspace that cannot be made puts the finding back to `queued`.
 
 Transition legality as enforced by the server:
 

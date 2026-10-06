@@ -282,3 +282,31 @@ async fn a_starting_daemon_reclaims_leftover_trees() {
     }
     daemon.abort();
 }
+
+/// A skipped cycle did no work: its pick was stale (the finding left
+/// `queued`), so the next cycle starts at once rather than idling the
+/// queue for the 15-minute default (or the 5-minute PR-sync cap).
+#[tokio::test]
+#[allow(
+    clippy::float_cmp,
+    reason = "the sleeps are exact constants, not computed values"
+)]
+async fn a_skipped_cycle_restarts_at_once() {
+    let dir = TempDir::new("daemon-skip-sleep");
+    let (_db, store) = support::fresh_store(&dir, "skip").await;
+    let skipped = hunter::scheduler::CycleSummary {
+        skipped: Some("finding #1 is no longer queued".into()),
+        ..Default::default()
+    };
+    assert_eq!(hunter::daemon::compute_sleep_s(&store, &skipped).await, 0.0);
+    let after_sync = hunter::scheduler::CycleSummary {
+        sync: Some(hunter::scheduler::SyncResult::default()),
+        ..skipped
+    };
+    assert_eq!(
+        hunter::daemon::compute_sleep_s(&store, &after_sync).await,
+        0.0
+    );
+    let idle = hunter::scheduler::CycleSummary::default();
+    assert_eq!(hunter::daemon::compute_sleep_s(&store, &idle).await, 900.0);
+}

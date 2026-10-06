@@ -2834,29 +2834,39 @@ impl Store {
         Ok(())
     }
 
-    /// Context manager equivalent: set status, run body, if status
-    /// unchanged on exit set fallback. Returns a guard that checks on
-    /// drop. In Rust: explicit start/finish calls instead.
-    pub async fn set_in_progress(
+    /// Move a finding from `from` to `to` only if it is still at `from`;
+    /// `false` when something else (an operator verdict) changed it since
+    /// the caller read it. Undo with [`Self::finalize_in_progress`].
+    pub async fn claim_in_progress(
         &self,
         finding_id: i64,
-        status: FindingStatus,
-    ) -> sqlx::Result<()> {
-        self.set_finding_status(finding_id, status).await
+        from: FindingStatus,
+        to: FindingStatus,
+    ) -> sqlx::Result<bool> {
+        let now = now_ms();
+        let claimed = sqlx::query!(
+            "UPDATE findings SET status = ?1, updated_at = ?2 WHERE id = ?3 AND status = ?4",
+            to,
+            now,
+            finding_id,
+            from
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(claimed.rows_affected() > 0)
     }
-    /// If finding is still at `expected_status`, reset to `fallback`.
+    /// If finding is still at `expected_status`, reset to `fallback`. One
+    /// guarded UPDATE, so a verdict landing between a read and a write here
+    /// cannot be overwritten.
     pub async fn finalize_in_progress(
         &self,
         finding_id: i64,
         expected_status: FindingStatus,
         fallback: FindingStatus,
     ) -> sqlx::Result<()> {
-        if let Some(f) = self.get_finding(finding_id).await?
-            && f.status == expected_status
-        {
-            self.set_finding_status(finding_id, fallback).await?;
-        }
-        Ok(())
+        self.claim_in_progress(finding_id, expected_status, fallback)
+            .await
+            .map(drop)
     }
 
     // -- stats -----------------------------------------------------------------
