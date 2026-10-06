@@ -311,6 +311,8 @@ deep-linked list explicit; future options are not silently admitted. Use
 the All control to return to an unrestricted selection. Defaults are omitted
 when controls update the URL.
 
+Card numbers (`F#123`) link to the focused finding view (`#findings:123`)
+and can be copied or opened in another tab.
 
 ## Users
 

@@ -148,7 +148,7 @@
   {#if live}
     <!-- Header row: id + type pill + severity dot/text + confidence + category + status pill (right) -->
     <div class="card-header">
-      <span class="fid">F#{finding.id}</span>
+      <a class="fid" href="#findings:{finding.id}" title="Open finding #{finding.id}">F#{finding.id}</a>
       <span class="type-pill" title={finding.type}>{typeLabel(finding.type)}</span>
       <span class="sev-indicator {sevClass(finding.severity)}">
         <span class="sev-dot"></span>
@@ -412,6 +412,10 @@
     font-size: 0.6875rem;
     font-family: ui-monospace, "SF Mono", "Cascadia Code", monospace;
     user-select: all;
+  }
+  .fid:hover, .fid:focus-visible {
+    color: var(--accent-hover);
+    text-decoration: underline;
   }
 
   .cat-label {
