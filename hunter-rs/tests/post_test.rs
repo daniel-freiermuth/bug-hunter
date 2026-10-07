@@ -579,7 +579,23 @@ async fn repo_add_happy_then_duplicate_409() {
 #[tokio::test]
 async fn repo_add_bad_name_and_missing_url() {
     let state = test_state().await;
-    for name in ["../../etc", "/etc/passwd", "..", "a/../../../b", ""] {
+    let too_long = "x".repeat(101);
+    for name in [
+        "",
+        "two\nlines",
+        "tab\there",
+        "nul\0",
+        "line\u{2028}sep",
+        "para\u{2029}sep",
+        "rlo\u{202E}txt.exe",
+        "alm\u{061C}x",
+        "lrm\u{200E}x",
+        "rlm\u{200F}x",
+        "lre\u{202A}x",
+        "lri\u{2066}x",
+        "pdi\u{2069}x",
+        too_long.as_str(),
+    ] {
         let (status, body) = post(
             &state,
             "/api/repos",
@@ -592,6 +608,40 @@ async fn repo_add_bad_name_and_missing_url() {
     let (status, body) = post(&state, "/api/repos", json!({ "name": "ok_name-1.0" })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["error"], "name and url are required");
+}
+
+/// The name is a label, not a path: spaces and path-looking names are
+/// accepted and still clone into `repo-<id>`.
+#[tokio::test]
+async fn repo_add_name_never_reaches_the_path() {
+    let state = test_state().await;
+    let longest = "y".repeat(100);
+    // U+202F (narrow no-break space) sits just past the refused U+202A-202E
+    // bidi range and is ordinary typography; Hebrew needs no bidi controls.
+    let names = [
+        "My Repo (fork)",
+        "../../etc",
+        "café",
+        "שלום-repo",
+        "a\u{202F}b",
+        longest.as_str(),
+    ];
+    for name in names {
+        let (status, body) = post(
+            &state,
+            "/api/repos",
+            json!({ "name": name, "url": "https://github.com/x/y.git" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "name {name:?}: {body}");
+        assert_eq!(body["repo"]["name"], name);
+        let rid = body["repo"]["id"].as_i64().unwrap();
+        let path = body["repo"]["path"].as_str().unwrap();
+        assert!(
+            path.ends_with(&format!("repos/repo-{rid}")),
+            "path was {path}"
+        );
+    }
 }
 
 #[tokio::test]

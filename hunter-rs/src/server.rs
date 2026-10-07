@@ -1261,16 +1261,31 @@ fn valid_repo_url(url: &str) -> bool {
         .any(|s| scheme.eq_ignore_ascii_case(s))
 }
 
-/// re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.\-]*', name) without a regex
-/// dependency (`server.Handler._add_repo`): ASCII alnum/underscore first, then
-/// alnum/underscore/dot/hyphen. No '/', so traversal is blocked here too.
+/// Longest accepted repo name, in characters. GitHub's own limit.
+const MAX_REPO_NAME_CHARS: usize = 100;
+
+/// A repo name is a display label only: the clone and notes paths are keyed
+/// by id (`Store::repo_dir`, `Store::notes_path`), so no character can
+/// reach the filesystem. What stays out is what would corrupt the places the
+/// name is printed -- event and log lines, the UI, worker prompts -- i.e.
+/// control characters such as newlines, the Unicode line and paragraph
+/// separators U+2028/U+2029 (category Zl/Zp, which `char::is_control`
+/// misses), the Unicode `Bidi_Control` characters, which reorder the text
+/// around them on screen (U+202E can make a name read as something else),
+/// plus anything absurdly long.
 fn valid_repo_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_ascii_alphanumeric() || c == '_' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    !name.is_empty()
+        && name.chars().count() <= MAX_REPO_NAME_CHARS
+        && !name.chars().any(|c| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '\u{2028}' | '\u{2029}' // line/paragraph separator
+                        | '\u{061C}' | '\u{200E}' | '\u{200F}' // ALM, LRM, RLM
+                        | '\u{202A}'..='\u{202E}' // LRE, RLE, PDF, LRO, RLO
+                        | '\u{2066}'..='\u{2069}' // LRI, RLI, FSI, PDI
+                )
+        })
 }
 
 async fn add_repo(
@@ -1291,7 +1306,7 @@ async fn add_repo(
         .unwrap_or("")
         .trim()
         .to_owned();
-    if name.is_empty() || !valid_repo_name(&name) {
+    if !valid_repo_name(&name) {
         return Err(ApiError::BadRequest("invalid repo name".to_owned()));
     }
     let url = body
