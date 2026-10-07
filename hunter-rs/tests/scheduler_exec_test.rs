@@ -772,6 +772,15 @@ async fn a_suspended_job_drains_the_queue_like_a_killed_one() {
     seed_repo(&pool).await;
     seed_findings(&pool).await;
     let store = rw_store(&path).await;
+    // The contrast: with the same fixes queued, a cycle that ran no job
+    // still sleeps the idle interval. That fall-through is where a
+    // suspended job used to land.
+    let no_job = hunter::scheduler::CycleSummary::default();
+    let idle_s = hunter::daemon::compute_sleep_s(&store, &no_job).await;
+    assert!(
+        (idle_s - 15.0 * 60.0).abs() < f64::EPSILON,
+        "no job slept {idle_s}s"
+    );
     for state in [
         hunter::domain::JobState::Killed,
         hunter::domain::JobState::Suspended,
