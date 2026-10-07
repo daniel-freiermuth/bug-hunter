@@ -240,6 +240,10 @@ async fn a_finished_fix_ships_and_records_its_draft_pr() {
     for case in ["created", "exists"] {
         let bins = support::FakeBins::acquire("fix-ship");
         let f = fixture("fix-ship").await;
+        // The commits to ship are counted against origin's default branch;
+        // a local `main` must not stand in for it.
+        git(&f.repo_dir, &["checkout", "--detach"]);
+        git(&f.repo_dir, &["branch", "-D", "main"]);
         // Push to the fixture's bare origin instead of the forge.
         let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
         git(
@@ -268,6 +272,17 @@ async fn a_finished_fix_ships_and_records_its_draft_pr() {
             .unwrap();
 
         assert_eq!(summary.outcome.as_deref(), Some("pr_open"), "{case}");
+        assert_eq!(
+            summary.kind,
+            Some(hunter::domain::FindingJobKind::Fix.into()),
+            "{case}"
+        );
+        assert_eq!(summary.finding_id, Some(f.fid), "{case}");
+        assert_eq!(
+            summary.tokens_new,
+            Some(support::done().tokens_new),
+            "{case}"
+        );
         assert_eq!(summary.pr_url.as_deref(), Some(URL), "{case}");
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         assert_eq!(finding.status.as_str(), "pr_open", "{case}");
@@ -396,6 +411,13 @@ async fn blocked_fix_keeps_checkpoint_and_requeues_without_losing_commits() {
     assert_eq!(summary.outcome.as_deref(), Some("blocked"));
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(finding.status.as_str(), "blocked");
+    let events = f.store.recent_events(20).await.unwrap();
+    assert!(
+        events.iter().any(|e| e
+            .message
+            .starts_with(&format!("#{} blocked; checkpoint retained at", f.fid))),
+        "{events:?}"
+    );
     assert_eq!(shown_blocker(&f).await, Some(expected_reason.clone()));
     assert_eq!(finding.verdict_reason, None, "the report is not copied");
     let tree = blocked.runs()[0].tree.clone();
@@ -646,6 +668,9 @@ async fn a_blocked_resume_that_concludes_is_not_blocked_again() {
             .await
             .unwrap();
         assert_eq!(summary.outcome.as_deref(), Some(expected), "{case}");
+        if case == "finished" {
+            assert_eq!(summary.failure.as_deref(), Some("no PR-DESCRIPTION.md"));
+        }
         let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
         assert_ne!(finding.status.as_str(), "blocked", "{case}");
     }
@@ -664,6 +689,7 @@ async fn repeated_identical_fix_failures_become_blocked_at_the_limit() {
         let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &empty, None)
             .await
             .unwrap();
+        assert_eq!(summary.failure.as_deref(), Some("no commits"));
         outcomes.push(summary.outcome.unwrap());
         last_job = summary.job_id;
     }
@@ -989,4 +1015,129 @@ async fn a_block_that_cannot_be_recorded_returns_the_finding_to_queued() {
     assert!(err.to_string().contains("injected"), "{err}");
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     assert_eq!(finding.status.as_str(), "queued");
+}
+
+/// A modernization finding gets its own branch prefix and playbook.
+#[tokio::test]
+async fn a_modernization_fix_uses_its_branch_and_playbook() {
+    let f = fixture("fix-modernize").await;
+    std::fs::write(
+        f.cfg.root.join("playbooks").join("apply_modernization.md"),
+        "modernize {{WORKTREE}}\n",
+    )
+    .unwrap();
+    let repo_id = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
+    let (fid, _) = f
+        .store
+        .upsert_finding(
+            repo_id,
+            &FindingInsert {
+                fingerprint: "fp-modernize-1".to_owned(),
+                file: "src/lib.rs".to_owned(),
+                severity: hunter::domain::Severity::Medium,
+                confidence: 0.9,
+                summary: "Move to the new API".to_owned(),
+                ..Default::default()
+            },
+            "modernization",
+            None,
+        )
+        .await
+        .unwrap();
+    f.store
+        .set_finding_status(fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let finding = f.store.get_finding(fid).await.unwrap().unwrap();
+    let worker = ScriptedBackend::noop();
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.branch.as_deref(),
+        Some(format!("modernize/move-to-the-new-api-{fid}").as_str())
+    );
+    assert!(
+        worker.runs()[0].prompt.starts_with("modernize "),
+        "{}",
+        worker.runs()[0].prompt
+    );
+}
+
+/// A one-shot budget override is spent by the attempt it bought; an
+/// exempt one stays.
+#[tokio::test]
+async fn a_one_shot_override_is_spent_by_its_fix_attempt() {
+    for (mode, after) in [
+        (hunter::domain::BudgetOverride::Once, None),
+        (
+            hunter::domain::BudgetOverride::Exempt,
+            Some(hunter::domain::BudgetOverride::Exempt),
+        ),
+    ] {
+        let f = fixture("fix-override").await;
+        f.store
+            .set_budget_override(f.fid, Some(mode))
+            .await
+            .unwrap();
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary =
+            hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &ScriptedBackend::noop(), None)
+                .await
+                .unwrap();
+        assert_eq!(summary.outcome.as_deref(), Some("requeued"), "{mode:?}");
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(finding.budget_override, after, "{mode:?}");
+    }
+}
+
+/// A finding that left `queued` before its fix started ends the cycle as
+/// skipped, without a job.
+#[tokio::test]
+async fn a_fix_for_a_finding_no_longer_queued_is_skipped() {
+    let f = fixture("fix-not-queued").await;
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::New)
+        .await
+        .unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let never = ScriptedBackend::new(|_| panic!("a finding that is not queued must not run"));
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &never, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.kind,
+        Some(hunter::domain::FindingJobKind::Fix.into())
+    );
+    assert_eq!(
+        summary.skipped,
+        Some(format!("finding #{} is new, not queued", f.fid))
+    );
+    assert_eq!(summary.job_id, None);
+}
+
+/// A PR description without commits ships nothing: there is no change to
+/// open a PR for.
+#[tokio::test]
+async fn a_description_without_commits_ships_nothing() {
+    let bins = support::FakeBins::acquire("fix-no-commits");
+    bins.ok("gh", "https://github.com/acme/widget/pull/43");
+    let f = fixture("fix-no-commits").await;
+    let origin = git(&f.repo_dir, &["remote", "get-url", "origin"]);
+    git(
+        &f.repo_dir,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", origin.trim()),
+            "git@github.com:acme/widget.git",
+        ],
+    );
+    let worker = ScriptedBackend::writing("PR-DESCRIPTION.md", "nothing changed");
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
+        .await
+        .unwrap();
+    assert_eq!(summary.outcome.as_deref(), Some("requeued"));
+    assert_eq!(summary.failure.as_deref(), Some("no commits"));
+    assert!(!bins.called_with("gh", "create"), "{:?}", bins.calls());
 }

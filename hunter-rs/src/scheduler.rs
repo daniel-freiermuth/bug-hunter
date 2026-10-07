@@ -2456,63 +2456,9 @@ fn extract_pr_url(text: &str) -> Option<String> {
     None
 }
 
-/// Hold a claimed fix as blocked ([`Store::block_fix_job`]). The claim
-/// made the finding `fixing`; if recording the block fails, the transaction
-/// left it there, where nothing picks it up again until a restart, so put
-/// it back to `queued` before returning the error.
-async fn hold_blocked(store: &Store, fid: i64, job: i64, report: &str) -> anyhow::Result<()> {
-    if let Err(e) = store.block_fix_job(fid, job, report).await {
-        let _ = store
-            .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-            .await;
-        return Err(e.into());
-    }
-    Ok(())
-}
-
-/// A worker's report file, read lossily: whatever bytes it wrote are its
-/// report. Only a file that cannot be read at all is an error.
-fn read_report(path: &Path) -> std::io::Result<String> {
-    Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
-}
-
-/// Run a fix job (`scheduler.run_fix`).
-#[allow(
-    clippy::too_many_lines,
-    reason = "linear job pipeline: branch, worker, tests, commit, push, PR. \
-              Each step's failure path must unwind the ones before it, so \
-              the ordering is the logic and splitting it hides the unwind"
-)]
-pub async fn run_fix(
-    store: &Store,
-    cfg: &Config,
-    finding: &Finding,
-    backend: &dyn Backend,
-    resume: Option<&ResumePlan>,
-) -> anyhow::Result<CycleSummary> {
-    let fid = finding.id;
-    if finding.status != FindingStatus::Queued {
-        return Ok(CycleSummary {
-            kind: Some(FindingJobKind::Fix.into()),
-            skipped: Some(format!("finding #{fid} is {}, not queued", finding.status)),
-            ..Default::default()
-        });
-    }
-    let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
-        let _ = store
-            .log_event(
-                "error",
-                &format!("fix #{fid}: repo {} missing", finding.repo_id),
-                None,
-                Some(fid),
-            )
-            .await;
-        anyhow::bail!("repo missing");
-    };
-    let rpath = PathBuf::from(&repo.path);
-    let is_bug = finding.kind == FindingType::Bug;
-    let is_modernization = finding.kind == FindingType::Modernization;
-    // Build branch name from summary slug
+/// `fix/<slug>-<id>` (`modernize/`, `improve/` for the other types): the
+/// branch every attempt at this finding works on.
+fn fix_branch(finding: &Finding) -> String {
     let slug: String = finding
         .summary
         .chars()
@@ -2531,22 +2477,79 @@ pub async fn run_fix(
         .join("-");
     let slug = &slug[..slug.len().min(40)];
     let slug = slug.trim_end_matches('-');
-    let branch_prefix = if is_bug {
-        "fix"
-    } else if is_modernization {
-        "modernize"
-    } else {
-        "improve"
+    let prefix = match finding.kind {
+        FindingType::Bug => "fix",
+        FindingType::Modernization => "modernize",
+        _ => "improve",
     };
-    let branch = format!("{branch_prefix}/{slug}-{fid}");
-    let override_mode = finding.budget_override;
+    format!("{prefix}/{slug}-{}", finding.id)
+}
+
+/// A fix job that owns its finding (`fixing`) and has a working tree.
+struct FixStart {
+    repo: Repo,
+    job: i64,
+    ws: Workspace,
+    branch: String,
+    cap: Option<i64>,
+    /// The report a resumed blocked chain works against.
+    previous_blocker: Option<String>,
+}
+
+/// Put the finding back to `queued` after a step between the claim and the
+/// worker failed; [`Store::finalize_in_progress`] only does so while the
+/// fix still owns it.
+async fn release_claim(store: &Store, fid: i64) {
+    let _ = store
+        .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
+        .await;
+}
+
+/// A fix cycle that ends before its job: the finding is not `queued`.
+fn fix_skipped(why: String) -> CycleSummary {
+    CycleSummary {
+        kind: Some(FindingJobKind::Fix.into()),
+        skipped: Some(why),
+        ..Default::default()
+    }
+}
+
+/// Everything before the worker runs: budget gate, claim, job row, tree.
+/// `Ok(Err(summary))` is a cycle that ends here without a worker (denied,
+/// skipped, refused, no tree); every failure after the claim releases it.
+async fn start_fix(
+    store: &Store,
+    cfg: &Config,
+    finding: &Finding,
+    backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<Result<FixStart, CycleSummary>> {
+    let fid = finding.id;
+    if finding.status != FindingStatus::Queued {
+        return Ok(Err(fix_skipped(format!(
+            "finding #{fid} is {}, not queued",
+            finding.status
+        ))));
+    }
+    let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
+        let _ = store
+            .log_event(
+                "error",
+                &format!("fix #{fid}: repo {} missing", finding.repo_id),
+                None,
+                Some(fid),
+            )
+            .await;
+        anyhow::bail!("repo missing");
+    };
+    let branch = fix_branch(finding);
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
         repo.id,
         FindingJobKind::Fix.into(),
-        override_mode.is_some(),
+        finding.budget_override.is_some(),
         &format!("fix #{fid}"),
         Some(fid),
         resume,
@@ -2554,9 +2557,8 @@ pub async fn run_fix(
     .await?
     {
         BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
-        BudgetDecision::Denied(d) => return Ok(*d),
+        BudgetDecision::Denied(d) => return Ok(Err(*d)),
     };
-
     // Claim before the job exists. A verdict that landed since `pick_next`
     // read the row must win: a job created first would overwrite it with
     // `fixing` and continue or supersede the checkpoint of a finding the
@@ -2565,60 +2567,14 @@ pub async fn run_fix(
         .claim_in_progress(fid, FindingStatus::Queued, FindingStatus::Fixing)
         .await?
     {
-        return Ok(CycleSummary {
-            kind: Some(FindingJobKind::Fix.into()),
-            skipped: Some(format!("finding #{fid} is no longer queued")),
-            ..Default::default()
-        });
+        return Ok(Err(fix_skipped(format!(
+            "finding #{fid} is no longer queued"
+        ))));
     }
-    // A resume of a blocked chain knows its blocker from the job row of the
-    // attempt it continues. A report still in the tree is that same blocker
-    // (the daemon died between recording and deleting it), not this
-    // attempt's outcome, so it goes after the claim (which a later verdict
-    // wins, so holding it blocked cannot overwrite one) but before the
-    // successor job exists: a step that fails after that leaves the
-    // checkpoint behind a row nothing resumes. If the stale report cannot be removed,
-    // the checkpoint is held as blocked again, still resumable, rather than
-    // retried into the same failure.
-    let previous_blocker = match resume {
-        Some(plan) => match store.job_blocker(plan.predecessor_id).await {
-            Ok(blocker) => blocker,
-            Err(e) => {
-                let _ = store
-                    .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-                    .await;
-                return Err(e.into());
-            }
-        },
-        None => None,
+    let previous_blocker = match prepare_blocked_resume(store, fid, resume).await? {
+        Ok(blocker) => blocker,
+        Err(held) => return Ok(Err(held)),
     };
-    if let (Some(plan), Some(blocker)) = (resume, &previous_blocker) {
-        let stale = plan.workspace.tree.join("BLOCKED.md");
-        if stale.exists()
-            && let Err(e) = std::fs::remove_file(&stale)
-        {
-            hold_blocked(store, fid, plan.predecessor_id, blocker).await?;
-            let failure = format!("cannot remove the stale {}: {e}", stale.display());
-            let _ = store
-                .log_event(
-                    "fix",
-                    &format!("#{fid} blocked again: {failure}"),
-                    Some(plan.predecessor_id),
-                    Some(fid),
-                )
-                .await;
-            return Ok(CycleSummary {
-                kind: Some(FindingJobKind::Fix.into()),
-                finding_id: Some(fid),
-                // The predecessor is held again, as the job that blocked.
-                state: Some(JobState::Suspended),
-                outcome: Some("blocked".into()),
-                failure: Some(failure),
-                ..Default::default()
-            });
-        }
-    }
-
     let created = match store
         .create_job(
             FindingJobKind::Fix.into(),
@@ -2633,13 +2589,11 @@ pub async fn run_fix(
     {
         Ok(j) => j,
         Err(e) => {
-            let _ = store
-                .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-                .await;
-            return job_refused(FindingJobKind::Fix.into(), Some(&repo.name), Some(fid), e);
+            release_claim(store, fid).await;
+            return job_refused(FindingJobKind::Fix.into(), Some(&repo.name), Some(fid), e)
+                .map(Err);
         }
     };
-    let job = created.id;
     // The branch is per finding, so a superseded fix chain of this finding
     // holds it checked out; `open_workspace` releases that chain's tree
     // before adding this one.
@@ -2659,50 +2613,123 @@ pub async fn run_fix(
     )
     .await;
     if !matches!(opened, Ok(Ok(_))) {
-        let _ = store
-            .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-            .await;
+        release_claim(store, fid).await;
     }
     let (ws, _pinned) = match opened? {
         Ok(opened) => opened,
-        Err(failed) => return Ok(failed),
+        Err(failed) => return Ok(Err(failed)),
     };
-    let worktree = ws.tree.clone();
+    Ok(Ok(FixStart {
+        repo,
+        job: created.id,
+        ws,
+        branch,
+        cap,
+        previous_blocker,
+    }))
+}
 
-    let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
-    let prompt = match if is_bug {
-        playbooks::build_fix_prompt(&cfg.root, finding, &worktree, &branch, &repo, &repo_notes)
-    } else if is_modernization {
-        playbooks::build_apply_modernization_prompt(
+/// The blocker a resume of a blocked chain works against, read from the
+/// attempt it continues. A report still in the tree is that same blocker
+/// (the daemon died between recording and deleting it), not this attempt's
+/// outcome, so it goes after the claim (which a later verdict wins, so
+/// holding it blocked cannot overwrite one) but before the successor job
+/// exists: a step that fails after that leaves the checkpoint behind a row
+/// nothing resumes. If the stale report cannot be removed, the checkpoint
+/// is held as blocked again, still resumable, rather than retried into the
+/// same failure: `Ok(Err(summary))`. An error releases the claim.
+async fn prepare_blocked_resume(
+    store: &Store,
+    fid: i64,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<Result<Option<String>, CycleSummary>> {
+    let Some(plan) = resume else {
+        return Ok(Ok(None));
+    };
+    let blocker = match store.job_blocker(plan.predecessor_id).await {
+        Ok(blocker) => blocker,
+        Err(e) => {
+            release_claim(store, fid).await;
+            return Err(e.into());
+        }
+    };
+    let Some(blocker) = blocker else {
+        return Ok(Ok(None));
+    };
+    let stale = plan.workspace.tree.join("BLOCKED.md");
+    if stale.exists()
+        && let Err(e) = std::fs::remove_file(&stale)
+    {
+        hold_blocked(store, fid, plan.predecessor_id, &blocker).await?;
+        let failure = format!("cannot remove the stale {}: {e}", stale.display());
+        let _ = store
+            .log_event(
+                "fix",
+                &format!("#{fid} blocked again: {failure}"),
+                Some(plan.predecessor_id),
+                Some(fid),
+            )
+            .await;
+        return Ok(Err(CycleSummary {
+            kind: Some(FindingJobKind::Fix.into()),
+            finding_id: Some(fid),
+            // The predecessor is held again, as the job that blocked.
+            state: Some(JobState::Suspended),
+            outcome: Some("blocked".into()),
+            failure: Some(failure),
+            ..Default::default()
+        }));
+    }
+    Ok(Ok(Some(blocker)))
+}
+
+/// The worker's prompt. The playbook builders run on a resume too: the
+/// session already holds the playbook, but a builder that fails is a
+/// configuration fault worth surfacing on either path.
+async fn fix_prompt(
+    store: &Store,
+    cfg: &Config,
+    finding: &Finding,
+    start: &FixStart,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<String> {
+    let fid = finding.id;
+    let worktree = &start.ws.tree;
+    let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
+    let built = match finding.kind {
+        FindingType::Bug => playbooks::build_fix_prompt(
             &cfg.root,
             finding,
-            &worktree,
-            &branch,
-            &repo,
+            worktree,
+            &start.branch,
+            &start.repo,
             &repo_notes,
-        )
-    } else {
-        playbooks::build_apply_improvement_prompt(
+        ),
+        FindingType::Modernization => playbooks::build_apply_modernization_prompt(
             &cfg.root,
             finding,
-            &worktree,
-            &branch,
-            &repo,
+            worktree,
+            &start.branch,
+            &start.repo,
             &repo_notes,
-        )
-    } {
+        ),
+        _ => playbooks::build_apply_improvement_prompt(
+            &cfg.root,
+            finding,
+            worktree,
+            &start.branch,
+            &start.repo,
+            &repo_notes,
+        ),
+    };
+    let prompt = match built {
         Ok(p) => p,
         Err(e) => {
-            let _ = store
-                .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-                .await;
+            release_claim(store, fid).await;
             anyhow::bail!("{e}");
         }
     };
-    // The session already holds the playbook, the finding and the branch
-    // name; the builders above still run because their failure is a real
-    // configuration fault worth surfacing on either path.
-    let prompt = if let Some(previous_blocker) = &previous_blocker {
+    Ok(if let Some(previous_blocker) = &start.previous_blocker {
         format!(
             "Resume this retained fix after an operator requeued it. Preserve the existing \
              committed implementation and proof. Re-evaluate the prerequisite, not whether \
@@ -2715,13 +2742,397 @@ pub async fn run_fix(
         RESUME_PROMPT.to_owned()
     } else {
         prompt
+    })
+}
+
+/// What a finished fix attempt amounts to. Exactly one per attempt;
+/// [`record_fix_outcome`] writes it.
+enum FixOutcome {
+    /// The worker wrote `BLOCKED.md` (`from_tree`), or an attempt resumed
+    /// against a blocker ended without any outcome: hold the checkpoint.
+    Blocked { report: String, from_tree: bool },
+    /// `NOT-A-BUG.md` / `DECLINED.md`: the finding is rejected.
+    Declined { reason: String },
+    /// The branch is pushed and its draft PR exists (`recovered`: it
+    /// already did).
+    Shipped { pr_url: String, recovered: bool },
+    /// The worker stopped mid-work and its tree and transcript are kept.
+    Suspended,
+    /// The same failure for the `streak`th time in a row: held as blocked.
+    Stuck { failure: String, streak: i64 },
+    /// No PR this time; the fix tier tries again.
+    Incomplete { failure: String },
+}
+
+/// Hold a claimed fix as blocked ([`Store::block_fix_job`]). The claim
+/// made the finding `fixing`; if recording the block fails, the transaction
+/// left it there, where nothing picks it up again until a restart, so put
+/// it back to `queued` before returning the error.
+async fn hold_blocked(store: &Store, fid: i64, job: i64, report: &str) -> anyhow::Result<()> {
+    if let Err(e) = store.block_fix_job(fid, job, report).await {
+        release_claim(store, fid).await;
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// A worker's report file, read lossily: whatever bytes it wrote are its
+/// report. Only a file that cannot be read at all is an error.
+fn read_report(path: &Path) -> std::io::Result<String> {
+    Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+}
+
+/// Read the worker's result and decide the attempt's outcome. Shipping is
+/// part of deciding (a push or a PR that fails is an incomplete attempt),
+/// and so is counting the failure streak.
+async fn conclude_fix(
+    store: &Store,
+    finding: &Finding,
+    start: &FixStart,
+    state: JobState,
+    previous_blocker: Option<&String>,
+) -> anyhow::Result<FixOutcome> {
+    let fid = finding.id;
+    let worktree = &start.ws.tree;
+    let decline_name = if finding.kind == FindingType::Bug {
+        "NOT-A-BUG.md"
+    } else {
+        "DECLINED.md"
     };
+    let decline_file = worktree.join(decline_name);
+    let blocked_file = worktree.join("BLOCKED.md");
+    let declined = decline_file.exists();
+    let report_file = if declined {
+        Some(&decline_file)
+    } else if blocked_file.exists() {
+        Some(&blocked_file)
+    } else {
+        None
+    };
+    // Any bytes the worker wrote are its report; only a file that cannot be
+    // read at all (a directory, permissions) is an error, and that must not
+    // strand the finding at `fixing`.
+    let report = match report_file.map(|f| read_report(f)).transpose() {
+        Ok(report) => report,
+        Err(e) => {
+            release_claim(store, fid).await;
+            anyhow::bail!("fix #{fid}: cannot read the worker's report: {e}");
+        }
+    };
+    if declined {
+        return Ok(FixOutcome::Declined {
+            reason: report.unwrap_or_default().chars().take(500).collect(),
+        });
+    }
+    if let Some(report) = report {
+        return Ok(FixOutcome::Blocked {
+            report,
+            from_tree: true,
+        });
+    }
+    // An attempt that ended with no outcome at all (a failed provider
+    // handoff, a cap) did not resolve the prerequisite it was resumed
+    // against, so the implementation stays operator-held.
+    if state != JobState::Done
+        && let Some(report) = previous_blocker
+    {
+        return Ok(FixOutcome::Blocked {
+            report: report.clone(),
+            from_tree: false,
+        });
+    }
+
+    let failure = match ship_pr(&start.repo, &start.branch, worktree, state).await {
+        Ok((pr_url, recovered)) => return Ok(FixOutcome::Shipped { pr_url, recovered }),
+        Err(failure) => failure,
+    };
+    if state == JobState::Suspended {
+        // A suspension is a pause, not a failure: counting it toward the
+        // streak would turn three pauses of one healthy fix into "stuck".
+        return Ok(FixOutcome::Suspended);
+    }
+    let streak = store.record_fix_attempt(fid, &failure).await.unwrap_or(1);
+    Ok(if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
+        FixOutcome::Stuck { failure, streak }
+    } else {
+        FixOutcome::Incomplete { failure }
+    })
+}
+
+/// Push the fix branch and open its draft PR: `(url, recovered)`, or why
+/// not. Nothing to ship (no commits, no `PR-DESCRIPTION.md`, a worker
+/// that did not finish) is a failure like a push that fails.
+async fn ship_pr(
+    repo: &Repo,
+    branch: &str,
+    worktree: &Path,
+    state: JobState,
+) -> Result<(String, bool), String> {
+    let db = repo.default_branch.clone();
+    let wts = worktree.to_string_lossy().to_string();
+    let db2 = db.clone();
+    let (rc, commits) = tokio::task::spawn_blocking(move || {
+        let (rc, out) = run_cmd_sync(
+            &[
+                "git",
+                "-C",
+                &wts,
+                "log",
+                &format!("origin/{db2}..HEAD"),
+                "--oneline",
+            ],
+            30,
+        );
+        if rc != 0 {
+            run_cmd_sync(
+                &[
+                    "git",
+                    "-C",
+                    &wts,
+                    "log",
+                    &format!("{db2}..HEAD"),
+                    "--oneline",
+                ],
+                30,
+            )
+        } else {
+            (rc, out)
+        }
+    })
+    .await
+    .unwrap_or((127, String::new()));
+    let commits = commits.trim();
+    let pr_desc = worktree.join("PR-DESCRIPTION.md");
+    if rc != 0 || commits.is_empty() || !pr_desc.exists() {
+        return Err(if state == JobState::Done {
+            if commits.is_empty() {
+                "no commits".to_owned()
+            } else {
+                "no PR-DESCRIPTION.md".to_owned()
+            }
+        } else {
+            format!("worker {state}")
+        });
+    }
+
+    let f = forge::forge_for(repo.forge);
+    let push_url = f.ssh_url(&repo.url);
+    let wts = worktree.to_string_lossy().to_string();
+    let (prc, pout) = tokio::task::spawn_blocking(move || {
+        run_cmd_sync(
+            &["git", "-C", &wts, "push", "--force", &push_url, "HEAD"],
+            600,
+        )
+    })
+    .await
+    .unwrap_or((127, "spawn error".to_owned()));
+    if prc != 0 {
+        let tail = crate::util::tail(&pout, 300);
+        return Err(format!("push failed: {tail}"));
+    }
+    if f.owner_repo(&repo.url).is_none() {
+        return Err(format!("unparseable repo url for PR: {:?}", repo.url));
+    }
+    let body = std::fs::read_to_string(&pr_desc).unwrap_or_default();
+    let wts = worktree.to_string_lossy().to_string();
+    let (_trc, title) = tokio::task::spawn_blocking(move || {
+        run_cmd_sync(&["git", "-C", &wts, "log", "-1", "--format=%s"], 30)
+    })
+    .await
+    .unwrap_or((127, branch.to_owned()));
+    let title = title.trim();
+    let title = if title.is_empty() { branch } else { title };
+    match f.create_pr(Path::new(&repo.path), branch, &db, title, &body) {
+        Ok(pr_url) => Ok((pr_url, false)),
+        Err(e) => {
+            let err_msg = e.to_string();
+            if err_msg.contains("already exists")
+                && let Some(pr_url) = extract_pr_url(&err_msg)
+            {
+                return Ok((pr_url, true));
+            }
+            let head: String = err_msg.chars().take(300).collect();
+            Err(format!("PR create failed: {head}"))
+        }
+    }
+}
+
+/// Log a fix-job event against its job and finding.
+async fn fix_event(
+    store: &Store,
+    kind: &str,
+    fid: i64,
+    job: i64,
+    message: String,
+) -> sqlx::Result<()> {
+    store.log_event(kind, &message, Some(job), Some(fid)).await
+}
+
+/// A blocked fix: the job row keeps the report and the checkpoint is held
+/// for the operator. Neither a budget override nor the claim is touched:
+/// the finding is `blocked` now, not `fixing`.
+async fn hold_blocked_fix(
+    store: &Store,
+    fid: i64,
+    start: &FixStart,
+    report: &str,
+    from_tree: bool,
+    summary: &mut CycleSummary,
+) -> anyhow::Result<()> {
+    hold_blocked(store, fid, start.job, report).await?;
+    // Recorded: the job row owns the report now, so the tree holds no stale
+    // one for the next attempt to mistake for its own.
+    if from_tree {
+        std::fs::remove_file(start.ws.tree.join("BLOCKED.md"))?;
+    }
+    let message = format!(
+        "#{fid} blocked; checkpoint retained at {}",
+        start.ws.root.display()
+    );
+    fix_event(store, "fix", fid, start.job, message).await?;
+    summary.state = Some(JobState::Suspended);
+    summary.outcome = Some("blocked".into());
+    Ok(())
+}
+
+/// A fix the worker declined (`NOT-A-BUG.md` / `DECLINED.md`): the finding
+/// is rejected with the worker's reason.
+async fn reject_declined_fix(
+    store: &Store,
+    fid: i64,
+    job: i64,
+    reason: &str,
+    summary: &mut CycleSummary,
+) {
+    let _ = store
+        .set_finding_verdict(fid, FindingStatus::Rejected, reason)
+        .await;
+    let _ = store.clear_fix_attempts(fid).await;
+    let first_line: String = reason
+        .lines()
+        .next()
+        .map(|l| l.chars().take(120).collect())
+        .unwrap_or_default();
+    let message = format!("#{fid} rejected by worker: {first_line}");
+    let _ = fix_event(store, "fix", fid, job, message).await;
+    summary.outcome = Some("rejected".into());
+    release_claim(store, fid).await;
+}
+
+/// Write a fix outcome: the finding's status, the event, and the summary.
+/// A one-shot budget override is spent by every outcome but a block or a
+/// decline; any outcome that leaves the finding `fixing` returns it to
+/// `queued`.
+async fn record_fix_outcome(
+    store: &Store,
+    finding: &Finding,
+    start: &FixStart,
+    outcome: FixOutcome,
+    stdout_tail: &str,
+    summary: &mut CycleSummary,
+) -> anyhow::Result<()> {
+    let fid = finding.id;
+    let job = start.job;
+    let tail = crate::util::tail(stdout_tail, 300);
+    match outcome {
+        FixOutcome::Blocked { report, from_tree } => {
+            return hold_blocked_fix(store, fid, start, &report, from_tree, summary).await;
+        }
+        FixOutcome::Declined { reason } => {
+            reject_declined_fix(store, fid, job, &reason, summary).await;
+            return Ok(());
+        }
+        FixOutcome::Shipped { pr_url, recovered } => {
+            let _ = store.set_finding_pr_open(fid, &pr_url).await;
+            let _ = store.clear_fix_attempts(fid).await;
+            let message = if recovered {
+                format!("#{fid} recovered existing PR: {pr_url}")
+            } else {
+                format!("#{fid} draft PR: {pr_url}")
+            };
+            let _ = fix_event(store, "ship", fid, job, message).await;
+            summary.outcome = Some("pr_open".into());
+            summary.pr_url = Some(pr_url);
+        }
+        FixOutcome::Suspended => {
+            // Back to queued below, where the fix tier continues it.
+            let _ = fix_event(
+                store,
+                "fix",
+                fid,
+                job,
+                format!(
+                    "#{fid} suspended; worktree kept at {} for the resume. tail: {tail}",
+                    start.ws.tree.display()
+                ),
+            )
+            .await;
+            summary.outcome = Some("suspended".into());
+            summary.worktree = Some(start.ws.tree.to_string_lossy().into_owned());
+        }
+        FixOutcome::Stuck { failure, streak } => {
+            let reason = format!(
+                "stuck: {streak} consecutive fix attempts hit the same failure: {failure}\n\n{tail}"
+            );
+            // The report lives on the job row; nothing goes in the tree.
+            hold_blocked(store, fid, job, &reason).await?;
+            summary.state = Some(JobState::Suspended);
+            let _ = fix_event(
+                store,
+                "fix",
+                fid,
+                job,
+                format!(
+                    "#{fid} gave up after {streak} identical failures ({failure}). tail: {tail}"
+                ),
+            )
+            .await;
+            summary.outcome = Some("blocked".into());
+            summary.failure = Some(failure);
+            summary.attempts = Some(streak);
+        }
+        FixOutcome::Incomplete { failure } => {
+            let _ = fix_event(
+                store,
+                "fix",
+                fid,
+                job,
+                format!("#{fid} incomplete ({failure}). tail: {tail}"),
+            )
+            .await;
+            summary.outcome = Some("requeued".into());
+            summary.failure = Some(failure);
+        }
+    }
+    if finding.budget_override == Some(BudgetOverride::Once) {
+        let _ = store.set_budget_override(fid, None).await;
+    }
+    release_claim(store, fid).await;
+    Ok(())
+}
+
+/// Run a fix job (`scheduler.run_fix`): start it ([`start_fix`]), run the
+/// worker, then decide ([`conclude_fix`]) and record
+/// ([`record_fix_outcome`]) what the attempt amounts to.
+pub async fn run_fix(
+    store: &Store,
+    cfg: &Config,
+    finding: &Finding,
+    backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<CycleSummary> {
+    let fid = finding.id;
+    let start = match start_fix(store, cfg, finding, backend, resume).await? {
+        Ok(start) => start,
+        Err(ended) => return Ok(ended),
+    };
+    let prompt = fix_prompt(store, cfg, finding, &start, resume).await?;
     let model = cfg.model_for("fix");
     let rr = match backend
         .run(
-            &ws,
+            &start.ws,
             &prompt,
-            cap,
+            start.cap,
             cfg.fix_max_wall_s,
             JobClass::Fix,
             resume.map(|r| r.session_file.as_path()),
@@ -2730,327 +3141,49 @@ pub async fn run_fix(
     {
         Ok(r) => r,
         Err(e) => {
-            if let Some(previous_blocker) = &previous_blocker {
-                hold_blocked(store, fid, job, previous_blocker).await?;
-                anyhow::bail!("{e}");
+            if let Some(previous_blocker) = &start.previous_blocker {
+                hold_blocked(store, fid, start.job, previous_blocker).await?;
+            } else {
+                release_claim(store, fid).await;
             }
-            let _ = store
-                .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-                .await;
             anyhow::bail!("{e}");
         }
     };
-    let state = record_job(store, job, &rr, model, resume)
+    let state = record_job(store, start.job, &rr, model, resume)
         .await
         .unwrap_or(JobState::Failed);
-    let summary = 'post: {
-        let mut summary = CycleSummary {
-            kind: Some(FindingJobKind::Fix.into()),
-            finding_id: Some(fid),
-            job_id: Some(job),
-            state: Some(state),
-            branch: Some(branch.clone()),
-            tokens_new: Some(rr.tokens_new),
-            ..Default::default()
-        };
-
-        // Check for decline/blocked file
-        let decline_name = if is_bug {
-            "NOT-A-BUG.md"
-        } else {
-            "DECLINED.md"
-        };
-        let decline_file = worktree.join(decline_name);
-        let blocked_file = worktree.join("BLOCKED.md");
-        let declined = decline_file.exists();
-        let report_file = if declined {
-            Some(&decline_file)
-        } else if blocked_file.exists() {
-            Some(&blocked_file)
-        } else {
-            None
-        };
-        // Any bytes the worker wrote are its report; only a file that
-        // cannot be read at all (a directory, permissions) is an error, and
-        // that must not strand the finding at `fixing`.
-        let report = match report_file.map(|f| read_report(f)).transpose() {
-            Ok(report) => report,
-            Err(e) => {
-                let _ = store
-                    .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-                    .await;
-                anyhow::bail!("fix #{fid}: cannot read the worker's report: {e}");
-            }
-        };
-        let reported = if declined { None } else { report.clone() };
-        // An attempt that ended with no outcome at all (a failed provider
-        // handoff, a cap) did not resolve the prerequisite it was resumed
-        // against, so the implementation stays operator-held.
-        let unresolved = if declined || state == JobState::Done {
-            None
-        } else {
-            previous_blocker.as_ref()
-        };
-        if let Some(report) = reported.as_ref().or(unresolved) {
-            hold_blocked(store, fid, job, report).await?;
-            // Recorded: the job row owns the report now, so the tree holds
-            // no stale one for the next attempt to mistake for its own.
-            if reported.is_some() {
-                std::fs::remove_file(&blocked_file)?;
-            }
-            store
-                .log_event(
-                    "fix",
-                    &format!(
-                        "#{fid} blocked; checkpoint retained at {}",
-                        ws.root.display()
-                    ),
-                    Some(job),
-                    Some(fid),
-                )
-                .await?;
-            summary.state = Some(JobState::Suspended);
-            summary.outcome = Some("blocked".into());
-            break 'post summary;
-        }
-        if declined {
-            let raw = report.unwrap_or_default();
-            let reason: String = raw.chars().take(500).collect();
-            let _ = store
-                .set_finding_verdict(fid, FindingStatus::Rejected, &reason)
-                .await;
-            let _ = store.clear_fix_attempts(fid).await;
-            let first_line: String = reason
-                .lines()
-                .next()
-                .map(|l| l.chars().take(120).collect())
-                .unwrap_or_default();
-            let verb = "rejected";
-            let _ = store
-                .log_event(
-                    "fix",
-                    &format!("#{fid} {verb} by worker: {first_line}"),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-            summary.outcome = Some("rejected".into());
-            let _ = store
-                .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-                .await;
-            break 'post summary;
-        }
-
-        // Check for commits + PR description
-        let db = repo.default_branch.clone();
-        let wts = worktree.to_string_lossy().to_string();
-        let db2 = db.clone();
-        let (rc, commits) = tokio::task::spawn_blocking(move || {
-            let (rc, out) = run_cmd_sync(
-                &[
-                    "git",
-                    "-C",
-                    &wts,
-                    "log",
-                    &format!("origin/{db2}..HEAD"),
-                    "--oneline",
-                ],
-                30,
-            );
-            if rc != 0 {
-                run_cmd_sync(
-                    &[
-                        "git",
-                        "-C",
-                        &wts,
-                        "log",
-                        &format!("{db2}..HEAD"),
-                        "--oneline",
-                    ],
-                    30,
-                )
-            } else {
-                (rc, out)
-            }
-        })
-        .await
-        .unwrap_or((127, String::new()));
-        let commits = commits.trim().to_owned();
-
-        let pr_desc = worktree.join("PR-DESCRIPTION.md");
-        let mut failure: Option<String> = None;
-
-        if rc == 0 && !commits.is_empty() && pr_desc.exists() {
-            let f = forge::forge_for(repo.forge);
-            let push_url = f.ssh_url(&repo.url);
-            let wts = worktree.to_string_lossy().to_string();
-            let pu = push_url.clone();
-            let (prc, pout) = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(&["git", "-C", &wts, "push", "--force", &pu, "HEAD"], 600)
-            })
-            .await
-            .unwrap_or((127, "spawn error".to_owned()));
-            if prc == 0 {
-                let owner_slug = f.owner_repo(&repo.url);
-                if let Some((_owner, _slug_name)) = owner_slug {
-                    let body = std::fs::read_to_string(&pr_desc).unwrap_or_default();
-                    let wts = worktree.to_string_lossy().to_string();
-                    let (_trc, title) = tokio::task::spawn_blocking(move || {
-                        run_cmd_sync(&["git", "-C", &wts, "log", "-1", "--format=%s"], 30)
-                    })
-                    .await
-                    .unwrap_or((127, branch.clone()));
-                    let title = title.trim();
-                    let title = if title.is_empty() { &branch } else { title };
-                    match f.create_pr(&rpath, &branch, &db, title, &body) {
-                        Ok(pr_url) => {
-                            let _ = store.set_finding_pr_open(fid, &pr_url).await;
-                            let _ = store.clear_fix_attempts(fid).await;
-                            let _ = store
-                                .log_event(
-                                    "ship",
-                                    &format!("#{fid} draft PR: {pr_url}"),
-                                    Some(job),
-                                    Some(fid),
-                                )
-                                .await;
-                            summary.outcome = Some("pr_open".into());
-                            summary.pr_url = Some(pr_url);
-                            if override_mode == Some(BudgetOverride::Once) {
-                                let _ = store.set_budget_override(fid, None).await;
-                            }
-                            let _ = store
-                                .finalize_in_progress(
-                                    fid,
-                                    FindingStatus::Fixing,
-                                    FindingStatus::Queued,
-                                )
-                                .await;
-                            break 'post summary;
-                        }
-                        Err(e) => {
-                            let err_msg = e.to_string();
-                            if err_msg.contains("already exists")
-                                && let Some(pr_url) = extract_pr_url(&err_msg)
-                            {
-                                let _ = store.set_finding_pr_open(fid, &pr_url).await;
-                                let _ = store.clear_fix_attempts(fid).await;
-                                let _ = store
-                                    .log_event(
-                                        "ship",
-                                        &format!("#{fid} recovered existing PR: {pr_url}"),
-                                        Some(job),
-                                        Some(fid),
-                                    )
-                                    .await;
-                                summary.outcome = Some("pr_open".into());
-                                summary.pr_url = Some(pr_url);
-                                if override_mode == Some(BudgetOverride::Once) {
-                                    let _ = store.set_budget_override(fid, None).await;
-                                }
-                                let _ = store
-                                    .finalize_in_progress(
-                                        fid,
-                                        FindingStatus::Fixing,
-                                        FindingStatus::Queued,
-                                    )
-                                    .await;
-                                break 'post summary;
-                            }
-                            let head: String = err_msg.chars().take(300).collect();
-                            failure = Some(format!("PR create failed: {head}"));
-                        }
-                    }
-                } else {
-                    failure = Some(format!("unparseable repo url for PR: {:?}", repo.url));
-                }
-            } else {
-                let tail = crate::util::tail(&pout, 300);
-                failure = Some(format!("push failed: {tail}"));
-            }
-        } else if failure.is_none() {
-            failure = Some(if state == JobState::Done {
-                if commits.is_empty() {
-                    "no commits".to_owned()
-                } else {
-                    "no PR-DESCRIPTION.md".to_owned()
-                }
-            } else {
-                format!("worker {state}")
-            });
-        }
-
-        // Salvage
-        let failure = failure.unwrap_or_else(|| "unknown failure".to_owned());
-        let tail = crate::util::tail(&rr.stdout_tail, 300);
-        if state == JobState::Suspended {
-            // A suspension is a pause, not a failure: the worker stopped
-            // mid-work (out of window headroom, or died after doing work) and
-            // its tree and transcript are kept for the resume. Counting it toward the streak would turn
-            // three pauses of one healthy fix into "stuck" and reject the
-            // finding. Back to queued, where the fix tier continues it.
-            let _ = store
-                .log_event(
-                    "fix",
-                    &format!(
-                        "#{fid} suspended; worktree kept at {} for the resume. tail: {tail}",
-                        worktree.display()
-                    ),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-            summary.outcome = Some("suspended".into());
-            summary.worktree = Some(worktree.to_string_lossy().into_owned());
-        } else {
-            let streak = store.record_fix_attempt(fid, &failure).await.unwrap_or(1);
-            if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
-                let reason = format!(
-                    "stuck: {streak} consecutive fix attempts hit the same failure: {failure}\n\n{tail}"
-                );
-                // The report lives on the job row; nothing goes in the tree.
-                hold_blocked(store, fid, job, &reason).await?;
-                summary.state = Some(JobState::Suspended);
-                let _ = store
-                .log_event(
-                    "fix",
-                    &format!(
-                        "#{fid} gave up after {streak} identical failures ({failure}). tail: {tail}"
-                    ),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-                summary.outcome = Some("blocked".into());
-                summary.failure = Some(failure);
-                summary.attempts = Some(streak);
-            } else {
-                let _ = store
-                    .log_event(
-                        "fix",
-                        &format!("#{fid} incomplete ({failure}). tail: {tail}"),
-                        Some(job),
-                        Some(fid),
-                    )
-                    .await;
-                summary.outcome = Some("requeued".into());
-                summary.failure = Some(failure);
-            }
-        }
-        if override_mode == Some(BudgetOverride::Once) {
-            let _ = store.set_budget_override(fid, None).await;
-        }
-        let _ = store
-            .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-            .await;
-        summary
+    let mut summary = CycleSummary {
+        kind: Some(FindingJobKind::Fix.into()),
+        finding_id: Some(fid),
+        job_id: Some(start.job),
+        state: Some(state),
+        branch: Some(start.branch.clone()),
+        tokens_new: Some(rr.tokens_new),
+        ..Default::default()
     };
+    let outcome = conclude_fix(
+        store,
+        finding,
+        &start,
+        state,
+        start.previous_blocker.as_ref(),
+    )
+    .await?;
+    record_fix_outcome(
+        store,
+        finding,
+        &start,
+        outcome,
+        &rr.stdout_tail,
+        &mut summary,
+    )
+    .await?;
     if state == JobState::Suspended
         && let Some(outcome @ ("rejected" | "pr_open")) = summary.outcome.as_deref()
     {
-        retire_concluded(store, job, outcome).await;
+        retire_concluded(store, start.job, outcome).await;
     }
-    close_workspace(store, &ws).await;
+    close_workspace(store, &start.ws).await;
     Ok(summary)
 }
 
@@ -3458,19 +3591,14 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
     summary
 }
 
-/// Run engage job (`scheduler.run_engage`).
-#[allow(
-    clippy::too_many_lines,
-    reason = "linear job pipeline: check out the PR branch, run the worker, \
-              test, push, reply. Shares the fix pipeline's unwind structure"
-)]
-pub async fn run_engage(
+/// The repo and PR an engage works on: its `pr_state` row, branch and
+/// number, with the PR head fetched into the clone for a cold attempt.
+/// Every way to lack one is logged and an error: sync records them first.
+async fn engage_target(
     store: &Store,
-    cfg: &Config,
     finding: &Finding,
-    backend: &dyn Backend,
     resume: Option<&ResumePlan>,
-) -> anyhow::Result<CycleSummary> {
+) -> anyhow::Result<(Repo, crate::types::PrState, String, i64)> {
     let fid = finding.id;
     let Ok(Some(repo)) = store.get_repo_by_id(finding.repo_id).await else {
         let _ = store
@@ -3543,13 +3671,11 @@ pub async fn run_engage(
             .await;
         anyhow::bail!("head_ref equals default branch");
     }
-
-    let rpath = PathBuf::from(&repo.path);
     // Fetch the PR head into the clone for a cold attempt; the tree is
     // added from it once the job exists. Never on a resume: the chain
     // continues in its own tree, at the head it was created at.
     if resume.is_none() {
-        let rps = rpath.to_string_lossy().to_string();
+        let rps = repo.path.clone();
         let hr = head_ref.clone();
         let (rc, out) = tokio::task::spawn_blocking(move || {
             run_cmd_sync(&["git", "-C", &rps, "fetch", "origin", &hr], 600)
@@ -3569,15 +3695,41 @@ pub async fn run_engage(
             anyhow::bail!("fetch failed: {tail}");
         }
     }
+    Ok((repo, ps, head_ref, pr_number))
+}
 
-    let override_mode = finding.budget_override;
+/// An engage job with its PR read and a tree at the PR head.
+struct EngageStart {
+    repo: Repo,
+    ps: crate::types::PrState,
+    head_ref: String,
+    pr_number: i64,
+    pr: PrView,
+    job: i64,
+    ws: Workspace,
+    pinned: String,
+    cap: Option<i64>,
+}
+
+/// Everything before the worker runs: target, fetch, budget gate, PR view,
+/// job row, tree. `Ok(Err(summary))` is a cycle that ends here.
+async fn start_engage(
+    store: &Store,
+    cfg: &Config,
+    finding: &Finding,
+    backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<Result<EngageStart, CycleSummary>> {
+    let fid = finding.id;
+    let (repo, ps, head_ref, pr_number) = engage_target(store, finding, resume).await?;
+
     let (cap, anticipated) = match budget_gate(
         backend,
         store,
         cfg,
         repo.id,
         FindingJobKind::Engage.into(),
-        override_mode.is_some(),
+        finding.budget_override.is_some(),
         &format!("engage #{fid}"),
         Some(fid),
         resume,
@@ -3585,7 +3737,7 @@ pub async fn run_engage(
     .await?
     {
         BudgetDecision::Approved { cap, anticipated } => (cap, anticipated),
-        BudgetDecision::Denied(d) => return Ok(*d),
+        BudgetDecision::Denied(d) => return Ok(Err(*d)),
     };
 
     let fg = forge::forge_for(repo.forge);
@@ -3623,10 +3775,10 @@ pub async fn run_engage(
                 Some(&repo.name),
                 Some(fid),
                 e,
-            );
+            )
+            .map(Err);
         }
     };
-    let job = created.id;
     let (ws, pinned) = match open_workspace(
         store,
         cfg,
@@ -3643,260 +3795,243 @@ pub async fn run_engage(
     .await?
     {
         Ok(opened) => opened,
-        Err(failed) => return Ok(failed),
+        Err(failed) => return Ok(Err(failed)),
     };
-    let worktree = ws.tree.clone();
+    Ok(Ok(EngageStart {
+        repo,
+        ps,
+        head_ref,
+        pr_number,
+        pr,
+        job: created.id,
+        ws,
+        pinned,
+        cap,
+    }))
+}
 
-    let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
-    let prompt = match resume {
-        Some(_) => RESUME_PROMPT.to_owned(),
-        None => playbooks::build_engage_prompt(
-            &cfg.root,
-            finding,
-            &worktree,
-            &head_ref,
-            &repo,
-            &pr,
-            &ps,
-            &repo_notes,
-        )?,
-    };
-    let model = cfg.model_for("fix");
-    let rr = backend
-        .run(
-            &ws,
-            &prompt,
-            cap,
-            cfg.fix_max_wall_s,
-            JobClass::Fix,
-            resume.map(|r| r.session_file.as_path()),
-        )
-        .await?;
-    let state = record_job(store, job, &rr, model, resume)
-        .await
-        .unwrap_or(JobState::Failed);
-    // Set only once the forge has accepted the close AND pr_state records
-    // it AND the finding is `closed`: a handoff into the closed PR's
-    // harvest for a PR that is still open would review a closure that
-    // never happened, one whose pr_state still reads OPEN would be run as
-    // a merged PR's harvest, and one whose finding is still `pr_open`
-    // would have its classification kept as if a human had set that
-    // status while the PR is marked harvested all the same.
-    let mut closed_on_forge = false;
-    let summary = 'post: {
-        let mut summary = CycleSummary {
-            kind: Some(FindingJobKind::Engage.into()),
-            finding_id: Some(fid),
-            job_id: Some(job),
-            state: Some(state),
-            pr_number: Some(pr_number),
-            tokens_new: Some(rr.tokens_new),
-            ..Default::default()
-        };
-
-        // Check for WITHDRAW.md
-        let withdraw = worktree.join("WITHDRAW.md");
-        if withdraw.exists() {
-            let reason = std::fs::read_to_string(&withdraw).unwrap_or_default();
-            let mut forge_closed = false;
-            if fg.owner_repo(&repo.url).is_some() {
-                if let Err(err) = fg.close_pr(&repo.url, pr_number, &reason) {
-                    // close_pr posts the withdrawal reason and only then closes,
-                    // so a failure here means the PR is still OPEN on the forge.
-                    // Recording the verdict anyway would mark it closed locally
-                    // and set the finding Closed -- and sync_prs only revisits
-                    // pr_open findings, so nothing would ever reconcile it.
-                    //
-                    // Leaving the finding untouched is not enough either: it
-                    // stays in list_attention, which pick_next ranks second, so
-                    // a persistently failing forge would monopolise every cycle
-                    // running a fresh worker each time. Unlike fix/recheck/
-                    // harvest there is no engage attempt counter to cap that.
-                    // So mark THIS attention reason addressed, exactly as a
-                    // reply-only engage does: the finding stops being re-picked
-                    // until the PR sees genuinely new activity (the attention
-                    // fingerprint or head_sha changes), and the error event
-                    // below is what surfaces it in the meantime.
-                    tracing::warn!(finding = fid, pr = pr_number, error = %err, "close_pr failed");
-                    let _ = store
-                        .mark_pr_engaged(
-                            fid,
-                            ps.last_activity_at.unwrap_or_else(now_ms),
-                            now_ms(),
-                            ps.attention_fingerprint.as_deref(),
-                            ps.head_sha.as_deref(),
-                        )
-                        .await;
-                    let _ = store
-                        .log_event(
-                            "error",
-                            &format!(
-                                "#{fid} withdrawal aborted: PR #{pr_number} could not be closed \
-                             (retries when the PR next changes)"
-                            ),
-                            Some(job),
-                            Some(fid),
-                        )
-                        .await;
-                    summary.outcome = Some("withdraw-failed".into());
-                    break 'post summary;
-                }
-                forge_closed = true;
-            }
-            // Closed, not Rejected: 14 of the first 15 engage withdrawals
-            // were "superseded/obsolete", i.e. the finding was right and its
-            // work landed elsewhere. Suppressing those told every later scan
-            // to stop reporting valid bugs. The harvest classifies the
-            // closure and also owns the follow-ups, which is why this no
-            // longer ingests a FOLLOW-UPS.json.
-            let reason_short: String = reason.chars().take(500).collect();
-            if let Err(err) = store.mark_pr_closed(fid, pr_number, now_ms()).await {
-                // The harvest picks its playbook from pr_state: with the row
-                // still OPEN it would run the merged-PR review, never ask
-                // why the PR closed, and still mark the finding harvested.
-                // So no handoff, and the finding stays pr_open rather than
-                // going Closed: Closed with an OPEN pr_state is a state
-                // nothing else produces, and pr_open is what sync_prs
-                // revisits. The PR is closed on the forge, so the next
-                // cycle's sync takes its Closed branch, records both, and
-                // the cold harvest follows with the right playbook.
-                tracing::warn!(finding = fid, pr = pr_number, error = %err, "mark_pr_closed failed");
-                let _ = store
-                    .log_event(
-                        "error",
-                        &format!(
-                            "#{fid} PR #{pr_number} withdrawn but not recorded closed: {err} \
-                             (the next PR sync records it)"
-                        ),
-                        Some(job),
-                        Some(fid),
-                    )
-                    .await;
-            } else if let Err(err) = store
-                .set_finding_verdict(fid, FindingStatus::Closed, &reason_short)
-                .await
-            {
-                // pr_state reads CLOSED but the finding is still pr_open, so
-                // no handoff: the harvest would take pr_open for a human's
-                // verdict, keep it, and mark the PR harvested, and the
-                // finding the next sync sets `closed` would never be
-                // harvested. sync_prs revisits pr_open findings, takes its
-                // Closed branch (mark_pr_closed is an UPSERT, so the row
-                // already reading CLOSED is fine), sets the finding
-                // `closed`, and the cold harvest follows.
-                tracing::warn!(finding = fid, pr = pr_number, error = %err, "closed verdict failed");
-                let _ = store
-                    .log_event(
-                        "error",
-                        &format!(
-                            "#{fid} PR #{pr_number} withdrawn but the finding was not set closed: \
-                             {err} (the next PR sync sets it)"
-                        ),
-                        Some(job),
-                        Some(fid),
-                    )
-                    .await;
-            } else {
-                closed_on_forge = forge_closed;
-            }
-            let first_line: String = reason
-                .lines()
-                .next()
-                .map(|l| l.chars().take(120).collect())
-                .unwrap_or_default();
+/// The worker asked to withdraw the PR (`WITHDRAW.md`): close it on the
+/// forge and record the finding `closed`. Returns whether the closure is
+/// complete enough to hand to the closed PR's harvest right away.
+async fn withdraw_pr(
+    store: &Store,
+    fid: i64,
+    start: &EngageStart,
+    reason: &str,
+    summary: &mut CycleSummary,
+) -> bool {
+    let (repo, job, pr_number, ps) = (&start.repo, start.job, start.pr_number, &start.ps);
+    let fg = forge::forge_for(repo.forge);
+    let mut forge_closed = false;
+    if fg.owner_repo(&repo.url).is_some() {
+        if let Err(err) = fg.close_pr(&repo.url, pr_number, reason) {
+            // close_pr posts the withdrawal reason and only then closes,
+            // so a failure here means the PR is still OPEN on the forge.
+            // Recording the verdict anyway would mark it closed locally
+            // and set the finding Closed -- and sync_prs only revisits
+            // pr_open findings, so nothing would ever reconcile it.
+            //
+            // Leaving the finding untouched is not enough either: it
+            // stays in list_attention, which pick_next ranks second, so
+            // a persistently failing forge would monopolise every cycle
+            // running a fresh worker each time. Unlike fix/recheck/
+            // harvest there is no engage attempt counter to cap that.
+            // So mark THIS attention reason addressed, exactly as a
+            // reply-only engage does: the finding stops being re-picked
+            // until the PR sees genuinely new activity (the attention
+            // fingerprint or head_sha changes), and the error event
+            // below is what surfaces it in the meantime.
+            tracing::warn!(finding = fid, pr = pr_number, error = %err, "close_pr failed");
+            let _ = store
+                .mark_pr_engaged(
+                    fid,
+                    ps.last_activity_at.unwrap_or_else(now_ms),
+                    now_ms(),
+                    ps.attention_fingerprint.as_deref(),
+                    ps.head_sha.as_deref(),
+                )
+                .await;
             let _ = store
                 .log_event(
-                    "verdict",
-                    &format!("#{fid} withdrawn by engage worker: {first_line}"),
+                    "error",
+                    &format!(
+                        "#{fid} withdrawal aborted: PR #{pr_number} could not be closed \
+                         (retries when the PR next changes)"
+                    ),
                     Some(job),
                     Some(fid),
                 )
                 .await;
-            summary.outcome = Some("withdrawn".into());
-            break 'post summary;
+            summary.outcome = Some("withdraw-failed".into());
+            return false;
         }
+        forge_closed = true;
+    }
+    // Closed, not Rejected: 14 of the first 15 engage withdrawals were
+    // "superseded/obsolete", i.e. the finding was right and its work
+    // landed elsewhere. Suppressing those told every later scan to stop
+    // reporting valid bugs. The harvest classifies the closure and also
+    // owns the follow-ups, which is why this no longer ingests a
+    // FOLLOW-UPS.json.
+    let reason_short: String = reason.chars().take(500).collect();
+    let mut closed_on_forge = false;
+    if let Err(err) = store.mark_pr_closed(fid, pr_number, now_ms()).await {
+        // The harvest picks its playbook from pr_state: with the row still
+        // OPEN it would run the merged-PR review, never ask why the PR
+        // closed, and still mark the finding harvested. So no handoff, and
+        // the finding stays pr_open rather than going Closed: Closed with
+        // an OPEN pr_state is a state nothing else produces, and pr_open is
+        // what sync_prs revisits. The PR is closed on the forge, so the
+        // next cycle's sync takes its Closed branch, records both, and the
+        // cold harvest follows with the right playbook.
+        tracing::warn!(finding = fid, pr = pr_number, error = %err, "mark_pr_closed failed");
+        let _ = store
+            .log_event(
+                "error",
+                &format!(
+                    "#{fid} PR #{pr_number} withdrawn but not recorded closed: {err} \
+                     (the next PR sync records it)"
+                ),
+                Some(job),
+                Some(fid),
+            )
+            .await;
+    } else if let Err(err) = store
+        .set_finding_verdict(fid, FindingStatus::Closed, &reason_short)
+        .await
+    {
+        // pr_state reads CLOSED but the finding is still pr_open, so no
+        // handoff: the harvest would take pr_open for a human's verdict,
+        // keep it, and mark the PR harvested, and the finding the next
+        // sync sets `closed` would never be harvested. sync_prs revisits
+        // pr_open findings, takes its Closed branch (mark_pr_closed is an
+        // UPSERT, so the row already reading CLOSED is fine), sets the
+        // finding `closed`, and the cold harvest follows.
+        tracing::warn!(finding = fid, pr = pr_number, error = %err, "closed verdict failed");
+        let _ = store
+            .log_event(
+                "error",
+                &format!(
+                    "#{fid} PR #{pr_number} withdrawn but the finding was not set closed: \
+                     {err} (the next PR sync sets it)"
+                ),
+                Some(job),
+                Some(fid),
+            )
+            .await;
+    } else {
+        closed_on_forge = forge_closed;
+    }
+    let first_line: String = reason
+        .lines()
+        .next()
+        .map(|l| l.chars().take(120).collect())
+        .unwrap_or_default();
+    let _ = store
+        .log_event(
+            "verdict",
+            &format!("#{fid} withdrawn by engage worker: {first_line}"),
+            Some(job),
+            Some(fid),
+        )
+        .await;
+    summary.outcome = Some("withdrawn".into());
+    closed_on_forge
+}
 
-        // Push + reply
-        let mut failure: Option<String> = if state == JobState::Done {
-            None
-        } else {
-            Some(format!("worker {state}"))
-        };
-        let mut pushed = false;
-        let mut replied = false;
-        if failure.is_none() {
-            let wts = worktree.to_string_lossy().to_string();
-            let hr = head_ref.clone();
-            let (rc, commits) = tokio::task::spawn_blocking(move || {
-                run_cmd_sync(
-                    &[
-                        "git",
-                        "-C",
-                        &wts,
-                        "log",
-                        &format!("origin/{hr}..HEAD"),
-                        "--oneline",
-                    ],
-                    30,
-                )
-            })
-            .await
-            .unwrap_or((127, String::new()));
-            if rc == 0 && !commits.trim().is_empty() {
-                let push_url = fg.ssh_url(&repo.url);
-                let wts = worktree.to_string_lossy().to_string();
-                let hr = head_ref.clone();
-                let (prc, pout) = tokio::task::spawn_blocking(move || {
-                    run_cmd_sync(
-                        &[
-                            "git",
-                            "-C",
-                            &wts,
-                            "push",
-                            "--force",
-                            &push_url,
-                            &format!("HEAD:{hr}"),
-                        ],
-                        600,
-                    )
-                })
-                .await
-                .unwrap_or((127, "spawn error".to_owned()));
-                if prc == 0 {
-                    pushed = true;
-                } else {
-                    let tail = crate::util::tail(&pout, 300);
-                    failure = Some(format!("push failed: {tail}"));
-                }
-            }
+/// Push the worker's commits to the PR branch and post its `PR-REPLY.md`:
+/// `(pushed, replied)`, or why the engage is incomplete. A worker that did
+/// not finish publishes nothing.
+async fn push_and_reply(start: &EngageStart, state: JobState) -> Result<(bool, bool), String> {
+    if state != JobState::Done {
+        return Err(format!("worker {state}"));
+    }
+    let (repo, worktree, head_ref) = (&start.repo, &start.ws.tree, &start.head_ref);
+    let fg = forge::forge_for(repo.forge);
+    let wts = worktree.to_string_lossy().to_string();
+    let hr = head_ref.clone();
+    let (rc, commits) = tokio::task::spawn_blocking(move || {
+        run_cmd_sync(
+            &[
+                "git",
+                "-C",
+                &wts,
+                "log",
+                &format!("origin/{hr}..HEAD"),
+                "--oneline",
+            ],
+            30,
+        )
+    })
+    .await
+    .unwrap_or((127, String::new()));
+    let mut pushed = false;
+    if rc == 0 && !commits.trim().is_empty() {
+        let push_url = fg.ssh_url(&repo.url);
+        let wts = worktree.to_string_lossy().to_string();
+        let hr = head_ref.clone();
+        let (prc, pout) = tokio::task::spawn_blocking(move || {
+            run_cmd_sync(
+                &[
+                    "git",
+                    "-C",
+                    &wts,
+                    "push",
+                    "--force",
+                    &push_url,
+                    &format!("HEAD:{hr}"),
+                ],
+                600,
+            )
+        })
+        .await
+        .unwrap_or((127, "spawn error".to_owned()));
+        if prc != 0 {
+            let tail = crate::util::tail(&pout, 300);
+            return Err(format!("push failed: {tail}"));
         }
-        if failure.is_none() {
-            let reply = worktree.join("PR-REPLY.md");
-            if reply.exists() {
-                let body = std::fs::read_to_string(&reply).unwrap_or_default();
-                match fg.comment_pr(&repo.url, pr_number, &body) {
-                    Ok(()) => {
-                        replied = true;
-                    }
-                    Err(e) => {
-                        failure = Some(format!(
-                            "PR comment failed: {}",
-                            crate::util::tail(&e.to_string(), 300)
-                        ));
-                    }
-                }
-            }
+        pushed = true;
+    }
+    let reply = worktree.join("PR-REPLY.md");
+    let mut replied = false;
+    if reply.exists() {
+        let body = std::fs::read_to_string(&reply).unwrap_or_default();
+        if let Err(e) = fg.comment_pr(&repo.url, start.pr_number, &body) {
+            return Err(format!(
+                "PR comment failed: {}",
+                crate::util::tail(&e.to_string(), 300)
+            ));
         }
+        replied = true;
+    }
+    Ok((pushed, replied))
+}
 
-        if let Some(ref fail) = failure {
+/// Record a finished engage: what it published, or why it is incomplete.
+/// Either way a one-shot budget override is spent.
+async fn record_engage(
+    store: &Store,
+    finding: &Finding,
+    start: &EngageStart,
+    state: JobState,
+    published: Result<(bool, bool), String>,
+    stdout_tail: &str,
+    summary: &mut CycleSummary,
+) {
+    let (fid, job, ps, pr_number) = (finding.id, start.job, &start.ps, start.pr_number);
+    match published {
+        Err(fail) => {
             if state == JobState::Done {
                 let _ = store.fail_job(job, fail.as_str()).await;
             }
-            let tail = crate::util::tail(&rr.stdout_tail, 300);
+            let tail = crate::util::tail(stdout_tail, 300);
             // Only a suspension keeps its tree; any other outcome ends the
-            // chain and the tree is released below.
+            // chain and the tree is released by the caller.
             let kept = if state == JobState::Suspended {
-                format!("; worktree kept at {} for the resume", worktree.display())
+                format!(
+                    "; worktree kept at {} for the resume",
+                    start.ws.tree.display()
+                )
             } else {
                 String::new()
             };
@@ -3909,72 +4044,146 @@ pub async fn run_engage(
                 )
                 .await;
             summary.outcome = Some("retry".into());
-            summary.failure = Some(fail.clone());
-            if override_mode == Some(BudgetOverride::Once) {
-                let _ = store.set_budget_override(fid, None).await;
-            }
-            break 'post summary;
+            summary.failure = Some(fail);
         }
+        Ok((pushed, replied)) => {
+            let engaged_mark = if replied {
+                now_ms() + 3_000
+            } else {
+                ps.last_activity_at.unwrap_or_else(now_ms)
+            };
+            let addressed_fp = if pushed {
+                None
+            } else {
+                ps.attention_fingerprint.as_deref()
+            };
+            let addressed_sha = if pushed { None } else { ps.head_sha.as_deref() };
+            let _ = store
+                .mark_pr_engaged(fid, engaged_mark, now_ms(), addressed_fp, addressed_sha)
+                .await;
+            let did: Vec<&str> = [("pushed", pushed), ("replied", replied)]
+                .iter()
+                .filter(|(_, on)| *on)
+                .map(|(b, _)| *b)
+                .collect();
+            let did_str = if did.is_empty() {
+                "no-op".to_owned()
+            } else {
+                did.join(", ")
+            };
+            let _ = store
+                .log_event(
+                    "engage",
+                    &format!("#{fid} PR #{pr_number} engaged ({did_str})"),
+                    Some(job),
+                    Some(fid),
+                )
+                .await;
+            summary.outcome = Some("engaged".into());
+        }
+    }
+    if finding.budget_override == Some(BudgetOverride::Once) {
+        let _ = store.set_budget_override(fid, None).await;
+    }
+}
 
-        // Success: update engagement state
-        let engaged_mark = if replied {
-            now_ms() + 3_000
-        } else {
-            ps.last_activity_at.unwrap_or_else(now_ms)
-        };
-        let addressed_fp: Option<&str> = if pushed {
-            None
-        } else {
-            ps.attention_fingerprint.as_deref()
-        };
-        let addressed_sha: Option<&str> = if pushed { None } else { ps.head_sha.as_deref() };
-        let _ = store
-            .mark_pr_engaged(fid, engaged_mark, now_ms(), addressed_fp, addressed_sha)
-            .await;
-        let did: Vec<&str> = [("pushed", pushed), ("replied", replied)]
-            .iter()
-            .filter(|(_, on)| *on)
-            .map(|(b, _)| *b)
-            .collect();
-        let did_str = if did.is_empty() {
-            "no-op".to_owned()
-        } else {
-            did.join(", ")
-        };
-        let _ = store
-            .log_event(
-                "engage",
-                &format!("#{fid} PR #{pr_number} engaged ({did_str})"),
-                Some(job),
-                Some(fid),
-            )
-            .await;
-        summary.outcome = Some("engaged".into());
-        if override_mode == Some(BudgetOverride::Once) {
-            let _ = store.set_budget_override(fid, None).await;
-        }
-        summary
+/// Run engage job (`scheduler.run_engage`): start it ([`start_engage`]),
+/// run the worker, then withdraw the PR ([`withdraw_pr`]) or publish its
+/// work ([`push_and_reply`]) and record that ([`record_engage`]).
+pub async fn run_engage(
+    store: &Store,
+    cfg: &Config,
+    finding: &Finding,
+    backend: &dyn Backend,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<CycleSummary> {
+    let fid = finding.id;
+    let start = match start_engage(store, cfg, finding, backend, resume).await? {
+        Ok(start) => start,
+        Err(ended) => return Ok(ended),
+    };
+    let repo_notes = Store::repo_notes(&cfg.work_root, start.repo.id);
+    let prompt = match resume {
+        Some(_) => RESUME_PROMPT.to_owned(),
+        None => playbooks::build_engage_prompt(
+            &cfg.root,
+            finding,
+            &start.ws.tree,
+            &start.head_ref,
+            &start.repo,
+            &start.pr,
+            &start.ps,
+            &repo_notes,
+        )?,
+    };
+    let model = cfg.model_for("fix");
+    let rr = backend
+        .run(
+            &start.ws,
+            &prompt,
+            start.cap,
+            cfg.fix_max_wall_s,
+            JobClass::Fix,
+            resume.map(|r| r.session_file.as_path()),
+        )
+        .await?;
+    let state = record_job(store, start.job, &rr, model, resume)
+        .await
+        .unwrap_or(JobState::Failed);
+    let mut summary = CycleSummary {
+        kind: Some(FindingJobKind::Engage.into()),
+        finding_id: Some(fid),
+        job_id: Some(start.job),
+        state: Some(state),
+        pr_number: Some(start.pr_number),
+        tokens_new: Some(rr.tokens_new),
+        ..Default::default()
+    };
+    // Set only once the forge has accepted the close AND pr_state records
+    // it AND the finding is `closed`: a handoff into the closed PR's
+    // harvest for a PR that is still open would review a closure that
+    // never happened, one whose pr_state still reads OPEN would be run as
+    // a merged PR's harvest, and one whose finding is still `pr_open`
+    // would have its classification kept as if a human had set that
+    // status while the PR is marked harvested all the same.
+    let withdraw = start.ws.tree.join("WITHDRAW.md");
+    let closed_on_forge = if withdraw.exists() {
+        let reason = std::fs::read_to_string(&withdraw).unwrap_or_default();
+        withdraw_pr(store, fid, &start, &reason, &mut summary).await
+    } else {
+        let published = push_and_reply(&start, state).await;
+        record_engage(
+            store,
+            finding,
+            &start,
+            state,
+            published,
+            &rr.stdout_tail,
+            &mut summary,
+        )
+        .await;
+        false
     };
     if state == JobState::Suspended
         && let Some(outcome @ ("withdrawn" | "withdraw-failed")) = summary.outcome.as_deref()
     {
-        retire_concluded(store, job, outcome).await;
+        retire_concluded(store, start.job, outcome).await;
     }
     if closed_on_forge {
         continue_into_harvest(
             store,
             cfg,
             backend,
-            &repo,
+            &start.repo,
             fid,
-            job,
-            &ws,
-            &pinned,
+            start.job,
+            &start.ws,
+            &start.pinned,
             rr.session_file.as_deref(),
         )
         .await;
     }
-    close_workspace(store, &ws).await;
+    close_workspace(store, &start.ws).await;
     Ok(summary)
 }
 
