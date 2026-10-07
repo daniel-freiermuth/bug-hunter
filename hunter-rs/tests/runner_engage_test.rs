@@ -1014,3 +1014,248 @@ async fn an_unrecorded_close_starts_no_harvest_and_waits_for_the_sync() {
     assert_eq!(f.pr_state().await.as_deref(), Some("CLOSED"));
     assert_left_for_the_cold_harvest(&f, &runs[0].tree).await;
 }
+
+/// Point the fixture clone's pushes at its own bare origin (or at `to`)
+/// instead of the forge.
+async fn push_to(f: &Fixture, to: Option<&str>) -> std::path::PathBuf {
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let clone = std::path::PathBuf::from(
+        f.store
+            .get_repo_by_id(finding.repo_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .path,
+    );
+    let origin = support::git(&clone, &["remote", "get-url", "origin"]);
+    let origin = origin.trim();
+    support::git(
+        &clone,
+        &[
+            "config",
+            &format!("url.{}.insteadOf", to.unwrap_or(origin)),
+            "git@github.com:acme/widget.git",
+        ],
+    );
+    std::path::PathBuf::from(origin)
+}
+
+/// A worker that commits to the PR branch and writes `PR-REPLY.md`.
+fn committing_and_replying() -> ScriptedBackend {
+    ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("review.txt"), "addressed\n").unwrap();
+        support::git(tree, &["add", "review.txt"]);
+        support::git(tree, &["commit", "-m", "address review"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "done, see the new commit").unwrap();
+        support::done()
+    })
+}
+
+/// A finished engage publishes its commits to the PR branch and its reply
+/// on the PR, then records the engagement: the PR counts as answered from
+/// a moment after now (so the reply itself is not new activity), the
+/// attention reason is not marked addressed (the push changed the PR), and
+/// a one-shot budget override is spent.
+#[tokio::test]
+async fn a_finished_engage_pushes_replies_and_records_it() {
+    let f = fixture("engage-publish").await;
+    let bins = FakeBins::acquire("engage-publish");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    f.store
+        .set_budget_override(f.fid, Some(hunter::domain::BudgetOverride::Once))
+        .await
+        .unwrap();
+    let backend = committing_and_replying();
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let before = hunter::util::now_ms();
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+    let after = hunter::util::now_ms();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert_eq!(
+        summary.kind,
+        Some(hunter::domain::FindingJobKind::Engage.into())
+    );
+    assert_eq!(summary.finding_id, Some(f.fid));
+    assert_eq!(summary.state, Some(hunter::domain::JobState::Done));
+    assert_eq!(summary.pr_number, Some(7));
+    assert_eq!(summary.tokens_new, Some(support::done().tokens_new));
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    assert_eq!(
+        support::git(&origin, &["log", "-1", "--format=%s", BRANCH]).trim(),
+        "address review"
+    );
+    let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+    let engaged = ps.last_engaged_activity_at.unwrap();
+    assert!(
+        (before + 3_000..=after + 3_000).contains(&engaged),
+        "{engaged} not 3 s after [{before}, {after}]"
+    );
+    assert_eq!(f.addressed_fp().await, None);
+    let events = f.store.recent_events(20).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message == format!("#{} PR #7 engaged (pushed, replied)", f.fid)),
+        "{events:?}"
+    );
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.budget_override, None);
+}
+
+/// A reply without commits pushes nothing and marks the current attention
+/// reason addressed, so the finding is not engaged again until the PR
+/// changes. An exempt override stays.
+#[tokio::test]
+async fn a_reply_only_engage_marks_the_attention_addressed() {
+    let f = fixture("engage-reply-only").await;
+    let bins = FakeBins::acquire("engage-reply-only");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = support::git(&origin, &["rev-parse", BRANCH]);
+    f.store
+        .set_budget_override(f.fid, Some(hunter::domain::BudgetOverride::Exempt))
+        .await
+        .unwrap();
+    let backend = ScriptedBackend::writing("PR-REPLY.md", "thanks, answered inline");
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("engaged"), "{summary:?}");
+    assert!(bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    assert_eq!(support::git(&origin, &["rev-parse", BRANCH]), head);
+    assert_eq!(f.addressed_fp().await.as_deref(), Some("af-1"));
+    let events = f.store.recent_events(20).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message == format!("#{} PR #7 engaged (replied)", f.fid)),
+        "{events:?}"
+    );
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(
+        finding.budget_override,
+        Some(hunter::domain::BudgetOverride::Exempt)
+    );
+}
+
+/// A push that fails leaves the engage incomplete: no reply is posted, the
+/// finished job is recorded failed, and the attempt still spends a one-shot
+/// override.
+#[tokio::test]
+async fn an_engage_whose_push_fails_posts_nothing_and_fails_its_job() {
+    let f = fixture("engage-push-fails").await;
+    let bins = FakeBins::acquire("engage-push-fails");
+    bins.ok("gh", PR_VIEW_JSON);
+    push_to(&f, Some("/nonexistent/origin.git")).await;
+    f.store
+        .set_budget_override(f.fid, Some(hunter::domain::BudgetOverride::Once))
+        .await
+        .unwrap();
+    let backend = committing_and_replying();
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    assert!(
+        summary
+            .failure
+            .as_deref()
+            .is_some_and(|m| m.starts_with("push failed")),
+        "{summary:?}"
+    );
+    assert!(!bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    let jobs = f.jobs().await;
+    assert_eq!(jobs.last().unwrap().2, "failed", "{jobs:?}");
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    assert_eq!(finding.budget_override, None);
+}
+
+/// A worker that did not finish publishes nothing, whatever it staged.
+#[tokio::test]
+async fn an_unfinished_engage_publishes_nothing() {
+    let f = fixture("engage-unfinished").await;
+    let bins = FakeBins::acquire("engage-unfinished");
+    bins.ok("gh", PR_VIEW_JSON);
+    let origin = push_to(&f, None).await;
+    let head = support::git(&origin, &["rev-parse", BRANCH]);
+    let backend = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("review.txt"), "half done\n").unwrap();
+        support::git(tree, &["add", "review.txt"]);
+        support::git(tree, &["commit", "-m", "half done"]);
+        std::fs::write(tree.join("PR-REPLY.md"), "almost").unwrap();
+        let mut result = support::done();
+        result.exit_code = Some(1);
+        result
+    });
+
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+    let state = summary.state.unwrap();
+    assert_ne!(state, hunter::domain::JobState::Done);
+    assert_eq!(summary.failure, Some(format!("worker {state}")));
+    assert!(!bins.called_with("gh", "comment"), "{:?}", bins.calls());
+    assert_eq!(support::git(&origin, &["rev-parse", BRANCH]), head);
+}
+
+/// Only a suspended engage keeps its tree for the resume, and its event
+/// says where; an engage that simply failed says nothing of the kind.
+#[tokio::test]
+async fn only_a_suspended_engage_reports_its_kept_worktree() {
+    for suspended in [true, false] {
+        let f = fixture("engage-kept-tree").await;
+        let bins = FakeBins::acquire("engage-kept-tree");
+        bins.ok("gh", PR_VIEW_JSON);
+        let backend = ScriptedBackend::new(move |tree| {
+            let mut result = support::done();
+            if suspended {
+                let session = tree.parent().unwrap().join("session/session.jsonl");
+                std::fs::write(&session, format!("{USAGE}\n")).unwrap();
+                result.exit_code = None;
+                result.killed_reason = Some("cap".to_owned());
+                result.session_file = Some(session.to_string_lossy().into_owned());
+            } else {
+                result.exit_code = Some(1);
+            }
+            result
+        });
+
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = hunter::scheduler::run_engage(&f.store, &f.cfg, &finding, &backend, None)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.outcome.as_deref(), Some("retry"), "{summary:?}");
+        assert_eq!(
+            summary.state == Some(hunter::domain::JobState::Suspended),
+            suspended,
+            "{summary:?}"
+        );
+        let events = f.store.recent_events(20).await.unwrap();
+        let incomplete = events
+            .iter()
+            .find(|e| e.message.starts_with(&format!("#{} incomplete (", f.fid)))
+            .unwrap_or_else(|| panic!("{events:?}"));
+        assert_eq!(
+            incomplete.message.contains("; worktree kept at "),
+            suspended,
+            "{}",
+            incomplete.message
+        );
+        drop(bins);
+    }
+}
