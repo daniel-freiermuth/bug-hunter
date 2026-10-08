@@ -745,7 +745,7 @@ use std::path::PathBuf;
 
 use crate::backend::{Backend, JobClass, Verdict};
 use crate::forge::{self, CheckConclusion, GhCheckRun, Mergeable, PrView, ReviewDecision};
-use crate::ingest::{IngestResult, ingest_findings};
+use crate::ingest::{EntryTypes, IngestResult, ingest_findings};
 use crate::playbooks;
 use crate::types::RunResult;
 use crate::workspace::{TreeSpec, Workspace};
@@ -988,7 +988,15 @@ async fn ingest_followups(
     if !followups_path.exists() {
         return None;
     }
-    let counts = ingest_findings(store, repo_id, &followups_path, None, Some(job), Some(fid)).await;
+    let counts = ingest_findings(
+        store,
+        repo_id,
+        &followups_path,
+        EntryTypes::Declared,
+        Some(job),
+        Some(fid),
+    )
+    .await;
     if counts.inserted > 0 || counts.invalid > 0 || counts.duplicates > 0 {
         let _ = store
             .log_event(
@@ -1579,7 +1587,7 @@ pub async fn run_hunt(
             store,
             rid,
             &out_path,
-            Some(FindingType::Bug),
+            EntryTypes::Fixed(FindingType::Bug),
             Some(job),
             None,
         )
@@ -2039,15 +2047,34 @@ type AnalysisPromptBuilder = fn(
 struct AnalysisSpec {
     kind: RepoJobKind,
     finding_type: FindingType,
+    /// Other types the worker may file instead, when what it found turns
+    /// out to be one of those. Their open findings and suppressions join
+    /// the prompt's, so the worker does not re-file them either.
+    also_files: &'static [FindingType],
     out_plural: &'static str,
     no_output_noun: &'static str,
     scope_note: &'static str,
     prompt_builder: AnalysisPromptBuilder,
 }
 
+impl AnalysisSpec {
+    fn entry_types(&self) -> EntryTypes {
+        if self.also_files.is_empty() {
+            EntryTypes::Fixed(self.finding_type)
+        } else {
+            EntryTypes::Mainly(self.finding_type, self.also_files)
+        }
+    }
+}
+
+// A gap whose code already misbehaves is a bug, not a missing test: filed
+// as a test_gap it is ranked and fixed as one (tests only), and the fix
+// never happens. Of the 369 open test_gaps on 2026-10-08, 210 also
+// described a present defect.
 const TEST_GAP_SPEC: AnalysisSpec = AnalysisSpec {
     kind: RepoJobKind::TestGap,
     finding_type: FindingType::TestGap,
+    also_files: &[FindingType::Bug],
     out_plural: "test_gaps",
     no_output_noun: "gaps",
     scope_note: "Full repository scan for test coverage gaps.",
@@ -2056,6 +2083,7 @@ const TEST_GAP_SPEC: AnalysisSpec = AnalysisSpec {
 const DEP_UPDATE_SPEC: AnalysisSpec = AnalysisSpec {
     kind: RepoJobKind::DepUpdate,
     finding_type: FindingType::DepUpdate,
+    also_files: &[],
     out_plural: "dep_updates",
     no_output_noun: "updates",
     scope_note: "Check all package manifests for outdated dependencies.",
@@ -2064,6 +2092,7 @@ const DEP_UPDATE_SPEC: AnalysisSpec = AnalysisSpec {
 const REFACTOR_SPEC: AnalysisSpec = AnalysisSpec {
     kind: RepoJobKind::Refactor,
     finding_type: FindingType::Refactor,
+    also_files: &[],
     out_plural: "refactorings",
     no_output_noun: "refactorings",
     scope_note: "Scan for safe, mechanical refactoring opportunities (duplication, dead code, complexity).",
@@ -2072,6 +2101,7 @@ const REFACTOR_SPEC: AnalysisSpec = AnalysisSpec {
 const MODERNIZATION_SPEC: AnalysisSpec = AnalysisSpec {
     kind: RepoJobKind::Modernization,
     finding_type: FindingType::Modernization,
+    also_files: &[],
     out_plural: "modernizations",
     no_output_noun: "modernizations",
     scope_note: "Scan for SOTA-drift modernization opportunities (deprecated/unmaintained deps, language-feature gaps, format/protocol shifts, major version debt, platform EOL).",
@@ -2080,6 +2110,7 @@ const MODERNIZATION_SPEC: AnalysisSpec = AnalysisSpec {
 const STANDARDS_SPEC: AnalysisSpec = AnalysisSpec {
     kind: RepoJobKind::Standards,
     finding_type: FindingType::Standards,
+    also_files: &[],
     out_plural: "standards",
     no_output_noun: "standards",
     scope_note: "Full repository audit against coding standards.",
@@ -2184,14 +2215,13 @@ async fn run_analysis_job(
         .join(format!("job{out_job}.{}.json", spec.out_plural));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
-    let suppressions = store
-        .suppressions(rid, kind.as_str())
-        .await
-        .unwrap_or_default();
-    let known = store
-        .known_active(rid, kind.as_str())
-        .await
-        .unwrap_or_default();
+    let mut suppressions = Vec::new();
+    let mut known = Vec::new();
+    for ft in std::iter::once(&spec.finding_type).chain(spec.also_files) {
+        let ft = ft.as_str();
+        suppressions.extend(store.suppressions(rid, ft).await.unwrap_or_default());
+        known.extend(store.known_active(rid, ft).await.unwrap_or_default());
+    }
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
     let prompt = match resume {
         Some(_) => RESUME_PROMPT.to_owned(),
@@ -2231,15 +2261,8 @@ async fn run_analysis_job(
     };
 
     if out_path.exists() {
-        let counts = ingest_findings(
-            store,
-            rid,
-            &out_path,
-            Some(spec.finding_type),
-            Some(job),
-            None,
-        )
-        .await;
+        let counts =
+            ingest_findings(store, rid, &out_path, spec.entry_types(), Some(job), None).await;
         let _ = store
             .log_event(
                 kind.as_str(),
@@ -2396,7 +2419,7 @@ pub async fn run_dep_update(
         store,
         repo.id,
         &out_path,
-        Some(FindingType::DepUpdate),
+        EntryTypes::Fixed(FindingType::DepUpdate),
         None,
         None,
     )

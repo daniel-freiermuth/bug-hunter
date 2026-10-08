@@ -21,17 +21,43 @@ Functions/methods with non-trivial contracts that lack tests for:
 
 NOT gaps: trivial getters/setters, pure plumbing (pass-through), thoroughly tested code, internal utilities already covered indirectly.
 
-# Known non-gaps (suppression corpus — do NOT re-file these or variants)
+# When the untested code is already wrong
+If verifying a gap shows the CURRENT code misbehaves — wrong output, a
+crash, a misparse, data dropped, an input it should refuse let through —
+that is a bug, not a missing test. File it as a bug instead (same output
+file, `"type": "bug"`, bug shape below) and do NOT also file the gap: the
+bug fix brings its own regression test. File a test gap only for behavior
+that is correct today and merely unguarded. "Could regress" is a gap; "does
+the wrong thing" is a bug.
+
+```json
+{
+  "type": "bug",
+  "fingerprint": "{{REPO_NAME}}:path/file.ext:symbol:bug-class",
+  "file": "path/file.ext",
+  "symbol": "functionOrMethod",
+  "line": 0,
+  "bug_class": "boundary|error-path|race|contract-drift|leak|logic",
+  "severity": "high|medium|low",
+  "confidence": 0.0,
+  "summary": "one sentence: what goes wrong",
+  "detail": "what breaks, why, with file:line code evidence",
+  "evidence_plan": "how to PROVE it + reachable rung: 1=failing automated test, 2=scripted repro, 3=argued trace"
+}
+```
+
+# Known non-candidates (suppression corpus — do NOT re-file these or variants)
+Rejected gaps and rejected bugs alike.
 {{SUPPRESSIONS}}
 
-# Already tracked (open gaps — file only if yours is genuinely NOVEL)
+# Already tracked (open gaps and bugs — file only if yours is genuinely NOVEL)
 {{KNOWN_GAPS}}
 
 # Output contract — INCREMENTAL, you may be killed at any moment
 Create {{OUT_PATH}} containing `[]` as your VERY FIRST action. After EACH
-verified gap, rewrite the complete file with everything confirmed so far
-— committed gaps survive a kill, anything only in your head does not.
-Max {{MAX_GAPS}} entries. Each entry:
+verified gap or bug, rewrite the complete file with everything confirmed so
+far — committed entries survive a kill, anything only in your head does not.
+Max {{MAX_GAPS}} entries, gaps and bugs together. Each test gap entry:
 
 ```json
 {

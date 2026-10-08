@@ -16,6 +16,18 @@ pub struct IngestResult {
     pub invalid: i64,
 }
 
+/// Which finding types a worker's output may hold.
+#[derive(Debug, Clone, Copy)]
+pub enum EntryTypes {
+    /// Every entry is this type; a `"type"` it declares is ignored.
+    Fixed(FindingType),
+    /// Entries are the first type unless they declare (`"type"`) one of
+    /// the others; declaring anything else makes the entry invalid.
+    Mainly(FindingType, &'static [FindingType]),
+    /// Every entry declares its own type (follow-ups).
+    Declared,
+}
+
 /// Per-type required fields (beyond the base fields every type needs).
 pub fn type_required_fields(finding_type: FindingType) -> &'static [&'static str] {
     match finding_type {
@@ -41,8 +53,7 @@ pub fn type_required_fields(finding_type: FindingType) -> &'static [&'static str
 /// Fields that must be non-empty lists (rather than non-empty strings).
 const LIST_REQUIRED_FIELDS: &[&str] = &["missing_tests"];
 
-/// Ingest findings from a JSON file. `finding_type` = `Some(FindingType::Bug)` for hunts,
-/// None for follow-ups (each entry declares its own type).
+/// Ingest findings from a JSON file whose entries may be `types`.
 #[allow(
     clippy::too_many_lines,
     reason = "per-entry validation followed by dedup and insert; the \
@@ -53,7 +64,7 @@ pub async fn ingest_findings(
     store: &Store,
     repo_id: i64,
     findings_path: &Path,
-    finding_type: Option<FindingType>,
+    types: EntryTypes,
     job: Option<i64>,
     source_finding: Option<i64>,
 ) -> IngestResult {
@@ -111,29 +122,42 @@ pub async fn ingest_findings(
     };
 
     for (i, f) in arr.iter().enumerate() {
-        let entry_type: FindingType = if let Some(ft) = finding_type {
-            ft
-        } else {
-            let raw = f
-                .as_object()
-                .and_then(|o| o.get("type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let Ok(ft) = raw.parse::<FindingType>() else {
+        // Absent is `None`; present but not a string is `Some("")`, which no
+        // type parses as, so it is never mistaken for an absent field.
+        let declared = f
+            .as_object()
+            .and_then(|o| o.get("type"))
+            .map(|v| v.as_str().unwrap_or(""));
+        let resolved = match types {
+            EntryTypes::Fixed(ft) => Ok(ft),
+            EntryTypes::Mainly(ft, _) if declared.is_none_or(|d| d == ft.as_str()) => Ok(ft),
+            EntryTypes::Mainly(_, also) => declared
+                .and_then(|d| d.parse::<FindingType>().ok())
+                .filter(|d| also.contains(d))
+                .ok_or(declared.unwrap_or("")),
+            EntryTypes::Declared => declared
+                .unwrap_or("")
+                .parse::<FindingType>()
+                .map_err(|_| declared.unwrap_or("")),
+        };
+        let entry_type: FindingType = match resolved {
+            Ok(ft) => ft,
+            Err(raw) => {
                 result.invalid += 1;
                 let truncated = serde_json::to_string(f).unwrap_or_default();
                 let truncated: String = truncated.chars().take(2000).collect();
                 let _ = store
                     .log_event(
                         "error",
-                        &format!("ingest: entry {i} has unknown/missing type {raw:?}: {truncated}"),
+                        &format!(
+                            "ingest: entry {i} has unknown/missing/unexpected type {raw:?}: {truncated}"
+                        ),
                         job,
                         source_finding,
                     )
                     .await;
                 continue;
-            };
-            ft
+            }
         };
         let entry_type_str = entry_type.to_string();
         let Some(obj) = f.as_object() else {

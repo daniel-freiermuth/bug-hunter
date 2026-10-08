@@ -52,7 +52,7 @@ async fn ingest_severity(raw: &str) -> (TempDir, Store, hunter::ingest::IngestRe
         &store,
         repo_id,
         Path::new(&path),
-        Some(FindingType::Bug),
+        hunter::ingest::EntryTypes::Fixed(FindingType::Bug),
         None,
         None,
     )
@@ -130,8 +130,15 @@ async fn a_non_bug_entry_cannot_smuggle_in_a_bug_class() {
     }]);
     let path = dir.join("findings.json");
     std::fs::write(&path, serde_json::to_string(&entry).unwrap()).unwrap();
-    let res =
-        hunter::ingest::ingest_findings(&store, repo_id, Path::new(&path), None, None, None).await;
+    let res = hunter::ingest::ingest_findings(
+        &store,
+        repo_id,
+        Path::new(&path),
+        hunter::ingest::EntryTypes::Declared,
+        None,
+        None,
+    )
+    .await;
     assert_eq!(res.inserted, 1, "a valid refactor entry is still accepted");
 
     let all = store
@@ -164,7 +171,7 @@ async fn hunt_producing_two(dir: &TempDir, store: &Store, repo_id: i64, job: i64
         store,
         repo_id,
         Path::new(&path),
-        Some(FindingType::Bug),
+        hunter::ingest::EntryTypes::Fixed(FindingType::Bug),
         Some(job),
         None,
     )
@@ -383,7 +390,7 @@ async fn follow_ups_link_to_the_finding_their_job_worked_on() {
         &store,
         repo_id,
         Path::new(&path),
-        None,
+        hunter::ingest::EntryTypes::Declared,
         Some(engage),
         Some(source),
     )
@@ -448,7 +455,7 @@ async fn a_non_finite_confidence_is_refused_by_validation() {
             &store,
             repo_id,
             &path,
-            Some(FindingType::Bug),
+            hunter::ingest::EntryTypes::Fixed(FindingType::Bug),
             None,
             None,
         )
@@ -465,4 +472,92 @@ async fn a_non_finite_confidence_is_refused_by_validation() {
             events.iter().map(|e| &e.message).collect::<Vec<_>>()
         );
     }
+}
+
+/// A test-gap scan may file a bug instead when the code it should cover
+/// already misbehaves; undeclared entries stay test gaps, and a type the
+/// scan was not allowed to file, or a malformed one, is refused rather than
+/// coerced.
+#[tokio::test]
+async fn a_test_gap_scan_may_file_a_bug_and_nothing_else() {
+    let dir = TempDir::new("ingest-mainly");
+    let store = Store::connect(&dir.join("hunter.db"))
+        .await
+        .expect("bootstrap");
+    let repo_id = store
+        .add_repo(
+            "widget",
+            "git@github.com:acme/widget.git",
+            std::path::Path::new("/tmp/wr/repos"),
+            "main",
+            ForgeName::Github,
+        )
+        .await
+        .unwrap();
+    let entries = serde_json::json!([
+        {
+            "fingerprint": "widget:src/a.rs:f:test-gap", "file": "src/a.rs",
+            "severity": "medium", "confidence": 0.8, "summary": "untested",
+            "missing_tests": ["boundary: empty"], "test_file": "tests/a.rs"
+        },
+        {
+            // Declaring the scan's own type is the same as declaring none.
+            "fingerprint": "widget:src/e.rs:m:test-gap", "type": "test_gap", "file": "src/e.rs",
+            "severity": "medium", "confidence": 0.8, "summary": "untested too",
+            "missing_tests": ["boundary: empty"], "test_file": "tests/e.rs"
+        },
+        {
+            "fingerprint": "widget:src/b.rs:g:boundary", "type": "bug", "file": "src/b.rs",
+            "bug_class": "boundary", "severity": "high", "confidence": 0.9,
+            "summary": "drops the last element"
+        },
+        {
+            "fingerprint": "widget:src/c.rs:h:duplication", "type": "refactor", "file": "src/c.rs",
+            "severity": "low", "confidence": 0.8, "summary": "duplicated",
+            "smell_type": "duplication", "suggested_refactor": "extract"
+        },
+        {
+            // A valid gap in every other field: a malformed declaration is
+            // not an absent one.
+            "fingerprint": "widget:src/d.rs:k:test-gap", "type": 123, "file": "src/d.rs",
+            "severity": "medium", "confidence": 0.8, "summary": "untested",
+            "missing_tests": ["boundary: empty"], "test_file": "tests/d.rs"
+        }
+    ]);
+    let path = dir.join("findings.json");
+    std::fs::write(&path, serde_json::to_string(&entries).unwrap()).unwrap();
+
+    let res = hunter::ingest::ingest_findings(
+        &store,
+        repo_id,
+        Path::new(&path),
+        hunter::ingest::EntryTypes::Mainly(FindingType::TestGap, &[FindingType::Bug]),
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!((res.inserted, res.invalid), (3, 2), "{res:?}");
+    let mut stored: Vec<(String, FindingType)> = store
+        .list_findings(&FindingFilter::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.fingerprint, f.kind))
+        .collect();
+    stored.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        stored,
+        vec![
+            (
+                "widget:src/a.rs:f:test-gap".to_owned(),
+                FindingType::TestGap
+            ),
+            ("widget:src/b.rs:g:boundary".to_owned(), FindingType::Bug),
+            (
+                "widget:src/e.rs:m:test-gap".to_owned(),
+                FindingType::TestGap
+            ),
+        ]
+    );
 }

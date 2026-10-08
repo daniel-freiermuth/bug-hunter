@@ -63,7 +63,7 @@ async fn ingest_one(
         &store,
         repo_id,
         Path::new(&path),
-        Some(FindingType::Standards),
+        hunter::ingest::EntryTypes::Fixed(FindingType::Standards),
         None,
         None,
     )
