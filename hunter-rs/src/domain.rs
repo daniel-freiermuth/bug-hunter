@@ -79,11 +79,12 @@ impl FindingStatus {
         }
     }
 
-    /// Statuses the verdict endpoint accepts.
+    /// Statuses the verdict endpoint accepts. Not `merged`: only the PR sync
+    /// sets that, from the forge's state of the finding's PR.
     pub fn is_verdict(self) -> bool {
         matches!(
             self,
-            Self::Queued | Self::Rejected | Self::Wontfix | Self::Note | Self::Merged
+            Self::Queued | Self::Rejected | Self::Wontfix | Self::Note
         )
     }
 
