@@ -58,7 +58,10 @@ blocking claim.
 ### For `type = 'dep_update'`:
 
 a. **Check for local patches** in patches/, .patch files, or vendored code
-b. **Upgrade the dependency** to the target version -- or to the highest
+b. **Upgrade the dependency** -- every one `detail` lists, when the finding
+   is a group (packages released together, or one tool pinned in several
+   files): they move in this one change, each to its own target, in every
+   file named. Upgrade to the target version -- or to the highest
    version you can safely reach this pass if the full target isn't
    achievable (a peer-dependency/toolchain constraint, needs a coordinated
    bump elsewhere). If you settle for anything below the finding's own

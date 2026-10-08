@@ -28,6 +28,24 @@ For each outdated dependency, assess:
 
 NOT candidates: Pre-release versions, dependencies pinned for compatibility, internal/vendored packages.
 
+# One entry per change someone would make
+An entry is one upgrade a single PR would carry, not one package or one
+version:
+- **Split the easy bump from the migration.** When a package has both a
+  newer release within its current major and a new major, file two entries:
+  the in-major update (`<package>-non-major`) and the major
+  (`<package>-major`). The first should never wait on the second.
+- **Group what must move together**: packages released in lockstep
+  (monorepos such as `@typescript-eslint/*` + `typescript-eslint`,
+  `@angular/*`), peers that only work at matching versions, and the same
+  tool pinned in several places (a `packageManager` field and the CI
+  workflow, the same crate in several workspace members). One entry; set
+  `package` to the group's name and list every member in `detail` as
+  `- name: current → target in file`.
+- **Target the newest release** of that unit (newest in-major, newest
+  major). A later release of the same unit is the SAME entry, not a new
+  one.
+
 # Known non-candidates (suppression corpus)
 Do NOT re-file these or variants unless the specific blocking reason below
 has actually been resolved upstream (e.g. a peer dependency range widened,
@@ -35,6 +53,9 @@ a removed API was reinstated) — a newer version number alone is not enough.
 {{SUPPRESSIONS}}
 
 # Already tracked (open updates — file only if yours is genuinely NOVEL)
+An entry here with the same unit and current version is the same update
+even if its target is older: re-file it with the SAME fingerprint and the
+newer target, and hunter updates it in place.
 {{KNOWN_UPDATES}}
 
 # Output contract — INCREMENTAL, you may be killed at any moment
@@ -45,19 +66,24 @@ Max {{MAX_UPDATES}} entries. Each entry:
 
 ```json
 {
-  "fingerprint": "{{REPO_NAME}}:ecosystem:package:current→latest",
+  "fingerprint": "{{REPO_NAME}}:dep:<package-or-group>-<non-major|major>@<installed version>",
   "ecosystem": "npm|cargo|pip|go",
-  "package": "package-name",
+  "package": "package-name or group name",
   "current_version": "1.0.0",
   "latest_version": "2.0.0",
   "update_type": "major|minor|patch",
   "severity": "high|medium|low",
   "confidence": 0.0,
   "summary": "one sentence describing update value",
-  "detail": "what changed, breaking changes, why update (with version comparison evidence)",
+  "detail": "what changed, breaking changes, why update (with version comparison evidence); for a group, every member with its versions",
   "security_advisory": "CVE-2024-XXXX description (if applicable)"
 }
 ```
+
+The fingerprint names the unit and the version installed TODAY (the
+lockfile's, not the manifest range), never the target: `acme:dep:pnpm-major@11.3.0`.
+For a group whose members are at different versions, join them sorted with
+`+`.
 
 Severity guide:
 - **high**: Security vulnerability, critical bug fix

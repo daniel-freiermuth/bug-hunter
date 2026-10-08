@@ -36,6 +36,26 @@ use crate::types::{
 };
 use crate::util::now_ms;
 
+/// The verdict a `dep_update` gets when a Renovate scan stops proposing it
+/// ([`Store::supersede_unproposed_dep_updates`]). Also the marker that lets
+/// a later scan proposing it again bring it back
+/// ([`Store::refresh_dep_update`]); a finding superseded for any other
+/// reason stays retired.
+pub const DEP_UNPROPOSED_REASON: &str = "no longer proposed by the dependency scan";
+
+/// One package move a dependency scan proposes: the finding that makes it
+/// (`fingerprint`) and its unit (`unit`, that fingerprint up to where the
+/// versions begin), the package, and whether that package's own update is
+/// a major one. A group's `update_type` is its strongest member's, so the
+/// class has to come from here, not from the finding.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProposedMove {
+    pub fingerprint: String,
+    pub unit: String,
+    pub package: String,
+    pub major: bool,
+}
+
 /// Write-path errors: a domain refusal (HTTP 400 with the exact message)
 /// vs an underlying DB error (HTTP 500).
 #[derive(Debug, thiserror::Error)]
@@ -2616,6 +2636,215 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok((result.last_insert_rowid(), true))
+    }
+
+    /// Bring an open `dep_update` up to date with the scan that just
+    /// reported it again. Its fingerprint names the update unit and where
+    /// the dependencies stand today, not the version they can move to, so a
+    /// newer upstream release arrives as the same finding with a new target:
+    /// this rewrites the target and the description instead of leaving the
+    /// old one behind. Only `new` and `queued` (no worker has started on
+    /// it), and a finding [`Self::supersede_unproposed_dep_updates`] retired,
+    /// which comes back as `new`: the scan proposing it again means it never
+    /// landed. `true` when anything changed.
+    pub async fn refresh_dep_update(
+        &self,
+        finding_id: i64,
+        row: &FindingInsert,
+    ) -> sqlx::Result<bool> {
+        let now = now_ms();
+        let new = FindingStatus::New;
+        let queued = FindingStatus::Queued;
+        let superseded = FindingStatus::Superseded;
+        let unproposed = DEP_UNPROPOSED_REASON;
+        let file = &row.file;
+        let severity = row.severity;
+        let confidence = row.confidence;
+        let summary = &row.summary;
+        let detail = row.detail.as_deref();
+        let ecosystem = row.ecosystem.as_deref();
+        let package = row.package.as_deref();
+        let current_version = row.current_version.as_deref();
+        let latest_version = row.latest_version.as_deref();
+        let update_type = row.update_type.as_deref();
+        let security_advisory = row.security_advisory.as_deref();
+        // SQLite evaluates every SET expression against the old row, so the
+        // two CASEs both see the status before this update.
+        let done = sqlx::query!(
+            "UPDATE findings SET file = ?1, severity = ?2, confidence = ?3, summary = ?4, \
+             detail = ?5, ecosystem = ?6, package = ?7, current_version = ?8, \
+             latest_version = ?9, update_type = ?10, security_advisory = ?11, \
+             status = CASE WHEN status = ?12 THEN ?13 ELSE status END, \
+             verdict_reason = CASE WHEN status = ?12 THEN NULL ELSE verdict_reason END, \
+             updated_at = ?14 \
+             WHERE id = ?15 AND type = 'dep_update' \
+               AND (status IN (?13, ?16) OR (status = ?12 AND verdict_reason = ?17)) \
+               AND (status = ?12 OR file IS NOT ?1 OR severity IS NOT ?2 \
+                    OR confidence IS NOT ?3 OR summary IS NOT ?4 OR detail IS NOT ?5 \
+                    OR ecosystem IS NOT ?6 OR package IS NOT ?7 \
+                    OR current_version IS NOT ?8 OR latest_version IS NOT ?9 \
+                    OR update_type IS NOT ?10 OR security_advisory IS NOT ?11)",
+            file,
+            severity,
+            confidence,
+            summary,
+            detail,
+            ecosystem,
+            package,
+            current_version,
+            latest_version,
+            update_type,
+            security_advisory,
+            superseded,
+            new,
+            now,
+            finding_id,
+            queued,
+            unproposed
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// Retire the repo's `new` `dep_update` findings that a Renovate scan
+    /// no longer proposes: the update landed some other way, or Renovate
+    /// now files it under another unit (a different group, the next major).
+    /// `proposed` is every fingerprint the scan produced; `unchecked` the
+    /// dependencies it skipped or failed to look up, whose findings stay.
+    /// A group finding is matched by its group name, not its members.
+    /// Anything a worker or the operator has taken up is left alone.
+    /// Returns how many were retired.
+    pub async fn supersede_unproposed_dep_updates(
+        &self,
+        repo_id: i64,
+        proposed: &[String],
+        unchecked: &[String],
+    ) -> sqlx::Result<u64> {
+        let now = now_ms();
+        let new = FindingStatus::New;
+        let superseded = FindingStatus::Superseded;
+        let unproposed = DEP_UNPROPOSED_REASON;
+        let proposed = serde_json::to_string(proposed).unwrap_or_else(|_| "[]".to_owned());
+        let unchecked = serde_json::to_string(unchecked).unwrap_or_else(|_| "[]".to_owned());
+        let done = sqlx::query!(
+            "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
+             WHERE repo_id = ?4 AND type = 'dep_update' AND status = ?5 \
+               AND fingerprint NOT IN (SELECT value FROM json_each(?6)) \
+               AND package NOT IN (SELECT value FROM json_each(?7))",
+            superseded,
+            unproposed,
+            now,
+            repo_id,
+            new,
+            proposed,
+            unchecked
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected())
+    }
+
+    /// Move the queue onto the scan's own findings: a `queued` `dep_update`
+    /// the scan no longer proposes, but whose move it proposes in another
+    /// finding, is superseded, and that finding is queued in its place
+    /// (with the queued one's budget override).
+    ///
+    /// The same move is the same package in the same class -- major or
+    /// not -- judged by that package's own update in `moves`, never by
+    /// the group's type: a group making `node` major and `@types/node`
+    /// minor is `major`, but a queued major `@types/node` is not its move.
+    /// Or it is the same unit: a queued finding whose fingerprint starts
+    /// with a proposed one's `unit` is that Renovate branch from before a
+    /// member moved. This is how a queued group is matched, since its
+    /// `package` names the group, not a member.
+    /// This is what the fingerprints alone cannot see: the AI fallback's
+    /// names a unit differently from Renovate's branch, a finding filed
+    /// before branch grouping keyed on versions, and one whose installed
+    /// version moved has a new fingerprint. Without it the queued one and
+    /// the proposal would both be worked. A queued finding with no such
+    /// match is left as it is. `moves` is every move of every finding the
+    /// scan produced. Returns how many were handed over.
+    pub async fn hand_over_queued_dep_updates(
+        &self,
+        repo_id: i64,
+        moves: &[ProposedMove],
+    ) -> sqlx::Result<u64> {
+        let now = now_ms();
+        let new = FindingStatus::New;
+        let queued = FindingStatus::Queued;
+        let superseded = FindingStatus::Superseded;
+        let exempt = BudgetOverride::Exempt;
+        let moves = serde_json::to_string(moves).unwrap_or_else(|_| "[]".to_owned());
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // JSON booleans extract as 1/0, the same as the comparison on q.
+        let pairs = sqlx::query!(
+            r#"SELECT q.id AS "from_id!: i64", MIN(p.id) AS "to_id!: i64"
+               FROM findings q
+               JOIN json_each(?4) m
+                 ON (json_extract(m.value, '$.package') = q.package
+                     AND json_extract(m.value, '$.major')
+                         = (COALESCE(q.update_type, '') = 'major'))
+                 OR substr(q.fingerprint, 1, length(json_extract(m.value, '$.unit')))
+                    = json_extract(m.value, '$.unit')
+               JOIN findings p
+                 ON p.repo_id = q.repo_id AND p.type = 'dep_update' AND p.status = ?3
+                AND p.fingerprint = json_extract(m.value, '$.fingerprint')
+               WHERE q.repo_id = ?1 AND q.type = 'dep_update' AND q.status = ?2
+                 AND q.fingerprint NOT IN
+                     (SELECT json_extract(value, '$.fingerprint') FROM json_each(?4))
+               GROUP BY q.id"#,
+            repo_id,
+            queued,
+            new,
+            moves
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut handed = 0;
+        for pair in pairs {
+            let reason = format!("replaced by #{} from the dependency scan", pair.to_id);
+            let from = sqlx::query!(
+                "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
+                 WHERE id = ?4 AND status = ?5",
+                superseded,
+                reason,
+                now,
+                pair.from_id,
+                queued
+            )
+            .execute(&mut *tx)
+            .await?;
+            if from.rows_affected() == 0 {
+                continue;
+            }
+            // Several queued findings can hand over to one group: keep the
+            // strongest override any of them (or the group) carries. `once`
+            // is cleared after the next attempt, `exempt` only by hand, so a
+            // `once` that arrived first must not displace a later `exempt`.
+            sqlx::query!(
+                "UPDATE findings SET status = ?1, updated_at = ?2, \
+                 budget_override = CASE \
+                     WHEN budget_override = ?6 \
+                       OR (SELECT budget_override FROM findings WHERE id = ?3) = ?6 \
+                     THEN ?6 \
+                     ELSE COALESCE(budget_override, \
+                         (SELECT budget_override FROM findings WHERE id = ?3)) \
+                 END \
+                 WHERE id = ?4 AND status IN (?5, ?1)",
+                queued,
+                now,
+                pair.from_id,
+                pair.to_id,
+                new,
+                exempt
+            )
+            .execute(&mut *tx)
+            .await?;
+            handed += 1;
+        }
+        tx.commit().await?;
+        Ok(handed)
     }
 
     /// Mark a PR as merged (UPSERT).

@@ -2312,7 +2312,7 @@ async fn renovate_scan(
     cfg: &Config,
     repo: &Repo,
     rpath: &std::path::Path,
-) -> Option<Vec<crate::dep_scan::DepCandidate>> {
+) -> Option<crate::dep_scan::DepScan> {
     let work_root = cfg.work_root.clone();
     let rp = rpath.to_owned();
     let rn = repo.name.clone();
@@ -2339,6 +2339,54 @@ async fn renovate_scan(
     .await
     .ok()
     .flatten()
+}
+
+/// After a Renovate scan whose every candidate was ingested: retire the
+/// open findings it no longer proposes, and hand queued ones over to the
+/// finding it proposes for the same move. Returns (retired, handed over).
+///
+/// An open finding Renovate checked and no longer proposes landed some
+/// other way or moved to another unit -- never one for a dependency
+/// Renovate skipped or could not look up this time. A queued one whose
+/// move Renovate proposes under another fingerprint hands its queue over
+/// instead, so the same update is not worked twice. Either failing fails
+/// the cycle, so the cadence stays put and the next cycle retries it
+/// (re-ingesting the same answer changes nothing).
+async fn settle_dep_updates(
+    store: &Store,
+    repo: &Repo,
+    scan: &crate::dep_scan::DepScan,
+) -> anyhow::Result<(u64, u64)> {
+    let proposed: Vec<String> = scan
+        .candidates
+        .iter()
+        .map(|cand| cand.fingerprint.clone())
+        .collect();
+    let retired = store
+        .supersede_unproposed_dep_updates(repo.id, &proposed, &scan.unchecked)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("dep_update {}: retiring unproposed updates: {e}", repo.name)
+        })?;
+    let moves: Vec<crate::store::ProposedMove> = scan
+        .candidates
+        .iter()
+        .flat_map(|cand| {
+            cand.moves.iter().map(|mv| crate::store::ProposedMove {
+                fingerprint: cand.fingerprint.clone(),
+                unit: cand.unit.clone(),
+                package: mv.package.clone(),
+                major: mv.major,
+            })
+        })
+        .collect();
+    let handed_over = store
+        .hand_over_queued_dep_updates(repo.id, &moves)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("dep_update {}: handing over queued updates: {e}", repo.name)
+        })?;
+    Ok((retired, handed_over))
 }
 
 /// Dependency scan. Renovate answers it for free whenever it can;
@@ -2378,7 +2426,7 @@ pub async fn run_dep_update(
 
     // Try Renovate (zero tokens). Its answer is authoritative even when it
     // is "nothing to update"; only an unavailable scan falls back to AI.
-    let Some(c) = renovate_scan(cfg, repo, &rpath).await else {
+    let Some(scan) = renovate_scan(cfg, repo, &rpath).await else {
         tracing::info!(
             "dep_update {}: renovate unavailable, falling back to AI",
             repo.name
@@ -2392,7 +2440,8 @@ pub async fn run_dep_update(
         .join("out")
         .join(format!("dep_scan_{}.json", repo.id));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(std::path::Path::new(".")));
-    let json_entries: Vec<_> = c
+    let json_entries: Vec<_> = scan
+        .candidates
         .iter()
         .map(|cand| {
             serde_json::json!({
@@ -2424,12 +2473,18 @@ pub async fn run_dep_update(
         None,
     )
     .await;
+    let (retired, handed_over) = if counts.invalid == 0 {
+        settle_dep_updates(store, repo, &scan).await?
+    } else {
+        (0, 0)
+    };
     let _ = store
         .log_event(
             "dep_update",
             &format!(
-                "{}: renovate scan +{} new / {} dup / {} invalid (0 tok)",
-                repo.name, counts.inserted, counts.duplicates, counts.invalid,
+                "{}: renovate scan +{} new / {} dup ({} refreshed) / {retired} retired / \
+                 {handed_over} queued handed over / {} invalid (0 tok)",
+                repo.name, counts.inserted, counts.duplicates, counts.refreshed, counts.invalid,
             ),
             None,
             None,
