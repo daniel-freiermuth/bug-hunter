@@ -360,6 +360,7 @@ async fn verdict_bad_status_400() {
         "pr_open",
         "closed",
         "superseded",
+        "merged",
     ] {
         let (status, body) = post(
             &state,
@@ -370,7 +371,7 @@ async fn verdict_bad_status_400() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
         assert_eq!(
             body["error"],
-            "status must be one of ['queued', 'rejected', 'wontfix', 'note', 'merged']"
+            "status must be one of ['queued', 'rejected', 'wontfix', 'note']"
         );
         assert_eq!(
             state.store.get_finding(1).await.unwrap().unwrap().status,

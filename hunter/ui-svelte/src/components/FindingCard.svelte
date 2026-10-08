@@ -308,7 +308,6 @@
               {#if finding.status !== "note"}
                 <button class="btn btn-muted" disabled={busy} onclick={() => doVerdict("note")} title="Mark as note">Note</button>
               {/if}
-              <button class="btn btn-queue" disabled={busy} onclick={() => doVerdict("merged")} title="Mark as merged">Merged</button>
             {/if}
 
             {#if canRecheck}

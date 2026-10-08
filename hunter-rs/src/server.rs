@@ -802,7 +802,7 @@ async fn verdict(
         // (`<Status.QUEUED: 'queued'>`, ...). We emit the plain value list —
         // the UI only ever displays this string.
         return Err(ApiError::BadRequest(
-            "status must be one of ['queued', 'rejected', 'wontfix', 'note', 'merged']".to_owned(),
+            "status must be one of ['queued', 'rejected', 'wontfix', 'note']".to_owned(),
         ));
     };
     // (body.get("reason") or "").strip() or None — absent/null/empty/
