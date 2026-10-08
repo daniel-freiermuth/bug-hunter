@@ -13,6 +13,9 @@ use crate::store::{FindingInsert, Store};
 pub struct IngestResult {
     pub inserted: i64,
     pub duplicates: i64,
+    /// Of `duplicates`: open `dep_update` findings brought up to date with
+    /// the entry that rediscovered them (`Store::refresh_dep_update`).
+    pub refreshed: i64,
     pub invalid: i64,
 }
 
@@ -325,8 +328,27 @@ pub async fn ingest_findings(
                     )
                     .await;
             }
-            Ok((_, false)) => {
+            Ok((fid, false)) => {
                 result.duplicates += 1;
+                if entry_type == FindingType::DepUpdate {
+                    match store.refresh_dep_update(fid, &insert).await {
+                        Ok(true) => result.refreshed += 1,
+                        Ok(false) => {}
+                        // The newer target is lost: as failed as an insert,
+                        // so the cycle neither advances nor sweeps.
+                        Err(e) => {
+                            result.invalid += 1;
+                            let _ = store
+                                .log_event(
+                                    "error",
+                                    &format!("ingest: refreshing #{fid} failed: {e}"),
+                                    job,
+                                    Some(fid),
+                                )
+                                .await;
+                        }
+                    }
+                }
             }
             Err(e) => {
                 let _ = store

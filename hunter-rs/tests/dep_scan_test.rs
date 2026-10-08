@@ -59,7 +59,9 @@ fn success_with_candidates_parses_them() {
     let work = TempDir::new("depscan-ok-repo");
     bins.ok("renovate", &format!("{CHATTER}\n{UPDATE_LINE}"));
 
-    let got = scan_repo(work.path(), REPO, None, 30).expect("renovate succeeded, so Some");
+    let got = scan_repo(work.path(), REPO, None, 30)
+        .expect("renovate succeeded, so Some")
+        .candidates;
 
     assert_renovate_invoked(&bins);
     assert_eq!(got.len(), 1, "one dep, one update: {got:?}");
@@ -67,16 +69,14 @@ fn success_with_candidates_parses_them() {
     assert_eq!(c.package, "left-pad");
     assert_eq!(c.file, "package.json");
     assert_eq!(c.ecosystem, "npm");
-    // The range marker is stripped from `current_version` but kept in the
-    // fingerprint, which is what dedup keys on downstream.
+    // Without a resolved version, the range stands in for it.
     assert_eq!(c.current_version, "1.2.0");
     assert_eq!(c.latest_version, "1.3.0");
     assert_eq!(c.update_type, "minor");
     assert_eq!(c.severity, Severity::Medium);
-    assert_eq!(
-        c.fingerprint,
-        "acme/widget:npm:left-pad:^1.2.0\u{2192}1.3.0"
-    );
+    // Where the dependency stands, never where it could go: a later release
+    // must land on this same finding.
+    assert_eq!(c.fingerprint, "acme/widget:dep:left-pad-non-major@1.2.0");
 }
 
 /// `Some(vec![])` is a real answer: renovate ran, everything is current.
@@ -92,13 +92,13 @@ fn success_with_no_updates_is_empty_not_none() {
 
     assert_renovate_invoked(&bins);
     assert!(
-        matches!(&got, Some(v) if v.is_empty()),
+        matches!(&got, Some(v) if v.candidates.is_empty()),
         "up-to-date repo must be Some(empty), not a model fallback: {got:?}"
     );
 }
 
 /// Scan a repo whose Renovate run printed `line` and exited 0.
-fn scan_printing(label: &str, line: &str) -> Option<Vec<hunter::dep_scan::DepCandidate>> {
+fn scan_printing(label: &str, line: &str) -> Option<hunter::dep_scan::DepScan> {
     let bins = FakeBins::acquire(label);
     let work = TempDir::new(label);
     bins.ok("renovate", &format!("{CHATTER}\n{line}"));
@@ -223,7 +223,9 @@ fn malformed_lines_do_not_discard_good_ones() {
         ),
     );
 
-    let got = scan_repo(work.path(), REPO, None, 30).expect("renovate succeeded, so Some");
+    let got = scan_repo(work.path(), REPO, None, 30)
+        .expect("renovate succeeded, so Some")
+        .candidates;
 
     assert_renovate_invoked(&bins);
     let packages: Vec<&str> = got.iter().map(|c| c.package.as_str()).collect();
@@ -287,7 +289,9 @@ fn single_candidate(
     let bins = FakeBins::acquire(label);
     let work = TempDir::new(label);
     bins.ok("renovate", &update_line(update_type, vulnerability));
-    let got = scan_repo(work.path(), REPO, None, 30).expect("renovate succeeded");
+    let got = scan_repo(work.path(), REPO, None, 30)
+        .expect("renovate succeeded")
+        .candidates;
     assert_eq!(got.len(), 1, "expected one candidate: {got:?}");
     got.into_iter().next().unwrap_or_else(|| unreachable!())
 }
@@ -392,7 +396,10 @@ fn a_renovate_shipped_by_the_scanned_repo_never_runs() {
         "the scanned repo's own renovate ran -- repo content executed as the daemon"
     );
     assert_renovate_invoked(&bins);
-    assert!(matches!(&got, Some(v) if v.is_empty()), "{got:?}");
+    assert!(
+        matches!(&got, Some(v) if v.candidates.is_empty()),
+        "{got:?}"
+    );
 }
 
 /// When the only `renovate` available is the repo's, there is no scan --
@@ -449,6 +456,12 @@ fn renovate_does_not_inherit_the_daemons_secrets() {
         "HOME must be forwarded:\n{env}"
     );
     assert!(env.contains("LOG_FORMAT=json"), "{env}");
+    // Grouping (monorepos, one tool in several files) comes from this preset.
+    assert!(
+        env.lines()
+            .any(|l| l == r#"RENOVATE_EXTENDS=["config:recommended"]"#),
+        "{env}"
+    );
 }
 
 /// The `PATH` Renovate itself runs with cannot reach into the checkout.
@@ -584,4 +597,277 @@ fn gh_output_beyond_one_token_is_no_token() {
     );
 
     assert_eq!(github_token(ForgeName::Github, None), None);
+}
+
+/// Renovate's lookup line for [`candidates_follow_renovates_branches`].
+fn branches_fixture() -> String {
+    let dep = |name: &str, current: &str, updates: serde_json::Value| {
+        serde_json::json!({
+            "depName": name, "currentValue": format!("^{current}"),
+            "currentVersion": current, "datasource": "npm", "updates": updates
+        })
+    };
+    let up = |new: &str, ut: &str, branch: Option<&str>| {
+        let mut u = serde_json::json!({"newVersion": new, "updateType": ut});
+        if let Some(b) = branch {
+            u["branchName"] = serde_json::json!(format!("renovate/{b}"));
+        }
+        u
+    };
+    let mut root_deps = serde_json::json!([
+        dep(
+            "@typescript-eslint/parser",
+            "8.64.0",
+            serde_json::json!([up("8.71.1", "minor", Some("typescript-eslint-monorepo"))])
+        ),
+        dep(
+            "typescript-eslint",
+            "8.64.0",
+            serde_json::json!([up("8.71.1", "minor", Some("typescript-eslint-monorepo"))])
+        ),
+        dep(
+            "typescript",
+            "6.0.3",
+            serde_json::json!([up("7.0.2", "major", Some("typescript-7.x"))])
+        ),
+        dep(
+            "pnpm",
+            "11.3.0",
+            serde_json::json!([
+                up("11.28.5", "minor", Some("pnpm-11.x")),
+                up("12.10.1", "major", Some("pnpm-12.x")),
+            ])
+        ),
+        // A group's members need not share an update type; listed weakest
+        // first, so the group's type is not simply its first member's.
+        dep(
+            "js-sys",
+            "0.3.103",
+            serde_json::json!([up("0.3.106", "patch", Some("wasm-monorepo"))])
+        ),
+        dep(
+            "wasm-bindgen",
+            "0.2.126",
+            serde_json::json!([up("0.3.0", "minor", Some("wasm-monorepo"))])
+        ),
+        dep(
+            "@types/node",
+            "24.13.3",
+            serde_json::json!([up("24.19.1", "minor", Some("node"))])
+        ),
+        dep(
+            "node",
+            "24.0.0",
+            serde_json::json!([up("26.0.0", "major", Some("node"))])
+        ),
+        // No branch name: the non-breaking and the major update stay apart.
+        dep(
+            "left-pad",
+            "1.2.0",
+            serde_json::json!([up("1.3.0", "minor", None), up("2.0.0", "major", None)])
+        ),
+    ]);
+    let mut lib_typescript = dep(
+        "typescript",
+        "6.0.3",
+        serde_json::json!([up("7.0.2", "major", Some("typescript-7.x"))]),
+    );
+    lib_typescript["updates"][0]["isVulnerabilityAlert"] = serde_json::json!(true);
+    // js-sys: a security patch grouped with an ordinary minor bump.
+    assert_eq!(root_deps[4]["depName"], "js-sys");
+    root_deps[4]["updates"][0]["isVulnerabilityAlert"] = serde_json::json!(true);
+    serde_json::json!({
+        "name": "renovate", "level": 20, "msg": "packageFiles with updates",
+        "config": {"npm": [
+            {"packageFile": "package.json", "deps": root_deps},
+            {"packageFile": "lib/package.json", "deps": [lib_typescript]},
+        ]}
+    })
+    .to_string()
+}
+
+/// One candidate per Renovate branch, i.e. per change Renovate would open a
+/// PR for: packages released together are one finding, the same move in
+/// several manifests is one member of it, and a package with both a
+/// non-breaking and a major update available is two findings. The
+/// strongest update type speaks for a group, and `detail` lists every
+/// member: it is what the fix worker moves.
+#[test]
+fn candidates_follow_renovates_branches() {
+    let line = branches_fixture();
+
+    let got = scan_printing("depscan-branches", &line)
+        .expect("renovate succeeded")
+        .candidates;
+
+    let shape: Vec<(&str, &str, &str, &str, &str)> = got
+        .iter()
+        .map(|c| {
+            (
+                c.fingerprint.as_str(),
+                c.package.as_str(),
+                c.update_type.as_str(),
+                c.file.as_str(),
+                c.detail.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (
+                "acme/widget:dep:typescript-eslint-monorepo@@typescript-eslint/parser=8.64.0+typescript-eslint=8.64.0",
+                "typescript-eslint-monorepo",
+                "minor",
+                "package.json",
+                "Renovate branch renovate/typescript-eslint-monorepo: one change moves all of these together.\n\
+                 - @typescript-eslint/parser (npm): 8.64.0 \u{2192} 8.71.1 [minor] in package.json\n\
+                 - typescript-eslint (npm): 8.64.0 \u{2192} 8.71.1 [minor] in package.json",
+            ),
+            (
+                "acme/widget:dep:typescript-7.x@6.0.3+6.0.3",
+                "typescript",
+                "major",
+                "package.json, lib/package.json",
+                // One move in two manifests is one member, and the advisory
+                // on the second copy is not lost.
+                "Renovate branch renovate/typescript-7.x: one change moves all of these together.\n\
+                 - typescript (npm): 6.0.3 \u{2192} 7.0.2 [major] [security] in package.json, lib/package.json",
+            ),
+            (
+                "acme/widget:dep:pnpm-11.x@11.3.0",
+                "pnpm",
+                "minor",
+                "package.json",
+                "Renovate branch renovate/pnpm-11.x: one change moves all of these together.\n\
+                 - pnpm (npm): 11.3.0 \u{2192} 11.28.5 [minor] in package.json",
+            ),
+            (
+                "acme/widget:dep:pnpm-12.x@11.3.0",
+                "pnpm",
+                "major",
+                "package.json",
+                "Renovate branch renovate/pnpm-12.x: one change moves all of these together.\n\
+                 - pnpm (npm): 11.3.0 \u{2192} 12.10.1 [major] in package.json",
+            ),
+            (
+                "acme/widget:dep:wasm-monorepo@js-sys=0.3.103+wasm-bindgen=0.2.126",
+                "wasm-monorepo",
+                "minor",
+                "package.json",
+                "Renovate branch renovate/wasm-monorepo: one change moves all of these together.\n\
+                 - js-sys (npm): 0.3.103 \u{2192} 0.3.106 [patch] [security] in package.json\n\
+                 - wasm-bindgen (npm): 0.2.126 \u{2192} 0.3.0 [minor] in package.json",
+            ),
+            (
+                "acme/widget:dep:node@@types/node=24.13.3+node=24.0.0",
+                "node",
+                "major",
+                "package.json",
+                "Renovate branch renovate/node: one change moves all of these together.\n\
+                 - @types/node (npm): 24.13.3 \u{2192} 24.19.1 [minor] in package.json\n\
+                 - node (npm): 24.0.0 \u{2192} 26.0.0 [major] in package.json",
+            ),
+            (
+                "acme/widget:dep:left-pad-non-major@1.2.0",
+                "left-pad",
+                "minor",
+                "package.json",
+                "Renovate branch renovate/left-pad-non-major: one change moves all of these together.\n\
+                 - left-pad (npm): 1.2.0 \u{2192} 1.3.0 [minor] in package.json",
+            ),
+            (
+                "acme/widget:dep:left-pad-major@1.2.0",
+                "left-pad",
+                "major",
+                "package.json",
+                "Renovate branch renovate/left-pad-major: one change moves all of these together.\n\
+                 - left-pad (npm): 1.2.0 \u{2192} 2.0.0 [major] in package.json",
+            ),
+        ]
+    );
+    assert_eq!(got[0].latest_version, "8.71.1");
+}
+
+/// A group is graded as high as its highest member would be on its own:
+/// the wasm group's security patch keeps it `high` despite the group's
+/// `minor` type, so a severity filter still finds the patch.
+#[test]
+fn groups_are_graded_by_their_highest_member() {
+    let got = scan_printing("depscan-group-severity", &branches_fixture())
+        .expect("renovate succeeded")
+        .candidates;
+
+    let severities: Vec<Severity> = got.iter().map(|c| c.severity).collect();
+    assert_eq!(
+        severities,
+        vec![
+            Severity::Medium,
+            Severity::High,
+            Severity::Medium,
+            Severity::High,
+            Severity::High,
+            Severity::High,
+            Severity::Medium,
+            Severity::High,
+        ]
+    );
+}
+
+/// The fingerprint is where every member stands, not which versions occur:
+/// after a partial upgrade the same set of versions remains, and the rest
+/// of the update would otherwise match the merged finding as a duplicate
+/// and never be filed again.
+#[test]
+fn a_partial_upgrade_changes_the_fingerprint() {
+    let group = |a: &str, b: &str, c: &str| {
+        let dep = |name: &str, current: &str| {
+            serde_json::json!({
+                "depName": name, "currentVersion": current, "datasource": "npm",
+                "updates": [{"newVersion": "3.0.0", "updateType": "major", "branchName": "renovate/kit-monorepo"}]
+            })
+        };
+        let line = serde_json::json!({
+            "name": "renovate", "level": 20, "msg": "packageFiles with updates",
+            "config": {"npm": [{"packageFile": "package.json",
+                "deps": [dep("@kit/a", a), dep("@kit/b", b), dep("@kit/c", c)]}]}
+        })
+        .to_string();
+        let got = scan_printing(&format!("depscan-partial-{a}{b}{c}"), &line)
+            .expect("renovate succeeded")
+            .candidates;
+        assert_eq!(got.len(), 1, "{got:?}");
+        got[0].fingerprint.clone()
+    };
+
+    let before = group("1.0.0", "1.0.0", "2.0.0");
+    let after = group("2.0.0", "1.0.0", "2.0.0");
+
+    assert_ne!(before, after);
+}
+
+/// Dependencies Renovate found but did not check -- skipped, or a failed
+/// lookup -- are reported, so nothing concludes their updates are done.
+#[test]
+fn skipped_and_failed_lookups_are_reported_unchecked() {
+    let line = serde_json::json!({
+        "name": "renovate", "level": 20, "msg": "packageFiles with updates",
+        "config": {"npm": [{"packageFile": "package.json", "deps": [
+            {"depName": "left-pad", "currentVersion": "1.3.0", "datasource": "npm", "updates": []},
+            {"depName": "private-pkg", "currentVersion": "1.0.0", "datasource": "npm",
+             "warnings": [{"topic": "private-pkg", "message": "Failed to look up npm package private-pkg"}],
+             "updates": []}
+        ]}], "github-actions": [{"packageFile": ".github/workflows/ci.yml", "deps": [
+            {"depName": "actions/checkout", "currentValue": "v4", "datasource": "github-tags",
+             "skipReason": "github-token-required"}
+        ]}]}
+    })
+    .to_string();
+
+    let got = scan_printing("depscan-unchecked", &line).expect("renovate succeeded");
+
+    assert!(got.candidates.is_empty(), "{got:?}");
+    let mut unchecked = got.unchecked;
+    unchecked.sort();
+    assert_eq!(unchecked, vec!["actions/checkout", "private-pkg"]);
 }

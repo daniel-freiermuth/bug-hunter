@@ -61,13 +61,36 @@ happens in the UI; the binary itself takes only `--root`, `--port` and the
 |---|---|---|
 | `bug` | Latent bugs — boundary, error-path, race, contract-drift, leak, logic | `playbooks/hunt.md` |
 | `test_gap` | Missing test coverage for real code paths; untested code that already misbehaves is filed as a `bug` instead | `playbooks/test_gap.md` |
-| `dep_update` | Outdated dependencies, with changelog/risk assessment | `playbooks/dep_update.md` |
+| `dep_update` | Outdated dependencies, one finding per Renovate branch (see below) | `playbooks/dep_update.md` |
 | `refactor` | Conservative, safe, mechanical refactoring opportunities | `playbooks/refactor.md` |
 | `modernization` | SOTA-drift — deprecated deps, language-feature gaps, format/protocol shifts, CI/CD gaps, platform EOL | `playbooks/modernization.md` |
 
 All five share one `findings` table (see [Data model](#data-model)) and one
 triage/fix pipeline; the UI's type filter and colored badges are the only
 place the distinction usually matters day to day.
+
+**Dependency updates** come from a zero-token Renovate lookup
+(`--dry-run=lookup`, with `config:recommended` under the repo's own config)
+whenever Renovate can read the repo, and from the `dep_update.md` worker
+otherwise. A finding is one Renovate branch, i.e. one PR's worth of change:
+packages released together (a monorepo group, the same tool pinned in a
+manifest and in CI) are one finding, and a package with both an in-major and
+a major update available gets one of each. The fingerprint is the branch
+plus the versions installed today, never the target, so:
+
+- a newer upstream release updates the open finding's target in place (only
+  while it is `new` or `queued`);
+- a merge or manual bump moves the installed version, which starts a new
+  finding;
+- a `new` finding the latest scan no longer proposes is set `superseded`,
+  and returns to `new` if a later scan proposes it again. A dependency the
+  scan skipped or failed to look up (e.g. GitHub Actions without a token)
+  keeps its finding: not checked is not done.
+- a `queued` finding the scan no longer proposes, whose move it proposes in
+  another finding (same package or group member, same major/non-major
+  class) -- e.g. one the AI fallback filed, or one from before grouping --
+  is set `superseded`, and that finding is queued instead, keeping the
+  budget override. Findings already in a PR are left alone.
 
 ### Finding lifecycle
 
