@@ -505,9 +505,11 @@ quota source for one installation.
   scheduler or a worker sees them: on a public repo anyone can comment on
   hunter's PRs, and engage commits and pushes in response. Bot reviews
   reach the worker in their own section, to verify rather than obey. On
-  GitHub, where `gh` reports an app by its bare name, a listed name that a
-  user account also holds is not taken as the bot (it logs a warning).
-  Default `[]`: no bot is listened to.
+  GitHub, where `gh` reports an app by its bare name (`greptile-apps`) and a
+  person may hold that same login, each comment or review by a listed name
+  counts as the bot's only if GitHub reports its author as a `Bot`
+  (GraphQL `__typename`, asked per item); the person's are screened like
+  anyone else's. Default `[]`: no bot is listened to.
 - `serve` controls who can reach the dashboard (Rust daemon only; the Python
   rollback always serves loopback). Defaults keep it local:
   - `serve.host` — address to bind, default `127.0.0.1`. `0.0.0.0` listens

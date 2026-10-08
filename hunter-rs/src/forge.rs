@@ -1,7 +1,7 @@
 //! Forge abstraction — GitHub / GitLab PR/MR lifecycle via CLI tools.
 //! Port of hunter/forge.py. Methods shell out to `gh` / `glab`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -107,6 +107,10 @@ pub struct GhAuthor {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GhComment {
+    /// GraphQL node id: what [`github_screen`] asks the author's account
+    /// type by.
+    #[serde(default)]
+    pub id: String,
     #[serde(default)]
     pub author: Option<GhAuthor>,
     #[serde(default)]
@@ -122,6 +126,10 @@ pub struct GhComment {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GhReview {
+    /// GraphQL node id: what [`github_screen`] asks the author's account
+    /// type by.
+    #[serde(default)]
+    pub id: String,
     #[serde(default)]
     pub author: Option<GhAuthor>,
     #[serde(default)]
@@ -305,48 +313,47 @@ fn normalize_login(login: &str) -> String {
 /// strangers, deleted accounts, items without an author -- is dropped, so
 /// it can neither reach a prompt nor raise a PR's attention.
 ///
-/// A login on the bot list counts as a bot only once `is_bot` confirms
-/// the account behind it is one: a login is just a name, and a human who
-/// holds the same name must not be read as the bot. Unconfirmed, it is
-/// screened like anyone else.
+/// An item by a login on the bot list counts as the bot's only once
+/// `is_bot` (given the item's id and login) confirms its author is one: a
+/// login is just a name, and a human who holds the same name must not be
+/// read as the bot. Unconfirmed, it is screened like anyone else's.
 ///
-/// Each check is asked at most once per distinct login. An error fails
+/// `can_push` is asked at most once per distinct login. An error fails
 /// the whole screen: guessing either way would drop a maintainer's
 /// request or hand a stranger's text to the worker.
 fn screen_feedback(
     pr: &mut PrView,
     bots: &ReviewBots,
-    mut is_bot: impl FnMut(&str) -> anyhow::Result<bool>,
+    mut is_bot: impl FnMut(&str, &str) -> anyhow::Result<bool>,
     mut can_push: impl FnMut(&str) -> anyhow::Result<bool>,
 ) -> anyhow::Result<()> {
-    let mut voices: HashMap<String, Option<Voice>> = HashMap::new();
-    let mut voice_of = |author: Option<&GhAuthor>| -> anyhow::Result<Option<Voice>> {
+    let mut push_access: HashMap<String, bool> = HashMap::new();
+    let mut voice_of = |id: &str, author: Option<&GhAuthor>| -> anyhow::Result<Option<Voice>> {
         let Some(login) = author.map(|a| a.login.as_str()).filter(|l| !l.is_empty()) else {
             return Ok(None);
         };
-        if let Some(voice) = voices.get(login) {
-            return Ok(*voice);
+        if bots.contains(login) && is_bot(id, login)? {
+            return Ok(Some(Voice::Bot));
         }
-        let voice = if bots.contains(login) && is_bot(login)? {
-            Some(Voice::Bot)
-        } else if can_push(login)? {
-            Some(Voice::Maintainer)
+        let maintainer = if let Some(&known) = push_access.get(login) {
+            known
         } else {
-            None
+            let asked = can_push(login)?;
+            push_access.insert(login.to_owned(), asked);
+            asked
         };
-        voices.insert(login.to_owned(), voice);
-        Ok(voice)
+        Ok(maintainer.then_some(Voice::Maintainer))
     };
     let mut comments = Vec::with_capacity(pr.comments.len());
     for mut c in std::mem::take(&mut pr.comments) {
-        if let Some(voice) = voice_of(c.author.as_ref())? {
+        if let Some(voice) = voice_of(&c.id, c.author.as_ref())? {
             c.voice = voice;
             comments.push(c);
         }
     }
     let mut reviews = Vec::with_capacity(pr.reviews.len());
     for mut r in std::mem::take(&mut pr.reviews) {
-        if let Some(voice) = voice_of(r.author.as_ref())? {
+        if let Some(voice) = voice_of(&r.id, r.author.as_ref())? {
             r.voice = voice;
             reviews.push(r);
         }
@@ -362,9 +369,9 @@ fn screen_feedback(
 /// believed for up to this long.
 const LOOKUP_TTL: Duration = Duration::from_mins(15);
 
-/// Screening answers by `<question>:<host>/<project>:<user>`, with the
-/// time each was recorded. Time is passed in rather than read, so the
-/// expiry boundary is testable.
+/// Screening answers by `<question>:<host>/<project>:<user>` (or
+/// `:<item>` for an author's type), with the time each was recorded. Time
+/// is passed in rather than read, so the expiry boundary is testable.
 #[derive(Default)]
 struct LookupCache(HashMap<String, (bool, Instant)>);
 
@@ -377,7 +384,21 @@ impl LookupCache {
     }
 
     fn record(&mut self, key: String, answer: bool, now: Instant) {
-        self.0.insert(key, (answer, now));
+        self.record_all([(key, answer)], now);
+    }
+
+    /// Record a batch of answers. Recording also drops every answer that
+    /// has expired by `now` -- once per batch, not per answer -- so the
+    /// cache holds what was asked in the last [`LOOKUP_TTL`], not every
+    /// comment and review the daemon has ever screened.
+    fn record_all(&mut self, answers: impl IntoIterator<Item = (String, bool)>, now: Instant) {
+        self.0
+            .retain(|_, &mut (_, at)| now.saturating_duration_since(at) < LOOKUP_TTL);
+        self.0.extend(
+            answers
+                .into_iter()
+                .map(|(key, answer)| (key, (answer, now))),
+        );
     }
 }
 
@@ -424,38 +445,82 @@ fn github_api_jq(url: &str, api: &str, jq: &str) -> anyhow::Result<(i32, String)
     Ok(run_cmd(&argv, 30))
 }
 
-/// Whether the login `gh pr view` reports for a configured bot really is
-/// the bot.
+/// The ids, among `ids` (GraphQL node ids of comments and reviews), whose
+/// author is a GitHub App (`Bot`).
 ///
-/// GraphQL names an app by its bare slug (`coderabbitai`, where REST says
-/// `coderabbitai[bot]`), and that bare name is an ordinary account name
-/// too: a user who holds it writes comments that read exactly like the
-/// bot's. Organizations cannot author comments, so only a `User` by that
-/// name makes the login ambiguous -- then it is not taken as the bot. No
-/// account by that name (404) leaves the bot as the only possible author.
-fn github_login_is_bot(url: &str, login: &str) -> anyhow::Result<bool> {
-    if !github_login_is_wellformed(login) {
-        return Ok(false);
+/// `gh pr view` names an app by its bare slug (`greptile-apps`, where REST
+/// says `greptile-apps[bot]`), and that bare name is an ordinary account
+/// name too: a person who holds it writes comments that read exactly like
+/// the bot's (github.com has a `User` called `greptile-apps`). The login
+/// cannot tell them apart; the author's type, asked per item, can. An item
+/// GitHub no longer returns (deleted meanwhile) is not the bot's.
+///
+/// An item's author never changes, so answers are cached per item and one
+/// GraphQL request covers up to 100 of the rest.
+fn github_bot_authored(url: &str, host: &str, ids: &[&str]) -> anyhow::Result<HashSet<String>> {
+    let key = |id: &str| format!("github-bot-item:{host}:{id}");
+    let mut bot = HashSet::new();
+    let mut ask = Vec::new();
+    {
+        let now = Instant::now();
+        let cache = LOOKUPS.lock().ok();
+        for &id in ids {
+            match cache.as_ref().and_then(|c| c.fresh(&key(id), now)) {
+                Some(true) => {
+                    bot.insert(id.to_owned());
+                }
+                Some(false) => {}
+                None => ask.push(id),
+            }
+        }
     }
-    let api = format!("users/{login}");
-    let (rc, out) = github_api_jq(url, &api, ".type")?;
+    for chunk in ask.chunks(100) {
+        let types = github_author_types(url, chunk)?;
+        let answers: Vec<(String, bool)> = chunk
+            .iter()
+            .map(|&id| (key(id), types.get(id).is_some_and(|t| t == "Bot")))
+            .collect();
+        bot.extend(
+            chunk
+                .iter()
+                .zip(&answers)
+                .filter(|(_, (_, is_bot))| *is_bot)
+                .map(|(&id, _)| id.to_owned()),
+        );
+        if let Ok(mut cache) = LOOKUPS.lock() {
+            cache.record_all(answers, Instant::now());
+        }
+    }
+    Ok(bot)
+}
+
+/// Author `__typename` (`Bot`, `User`, ...) of each comment or review in
+/// `ids`, by id, in one GraphQL request.
+fn github_author_types(url: &str, ids: &[&str]) -> anyhow::Result<HashMap<String, String>> {
+    const QUERY: &str = "query($ids: [ID!]!) { nodes(ids: $ids) { id \
+                         ... on Comment { author { __typename } } } }";
+    const JQ: &str = r#".data.nodes[] | select(. != null) | "\(.id)\t\(.author.__typename // "")""#;
+    let (host, _) =
+        url_host_path(url).ok_or_else(|| anyhow::anyhow!("cannot parse host from {url}"))?;
+    let query = format!("query={QUERY}");
+    let id_args: Vec<String> = ids.iter().map(|id| format!("ids[]={id}")).collect();
+    let mut argv = vec!["gh", "api", "graphql", "-f", &query];
+    for arg in &id_args {
+        argv.extend(["-f", arg]);
+    }
+    argv.extend(["--jq", JQ]);
+    if !host.eq_ignore_ascii_case("github.com") {
+        argv.extend(["--hostname", host]);
+    }
+    let (rc, out) = run_cmd(&argv, 30);
     if rc != 0 {
-        if out.contains("(HTTP 404)") {
-            return Ok(true);
-        }
-        anyhow::bail!("gh api {api} failed (rc={rc}): {out}");
+        anyhow::bail!("gh api graphql (author types) failed (rc={rc}): {out}");
     }
-    match out.trim() {
-        "User" => {
-            tracing::warn!(
-                "feedback.bots lists {login:?}, but a user account holds that login, so its \
-                 comments cannot be told from the bot's; screening them as a user's"
-            );
-            Ok(false)
-        }
-        "Organization" | "Bot" => Ok(true),
-        other => anyhow::bail!("gh api {api}: unexpected account type {other:?}"),
-    }
+    Ok(out
+        .lines()
+        .filter_map(|l| l.split_once('\t'))
+        .map(|(id, kind)| (id.to_owned(), kind.trim().to_owned()))
+        .collect())
 }
 
 /// Whether `login` can push to the GitHub repo at `url`: the collaborator
@@ -520,15 +585,28 @@ fn github_screen(url: &str, pr: &mut PrView, bots: &ReviewBots) -> anyhow::Resul
             (host, repo)
         },
     );
+    // Only items a listed bot's login wrote need their author's type.
+    let ids: Vec<&str> = pr
+        .comments
+        .iter()
+        .map(|c| (c.id.as_str(), c.author.as_ref()))
+        .chain(
+            pr.reviews
+                .iter()
+                .map(|r| (r.id.as_str(), r.author.as_ref())),
+        )
+        .filter(|(id, a)| !id.is_empty() && a.is_some_and(|a| bots.contains(&a.login)))
+        .map(|(id, _)| id)
+        .collect();
+    let bot_authored = if ids.is_empty() {
+        HashSet::new()
+    } else {
+        github_bot_authored(url, &host, &ids)?
+    };
     screen_feedback(
         pr,
         bots,
-        |login| {
-            cached_lookup(
-                format!("github-bot:{host}:{}", login.to_ascii_lowercase()),
-                || github_login_is_bot(url, login),
-            )
-        },
+        |id, _| Ok(bot_authored.contains(id)),
         |login| {
             cached_lookup(
                 format!("github-push:{repo}:{}", normalize_login(login)),
@@ -569,7 +647,7 @@ fn gitlab_feedback(
     screen_feedback(
         &mut view,
         bots,
-        |_| Ok(true),
+        |_, _| Ok(true),
         |login| {
             // Membership is looked up by id; a note that names its author
             // without one leaves who wrote it unknown, which is not the
@@ -907,6 +985,8 @@ fn gitlab_split_notes(notes: &[GlNote]) -> (Vec<GhComment>, Vec<GhReview>) {
         });
         if n.note_type.as_deref() == Some("DiffNote") {
             reviews.push(GhReview {
+                // Only GitHub screening asks by item; see `gitlab_feedback`.
+                id: String::new(),
                 submitted_at: ts.clone(),
                 body: n.body.clone(),
                 author,
@@ -915,6 +995,7 @@ fn gitlab_split_notes(notes: &[GlNote]) -> (Vec<GhComment>, Vec<GhReview>) {
             });
         } else {
             comments.push(GhComment {
+                id: String::new(),
                 created_at: ts.clone(),
                 body: n.body.clone(),
                 author,
@@ -1488,5 +1569,52 @@ mod lookup_cache_tests {
         );
         assert_eq!(cache.fresh("github-push:h/o/r:lead", t0 + LOOKUP_TTL), None);
         assert_eq!(cache.fresh("github-push:h/o/r:other", t0), None);
+    }
+
+    /// The cache holds what was asked in the last [`LOOKUP_TTL`], not
+    /// everything ever asked: answers per comment or review would
+    /// otherwise pile up for as long as the daemon runs.
+    #[test]
+    fn recording_drops_expired_answers_and_keeps_fresh_ones() {
+        let t0 = Instant::now();
+        let mut cache = LookupCache::default();
+        cache.record("github-bot-item:h:IC_old".to_owned(), true, t0);
+        let later = t0 + LOOKUP_TTL.saturating_sub(Duration::from_secs(1));
+        cache.record("github-bot-item:h:IC_recent".to_owned(), true, later);
+
+        cache.record(
+            "github-bot-item:h:IC_new".to_owned(),
+            false,
+            t0 + LOOKUP_TTL,
+        );
+
+        let mut kept: Vec<&str> = cache.0.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            ["github-bot-item:h:IC_new", "github-bot-item:h:IC_recent"]
+        );
+    }
+
+    /// A batch (one GraphQL answer for many items) keeps each answer as
+    /// given and, like a single answer, drops what has expired.
+    #[test]
+    fn a_batch_keeps_every_answer_and_drops_expired_ones() {
+        let t0 = Instant::now();
+        let mut cache = LookupCache::default();
+        cache.record("github-bot-item:h:IC_old".to_owned(), true, t0);
+
+        let now = t0 + LOOKUP_TTL;
+        cache.record_all(
+            [
+                ("github-bot-item:h:IC_bot".to_owned(), true),
+                ("github-bot-item:h:IC_user".to_owned(), false),
+            ],
+            now,
+        );
+
+        assert_eq!(cache.fresh("github-bot-item:h:IC_bot", now), Some(true));
+        assert_eq!(cache.fresh("github-bot-item:h:IC_user", now), Some(false));
+        assert_eq!(cache.0.len(), 2, "the expired answer is gone");
     }
 }

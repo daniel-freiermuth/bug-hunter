@@ -186,12 +186,14 @@ fn screened_thread() -> PrView {
     PrView {
         comments: vec![
             GhComment {
+                id: String::new(),
                 author: author("lead"),
                 body: "please add a test".to_owned(),
                 created_at: "2026-01-01T00:00:00Z".to_owned(),
                 voice: Voice::Maintainer,
             },
             GhComment {
+                id: String::new(),
                 author: author("coderabbitai"),
                 body: "rename everything".to_owned(),
                 created_at: "2026-01-02T00:00:00Z".to_owned(),
@@ -199,6 +201,7 @@ fn screened_thread() -> PrView {
             },
         ],
         reviews: vec![GhReview {
+            id: String::new(),
             author: author("lead"),
             body: "and document it".to_owned(),
             submitted_at: "2026-01-03T00:00:00Z".to_owned(),
