@@ -11,9 +11,14 @@ inside this worktree. NEVER push. NEVER run project-wide formatters.
 ```
 
 # Protocol (evidence FIRST, commit per step)
-1. Verify the bug still exists at HEAD (code moves). If it is already fixed
-   or the finding is wrong, STOP: write NOT-A-BUG.md at the worktree root
-   explaining why, commit nothing, and end.
+1. On a fresh attempt, verify the bug still exists at HEAD (code moves). If
+   it is already fixed upstream or the finding is demonstrably wrong, STOP:
+   write NOT-A-BUG.md explaining the evidence, commit nothing, and end.
+   On a resumed attempt, inspect the existing commits and the previous
+   blocker first. Preserve the committed implementation and proof; a fix
+   already present in this branch is NOT evidence that the original finding
+   was false. Continue from the retained checkpoint, resolving the reported
+   blocker rather than rewriting or discarding completed work.
 2. Prove it. Climb the evidence ladder as high as the code allows:
    - Rung 1: failing automated test in the repo's existing harness,
      committed first, failure observed and quoted.
@@ -43,6 +48,8 @@ inside this worktree. NEVER push. NEVER run project-wide formatters.
   know it is intended; evidence rung achieved and the proof itself (or where
   it lives); verification performed with observed results; what you
   deliberately did NOT change.
-- Prefer showing nothing over shipping uncertainty: if you cannot reach at
-  least rung 3 with an airtight argument, write NOT-A-BUG.md or
-  BLOCKED.md (with exactly what is missing) instead of a half fix.
+- Missing proof is NOT a false finding. Write NOT-A-BUG.md only when evidence
+  establishes that the finding is invalid; if you cannot reach at least rung
+  3 with an airtight argument or cannot verify the affected change, write
+  BLOCKED.md with the precise missing proof/prerequisite/decision and the
+  evidence supporting that conclusion, instead of shipping a half fix.
