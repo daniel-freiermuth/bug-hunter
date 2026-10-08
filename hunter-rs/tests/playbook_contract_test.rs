@@ -231,6 +231,7 @@ fn sample_pr_view() -> PrView {
         }],
         comments: vec![
             GhComment {
+                id: String::new(),
                 author: Some(GhAuthor {
                     login: "reviewer".to_owned(),
                 }),
@@ -239,6 +240,7 @@ fn sample_pr_view() -> PrView {
                 voice: Voice::Maintainer,
             },
             GhComment {
+                id: String::new(),
                 author: Some(GhAuthor {
                     login: "coderabbitai".to_owned(),
                 }),
@@ -248,6 +250,7 @@ fn sample_pr_view() -> PrView {
             },
         ],
         reviews: vec![GhReview {
+            id: String::new(),
             author: Some(GhAuthor {
                 login: "reviewer".to_owned(),
             }),

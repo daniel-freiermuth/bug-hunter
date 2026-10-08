@@ -437,14 +437,14 @@ async fn only_maintainers_and_configured_bots_flag_new_comments() {
             "gh",
             &format!(
                 "case \"$*\" in\n\
-                 \x20 *users/coderabbitai\\ *) echo Organization; exit 0 ;;\n\
+                 \x20 *graphql*) printf 'IC_1\\tBot\\n'; exit 0 ;;\n\
                  \x20 *collaborators/maintainer/permission*) echo true; exit 0 ;;\n\
                  \x20 *permission*) echo false; exit 0 ;;\n\
                  esac\n\
                  cat <<'__PR_EOF__'\n\
                  {{\"state\":\"OPEN\",\"mergeable\":\"MERGEABLE\",\"reviewDecision\":\"\",\"statusCheckRollup\":[],\
                  \"updatedAt\":\"2026-01-02T03:04:05Z\",\"headRefName\":\"{BRANCH}\",\"headRefOid\":\"deadbeef\",\
-                 \"reviews\":[],\"comments\":[{{\"author\":{{\"login\":\"{author}\"}},\
+                 \"reviews\":[],\"comments\":[{{\"id\":\"IC_1\",\"author\":{{\"login\":\"{author}\"}},\
                  \"body\":\"please change this\",\"createdAt\":\"2026-01-02T03:04:05Z\"}}]}}\n\
                  __PR_EOF__\nexit 0"
             ),
