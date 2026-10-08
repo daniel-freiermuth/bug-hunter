@@ -60,7 +60,7 @@ happens in the UI; the binary itself takes only `--root`, `--port` and the
 | Type | What it looks for | Prompt |
 |---|---|---|
 | `bug` | Latent bugs — boundary, error-path, race, contract-drift, leak, logic | `playbooks/hunt.md` |
-| `test_gap` | Missing test coverage for real code paths | `playbooks/test_gap.md` |
+| `test_gap` | Missing test coverage for real code paths; untested code that already misbehaves is filed as a `bug` instead | `playbooks/test_gap.md` |
 | `dep_update` | Outdated dependencies, with changelog/risk assessment | `playbooks/dep_update.md` |
 | `refactor` | Conservative, safe, mechanical refactoring opportunities | `playbooks/refactor.md` |
 | `modernization` | SOTA-drift — deprecated deps, language-feature gaps, format/protocol shifts, CI/CD gaps, platform EOL | `playbooks/modernization.md` |
