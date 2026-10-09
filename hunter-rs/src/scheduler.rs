@@ -2070,8 +2070,16 @@ pub async fn run_recheck(
             "confirmed"
         }
         RecheckOutcome::Stale => {
+            // Superseded, not suppressed: the code moved on and took the
+            // bug with it, which says nothing against the finding. As
+            // `wontfix` it told every later scan not to report the bug
+            // again, should the rewritten code bring it back.
             let _ = store
-                .set_finding_verdict(fid, FindingStatus::Wontfix, &format!("recheck: {reason}"))
+                .set_finding_verdict(
+                    fid,
+                    FindingStatus::Superseded,
+                    &format!("recheck: {reason}"),
+                )
                 .await;
             let _ = store.clear_recheck_attempts(fid).await;
             let _ = store
