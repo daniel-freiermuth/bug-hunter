@@ -378,7 +378,8 @@ Card numbers (`F#123`) link to the finding on All Findings
 copied or opened in another tab. The linked card is placed at the top of the
 list and outlined. If a carried filter hides it (its status or confidence
 changed since the link was made), only that filter is dropped; an unknown
-number shows a "not found" notice.
+number shows a "not found" notice. Changing filters or sort keeps the focus
+while the card stays visible; a filter that hides it drops the focus.
 
 ## Users
 
