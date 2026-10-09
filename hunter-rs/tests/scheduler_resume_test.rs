@@ -1788,6 +1788,51 @@ async fn a_recheck_severity_outside_the_enum_is_not_stored() {
     assert_eq!(finding.status, FindingStatus::New);
 }
 
+/// A stale recheck (the code moved on) supersedes the finding and an
+/// invalid one rejects it; only the rejection reaches the suppression list
+/// every later scan is shown. Stale used to land as `wontfix`: all seven
+/// `wontfix` findings it set in production were code that had been
+/// removed or rewritten, suppressed as if someone had decided against them.
+#[tokio::test]
+async fn a_stale_recheck_supersedes_and_only_an_invalid_one_suppresses() {
+    for (verdict, status, suppressed) in [
+        ("stale", FindingStatus::Superseded, false),
+        ("invalid", FindingStatus::Rejected, true),
+    ] {
+        let (dir, path, pool) = fresh_db().await;
+        let store = rw_store(&path).await;
+        let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
+        let cfg = test_config(dir.path());
+        let out = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
+        let worker = ScriptedBackend::new(move |_| {
+            let body = serde_json::json!({ "verdict": verdict, "reason": "src/x.rs:1 is gone" });
+            std::fs::write(&out, body.to_string()).unwrap();
+            support::done()
+        });
+
+        let finding = store.get_finding(fid).await.unwrap().unwrap();
+        let summary = run_recheck(&store, &cfg, &finding, &worker, None)
+            .await
+            .unwrap();
+
+        assert_eq!(summary.outcome.as_deref(), Some(verdict));
+        let after = store.get_finding(fid).await.unwrap().unwrap();
+        assert_eq!(after.status, status, "{verdict}");
+        assert_eq!(
+            after.verdict_reason.as_deref(),
+            Some("recheck: src/x.rs:1 is gone"),
+            "{verdict}"
+        );
+        let listed = store
+            .suppressions(1, "bug")
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.id == fid);
+        assert_eq!(listed, suppressed, "{verdict}");
+    }
+}
+
 /// Minimal `gh pr view --json` payload that `view_pr_engage` can parse.
 const PR_VIEW_JSON: &str = r#"{"state":"MERGED","mergeable":"MERGEABLE","title":"a fix","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"feature","headRefOid":"deadbeef"}"#;
 

@@ -95,7 +95,7 @@ plus the versions installed today, never the target, so:
 ### Finding lifecycle
 
 ```
-new ──recheck──> new / wontfix / rejected
+new ──recheck──> new / superseded / rejected
  │
  ├─ queue for fix ─> queued ─> fixing ─> pr_open ─┬─> merged
  │                      ↑           │              └─> closed (closed unmerged)
@@ -153,7 +153,8 @@ new ──recheck──> new / wontfix / rejected
 - **Recheck** (UI button, human-triggered only) re-evaluates a `new`
   finding against the *current* codebase with an adversarially skeptical
   second opinion: `confirmed` (refreshes the analysis, stays `new`),
-  `stale` (→ `wontfix`), `invalid` (→ `rejected`).
+  `stale` (→ `superseded`: the code moved on, so nothing is suppressed),
+  `invalid` (→ `rejected`).
 
 ### Scheduling loop
 
