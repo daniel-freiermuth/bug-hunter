@@ -31,16 +31,21 @@ function scrollRoot(el: Element): Element | null {
   if (!parent) return null;
   const cached = rootByParent.get(parent);
   if (cached !== undefined) return cached;
-  let root: Element | null = null;
-  for (let p: Element | null = parent; p; p = p.parentElement) {
-    const { overflowY } = getComputedStyle(p);
-    if ((overflowY === "auto" || overflowY === "scroll") && p.scrollHeight > p.clientHeight) {
-      root = p;
-      break;
-    }
-  }
+  const root = findScrollRoot(parent);
   rootByParent.set(parent, root);
   return root;
+}
+
+/**
+ * The nearest ancestor-or-self of `el` that scrolls vertically right now,
+ * resolved fresh: whether a list overflows changes as its cards render.
+ */
+export function findScrollRoot(el: Element): Element | null {
+  for (let p: Element | null = el; p; p = p.parentElement) {
+    const { overflowY } = getComputedStyle(p);
+    if ((overflowY === "auto" || overflowY === "scroll") && p.scrollHeight > p.clientHeight) return p;
+  }
+  return null;
 }
 
 /**
