@@ -5,6 +5,7 @@
   import { SEV_RANK } from "../lib/format";
   import { Filter, needsSelector } from "../lib/filter.svelte";
   import { navigation } from "../lib/navigation.svelte";
+  import { hidingParams } from "../lib/findingFilter";
   import { readConfidence, readSelection, readSort, writeSelection, type FilterKey } from "../lib/filterUrl";
   import MultiSelect from "./MultiSelect.svelte";
 
@@ -37,15 +38,32 @@
   const minConfidence = $derived(readConfidence(navigation.route.params));
   const sortBy = $derived(readSort(navigation.route.params));
 
+  // A focused finding stays focused while it stays visible. A filter the
+  // user picks that hides it drops the focus instead: their filter wins
+  // over the link's finding. Only links arriving stale reveal a finding
+  // (AllFindingsPage), so the user's own filter is never undone.
+  const focused = $derived.by(() => {
+    const id = navigation.route.focusId;
+    return id == null ? undefined : findings.find((f) => f.id === id);
+  });
+
+  function keepsFocus(params: URLSearchParams): boolean {
+    return !focused || hidingParams(focused, params, { repoNames, showStatus }).length === 0;
+  }
+
   function selectFilter(key: FilterKey, filter: Filter) {
-    navigation.updateParams((params) => writeSelection(params, key, filter.selection));
+    navigation.updateParams((params) => writeSelection(params, key, filter.selection), false, keepsFocus);
   }
 
   function selectConfidence(value: number, replace: boolean) {
-    navigation.updateParams((params) => {
-      if (value === 0) params.delete("confidence");
-      else params.set("confidence", String(value));
-    }, replace);
+    navigation.updateParams(
+      (params) => {
+        if (value === 0) params.delete("confidence");
+        else params.set("confidence", String(value));
+      },
+      replace,
+      keepsFocus,
+    );
   }
 
   // A slider drag is one history step, not one for every input event.

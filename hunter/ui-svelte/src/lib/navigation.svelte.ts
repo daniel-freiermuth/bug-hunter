@@ -43,12 +43,21 @@ class Navigation {
     this.commit(`#${target}`, false);
   }
 
-  /** Edit filter parameters without losing the page or focused finding; replace coalesces slider input. */
-  updateParams(update: (params: URLSearchParams) => void, replace = false): void {
+  /**
+   * Edit filter parameters without losing the page; replace coalesces slider
+   * input. The focused finding is kept unless `keepsFocus` says the edited
+   * parameters would hide it.
+   */
+  updateParams(
+    update: (params: URLSearchParams) => void,
+    replace = false,
+    keepsFocus: (params: URLSearchParams) => boolean = () => true,
+  ): void {
     const question = this.hash.indexOf("?");
-    const target = (question < 0 ? this.hash : this.hash.slice(0, question)) || "#inbox";
+    let target = (question < 0 ? this.hash : this.hash.slice(0, question)) || "#inbox";
     const params = this.route.params;
     update(params);
+    if (!keepsFocus(params)) target = target.replace(/:.*$/, "");
     const query = params.toString();
     this.commit(query ? `${target}?${query}` : target, replace);
   }
