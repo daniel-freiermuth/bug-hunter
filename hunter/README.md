@@ -193,7 +193,10 @@ what actually runs):
    always hunts first). **Modernization** joins this rotation too, but only
    once `modernization.intervalDays` (config, default 30) has passed since it last ran for that
    repo — a periodic strategic check, not a tight-loop scan competing for
-   every cycle.
+   every cycle. A repo with a **full re-hunt** queued from the Repos page
+   goes first, and its hunt runs ahead of its other scans and of the scan
+   interval — until a hunt has attempted that request, so a failing hunt
+   is not retried back to back.
 
 Each of 1-5 picks a (finding, kind). When that finding has a suspended
 attempt of that same kind that can still be continued, the tier continues
@@ -346,7 +349,7 @@ Served at `http://localhost:8377` (configurable). Left-nav pages:
 | **Inbox** | New findings awaiting triage, with per-type filters |
 | **Kanban / Pipeline** | Findings in flight, a separate Blocked section with prerequisite reports and Resume fix controls, suppressed (rejected/wontfix), and informational (note) findings |
 | **All Findings** | Every finding, filterable by repo/type/status/severity, with full detail (jobs, PR state, timeline) on expand, and the actions its status allows (verdicts on new/blocked/note/closed, Recheck on new, Unqueue on queued, budget override while something will still pick it) |
-| **Repos** | Add/remove/pause repos; per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
+| **Repos** | Add/remove/pause repos; queue a full re-hunt (the next hunt reviews the repo's complete history instead of only new commits — the same scope as the periodic `hunt.rehuntDays` re-hunt — and the request stays pending until such a hunt finishes cleanly); per-repo notes (free-text context injected into every prompt for that repo — coding conventions, known false positives, anything worth a hunter remembering across runs) |
 | **Stats** | Aggregate totals by kind and by finding type |
 | **Log** | Full job and event history |
 
@@ -423,6 +426,7 @@ answers `401 {"error": "login required"}` without a live session cookie.
 | POST | `/api/repo` | Update a repo (pause/resume, etc.) |
 | POST | `/api/repos` | Add a repo |
 | POST | `/api/repo/delete` | Remove a repo |
+| POST | `/api/repo/rehunt` | Queue a full re-hunt of a repo |
 | POST | `/api/repo/notes` | Append a note to a repo |
 
 ## Architecture

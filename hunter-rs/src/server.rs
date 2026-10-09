@@ -256,6 +256,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/repo", post(update_repo))
         .route("/api/repo/notes", get(repo_notes).post(add_repo_note))
         .route("/api/repo/delete", post(delete_repo))
+        .route("/api/repo/rehunt", post(request_rehunt))
         .route("/api/events", get(events))
         .route("/api/stats", get(stats))
         .route("/api/verdict", post(verdict))
@@ -1663,6 +1664,42 @@ async fn delete_repo(
         );
     }
     Ok(Json(json!({ "ok": true })).into_response())
+}
+
+// -- POST /api/repo/rehunt (WRITES contract §8.1) -------------------------------
+
+/// Queue a full re-hunt of one repo: its next cold hunt reviews the
+/// complete history, and the rotation runs it ahead of the repo's other
+/// scans. A paused repo keeps the request until it is resumed.
+async fn request_rehunt(
+    State(state): State<AppState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    raw: Bytes,
+) -> Result<Response, ApiError> {
+    post_gate(&headers)?;
+    let body = parse_object(&raw)?;
+    let rid = require_int(&body, "id", "id must be an integer")?;
+    let repo = fetch_repo(&state.store, rid).await?;
+    // The lookup above and this write are separate statements; a delete
+    // landing between them leaves nothing to queue the hunt on.
+    if !state.store.request_full_hunt(rid).await? {
+        return Err(ApiError::NotFound(format!("no repo {rid}")));
+    }
+    state
+        .store
+        .log_user_event(
+            &user,
+            "repo",
+            &format!("full re-hunt queued for {}", repo.name),
+            None,
+        )
+        .await?;
+    let refreshed = fetch_repo(&state.store, rid).await?;
+    // The rotation has an urgent hunt now; pick it without waiting for
+    // the loop's next natural wake.
+    state.scheduler.wake.notify_one();
+    Ok(Json(json!({ "ok": true, "repo": refreshed })).into_response())
 }
 
 // -- POST /api/repo/notes (contract §9) -------------------------------------------

@@ -1939,3 +1939,71 @@ async fn block_fix_job_guards_identity_and_rolls_back_both_rows_on_error() {
         assert_eq!(job.finished_at, None);
     }
 }
+
+/// A re-hunt request lands only on a live repo: the endpoint's lookup and
+/// this write are separate statements, and a delete between them must
+/// come back as "no such repo" rather than as a request recorded on a
+/// row that is already gone from every read path.
+#[tokio::test]
+async fn a_full_hunt_request_needs_a_live_repo() {
+    let (_dir, path, pool) = fresh_db().await;
+    sqlx::raw_sql(
+        r"
+        INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at)
+        VALUES (1, 'alpha', 'u1', '/tmp/a', 'github', 'main', 1, 1000),
+               (2, 'beta',  'u2', '/tmp/b', 'github', 'main', 1, 1000);
+        ",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    store.soft_delete_repo(2).await.unwrap();
+
+    assert!(store.request_full_hunt(1).await.unwrap());
+    assert!(!store.request_full_hunt(2).await.unwrap());
+    assert!(!store.request_full_hunt(3).await.unwrap(), "never a repo");
+}
+
+/// Every full re-hunt request gets a value no earlier request and no
+/// attempted one has had — hunts tell requests apart by that value, so a
+/// repeat would make a re-queue look already answered. Seeded ahead of
+/// the clock so the next request cannot simply take the time.
+#[tokio::test]
+async fn a_full_hunt_request_never_reuses_a_value() {
+    let (_dir, path, pool) = fresh_db().await;
+    let ahead = hunter::util::now_ms() + 60_000;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at, \
+         full_hunt_requested_at, full_hunt_request_attempted) \
+         VALUES (1, 'alpha', 'u1', '/tmp/a', 'github', 'main', 1, 1000, ?1, NULL), \
+                (2, 'beta',  'u2', '/tmp/b', 'github', 'main', 1, 1000, NULL, ?1)",
+    )
+    .bind(ahead)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let store = rw_store(&path).await;
+    let requested = |id| {
+        let store = &store;
+        async move {
+            store
+                .get_repo_by_id(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .full_hunt_requested_at
+                .unwrap()
+        }
+    };
+
+    // Replacing a pending request.
+    assert!(store.request_full_hunt(1).await.unwrap());
+    assert_eq!(requested(1).await, ahead + 1);
+    assert!(store.request_full_hunt(1).await.unwrap());
+    assert_eq!(requested(1).await, ahead + 2);
+
+    // A new request after one was attempted and settled.
+    assert!(store.request_full_hunt(2).await.unwrap());
+    assert_eq!(requested(2).await, ahead + 1);
+}

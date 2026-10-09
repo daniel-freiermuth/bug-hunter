@@ -324,6 +324,29 @@ Phase two is attempted inline so the common case completes before the response, 
 
 ---
 
+## 8.1 POST /api/repo/rehunt — queue a full re-hunt (Rust only)
+
+Handler `request_rehunt` (server.rs). No Python counterpart.
+
+**Request**: `{"id": int}`.
+
+**Validation order**:
+1. non-int id -> `400 {"error": "id must be an integer"}`.
+2. no active repo (`get_repo_by_id`, `deleted_at IS NULL`) -> `404 {"error": "no repo <rid>"}`. A delete that lands between the lookup and the write gives the same 404 (`Store::request_full_hunt` is itself `WHERE deleted_at IS NULL` and reports whether it matched).
+
+**Write**: `UPDATE repos SET full_hunt_requested_at = MAX(<now>, full_hunt_requested_at + 1, full_hunt_request_attempted + 1)` (migration 020; NULLs count as 0). The value identifies the request — hunts compare it by equality — so it never repeats, even for two requests in the same millisecond. A pending request is overwritten, not kept: asking again after a chain has started queues another full pass instead of being absorbed by the one in flight. A paused repo accepts the request and keeps it until resumed. Then `log_event("repo", "full re-hunt queued for <name>")`, attributed (§10), and the scheduler is woken.
+
+**Success**: `200 {"ok": true, "repo": Row}` — the refreshed repo, `full_hunt_requested_at` set.
+
+**Scheduler semantics** (`scheduler::pick_next`, `scheduler::run_hunt`):
+- Until a hunt has **attempted** the request, the rotation tier (below every finding tier and the resume tier) sorts the repo first and picks its hunt ahead of its other scans and of `scan.intervalDays`. A cold hunt records the request it read from the repo row (`repos.full_hunt_request_attempted`, migration 020) once it has created its job, or when it fails before that (a fetch error); a hunt the budget gate turns away has attempted nothing. Requests are matched by value, not time, so a request that lands while some other hunt is being prepared or run — one that read the repo row before it — stays unanswered. Once attempted, the request stops jumping the queue — a failing hunt is retried after the scan interval, like any failed rotation scan, not back to back — but stays pending.
+- While pending, the next **cold** hunt reviews the complete history (`<empty tree>..<tip>`), exactly as the periodic `hunt.rehuntDays` re-hunt does, and never takes the "no new commits" skip. The chain records that scope and the request it accepted on its jobs (`jobs.full_history`, `jobs.full_hunt_request`, migration 020), and every resume of it inherits both.
+- The request is cleared only when a full-history chain finishes `done` with no invalid findings **and** the pending request is the one that chain accepted (`Store::settle_full_hunt_request`). A request made or replaced while a chain is prepared or runs — full or incremental — survives it.
+
+**UI** (`ReposPage.requestRehunt`): a "Full re-hunt" button per repo — "Re-queue re-hunt" while a request is pending — behind a `confirm(...)` whose text says which of the two it is; success -> `toast("Full re-hunt queued for <name>", true)` + `store.refresh()`; failure -> `console.error` with the status plus `toast("Failed to queue re-hunt of <name>", false)`. A pending request shows as a "full re-hunt queued" badge, read from `/api/summary.repos[].full_hunt_requested_at`.
+
+---
+
 ## 9. POST /api/repo/notes — append a repo note (filesystem write)
 
 Handler `_add_repo_note` (server.py:701-725).
@@ -360,14 +383,14 @@ Accounts are created by the operator (`hunter user add|passwd|disable <name>`, `
 - **`GET /api/me`** — `200 {"username": str}` (`SessionUser`).
 - `hunter user passwd` and `hunter user disable` delete every session of the account in the same transaction.
 
-**Attribution.** The handlers that log an event for an operator action (§1 verdict, §3 recheck, §4 unqueue, §5 override, §6–§9 repo writes) record the session's account in `events.user_id` (`Store::log_user_event`); `/api/events` and finding timelines expose it as `username` (null for scheduler events).
+**Attribution.** The handlers that log an event for an operator action (§1 verdict, §3 recheck, §4 unqueue, §5 override, §6–§9 repo writes, including §8.1) record the session's account in `events.user_id` (`Store::log_user_event`); `/api/events` and finding timelines expose it as `username` (null for scheduler events).
 
 ## Appendix A. CSRF & concurrency guards
 
 - **CSRF**: the `application/json` prefix gate on all POSTs (server.py:409-412, the HTTP 415 at :411) blocks HTML-form/simple cross-origin requests; combined with loopback-only bind `127.0.0.1` (server.py:903) and no CORS headers anywhere. GETs have no gate.
 - **Process exclusivity**: exclusive non-blocking `flock` on `<work_root>/hunter.lock`, held for process lifetime; loser exits with a SystemExit message (server.py:65-87). Both `serve()` (server.py:922) and `daemon()` (server.py:1244) take it.
 - **Cycle exclusivity**: `_cycle_lock` (server.py:93) — POST /api/cycle (server.py:490), daemon loop (server.py:1266-1299), summary's `cycle_running` probe (server.py:311).
-- **Daemon wake**: `SchedulerHandle.wake` is notified by `/api/cycle`, `/api/scheduler`, `/api/overdrive`, and budget-override changes so the loop reacts without waiting for its current sleep deadline.
+- **Daemon wake**: `SchedulerHandle.wake` is notified by `/api/cycle`, `/api/scheduler`, `/api/overdrive`, `/api/repo/rehunt`, and budget-override changes so the loop reacts without waiting for its current sleep deadline.
 - **No per-row or per-table write locks**: every request builds its own `Store`/connection (server.py:157-160); serialization is SQLite-level (WAL, default 5 s busy timeout). Handlers are not atomic across their multiple store calls (§0.3); e.g. two concurrent verdicts on the same finding interleave at statement granularity — last `UPDATE` wins, both events logged.
 - **Response-then-side-effect ordering**: /api/override writes the response *before* `_wake.set()` (server.py:590-592); /api/cycle responds 202 while the cycle thread runs concurrently (server.py:517-518). All other endpoints complete every write before responding.
 
@@ -386,6 +409,7 @@ Accounts are created by the operator (`hunter user add|passwd|disable <name>`, `
 | /api/repo | 200 | `{"ok": true, "repo": Row}` | `get_repo` (store.py:585-590) |
 | /api/repos | 201 | `{"ok": true, "repo": Row}` | `get_repo` |
 | /api/repo/delete | 200 | `{"ok": true}` | — |
+| /api/repo/rehunt | 200 | `{"ok": true, "repo": Row}` | `get_repo_by_id` |
 | /api/repo/notes | 201 | `{"ok": true, "notes": str}` | `repo_notes` (store.py:731-745) |
 
 All finding/repo Rows are `SELECT *` full rows — shapes per round-1 `hunter-rs/API-CONTRACT.md`. **The Svelte UI reads none of them**, including `/api/repo/notes`' `notes` string (§9): every write path calls `store.refresh()` or re-GETs instead. They are soft contract with no consumer today; ship them for parity.

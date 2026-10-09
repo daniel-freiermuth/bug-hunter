@@ -601,6 +601,8 @@ pub fn sample_repo() -> hunter::types::Repo {
         last_refactor_at: None,
         last_modernization_at: None,
         last_standards_at: None,
+        full_hunt_requested_at: None,
+        full_hunt_request_attempted: None,
     }
 }
 

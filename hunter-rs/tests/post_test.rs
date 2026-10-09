@@ -238,7 +238,7 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for LogSink {
     }
 }
 
-const POST_PATHS: [&str; 9] = [
+const POST_PATHS: [&str; 10] = [
     "/api/verdict",
     "/api/cycle",
     "/api/recheck",
@@ -248,6 +248,7 @@ const POST_PATHS: [&str; 9] = [
     "/api/repos",
     "/api/repo/delete",
     "/api/repo/notes",
+    "/api/repo/rehunt",
 ];
 
 // -- §0.1 Content-Type gate ---------------------------------------------------
@@ -1765,6 +1766,7 @@ async fn every_api_route_needs_a_session() {
         ("GET", "/api/repo/notes?id=1"),
         ("POST", "/api/repo/notes"),
         ("POST", "/api/repo/delete"),
+        ("POST", "/api/repo/rehunt"),
         ("GET", "/api/events"),
         ("GET", "/api/stats"),
         ("POST", "/api/verdict"),
@@ -2368,4 +2370,55 @@ async fn queue_changes_wake_the_scheduler_loop() {
             .await
             .unwrap_or_else(|_| panic!("{path} must wake the scheduler loop"));
     }
+}
+
+// -- §8.1 /api/repo/rehunt -----------------------------------------------------
+
+/// Queuing a full re-hunt records the request on the repo, shows it in
+/// the summary the Repos page reads, attributes it, and wakes the loop.
+#[tokio::test]
+async fn queuing_a_full_rehunt_marks_the_repo_and_wakes_the_scheduler() {
+    let state = test_state().await;
+    let wake = Arc::clone(&state.scheduler.wake);
+    let before = hunter::util::now_ms();
+    let (status, body) = post(&state, "/api/repo/rehunt", json!({ "id": 1 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], json!(true));
+    let at = body["repo"]["full_hunt_requested_at"]
+        .as_i64()
+        .expect("the request time is on the returned row");
+    assert!(at >= before, "{at} predates the request");
+    tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+        .await
+        .expect("queuing a re-hunt must wake the scheduler loop");
+
+    let summary = get_json(&state, "/api/summary").await;
+    let row = summary["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == 1)
+        .unwrap();
+    assert_eq!(row["full_hunt_requested_at"], json!(at));
+
+    let events = get_json(&state, "/api/events").await;
+    assert!(
+        events
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["message"] == "full re-hunt queued for demo"),
+        "{events}"
+    );
+}
+
+#[tokio::test]
+async fn queuing_a_rehunt_needs_an_existing_repo() {
+    let state = test_state().await;
+    let (status, body) = post(&state, "/api/repo/rehunt", json!({ "id": "1" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, json!({ "error": "id must be an integer" }));
+    let (status, body) = post(&state, "/api/repo/rehunt", json!({ "id": 999 })).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body, json!({ "error": "no repo 999" }));
 }
