@@ -23,6 +23,16 @@ class Navigation {
     return parseHash(this.hash);
   }
 
+  /**
+   * Link to a finding on All Findings that keeps the current view's filters
+   * and sort, so the finding opens among the cards it was found among. Every
+   * page uses the same parameter names; pages without filters carry none.
+   */
+  findingHref(id: number): string {
+    const query = this.route.params.toString();
+    return query ? `#findings:${id}?${query}` : `#findings:${id}`;
+  }
+
   /** Restore the current browser entry after hash navigation or Back/Forward. */
   sync(): void {
     this.hash = window.location.hash;

@@ -2,6 +2,7 @@
   import { store } from "../lib/api.svelte";
   import type { JobListEntry } from "../lib/types";
   import { datetime, ktok, dur } from "../lib/format";
+  import { navigation } from "../lib/navigation.svelte";
 
   let events = $derived(store.events);
   let jobs = $derived(store.jobs);
@@ -109,14 +110,14 @@
                          Hunts only file; engage/harvest jobs can do both
                          (FOLLOW-UPS.json), shown as "F#2010 → F#3474". -->
                     {#if job.finding_id != null}
-                      <a href="#findings:{job.finding_id}" class="finding-link">
+                      <a href={navigation.findingHref(job.finding_id)} class="finding-link">
                         F#{job.finding_id}
                       </a>
                     {/if}
                     {#if produced(job).length > 0}
                       {#if job.finding_id != null}<span class="dim">→</span>{/if}
                       {#each produced(job).slice(0, MAX_PRODUCED_LINKS) as fid (fid)}
-                        <a href="#findings:{fid}" class="finding-link">F#{fid}</a>
+                        <a href={navigation.findingHref(fid)} class="finding-link">F#{fid}</a>
                       {/each}
                       {#if produced(job).length > MAX_PRODUCED_LINKS}
                         <span class="dim" title={produced(job).join(", ")}>
@@ -179,7 +180,7 @@
                   <td class="cell-msg" title={ev.message}>{ev.message}</td>
                   <td class="cell-links">
                     {#if ev.finding_id != null}
-                      <a href="#findings:{ev.finding_id}" class="finding-link">
+                      <a href={navigation.findingHref(ev.finding_id)} class="finding-link">
                         F#{ev.finding_id}
                       </a>
                     {/if}
