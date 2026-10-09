@@ -1,6 +1,6 @@
 <script lang="ts">
   import { store, post } from "../lib/api.svelte";
-  import { ts, countdown, dur, ktok } from "../lib/format";
+  import { ts, clock, countdown, dur, ktok } from "../lib/format";
   import type { NextCandidate } from "../lib/types";
 
   let btnText = $state("Run Cycle");
@@ -171,7 +171,7 @@
         </div>
         {#if nc.budget_retry_at}
           <div class="row dim sub-row">
-            budget available ~{countdown(nc.budget_retry_at)} ({ts(nc.budget_retry_at)})
+            budget available ~{countdown(nc.budget_retry_at)} ({clock(nc.budget_retry_at)})
           </div>
         {/if}
         {#if ss?.next_wake_at}

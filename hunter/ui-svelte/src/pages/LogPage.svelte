@@ -1,7 +1,7 @@
 <script lang="ts">
   import { store } from "../lib/api.svelte";
   import type { JobListEntry } from "../lib/types";
-  import { ts, datetime, ktok, dur } from "../lib/format";
+  import { datetime, ktok, dur } from "../lib/format";
 
   let events = $derived(store.events);
   let jobs = $derived(store.jobs);
@@ -69,54 +69,6 @@
   <div class="page">
     <h2 class="page-title">Log</h2>
 
-    <!-- Recent Events -->
-    <div class="card">
-      <h3 class="section-title">Recent Events</h3>
-      {#if events.length === 0}
-        <p class="empty">No events.</p>
-      {:else}
-        <div class="scroll-wrap">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th class="th-ts">Time</th>
-                <th class="th-kind">Kind</th>
-                <!-- The operator account behind the event; blank for the
-                     scheduler's own. -->
-                <th class="th-by">By</th>
-                <th>Message</th>
-                <th class="th-links right">Links</th>
-              </tr>
-            </thead>
-            <tbody>
-              {#each events as ev (ev.id)}
-                <tr>
-                  <td class="cell-ts">{ts(ev.at)}</td>
-                  <td>
-                    <span class="badge {kindClass(ev.kind)}">
-                      {ev.kind}
-                    </span>
-                  </td>
-                  <td class="dim">{ev.username ?? ""}</td>
-                  <td class="cell-msg" title={ev.message}>{ev.message}</td>
-                  <td class="cell-links">
-                    {#if ev.finding_id != null}
-                      <a href="#findings:{ev.finding_id}" class="finding-link">
-                        F#{ev.finding_id}
-                      </a>
-                    {/if}
-                    {#if ev.job_id != null}
-                      <span class="dim">J#{ev.job_id}</span>
-                    {/if}
-                  </td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
-      {/if}
-    </div>
-
     <!-- Recent Jobs -->
     <div class="card">
       <h3 class="section-title">Recent Jobs</h3>
@@ -143,10 +95,9 @@
               {#each jobs as job (job.id)}
                 <tr>
                   <td class="cell-ts">#{job.id}</td>
-                  <!-- Date and time, not the bare time the events table
-                       above uses: 50 jobs routinely span several days, so
-                       "2:05 PM" alone would be ambiguous. The exact
-                       instant, to the second, is in the tooltip. -->
+                  <!-- Date and time: 50 jobs routinely span several days, so
+                       "2:05 PM" alone would be ambiguous. The exact instant,
+                       to the second, is in the tooltip. -->
                   <td class="cell-started" title={exact(job.started_at)}>
                     {datetime(job.started_at)}
                   </td>
@@ -186,6 +137,56 @@
                   <td class="right mono">{job.calls ?? '–'}</td>
                   <td class="right mono">{dur(job.started_at, job.finished_at)}</td>
                   <td class="dim">{job.model ?? '–'}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+      {/if}
+    </div>
+
+    <!-- Recent Events -->
+    <div class="card">
+      <h3 class="section-title">Recent Events</h3>
+      {#if events.length === 0}
+        <p class="empty">No events.</p>
+      {:else}
+        <div class="scroll-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th class="th-started">Time</th>
+                <th class="th-kind">Kind</th>
+                <!-- The operator account behind the event; blank for the
+                     scheduler's own. -->
+                <th class="th-by">By</th>
+                <th>Message</th>
+                <th class="th-links right">Links</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each events as ev (ev.id)}
+                <tr>
+                  <!-- Date and time, with the exact instant in the tooltip:
+                       the event list spans days, so a bare time is ambiguous. -->
+                  <td class="cell-started" title={exact(ev.at)}>{datetime(ev.at)}</td>
+                  <td>
+                    <span class="badge {kindClass(ev.kind)}">
+                      {ev.kind}
+                    </span>
+                  </td>
+                  <td class="dim">{ev.username ?? ""}</td>
+                  <td class="cell-msg" title={ev.message}>{ev.message}</td>
+                  <td class="cell-links">
+                    {#if ev.finding_id != null}
+                      <a href="#findings:{ev.finding_id}" class="finding-link">
+                        F#{ev.finding_id}
+                      </a>
+                    {/if}
+                    {#if ev.job_id != null}
+                      <span class="dim">J#{ev.job_id}</span>
+                    {/if}
+                  </td>
                 </tr>
               {/each}
             </tbody>
