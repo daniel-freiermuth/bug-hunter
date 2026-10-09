@@ -137,6 +137,40 @@
     }
   }
 
+  // Repos with a re-hunt request in flight: a second click would only
+  // repeat the same write.
+  const rehuntSending = new SvelteSet<number>();
+
+  async function requestRehunt(repo: RepoBrief) {
+    if (rehuntSending.has(repo.id)) return;
+    // Asking again is not a no-op: the new request time outlives a hunt
+    // already running, and makes a request that has had its attempt jump
+    // the queue again. Say so, so it is never a double-click by accident.
+    const question =
+      repo.full_hunt_requested_at === null
+        ? `Queue a full re-hunt of "${repo.name}"? Its next hunt reviews the complete history, not just new commits.`
+        : `A full re-hunt of "${repo.name}" is already queued (since ${datetime(repo.full_hunt_requested_at)}). Queue it again? That asks for a further full pass after any hunt already running, and puts it at the front of the queue.`;
+    if (!confirm(question)) return;
+    rehuntSending.add(repo.id);
+    try {
+      const r = await post("/api/repo/rehunt", { id: repo.id });
+      if (r.ok) {
+        toast(`Full re-hunt queued for ${repo.name}`, true);
+        store.refresh();
+      } else {
+        console.error(
+          `queue re-hunt of ${repo.name} (id ${repo.id}) rejected with HTTP ${r.status}`,
+        );
+        toast(`Failed to queue re-hunt of ${repo.name}`, false);
+      }
+    } catch (err) {
+      console.error(`queue re-hunt of ${repo.name} (id ${repo.id}) failed`, err);
+      toast(`Failed to queue re-hunt of ${repo.name}`, false);
+    } finally {
+      rehuntSending.delete(repo.id);
+    }
+  }
+
   /** Returns true only when the repo was actually created. */
   async function addRepo(): Promise<boolean> {
     if (!newName.trim() || !newUrl.trim()) {
@@ -369,6 +403,14 @@
                   {#if !repo.enabled}
                     <span class="paused-badge">paused</span>
                   {/if}
+                  {#if repo.full_hunt_requested_at !== null}
+                    <span
+                      class="rehunt-badge"
+                      title="Queued {datetime(repo.full_hunt_requested_at)}"
+                    >
+                      full re-hunt queued
+                    </span>
+                  {/if}
                 </div>
                 <div class="repo-meta">
                   {#if isHttpUrl(repo.url)}
@@ -399,6 +441,14 @@
                   aria-label="Notes for {repo.name}"
                 >
                   Notes {expandedNotes.has(repo.id) ? '▾' : '▸'}
+                </button>
+                <button
+                  onclick={() => requestRehunt(repo)}
+                  disabled={rehuntSending.has(repo.id)}
+                  class="rehunt-btn"
+                  aria-label="{repo.full_hunt_requested_at === null ? 'Queue' : 'Re-queue'} a full re-hunt of {repo.name}"
+                >
+                  {repo.full_hunt_requested_at === null ? 'Full re-hunt' : 'Re-queue re-hunt'}
                 </button>
                 <button
                   onclick={() => toggleRepo(repo)}
@@ -714,6 +764,14 @@
     color: var(--stale);
   }
 
+  .rehunt-badge {
+    font-size: 0.625rem;
+    padding: 0.0625rem 0.375rem;
+    border-radius: 99px;
+    background: rgba(88, 166, 255, 0.12);
+    color: var(--accent);
+  }
+
   .repo-meta {
     font-size: 0.6875rem;
     color: var(--text-dim);
@@ -748,6 +806,18 @@
   .notes-btn:hover {
     color: var(--text);
     border-color: var(--border-hover);
+  }
+
+  .rehunt-btn {
+    font-size: 0.6875rem;
+    padding: 0.1875rem 0.625rem;
+    border-radius: var(--radius-sm);
+    color: var(--text-dim);
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .rehunt-btn:hover:not(:disabled) {
+    background: rgba(88, 166, 255, 0.15);
+    color: var(--accent);
   }
 
   .toggle-btn {

@@ -564,3 +564,27 @@ async fn summary_overdrive_prioritizes_candidate_but_keeps_hard_denial() {
     assert_eq!(nc["budget_reason"], "no window data -- deny until fresh");
     assert_eq!(v["activity_status"]["kind"], "paused");
 }
+
+/// A repo with an unanswered full re-hunt request goes first in the
+/// rotation, ahead of a staler repo whose own hunt is due.
+#[tokio::test]
+async fn a_requested_full_rehunt_jumps_a_staler_repo() {
+    let (dir, path, pool) = fresh_db().await;
+    let stale = Ran {
+        hunt: 10.0,
+        ..FRESH
+    };
+    seed_scanned_repo(&pool, 1, "alpha", dir.path(), stale).await;
+    seed_scanned_repo(&pool, 2, "beta", dir.path(), FRESH).await;
+    sqlx::query("UPDATE repos SET full_hunt_requested_at = ?1 WHERE id = 2")
+        .bind(now_ms())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = open_store(pool, &path).await;
+    let cfg = test_config(3600.0);
+
+    let picked = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    assert_eq!(picked.repo_id(), 2);
+    assert_eq!(picked.job_kind(), RepoJobKind::Hunt.into());
+}

@@ -300,9 +300,10 @@ pub async fn pick_next(
         return Ok(Some(c));
     }
 
-    // (7) Repo rotation: enabled repos in staleness order — never-hunted
-    // first, then oldest last_hunt_at first; ties keep list_repos' name
-    // order (Python sorted() and Vec::sort_by_key are both stable).
+    // (7) Repo rotation: enabled repos in staleness order — a repo with an
+    // urgent full re-hunt request first, then never-hunted, then oldest
+    // last_hunt_at first; ties keep list_repos' name order (Python
+    // sorted() and Vec::sort_by_key are both stable).
     let mut repos: Vec<Repo> = store
         .list_repos()
         .await?
@@ -315,60 +316,90 @@ pub async fn pick_next(
             }
         })
         .collect();
-    repos.sort_by_key(|r| (r.last_hunt_at.is_some(), r.last_hunt_at.unwrap_or(0)));
+    repos.sort_by_key(|r| {
+        (
+            !full_hunt_urgent(r),
+            r.last_hunt_at.is_some(),
+            r.last_hunt_at.unwrap_or(0),
+        )
+    });
 
-    let scan_interval_ms = (cfg.scan_interval_days * 86_400_000.0) as i64;
-    let mod_interval_ms = cfg.modernization_interval_days * 86_400_000;
     let now = now_ms();
-
     for target in &repos {
         if !Path::new(&target.path).exists() {
             // Not cloned yet -> hunt does the clone (`scheduler.pick_next`).
             return Ok(Some(repo_candidate(RepoJobKind::Hunt, target)));
         }
 
-        // Eligible job types with their last-run timestamps, in
-        // RepoJobKind::ALL insertion order (mirrors Python's dict).
-        let mut job_times: Vec<(RepoJobKind, i64)> = Vec::with_capacity(RepoJobKind::ALL.len());
-        for (kind, last) in [
-            (RepoJobKind::Hunt, target.last_hunt_at),
-            (RepoJobKind::TestGap, target.last_test_gap_at),
-            (RepoJobKind::DepUpdate, target.last_dep_update_at),
-            (RepoJobKind::Refactor, target.last_refactor_at),
-        ] {
-            let last = last.unwrap_or(0);
-            if last == 0 || (now - last) >= scan_interval_ms {
-                job_times.push((kind, last));
-            }
-        }
-        let last_modernization = target.last_modernization_at.unwrap_or(0);
-        if last_modernization == 0 || (now - last_modernization) >= mod_interval_ms {
-            job_times.push((RepoJobKind::Modernization, last_modernization));
-        }
-        let last_standards = target.last_standards_at.unwrap_or(0);
-        let std_interval_ms = cfg.standards_interval_days * 86_400_000;
-        if last_standards == 0 || (now - last_standards) >= std_interval_ms {
-            job_times.push((RepoJobKind::Standards, last_standards));
+        // An operator asked for a full re-hunt: that hunt goes ahead of
+        // the repo's other scans and of the scan interval.
+        if full_hunt_urgent(target) {
+            return Ok(Some(repo_candidate(RepoJobKind::Hunt, target)));
         }
 
-        if job_times.is_empty() {
-            continue; // all scan types ran within their intervals for this repo
+        if let Some(kind) = rotation_kind(cfg, target, now) {
+            return Ok(Some(repo_candidate(kind, target)));
         }
-
-        // never-run beats stale-run; both tie-break on JOB_TYPE_PRIORITY,
-        // which is job_times' insertion order (Python: next() over
-        // _JOB_TYPE_PRIORITY, resp. min() first-wins in insertion order —
-        // Iterator::min_by_key also returns the FIRST minimal element).
-        let picked = job_times
-            .iter()
-            .find(|&&(_, last)| last == 0)
-            .or_else(|| job_times.iter().min_by_key(|&&(_, last)| last));
-        if let Some(&(job_type, _)) = picked {
-            return Ok(Some(repo_candidate(job_type, target)));
-        }
+        // All scan types ran within their intervals for this repo.
     }
 
     Ok(None)
+}
+
+/// The rotation scan `target` is due for at `now`, if any.
+fn rotation_kind(cfg: &Config, target: &Repo, now: i64) -> Option<RepoJobKind> {
+    let scan_interval_ms = (cfg.scan_interval_days * 86_400_000.0) as i64;
+    let mod_interval_ms = cfg.modernization_interval_days * 86_400_000;
+
+    // Eligible job types with their last-run timestamps, in
+    // RepoJobKind::ALL insertion order (mirrors Python's dict).
+    let mut job_times: Vec<(RepoJobKind, i64)> = Vec::with_capacity(RepoJobKind::ALL.len());
+    for (kind, last) in [
+        (RepoJobKind::Hunt, target.last_hunt_at),
+        (RepoJobKind::TestGap, target.last_test_gap_at),
+        (RepoJobKind::DepUpdate, target.last_dep_update_at),
+        (RepoJobKind::Refactor, target.last_refactor_at),
+    ] {
+        let last = last.unwrap_or(0);
+        if last == 0 || (now - last) >= scan_interval_ms {
+            job_times.push((kind, last));
+        }
+    }
+    let last_modernization = target.last_modernization_at.unwrap_or(0);
+    if last_modernization == 0 || (now - last_modernization) >= mod_interval_ms {
+        job_times.push((RepoJobKind::Modernization, last_modernization));
+    }
+    let last_standards = target.last_standards_at.unwrap_or(0);
+    let std_interval_ms = cfg.standards_interval_days * 86_400_000;
+    if last_standards == 0 || (now - last_standards) >= std_interval_ms {
+        job_times.push((RepoJobKind::Standards, last_standards));
+    }
+
+    // never-run beats stale-run; both tie-break on JOB_TYPE_PRIORITY,
+    // which is job_times' insertion order (Python: next() over
+    // _JOB_TYPE_PRIORITY, resp. min() first-wins in insertion order —
+    // Iterator::min_by_key also returns the FIRST minimal element).
+    job_times
+        .iter()
+        .find(|&&(_, last)| last == 0)
+        .or_else(|| job_times.iter().min_by_key(|&&(_, last)| last))
+        .map(|&(kind, _)| kind)
+}
+
+/// Whether `repo` has a full re-hunt request that no hunt has started to
+/// answer yet.
+///
+/// Answered by identity, not by time: a hunt records the request it read
+/// (`full_hunt_request_attempted`) once it has attempted it, so neither a
+/// hunt already running when the request landed nor one prepared from a
+/// repo row read before it takes the request's place in the queue. Once a
+/// hunt has attempted the request, it stops jumping the queue — a failing
+/// hunt is retried after the scan interval, not back to back — but stays
+/// pending, so the repo's next hunt is still a full one. Asking again
+/// makes it urgent again.
+fn full_hunt_urgent(repo: &Repo) -> bool {
+    repo.full_hunt_requested_at.is_some()
+        && repo.full_hunt_requested_at != repo.full_hunt_request_attempted
 }
 
 // ---------------------------------------------------------------------------
@@ -1284,6 +1315,31 @@ async fn retire_concluded(store: &Store, job: i64, outcome: &str) {
         .await;
 }
 
+/// Fetch `repo`'s clone and return the tip of its default branch: where a
+/// cold hunt's chain is pinned.
+async fn fetch_tip(store: &Store, repo: &Repo) -> anyhow::Result<String> {
+    let rname = &repo.name;
+    let db = &repo.default_branch;
+    let rpath = PathBuf::from(&repo.path);
+    sync_repo(store, &repo.url, &rpath, &format!("hunt {rname}"), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rev = format!("origin/{db}");
+    let tip = tokio::task::spawn_blocking(move || crate::workspace::resolve(&rpath, &rev)).await?;
+    let Some(tip) = tip else {
+        let _ = store
+            .log_event(
+                "error",
+                &format!("hunt {rname}: origin/{db} does not resolve"),
+                None,
+                None,
+            )
+            .await;
+        anyhow::bail!("origin/{db} does not resolve");
+    };
+    Ok(tip)
+}
+
 /// Run a hunt job (`scheduler.run_hunt`).
 ///
 /// `resume` continues a suspended attempt: no sync, the diff range ending
@@ -1311,7 +1367,9 @@ pub async fn run_hunt(
     let rid = repo.id;
     let rname = &repo.name;
     let rpath = PathBuf::from(&repo.path);
-    let db = &repo.default_branch;
+    // The full re-hunt request this hunt answers, if one was pending when
+    // the repo row was read; a request landing after that is another hunt's.
+    let request = repo.full_hunt_requested_at;
 
     // The commit this chain reviews up to. Cold: the freshly fetched tip
     // of the default branch, which the chain's tree is created at below.
@@ -1324,25 +1382,18 @@ pub async fn run_hunt(
     let head = if let Some(plan) = resume {
         plan.pinned_sha.clone()
     } else {
-        sync_repo(store, &repo.url, &rpath, &format!("hunt {rname}"), None)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let clone = rpath.clone();
-        let rev = format!("origin/{db}");
-        let tip =
-            tokio::task::spawn_blocking(move || crate::workspace::resolve(&clone, &rev)).await?;
-        let Some(tip) = tip else {
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!("hunt {rname}: origin/{db} does not resolve"),
-                    None,
-                    None,
-                )
-                .await;
-            anyhow::bail!("origin/{db} does not resolve");
-        };
-        tip
+        match fetch_tip(store, repo).await {
+            Ok(tip) => tip,
+            Err(e) => {
+                // The attempt is over before it had a job. It still answers
+                // the request's place in the queue, or a fetch that keeps
+                // failing would put this hunt first in every cycle.
+                if let Some(r) = request {
+                    let _ = store.mark_full_hunt_attempted(rid, r).await;
+                }
+                return Err(e);
+            }
+        }
     };
     let rp_str = rpath.to_string_lossy().to_string();
 
@@ -1351,22 +1402,32 @@ pub async fn run_hunt(
         .as_deref()
         .map(std::borrow::ToOwned::to_owned);
     let last_full = repo.last_full_hunt_at;
+    let requested = request.is_some();
     let rehunt_interval_ms = cfg.hunt_rehunt_days * 86_400_000;
     // Both of the decisions below answer "should this work START", and
     // on a resume that question was settled in an earlier cycle. Firing
-    // the periodic full re-hunt here would re-scope work already in
-    // flight, and the no-new-commits skip would abandon a live session.
-    let rehunt_due =
-        resume.is_none() && last_full.is_some_and(|lf| (now_ms() - lf) > rehunt_interval_ms);
+    // a full re-hunt here — periodic or requested — would re-scope work
+    // already in flight, and the no-new-commits skip would abandon a live
+    // session.
+    //
+    // Due once the interval has passed, `>=` like the rotation's own
+    // intervals (`rotation_kind`). The two differ only in the one
+    // millisecond where the elapsed time equals the interval, which no
+    // test can hit, so a strict `>` here is a surviving mutant rather
+    // than a decision.
+    let rehunt_due = resume.is_none()
+        && (requested || last_full.is_some_and(|lf| (now_ms() - lf) >= rehunt_interval_ms));
     let last = if rehunt_due {
         let _ = store.clear_last_hunt_sha(rid).await;
+        let why = if requested {
+            "requested".to_owned()
+        } else {
+            format!("{}d interval", cfg.hunt_rehunt_days)
+        };
         let _ = store
             .log_event(
                 "hunt",
-                &format!(
-                    "{rname}: full re-hunt triggered ({}d interval)",
-                    cfg.hunt_rehunt_days
-                ),
+                &format!("{rname}: full re-hunt triggered ({why})"),
                 None,
                 None,
             )
@@ -1375,13 +1436,19 @@ pub async fn run_hunt(
     } else {
         last
     };
-    // Whether this chain reviews the complete history. A resume keeps the
-    // scope its chain started with, and starting a full re-hunt is the
-    // only thing that clears the watermark of a repo that has had a full
-    // hunt — so a resume finding none there is continuing one, and has to
-    // record it as such when it finishes, or the next cold hunt starts the
-    // same full re-hunt over again.
-    let full_scope = rehunt_due || (resume.is_some() && last.is_none() && last_full.is_some());
+    // A resume keeps the scope its chain started with, which the chain's
+    // jobs carry (`full_history`): the repo row that decided it may have
+    // changed since. For a chain from before that column: starting a full
+    // re-hunt is the only thing that clears the watermark of a repo that
+    // has had a full hunt, so a resume finding none there is continuing
+    // one.
+    let resumed_full = match resume {
+        Some(plan) => {
+            store.job_full_history(plan.predecessor_id).await?
+                || (last.is_none() && last_full.is_some())
+        }
+        None => false,
+    };
     if resume.is_none() && last.as_deref() == Some(&head) {
         // The watermark is what makes the next pick move on; a skip that
         // failed to record it would be re-picked at once (a skipped cycle
@@ -1414,11 +1481,12 @@ pub async fn run_hunt(
                 &l[..12.min(l.len())]
             ),
         )
-    } else if full_scope {
+    } else if rehunt_due || resumed_full {
         // Full re-hunt: complete history including root commit
+        let why = if requested { "Requested" } else { "Periodic" };
         (
             format!("{EMPTY_TREE}..{head}"),
-            "Periodic full re-hunt: complete history including root commit.".to_owned(),
+            format!("{why} full re-hunt: complete history including root commit."),
         )
     } else {
         // First hunt: last 3 weeks or 30 commits (bounded)
@@ -1475,6 +1543,12 @@ pub async fn run_hunt(
             )
         }
     };
+    // Whether this chain reviews the complete history — a full re-hunt, or
+    // the first hunt of a repo small enough to take whole. Such a chain
+    // records a full hunt when it finishes and answers a full re-hunt
+    // request; failing to record it would start the same full pass over
+    // again on the next cold hunt.
+    let full_scope = diff_range.starts_with(EMPTY_TREE);
 
     let (cap, anticipated) = match budget_gate(
         backend,
@@ -1509,6 +1583,18 @@ pub async fn run_hunt(
         Err(e) => return job_refused(RepoJobKind::Hunt.into(), Some(rname), None, e),
     };
     let job = created.id;
+    if resume.is_none() {
+        if full_scope {
+            // Before the worker runs, so a suspension carries it to the
+            // resume. Best-effort like the job's other bookkeeping: a
+            // resume that cannot read it falls back to the watermark
+            // heuristic, and the request stays pending for another pass.
+            let _ = store.mark_full_history(job, request).await;
+        }
+        if let Some(r) = request {
+            let _ = store.mark_full_hunt_attempted(rid, r).await;
+        }
+    }
     let (ws, pinned) = match open_workspace(
         store,
         cfg,
@@ -1618,6 +1704,9 @@ pub async fn run_hunt(
             let _ = store.set_last_hunt(rid, &pinned).await;
             if full_scope || last_full.is_none() {
                 let _ = store.set_last_full_hunt(rid).await;
+            }
+            if full_scope {
+                let _ = store.settle_full_hunt_request(rid, job).await;
             }
         }
         summary.ingest = Some(counts);

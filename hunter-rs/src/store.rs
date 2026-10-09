@@ -1119,7 +1119,8 @@ impl Store {
             SELECT id, name, url, path, forge AS "forge: ForgeName", default_branch, last_hunt_sha,
                    last_hunt_at, enabled, added_at, last_full_hunt_at,
                    last_test_gap_at, last_dep_update_at, last_refactor_at,
-                   last_modernization_at, last_standards_at
+                   last_modernization_at, last_standards_at, full_hunt_requested_at,
+                   full_hunt_request_attempted
             FROM repos
             WHERE deleted_at IS NULL
             ORDER BY name
@@ -1136,7 +1137,8 @@ impl Store {
             SELECT id, name, url, path, forge AS "forge: ForgeName", default_branch, last_hunt_sha,
                    last_hunt_at, enabled, added_at, last_full_hunt_at,
                    last_test_gap_at, last_dep_update_at, last_refactor_at,
-                   last_modernization_at, last_standards_at
+                   last_modernization_at, last_standards_at, full_hunt_requested_at,
+                   full_hunt_request_attempted
             FROM repos
             WHERE id = ?1 AND deleted_at IS NULL
             "#,
@@ -1153,7 +1155,8 @@ impl Store {
             SELECT id, name, url, path, forge AS "forge: ForgeName", default_branch, last_hunt_sha,
                    last_hunt_at, enabled, added_at, last_full_hunt_at,
                    last_test_gap_at, last_dep_update_at, last_refactor_at,
-                   last_modernization_at, last_standards_at
+                   last_modernization_at, last_standards_at, full_hunt_requested_at,
+                   full_hunt_request_attempted
             FROM repos
             WHERE name = ?1 AND deleted_at IS NULL
             "#,
@@ -2029,10 +2032,12 @@ impl Store {
         let result = sqlx::query!(
             "INSERT INTO jobs \
              (kind, repo_id, finding_id, cap_tokens, state, started_at, estimated_tokens, \
-              resumed_from, pinned_sha, blocker) \
+              resumed_from, pinned_sha, blocker, full_history, full_hunt_request) \
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, \
                     (SELECT p.pinned_sha FROM jobs p WHERE p.id = ?8), \
-                    (SELECT p.blocker FROM jobs p WHERE p.id = ?8) \
+                    (SELECT p.blocker FROM jobs p WHERE p.id = ?8), \
+                    COALESCE((SELECT p.full_history FROM jobs p WHERE p.id = ?8), 0), \
+                    (SELECT p.full_hunt_request FROM jobs p WHERE p.id = ?8) \
              WHERE EXISTS (SELECT 1 FROM repos WHERE id = ?2 AND deleted_at IS NULL)",
             kind,
             repo_id,
@@ -2336,6 +2341,91 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Record an operator's request for a full re-hunt of `repo_id`, as of
+    /// now. A pending request is replaced, so asking again while a chain
+    /// is under way queues another full pass rather than being absorbed
+    /// by the one in flight. False if the repo is gone.
+    ///
+    /// The value identifies the request — hunts record which one they
+    /// accepted and attempted, and compare by equality — so it must never
+    /// repeat: it is the time of the request, or one past the last value
+    /// this repo issued or a hunt attempted if that is not already later.
+    /// Two requests in the same millisecond would otherwise share a value,
+    /// and a hunt that read the first would count the second as answered.
+    /// One statement, so concurrent requests serialize on the row.
+    pub async fn request_full_hunt(&self, repo_id: i64) -> sqlx::Result<bool> {
+        let now = now_ms();
+        let result = sqlx::query!(
+            "UPDATE repos SET full_hunt_requested_at = MAX( \
+                 ?1, \
+                 COALESCE(full_hunt_requested_at, 0) + 1, \
+                 COALESCE(full_hunt_request_attempted, 0) + 1) \
+             WHERE id = ?2 AND deleted_at IS NULL",
+            now,
+            repo_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Record that a hunt has started to answer `request` (a
+    /// `full_hunt_requested_at` value), so that request no longer jumps
+    /// the rotation.
+    pub async fn mark_full_hunt_attempted(&self, repo_id: i64, request: i64) -> sqlx::Result<()> {
+        sqlx::query!(
+            "UPDATE repos SET full_hunt_request_attempted = ?1 WHERE id = ?2",
+            request,
+            repo_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Settle the pending full re-hunt request with the full-history hunt
+    /// chain that `job_id` belongs to, which has just finished — but only
+    /// if it is the request that chain accepted. One made since asked for
+    /// a pass over a tree this chain had already pinned, and stays pending.
+    pub async fn settle_full_hunt_request(&self, repo_id: i64, job_id: i64) -> sqlx::Result<()> {
+        sqlx::query!(
+            "UPDATE repos SET full_hunt_requested_at = NULL \
+             WHERE id = ?1 \
+               AND full_hunt_requested_at = \
+                   (SELECT full_hunt_request FROM jobs WHERE id = ?2)",
+            repo_id,
+            job_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record that hunt job `job_id` starts a chain over the repo's
+    /// complete history, answering `request` if one was pending; every
+    /// resume of the chain inherits both.
+    pub async fn mark_full_history(&self, job_id: i64, request: Option<i64>) -> sqlx::Result<()> {
+        sqlx::query!(
+            "UPDATE jobs SET full_history = 1, full_hunt_request = ?1 WHERE id = ?2",
+            request,
+            job_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether job `job_id`'s chain reviews the complete history.
+    pub async fn job_full_history(&self, job_id: i64) -> sqlx::Result<bool> {
+        Ok(sqlx::query_scalar!(
+            r#"SELECT full_history AS "full_history: bool" FROM jobs WHERE id = ?1"#,
+            job_id
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .unwrap_or(false))
     }
 
     /// Targeted query for `anticipated_tokens`: is there a warm (non-denied,

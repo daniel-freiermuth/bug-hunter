@@ -39,7 +39,8 @@ pub enum BudgetState {
 // never SELECT *: the live DB carries residual columns absent from dev.db).
 // ---------------------------------------------------------------------------
 
-/// repos row, all 16 columns (10 base + 6 migration-added last_*_at).
+/// repos row, all 18 columns (10 base + 6 migration-added last_*_at +
+/// the two full re-hunt request columns of migration 020).
 /// Served verbatim by /api/repos; /api/summary uses `RepoBrief` instead.
 #[derive(Debug, Clone, Serialize)]
 pub struct Repo {
@@ -59,10 +60,15 @@ pub struct Repo {
     pub last_refactor_at: Option<i64>,
     pub last_modernization_at: Option<i64>,
     pub last_standards_at: Option<i64>,
+    /// A pending operator request for a full re-hunt (migration 020).
+    pub full_hunt_requested_at: Option<i64>,
+    /// The request a hunt last started to answer (migration 020).
+    pub full_hunt_request_attempted: Option<i64>,
 }
 
-/// The 10-key repo object inside /api/summary (pydantic strips the 6
-/// migration columns there). The client does NOT require exactly these
+/// The 11-key repo object inside /api/summary (the 10 base columns plus
+/// `full_hunt_requested_at`, which the Repos page shows as a queued
+/// re-hunt). The client does NOT require exactly these
 /// keys -- `isKeyedList` checks `id` is a number and the components read
 /// `url`, `added_at` and `name` off every entry, so extra keys pass and a
 /// missing one of those four blanks the page (validate.ts:83-96).
@@ -78,6 +84,7 @@ pub struct RepoBrief {
     pub last_hunt_at: Option<i64>,
     pub enabled: i64,
     pub added_at: i64,
+    pub full_hunt_requested_at: Option<i64>,
 }
 
 impl From<&Repo> for RepoBrief {
@@ -93,6 +100,7 @@ impl From<&Repo> for RepoBrief {
             last_hunt_at: r.last_hunt_at,
             enabled: r.enabled,
             added_at: r.added_at,
+            full_hunt_requested_at: r.full_hunt_requested_at,
         }
     }
 }
