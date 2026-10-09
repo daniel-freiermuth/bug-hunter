@@ -20,8 +20,8 @@ const rootByParent = new WeakMap<Element, Element | null>();
  *
  * The observer has to use it as its root: `rootMargin` widens only the
  * root's box, while every scroll container in between clips at its own
- * edge. Against the viewport, an item inside a scrolling `<main>` would get
- * no margin at all and render blank for a frame as it scrolled in.
+ * edge. Against the viewport, an item inside a scrolling page container
+ * would get no margin at all and render blank for a frame as it scrolled in.
  * Overflowing is part of the test because `overflow-x: auto` computes
  * `overflow-y` to `auto` as well (Kanban's swipeable board on mobile),
  * without that element ever scrolling vertically.
