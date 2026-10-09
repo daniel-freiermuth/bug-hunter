@@ -1,6 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { isHttpUrl } from "./format";
+import { clock, datetime, isHttpUrl, ts } from "./format";
 
 /**
  * Repo URLs are operator-supplied and rendered as links. Only http(s)
@@ -27,5 +27,42 @@ describe("isHttpUrl", () => {
   it("shows an ssh clone URL as text rather than a link", () => {
     // Not dangerous, but not navigable either.
     expect(isHttpUrl("git@github.com:acme/widget.git")).toBe(false);
+  });
+});
+
+/**
+ * The budget ETA is read at a glance: a bare "8:00 AM" that is really
+ * tomorrow's reads as a few hours away. The date goes in exactly when the
+ * instant is not on today's local calendar date, however close it is.
+ */
+describe("clock", () => {
+  // Local-time constructors, so the boundary is local midnight in any TZ.
+  const now = new Date(2026, 9, 9, 23, 58).getTime();
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(now);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows only the time for the last minute of today", () => {
+    const t = new Date(2026, 9, 9, 23, 59).getTime();
+    expect(clock(t)).toBe(ts(t));
+  });
+
+  it("dates the first minute of tomorrow", () => {
+    const t = new Date(2026, 9, 10, 0, 0).getTime();
+    expect(clock(t)).toBe(datetime(t));
+  });
+
+  it("dates the same clock time on another day", () => {
+    const t = new Date(2026, 9, 10, 23, 58).getTime();
+    expect(clock(t)).toBe(datetime(t));
+  });
+
+  it("shows a dash when there is no instant", () => {
+    expect(clock(null)).toBe("\u2013");
   });
 });
