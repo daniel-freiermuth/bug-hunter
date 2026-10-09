@@ -711,37 +711,45 @@ async fn a_cold_job_fetches_the_clone_but_never_moves_its_checkout() {
 /// A fix whose worker concluded before the cap stopped it — here it left
 /// its verdict — is retired rather than left `suspended`: the finding is
 /// no longer queued, so nothing could ever resume it, and a suspension
-/// kept around would pin its tree and be offered every cycle.
+/// kept around would pin its tree and be offered every cycle. Every
+/// status a decline can land at counts, not only `rejected`.
 #[tokio::test]
 async fn a_suspended_fix_whose_work_concluded_is_retired_and_released() {
-    let f = fixture("ws-fix-concluded", "main").await;
-    let fid = queued_finding(&f.store).await;
-    let finding = f.store.get_finding(fid).await.unwrap().unwrap();
-    let concluded = ScriptedBackend::new(|tree| {
-        std::fs::write(
-            tree.join("NOT-A-BUG.md"),
-            "Classification: wrong\nmisread the code",
-        )
-        .unwrap();
-        suspended_at_cap(&tree.parent().unwrap().join("session"))
-    });
+    for (report, outcome) in [
+        ("Classification: wrong\nmisread the code", "rejected"),
+        ("Classification: superseded\nfixed by abc1234", "superseded"),
+        ("Classification: unwanted\nCI pins Node 24", "wontfix"),
+        ("misread the code", "new"),
+    ] {
+        let f = fixture("ws-fix-concluded", "main").await;
+        let fid = queued_finding(&f.store).await;
+        let finding = f.store.get_finding(fid).await.unwrap().unwrap();
+        let concluded = ScriptedBackend::new(move |tree| {
+            std::fs::write(tree.join("NOT-A-BUG.md"), report).unwrap();
+            suspended_at_cap(&tree.parent().unwrap().join("session"))
+        });
 
-    let summary = run_fix(&f.store, &f.cfg, &finding, &concluded, None)
-        .await
-        .unwrap();
+        let summary = run_fix(&f.store, &f.cfg, &finding, &concluded, None)
+            .await
+            .unwrap();
 
-    assert_eq!(summary.outcome.as_deref(), Some("rejected"));
-    let job = summary.job_id.unwrap();
-    assert_eq!(job_state(&f.pool, job).await.0, "killed");
-    assert!(f.store.list_resumable_jobs().await.unwrap().is_empty());
-    assert!(
-        !f.cfg
-            .work_root
-            .join("jobs")
-            .join(job.to_string())
-            .join("tree")
-            .exists()
-    );
+        assert_eq!(summary.outcome.as_deref(), Some(outcome));
+        let job = summary.job_id.unwrap();
+        assert_eq!(job_state(&f.pool, job).await.0, "killed", "{outcome}");
+        assert!(
+            f.store.list_resumable_jobs().await.unwrap().is_empty(),
+            "{outcome}"
+        );
+        assert!(
+            !f.cfg
+                .work_root
+                .join("jobs")
+                .join(job.to_string())
+                .join("tree")
+                .exists(),
+            "{outcome}"
+        );
+    }
 }
 
 // -- harvest keeps a suspended tree ------------------------------------------
