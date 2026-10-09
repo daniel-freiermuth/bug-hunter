@@ -10,6 +10,7 @@
   import StatsPage from "./pages/StatsPage.svelte";
   import LogPage from "./pages/LogPage.svelte";
   import Login from "./components/Login.svelte";
+  import Toasts from "./components/Toasts.svelte";
   import "./app.css";
 
   const NAV = [
@@ -179,6 +180,7 @@
     {/key}
   </main>
 </div>
+<Toasts />
 {/if}
 
 <style>
