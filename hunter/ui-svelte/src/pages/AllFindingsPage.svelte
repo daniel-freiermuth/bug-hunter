@@ -7,7 +7,7 @@
   let { focusId = null }: { focusId?: number | null } = $props();
 
   let displayed = $state<FindingOut[]>([]);
-  let filterBar: { clearFilters: () => void } | undefined = $state();
+  let filterBar: { reveal: (finding: FindingOut) => void } | undefined = $state();
   const repoNames = $derived(new Map((store.summary?.repos ?? []).map((r) => [r.id, r.name])));
 
   // Frames the focused card must hold still before the jump counts as done,
@@ -18,7 +18,7 @@
   $effect(() => {
     if (focusId == null) return;
     const target = `finding-${focusId}`;
-    let clearedFilters = false;
+    let revealed = false;
     let highlighted: HTMLElement | null = null;
     let frame = 0;
 
@@ -54,9 +54,10 @@
         return;
       }
       // Finding exists in data but not rendered → filters are hiding it.
-      if (!clearedFilters && store.findings.some((f) => f.id === focusId)) {
-        clearedFilters = true;
-        filterBar?.clearFilters();
+      const finding = revealed ? undefined : store.findings.find((f) => f.id === focusId);
+      if (finding) {
+        revealed = true;
+        filterBar?.reveal(finding);
       }
     }, 50);
     const giveUp = setTimeout(() => clearInterval(interval), 5000);
