@@ -18,6 +18,12 @@ export function parseHash(hash: string): { page: string; focusId: number | null;
 /** Hash routes remain the source of truth, including same-page Back/Forward. */
 class Navigation {
   hash = $state(typeof window === "undefined" ? "" : window.location.hash);
+  /**
+   * The current history entry. Two entries can share a URL, so code that
+   * must run once per entry (restoring its scroll position, placing its
+   * focused finding) follows this rather than `hash`.
+   */
+  entry = $state(typeof window === "undefined" ? "" : (window.navigation?.currentEntry?.key ?? ""));
 
   get route() {
     return parseHash(this.hash);
@@ -36,6 +42,7 @@ class Navigation {
   /** Restore the current browser entry after hash navigation or Back/Forward. */
   sync(): void {
     this.hash = window.location.hash;
+    this.entry = window.navigation.currentEntry?.key ?? "";
   }
 
   /** Open a page as a new history entry, clearing filters belonging to the old page. */
@@ -67,7 +74,7 @@ class Navigation {
     if (window.location.hash === hash) return;
     if (replace) window.history.replaceState(null, "", hash);
     else window.history.pushState(null, "", hash);
-    this.hash = window.location.hash;
+    this.sync();
   }
 }
 

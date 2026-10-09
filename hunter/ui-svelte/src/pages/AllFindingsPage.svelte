@@ -4,6 +4,7 @@
   import { filterFindings, hidingParams, type FilterScope } from "../lib/findingFilter";
   import { toast } from "../lib/toast.svelte";
   import { placeAtTop, settle } from "../lib/scroll";
+  import * as scrollMemory from "../lib/scrollMemory";
   import FilterBar from "../components/FilterBar.svelte";
   import FindingCard from "../components/FindingCard.svelte";
 
@@ -22,11 +23,17 @@
 
   $effect(() => {
     const id = focusId;
-    const entry = window.navigation.currentEntry?.key ?? null;
+    const entry = navigation.entry;
     // A jump still pending for another entry (one that cannot complete,
     // like a short list's last card) must not move this one.
     if (entry !== placedEntry) cancelPlace();
     if (id == null || entry === placedEntry) return;
+    // Back, Forward and reload return to where the user had scrolled (App
+    // restores it), not to the finding the link named.
+    if (scrollMemory.saved()) {
+      placedEntry = entry;
+      return;
+    }
     // Nothing to decide until the first poll has landed; summary and
     // findings arrive together.
     if (store.summary === null) return;
@@ -80,7 +87,7 @@
       <p class="empty-sub">No findings match the current filters. Try broadening your criteria.</p>
     </div>
   {:else}
-    <div class="card-list">
+    <div class="card-list" data-scroll-list>
       {#each displayed as finding (finding.id)}
         <FindingCard {finding} actions={true} focused={finding.id === focusId} />
       {/each}

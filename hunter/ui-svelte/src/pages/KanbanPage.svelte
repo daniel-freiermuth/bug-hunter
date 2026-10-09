@@ -98,7 +98,7 @@
     repoNames={repoNames}
   />
 
-  <div class="board">
+  <div class="board" data-scroll-x="board">
     {#each columns as col (col.label)}
       <div class="column">
         <div class="col-header">
@@ -111,7 +111,7 @@
         {#if col.findings.length === 0}
           <p class="col-empty">—</p>
         {:else}
-          <div class="col-cards">
+          <div class="col-cards" data-scroll-list={col.label}>
             {#each col.findings as finding (finding.id)}
               <FindingCard {finding} actions={false} />
             {/each}
@@ -131,7 +131,7 @@
       {#if blocked.length === 0}
         <p class="blocked-help">No blocked findings match the current filters.</p>
       {:else}
-        <div class="section-body">
+        <div class="section-body" data-scroll-list="blocked">
           {#each blocked as finding (finding.id)}
             <FindingCard {finding} actions={true} />
           {/each}
