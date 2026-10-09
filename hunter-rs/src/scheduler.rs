@@ -1358,7 +1358,6 @@ pub async fn run_hunt(
     // flight, and the no-new-commits skip would abandon a live session.
     let rehunt_due =
         resume.is_none() && last_full.is_some_and(|lf| (now_ms() - lf) > rehunt_interval_ms);
-    let mut full_rehunt_triggered = false;
     let last = if rehunt_due {
         let _ = store.clear_last_hunt_sha(rid).await;
         let _ = store
@@ -1372,11 +1371,17 @@ pub async fn run_hunt(
                 None,
             )
             .await;
-        full_rehunt_triggered = true;
         None
     } else {
         last
     };
+    // Whether this chain reviews the complete history. A resume keeps the
+    // scope its chain started with, and starting a full re-hunt is the
+    // only thing that clears the watermark of a repo that has had a full
+    // hunt — so a resume finding none there is continuing one, and has to
+    // record it as such when it finishes, or the next cold hunt starts the
+    // same full re-hunt over again.
+    let full_scope = rehunt_due || (resume.is_some() && last.is_none() && last_full.is_some());
     if resume.is_none() && last.as_deref() == Some(&head) {
         // The watermark is what makes the next pick move on; a skip that
         // failed to record it would be re-picked at once (a skipped cycle
@@ -1409,7 +1414,7 @@ pub async fn run_hunt(
                 &l[..12.min(l.len())]
             ),
         )
-    } else if full_rehunt_triggered {
+    } else if full_scope {
         // Full re-hunt: complete history including root commit
         (
             format!("{EMPTY_TREE}..{head}"),
@@ -1578,7 +1583,7 @@ pub async fn run_hunt(
         diff_range: Some(diff_range.clone()),
         tokens_new: Some(rr.tokens_new),
         head: Some(head.clone()),
-        full_rehunt: Some(full_rehunt_triggered),
+        full_rehunt: Some(full_scope),
         ..Default::default()
     };
 
@@ -1611,7 +1616,7 @@ pub async fn run_hunt(
             // The chain's pinned commit, never the clone's current tip:
             // see where `head` is resolved.
             let _ = store.set_last_hunt(rid, &pinned).await;
-            if full_rehunt_triggered || last_full.is_none() {
+            if full_scope || last_full.is_none() {
                 let _ = store.set_last_full_hunt(rid).await;
             }
         }
