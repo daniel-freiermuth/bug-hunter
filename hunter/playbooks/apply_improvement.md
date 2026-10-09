@@ -149,10 +149,14 @@ OR if not actionable:
 
 - **DECLINED.md**: Why the improvement isn't worth doing (already covered, too
   risky, not valuable enough, dependency pinned for compatibility), with the
-  verification command + output backing any factual claim
+  verification command + output backing any factual claim, classified as
+  below
 - **BLOCKED.md**: What's blocking you (patch conflicts, missing arch decisions,
   a verified incompatibility needing human review) with exactly what is
   needed to unblock, and the verification command + output for the claim
+
+## Classifying DECLINED.md
+{{DECLINE_CLASSIFICATION}}
 
 # Improvement-specific guidance
 

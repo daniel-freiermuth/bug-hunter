@@ -524,7 +524,8 @@ async fn a_fresh_fix_superseding_a_suspended_fix_takes_over_its_branch() {
     assert!(old_tree.is_dir());
 
     let finding = f.store.get_finding(fid).await.unwrap().unwrap();
-    let declining = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code");
+    let declining =
+        ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
     let fresh = run_fix(&f.store, &f.cfg, &finding, &declining, None)
         .await
         .unwrap();
@@ -717,7 +718,11 @@ async fn a_suspended_fix_whose_work_concluded_is_retired_and_released() {
     let fid = queued_finding(&f.store).await;
     let finding = f.store.get_finding(fid).await.unwrap().unwrap();
     let concluded = ScriptedBackend::new(|tree| {
-        std::fs::write(tree.join("NOT-A-BUG.md"), "misread the code").unwrap();
+        std::fs::write(
+            tree.join("NOT-A-BUG.md"),
+            "Classification: wrong\nmisread the code",
+        )
+        .unwrap();
         suspended_at_cap(&tree.parent().unwrap().join("session"))
     });
 

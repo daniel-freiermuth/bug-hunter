@@ -164,8 +164,10 @@ impl std::str::FromStr for BudgetOverride {
 // Why a pull request closed without merging
 // ---------------------------------------------------------------------------
 
-/// The closed-PR harvest's verdict on why a PR closed unmerged
-/// (`CLOSE-REASON.json`'s `classification`).
+/// Why a finding's work ended without a merge: the closed-PR harvest's
+/// verdict on a PR closed unmerged (`CLOSE-REASON.json`'s
+/// `classification`), and a fix worker's on a finding it declined (the
+/// first line of `NOT-A-BUG.md` / `DECLINED.md`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClosureClass {
     Superseded,

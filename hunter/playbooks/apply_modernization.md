@@ -97,7 +97,9 @@ step 1, not the original hunt-time claim restated.
 OR if re-verification showed the premise no longer holds:
 
 - **DECLINED.md**: what you re-verified and why it is no longer worth pursuing, with the
-  verification command/output backing the claim
+  verification command/output backing the claim, classified as follows:
+
+{{DECLINE_CLASSIFICATION}}
 
 # What this is not
 

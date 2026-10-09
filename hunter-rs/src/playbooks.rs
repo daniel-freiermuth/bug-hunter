@@ -284,6 +284,32 @@ pub fn build_hunt_prompt(
     render(&template, &slots)
 }
 
+/// How a fix worker classifies a decline (`NOT-A-BUG.md` / `DECLINED.md`),
+/// spliced into every playbook that offers one so the instructions match
+/// the parser (`scheduler::parse_decline`). The words are
+/// [`crate::domain::ClosureClass`]'s, and so are the statuses they land as.
+pub const DECLINE_CLASSIFICATION: &str = "\
+The FIRST line of the decline file must be `Classification: <word>`, with
+exactly one of these words, lowercase. The explanation and its evidence
+follow from the second line on.
+- `superseded`: the finding was valid, and its fix or change has landed
+  since by another way (a commit, a PR, a larger change). Name the commit.
+- `duplicate`: another finding or PR already covers the same change. Name it.
+- `obsolete`: the code the finding is about no longer exists, or its
+  premise no longer applies, for reasons unrelated to this finding.
+- `wrong`: the finding's premise is false: there is no bug, the gap does
+  not exist, or the change is not an improvement. Only when evidence from
+  the current code SHOWS it, never because proof was hard to get.
+- `unwanted`: the problem is real, but the project has decided against
+  this kind of change. Cite where it decided (its docs, CI configuration,
+  repository notes, a maintainer's words), not your own preference.
+`wrong` and `unwanted` suppress: every later scan of this repository is
+told not to report the finding again. The others do not. When in doubt
+between a word that suppresses and one that does not, pick the one that
+does not: a wrongly suppressed finding is never reported again. A decline
+file whose first line is not a valid classification sends the finding
+back to the operator's triage.";
+
 pub fn build_fix_prompt(
     root: &Path,
     finding: &Finding,
@@ -300,6 +326,7 @@ pub fn build_fix_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("REPO_NOTES", notes);
+    slots.insert("DECLINE_CLASSIFICATION", DECLINE_CLASSIFICATION.to_owned());
     render(&template, &slots)
 }
 
@@ -319,6 +346,7 @@ pub fn build_apply_improvement_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("REPO_NOTES", notes);
+    slots.insert("DECLINE_CLASSIFICATION", DECLINE_CLASSIFICATION.to_owned());
     render(&template, &slots)
 }
 
@@ -338,6 +366,7 @@ pub fn build_apply_modernization_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("REPO_NOTES", notes);
+    slots.insert("DECLINE_CLASSIFICATION", DECLINE_CLASSIFICATION.to_owned());
     render(&template, &slots)
 }
 

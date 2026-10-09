@@ -100,7 +100,8 @@ async fn leftover_branch_without_a_worktree_does_not_wedge_the_fix() {
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
     // Declining needs no forge: the run ends at NOT-A-BUG.md, so what is
     // under test is the worktree setup that precedes it.
-    let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code");
+    let backend =
+        ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
     let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .expect("a leftover branch is reclaimable, not a permanent failure");
@@ -131,7 +132,8 @@ async fn leftover_branch_held_by_a_killed_worktree_add_does_not_wedge_the_fix() 
     std::fs::remove_dir_all(tree.parent().unwrap()).unwrap();
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code");
+    let backend =
+        ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
     let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
@@ -150,7 +152,8 @@ async fn clean_repo_runs_the_fix() {
     let f = fixture("fix-clean").await;
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code");
+    let backend =
+        ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
     let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
@@ -178,7 +181,8 @@ async fn granted_cap_is_the_backend_headroom_verbatim() {
     // Deliberately above every cap the config used to impose, so a
     // surviving min() shows up as the config number instead.
     let backend =
-        ScriptedBackend::writing("NOT-A-BUG.md", "misread the code").granting(Some(777_000));
+        ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code")
+            .granting(Some(777_000));
     hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
@@ -200,7 +204,9 @@ async fn backend_without_a_ceiling_leaves_the_job_unbounded() {
     let f = fixture("fix-cap-none").await;
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let backend = ScriptedBackend::writing("NOT-A-BUG.md", "misread the code").granting(None);
+    let backend =
+        ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code")
+            .granting(None);
     hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
         .await
         .unwrap();
@@ -658,7 +664,11 @@ async fn a_blocked_resume_that_concludes_is_not_blocked_again() {
             if case == "finished" {
                 std::fs::remove_file(tree.join("PR-DESCRIPTION.md")).unwrap();
             } else {
-                std::fs::write(tree.join("NOT-A-BUG.md"), "intended behaviour").unwrap();
+                std::fs::write(
+                    tree.join("NOT-A-BUG.md"),
+                    "Classification: wrong\nintended behaviour",
+                )
+                .unwrap();
                 result.exit_code = Some(1);
             }
             result.session_file = session.map(|path| path.to_string_lossy().into_owned());
@@ -906,7 +916,7 @@ async fn a_blocked_resume_whose_backend_fails_stays_resumable() {
 async fn a_report_that_is_not_utf8_still_counts() {
     for (file, expected, status) in [
         ("BLOCKED.md", "blocked", "blocked"),
-        ("NOT-A-BUG.md", "rejected", "rejected"),
+        ("NOT-A-BUG.md", "new", "new"),
     ] {
         let f = fixture("fix-non-utf8").await;
         let worker = ScriptedBackend::new(move |tree| {
@@ -930,6 +940,82 @@ async fn a_report_that_is_not_utf8_still_counts() {
             Some("needs a rig \u{fffd}\u{fffd}"),
             "{file}"
         );
+    }
+}
+
+/// A declined fix lands as its classification's status, the way a closed
+/// PR's does, and only `wrong` and `unwanted` reach the suppression list
+/// every later scan is shown. Before, every decline was `rejected`: of 38
+/// rejected findings on 2026-10-09, 14 were already fixed at HEAD and 6
+/// declined by policy, all telling later scans not to report them again.
+/// A first line that classifies nothing, or a classification with no
+/// explanation, goes back to triage with the whole report.
+#[tokio::test]
+async fn a_decline_lands_as_its_classification() {
+    let cases = [
+        (
+            "Classification: superseded\nfixed by abc1234",
+            "superseded",
+            "superseded: fixed by abc1234",
+            false,
+        ),
+        (
+            "Classification: duplicate\nsee #7",
+            "superseded",
+            "duplicate: see #7",
+            false,
+        ),
+        (
+            "Classification: obsolete\ncode gone",
+            "superseded",
+            "obsolete: code gone",
+            false,
+        ),
+        (
+            "**Classification:** `Wrong`\n\n# NOT A BUG\nintended",
+            "rejected",
+            "wrong: # NOT A BUG\nintended",
+            true,
+        ),
+        (
+            "Classification: unwanted\nCI pins Node 24",
+            "wontfix",
+            "unwanted: CI pins Node 24",
+            true,
+        ),
+        ("# NOT A BUG\nmisread", "new", "# NOT A BUG\nmisread", false),
+        (
+            "Classification: sideways\nhm",
+            "new",
+            "Classification: sideways\nhm",
+            false,
+        ),
+        (
+            "Classification: wrong\n  \n",
+            "new",
+            "Classification: wrong\n  \n",
+            false,
+        ),
+    ];
+    for (report, status, reason, suppressed) in cases {
+        let f = fixture("fix-decline-class").await;
+        let backend = ScriptedBackend::writing("NOT-A-BUG.md", report);
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &backend, None)
+            .await
+            .unwrap();
+        assert_eq!(summary.outcome.as_deref(), Some(status), "{report:?}");
+        let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        assert_eq!(after.status.as_str(), status, "{report:?}");
+        assert_eq!(after.verdict_reason.as_deref(), Some(reason), "{report:?}");
+        let listed = f
+            .store
+            .suppressions(finding.repo_id, "bug")
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.id == f.fid);
+        assert_eq!(listed, suppressed, "{report:?}");
     }
 }
 

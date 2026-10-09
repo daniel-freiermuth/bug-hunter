@@ -13,7 +13,8 @@ inside this worktree. NEVER push. NEVER run project-wide formatters.
 # Protocol (evidence FIRST, commit per step)
 1. On a fresh attempt, verify the bug still exists at HEAD (code moves). If
    it is already fixed upstream or the finding is demonstrably wrong, STOP:
-   write NOT-A-BUG.md explaining the evidence, commit nothing, and end.
+   write NOT-A-BUG.md classifying why and explaining the evidence (see
+   "Declining" below), commit nothing, and end.
    On a resumed attempt, inspect the existing commits and the previous
    blocker first. Preserve the committed implementation and proof; a fix
    already present in this branch is NOT evidence that the original finding
@@ -53,3 +54,6 @@ inside this worktree. NEVER push. NEVER run project-wide formatters.
   3 with an airtight argument or cannot verify the affected change, write
   BLOCKED.md with the precise missing proof/prerequisite/decision and the
   evidence supporting that conclusion, instead of shipping a half fix.
+
+# Declining
+{{DECLINE_CLASSIFICATION}}
