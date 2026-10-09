@@ -1,6 +1,8 @@
 <script lang="ts">
   import { SvelteSet } from "svelte/reactivity";
   import { store, post } from "../lib/api.svelte";
+  import { navigation } from "../lib/navigation.svelte";
+  import { filterFindings } from "../lib/findingFilter";
   import type { FindingOut } from "../lib/types";
   import FilterBar from "../components/FilterBar.svelte";
   import FindingCard from "../components/FindingCard.svelte";
@@ -24,7 +26,7 @@
     store.findings.filter((f) => f.status === "blocked" || COLUMNS.some((c) => c.filter(f)))
   );
 
-  let filtered = $state<FindingOut[]>([]);
+  const filtered = $derived(filterFindings(pipelineFindings, navigation.route.params, { repoNames, showStatus: false }));
 
   // Group filtered findings by column
   const columns = $derived(
@@ -94,7 +96,6 @@
     prefix="k"
     showStatus={false}
     repoNames={repoNames}
-    onFilter={(f: FindingOut[]) => { filtered = f; }}
   />
 
   <div class="board">

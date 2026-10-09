@@ -1,6 +1,7 @@
 <script lang="ts">
   import { store } from "../lib/api.svelte";
-  import type { FindingOut } from "../lib/types";
+  import { navigation } from "../lib/navigation.svelte";
+  import { filterFindings, hidingParams, type FilterScope } from "../lib/findingFilter";
   import { toast } from "../lib/toast.svelte";
   import { placeAtTop, settle } from "../lib/scroll";
   import FilterBar from "../components/FilterBar.svelte";
@@ -8,9 +9,9 @@
 
   let { focusId = null }: { focusId?: number | null } = $props();
 
-  let displayed = $state<FindingOut[]>([]);
-  let filterBar: { reveal: (finding: FindingOut) => void } | undefined = $state();
   const repoNames = $derived(new Map((store.summary?.repos ?? []).map((r) => [r.id, r.name])));
+  const scope: FilterScope = $derived({ repoNames, showStatus: true });
+  const displayed = $derived(filterFindings(store.findings, navigation.route.params, scope));
 
   // Each history entry places its finding once: later polls must not pull
   // the view back to it after the user has scrolled on, but a new visit to
@@ -35,10 +36,18 @@
       toast(`F#${id} not found`, false);
       return;
     }
-    // In the data but not in the list: filters hide it. Revealing changes
-    // the URL, the list follows, and this runs again.
+    // In the data but not in the list: filters hide it. Drop only those, so
+    // the rest of the view survives. A link carries the filters of the view
+    // it was made in, where the finding was visible; one that hides it now
+    // means the finding changed since (status moved on, a recheck changed
+    // confidence). Replacing the entry corrects the navigation that opened
+    // the link, so Back does not land on the view that hid the finding. The
+    // list follows the URL, and this runs again.
     if (!displayed.some((f) => f.id === id)) {
-      filterBar?.reveal(finding);
+      const hiding = hidingParams(finding, navigation.route.params, scope);
+      navigation.updateParams((params) => {
+        for (const name of hiding) params.delete(name);
+      }, true);
       return;
     }
     placedEntry = entry;
@@ -58,12 +67,10 @@
   </h2>
 
   <FilterBar
-    bind:this={filterBar}
     findings={store.findings}
     prefix="a"
     showStatus={true}
     repoNames={repoNames}
-    onFilter={(f: FindingOut[]) => { displayed = f; }}
   />
 
   {#if displayed.length === 0}
