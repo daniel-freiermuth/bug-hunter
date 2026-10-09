@@ -362,8 +362,17 @@
     scroll-behavior: smooth;
   }
 
+  /* Opacity only, unlike the shared fadeIn: this element is the scroll
+     container, and a transform changing on it switches scroll anchoring
+     off for every frame of the animation, so cards mounting in those
+     150ms push the content around instead of being absorbed. */
   .page-enter {
-    animation: fadeIn 150ms ease both;
+    animation: page-in 150ms ease both;
+  }
+
+  @keyframes page-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
   }
 
   .api-banner {
