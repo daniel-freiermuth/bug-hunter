@@ -154,8 +154,10 @@
         <span>Cannot reach the API ({store.error}) — data shown below may be stale.</span>
       </div>
     {/if}
+    <!-- Each page owns its scroll container, so a page switch starts at the
+         top instead of inheriting the previous page's offset. -->
     {#key page}
-      <div class="page-enter">
+      <div class="page-scroll page-enter">
         {#if page === "status"}
           <StatusPage />
         {:else if page === "inbox"}
@@ -347,6 +349,14 @@
   /* ── Main content ────────────────────────────────────────────── */
   .content {
     flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .page-scroll {
+    flex: 1;
+    min-height: 0;
     overflow: auto;
     padding: 1.5rem 2rem;
     scroll-behavior: smooth;
@@ -360,7 +370,7 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    margin-bottom: 1.25rem;
+    margin: 1.5rem 2rem 0;
     padding: 0.5rem 0.75rem;
     background: var(--bg-elevated);
     border: 1px solid var(--bad);
@@ -408,8 +418,12 @@
       visibility: visible;
     }
 
-    .content {
+    .page-scroll {
       padding: 1rem;
+    }
+
+    .api-banner {
+      margin: 1rem 1rem 0;
     }
   }
 </style>
