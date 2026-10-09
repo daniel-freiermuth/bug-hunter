@@ -1297,6 +1297,30 @@ async fn close_workspace(store: &Store, ws: &Workspace) {
     }
 }
 
+/// Log a failed store write the job deliberately continues past.
+///
+/// These writes sit mid-job, ahead of steps that must still run —
+/// `finalize_in_progress`, releasing the tree, retiring the job row — so
+/// aborting with `?` would trade one inconsistency for a worse one, such
+/// as a finding stranded in `fixing` until the next restart. Continuing
+/// is intended; doing so without a trace is not. Logged through `tracing`
+/// rather than `log_event`: a store that just refused a write is the
+/// least likely place for the record of that refusal to land.
+///
+/// Returns the value on success, so a write that also reports something
+/// (an attempt streak, the recorded job state) keeps its caller's
+/// fallback for the failure case.
+fn log_write_failure<T, E: std::fmt::Display>(
+    result: Result<T, E>,
+    what: std::fmt::Arguments<'_>,
+) -> Option<T> {
+    result
+        .inspect_err(
+            |e| tracing::error!(error = %format_args!("{e:#}"), "store write failed: {what}"),
+        )
+        .ok()
+}
+
 /// Retire a suspended attempt whose work concluded anyway.
 ///
 /// A worker can finish the finding's business before the cap stops it —
@@ -1310,9 +1334,12 @@ async fn close_workspace(store: &Store, ws: &Workspace) {
 async fn retire_concluded(store: &Store, job: i64, outcome: &str) {
     let msg =
         format!("job {job} suspended after its work concluded ({outcome}); nothing to resume");
-    let _ = store
-        .retire_suspended_job(job, JobState::Killed, None, &msg)
-        .await;
+    log_write_failure(
+        store
+            .retire_suspended_job(job, JobState::Killed, None, &msg)
+            .await,
+        format_args!("job {job}: retiring concluded suspended attempt"),
+    );
 }
 
 /// Fetch `repo`'s clone and return the tip of its default branch: where a
@@ -1389,7 +1416,10 @@ pub async fn run_hunt(
                 // the request's place in the queue, or a fetch that keeps
                 // failing would put this hunt first in every cycle.
                 if let Some(r) = request {
-                    let _ = store.mark_full_hunt_attempted(rid, r).await;
+                    log_write_failure(
+                        store.mark_full_hunt_attempted(rid, r).await,
+                        format_args!("repo {rid}: marking full-hunt request {r} attempted"),
+                    );
                 }
                 return Err(e);
             }
@@ -1418,7 +1448,10 @@ pub async fn run_hunt(
     let rehunt_due = resume.is_none()
         && (requested || last_full.is_some_and(|lf| (now_ms() - lf) >= rehunt_interval_ms));
     let last = if rehunt_due {
-        let _ = store.clear_last_hunt_sha(rid).await;
+        log_write_failure(
+            store.clear_last_hunt_sha(rid).await,
+            format_args!("repo {rid}: clearing last-hunt sha for the full re-hunt"),
+        );
         let why = if requested {
             "requested".to_owned()
         } else {
@@ -1589,10 +1622,16 @@ pub async fn run_hunt(
             // resume. Best-effort like the job's other bookkeeping: a
             // resume that cannot read it falls back to the watermark
             // heuristic, and the request stays pending for another pass.
-            let _ = store.mark_full_history(job, request).await;
+            log_write_failure(
+                store.mark_full_history(job, request).await,
+                format_args!("job {job}: marking full-history scope"),
+            );
         }
         if let Some(r) = request {
-            let _ = store.mark_full_hunt_attempted(rid, r).await;
+            log_write_failure(
+                store.mark_full_hunt_attempted(rid, r).await,
+                format_args!("repo {rid}: marking full-hunt request {r} attempted"),
+            );
         }
     }
     let (ws, pinned) = match open_workspace(
@@ -1657,9 +1696,11 @@ pub async fn run_hunt(
             resume.map(|r| r.session_file.as_path()),
         )
         .await?;
-    let state = record_job(store, job, &rr, model, resume)
-        .await
-        .unwrap_or(JobState::Failed);
+    let state = log_write_failure(
+        record_job(store, job, &rr, model, resume).await,
+        format_args!("job {job}: recording outcome"),
+    )
+    .unwrap_or(JobState::Failed);
 
     let mut summary = CycleSummary {
         kind: Some(RepoJobKind::Hunt.into()),
@@ -1701,12 +1742,21 @@ pub async fn run_hunt(
         if state == JobState::Done && counts.invalid == 0 {
             // The chain's pinned commit, never the clone's current tip:
             // see where `head` is resolved.
-            let _ = store.set_last_hunt(rid, &pinned).await;
+            log_write_failure(
+                store.set_last_hunt(rid, &pinned).await,
+                format_args!("repo {rid}: last-hunt sha -> {pinned}"),
+            );
             if full_scope || last_full.is_none() {
-                let _ = store.set_last_full_hunt(rid).await;
+                log_write_failure(
+                    store.set_last_full_hunt(rid).await,
+                    format_args!("repo {rid}: recording last full hunt"),
+                );
             }
             if full_scope {
-                let _ = store.settle_full_hunt_request(rid, job).await;
+                log_write_failure(
+                    store.settle_full_hunt_request(rid, job).await,
+                    format_args!("repo {rid}: settling full-hunt request for job {job}"),
+                );
             }
         }
         summary.ingest = Some(counts);
@@ -1736,13 +1786,20 @@ async fn handle_recheck_failure(
     failure: &str,
     override_mode: Option<BudgetOverride>,
 ) -> CycleSummary {
-    let streak = store
-        .record_recheck_attempt(fid, failure)
-        .await
-        .unwrap_or(1);
+    let streak = log_write_failure(
+        store.record_recheck_attempt(fid, failure).await,
+        format_args!("#{fid}: recording recheck attempt"),
+    )
+    .unwrap_or(1);
     if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
-        let _ = store.set_finding_status(fid, FindingStatus::New).await;
-        let _ = store.clear_recheck_attempts(fid).await;
+        log_write_failure(
+            store.set_finding_status(fid, FindingStatus::New).await,
+            format_args!("#{fid}: status -> new"),
+        );
+        log_write_failure(
+            store.clear_recheck_attempts(fid).await,
+            format_args!("#{fid}: clearing recheck attempts"),
+        );
         let _ = store
             .log_event(
                 "recheck",
@@ -1764,7 +1821,10 @@ async fn handle_recheck_failure(
         summary.outcome = Some("requeued".into());
     }
     if override_mode == Some(BudgetOverride::Once) {
-        let _ = store.set_budget_override(fid, None).await;
+        log_write_failure(
+            store.set_budget_override(fid, None).await,
+            format_args!("#{fid}: clearing one-shot budget override"),
+        );
     }
     summary.clone()
 }
@@ -1950,9 +2010,11 @@ pub async fn run_recheck(
             resume.map(|r| r.session_file.as_path()),
         )
         .await?;
-    let state = record_job(store, job, &rr, model, resume)
-        .await
-        .unwrap_or(JobState::Failed);
+    let state = log_write_failure(
+        record_job(store, job, &rr, model, resume).await,
+        format_args!("job {job}: recording outcome"),
+    )
+    .unwrap_or(JobState::Failed);
     // Released here rather than at each return below: everything after
     // this point reads the verdict under `out/`, never the tree.
     close_workspace(store, &ws).await;
@@ -1984,7 +2046,10 @@ pub async fn run_recheck(
         summary.outcome = Some("suspended".into());
         summary.worktree = Some(ws.tree.to_string_lossy().into_owned());
         if override_mode == Some(BudgetOverride::Once) {
-            let _ = store.set_budget_override(fid, None).await;
+            log_write_failure(
+                store.set_budget_override(fid, None).await,
+                format_args!("#{fid}: clearing one-shot budget override"),
+            );
         }
         return Ok(summary);
     }
@@ -2055,9 +2120,18 @@ pub async fn run_recheck(
                 confidence: verdict_obj.updated_confidence,
                 severity,
             };
-            let _ = store.update_finding_analysis(fid, &update).await;
-            let _ = store.set_finding_status(fid, FindingStatus::New).await;
-            let _ = store.clear_recheck_attempts(fid).await;
+            log_write_failure(
+                store.update_finding_analysis(fid, &update).await,
+                format_args!("#{fid}: recording recheck analysis"),
+            );
+            log_write_failure(
+                store.set_finding_status(fid, FindingStatus::New).await,
+                format_args!("#{fid}: status -> new"),
+            );
+            log_write_failure(
+                store.clear_recheck_attempts(fid).await,
+                format_args!("#{fid}: clearing recheck attempts"),
+            );
             let _ = store
                 .log_event(
                     "recheck",
@@ -2074,14 +2148,20 @@ pub async fn run_recheck(
             // bug with it, which says nothing against the finding. As
             // `wontfix` it told every later scan not to report the bug
             // again, should the rewritten code bring it back.
-            let _ = store
-                .set_finding_verdict(
-                    fid,
-                    FindingStatus::Superseded,
-                    &format!("recheck: {reason}"),
-                )
-                .await;
-            let _ = store.clear_recheck_attempts(fid).await;
+            log_write_failure(
+                store
+                    .set_finding_verdict(
+                        fid,
+                        FindingStatus::Superseded,
+                        &format!("recheck: {reason}"),
+                    )
+                    .await,
+                format_args!("#{fid}: verdict -> superseded"),
+            );
+            log_write_failure(
+                store.clear_recheck_attempts(fid).await,
+                format_args!("#{fid}: clearing recheck attempts"),
+            );
             let _ = store
                 .log_event(
                     "recheck",
@@ -2094,10 +2174,20 @@ pub async fn run_recheck(
             "stale"
         }
         RecheckOutcome::Invalid => {
-            let _ = store
-                .set_finding_verdict(fid, FindingStatus::Rejected, &format!("recheck: {reason}"))
-                .await;
-            let _ = store.clear_recheck_attempts(fid).await;
+            log_write_failure(
+                store
+                    .set_finding_verdict(
+                        fid,
+                        FindingStatus::Rejected,
+                        &format!("recheck: {reason}"),
+                    )
+                    .await,
+                format_args!("#{fid}: verdict -> rejected"),
+            );
+            log_write_failure(
+                store.clear_recheck_attempts(fid).await,
+                format_args!("#{fid}: clearing recheck attempts"),
+            );
             let _ = store
                 .log_event(
                     "recheck",
@@ -2126,7 +2216,10 @@ pub async fn run_recheck(
     summary.verdict = Some(verdict_str.to_owned());
     summary.reason = Some(reason.to_owned());
     if override_mode == Some(BudgetOverride::Once) {
-        let _ = store.set_budget_override(fid, None).await;
+        log_write_failure(
+            store.set_budget_override(fid, None).await,
+            format_args!("#{fid}: clearing one-shot budget override"),
+        );
     }
     Ok(summary)
 }
@@ -2350,9 +2443,11 @@ async fn run_analysis_job(
             resume.map(|r| r.session_file.as_path()),
         )
         .await?;
-    let state = record_job(store, job, &rr, model, resume)
-        .await
-        .unwrap_or(JobState::Failed);
+    let state = log_write_failure(
+        record_job(store, job, &rr, model, resume).await,
+        format_args!("job {job}: recording outcome"),
+    )
+    .unwrap_or(JobState::Failed);
     let mut summary = CycleSummary {
         kind: Some(kind.into()),
         repo: Some(rname.to_owned()),
@@ -2378,7 +2473,10 @@ async fn run_analysis_job(
             .await;
         if state == JobState::Done && counts.invalid == 0 {
             // Update last_{kind}_at timestamp
-            let _ = store.set_last_kind_at(rid, kind).await;
+            log_write_failure(
+                store.set_last_kind_at(rid, kind).await,
+                format_args!("repo {rid}: recording last {kind} run"),
+            );
         }
         summary.ingest = Some(counts);
     } else {
@@ -2595,7 +2693,10 @@ pub async fn run_dep_update(
 
     // Only advance timestamp after successful ingestion (no invalid entries)
     if counts.invalid == 0 {
-        let _ = store.set_last_dep_update(repo.id).await;
+        log_write_failure(
+            store.set_last_dep_update(repo.id).await,
+            format_args!("repo {}: recording last dep_update run", repo.id),
+        );
     }
 
     Ok(CycleSummary {
@@ -2695,9 +2796,12 @@ struct FixStart {
 /// worker failed; [`Store::finalize_in_progress`] only does so while the
 /// fix still owns it.
 async fn release_claim(store: &Store, fid: i64) {
-    let _ = store
-        .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
-        .await;
+    log_write_failure(
+        store
+            .finalize_in_progress(fid, FindingStatus::Fixing, FindingStatus::Queued)
+            .await,
+        format_args!("#{fid}: finalizing fixing -> queued"),
+    );
 }
 
 /// A fix cycle that ends before its job: the finding is not `queued`.
@@ -3084,7 +3188,11 @@ async fn conclude_fix(
         // streak would turn three pauses of one healthy fix into "stuck".
         return Ok(FixOutcome::Suspended);
     }
-    let streak = store.record_fix_attempt(fid, &failure).await.unwrap_or(1);
+    let streak = log_write_failure(
+        store.record_fix_attempt(fid, &failure).await,
+        format_args!("#{fid}: recording fix attempt"),
+    )
+    .unwrap_or(1);
     Ok(if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
         FixOutcome::Stuck { failure, streak }
     } else {
@@ -3243,8 +3351,14 @@ async fn record_declined_fix(
     summary: &mut CycleSummary,
 ) {
     let status = class.map_or(FindingStatus::New, ClosureClass::status);
-    let _ = store.set_finding_verdict(fid, status, reason).await;
-    let _ = store.clear_fix_attempts(fid).await;
+    log_write_failure(
+        store.set_finding_verdict(fid, status, reason).await,
+        format_args!("#{fid}: verdict -> {status}"),
+    );
+    log_write_failure(
+        store.clear_fix_attempts(fid).await,
+        format_args!("#{fid}: clearing fix attempts"),
+    );
     let first_line: String = reason
         .lines()
         .next()
@@ -3285,8 +3399,14 @@ async fn record_fix_outcome(
             return Ok(());
         }
         FixOutcome::Shipped { pr_url, recovered } => {
-            let _ = store.set_finding_pr_open(fid, &pr_url).await;
-            let _ = store.clear_fix_attempts(fid).await;
+            log_write_failure(
+                store.set_finding_pr_open(fid, &pr_url).await,
+                format_args!("#{fid}: status -> pr_open ({pr_url})"),
+            );
+            log_write_failure(
+                store.clear_fix_attempts(fid).await,
+                format_args!("#{fid}: clearing fix attempts"),
+            );
             let message = if recovered {
                 format!("#{fid} recovered existing PR: {pr_url}")
             } else {
@@ -3347,7 +3467,10 @@ async fn record_fix_outcome(
         }
     }
     if finding.budget_override == Some(BudgetOverride::Once) {
-        let _ = store.set_budget_override(fid, None).await;
+        log_write_failure(
+            store.set_budget_override(fid, None).await,
+            format_args!("#{fid}: clearing one-shot budget override"),
+        );
     }
     release_claim(store, fid).await;
     Ok(())
@@ -3391,9 +3514,11 @@ pub async fn run_fix(
             anyhow::bail!("{e}");
         }
     };
-    let state = record_job(store, start.job, &rr, model, resume)
-        .await
-        .unwrap_or(JobState::Failed);
+    let state = log_write_failure(
+        record_job(store, start.job, &rr, model, resume).await,
+        format_args!("job {}: recording outcome", start.job),
+    )
+    .unwrap_or(JobState::Failed);
     let mut summary = CycleSummary {
         kind: Some(FindingJobKind::Fix.into()),
         finding_id: Some(fid),
@@ -3626,7 +3751,10 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
                     finding_id = fid,
                     "pr_open finding has no pr_url — requeueing"
                 );
-                let _ = store.set_finding_status(fid, FindingStatus::Queued).await;
+                log_write_failure(
+                    store.set_finding_status(fid, FindingStatus::Queued).await,
+                    format_args!("#{fid}: status -> queued"),
+                );
                 let _ = store.log_event(
                     "fix", &format!("#{fid} requeued: pr_open with no pr_url (prior fix failed before PR creation)"),
                     None, Some(fid),
@@ -3677,8 +3805,14 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
 
         match pr.state {
             forge::PrState::Merged => {
-                let _ = store.set_finding_status(fid, FindingStatus::Merged).await;
-                let _ = store.mark_pr_merged(fid, pr_number, now_ms()).await;
+                log_write_failure(
+                    store.set_finding_status(fid, FindingStatus::Merged).await,
+                    format_args!("#{fid}: status -> merged"),
+                );
+                log_write_failure(
+                    store.mark_pr_merged(fid, pr_number, now_ms()).await,
+                    format_args!("#{fid}: recording PR #{pr_number} merged"),
+                );
                 let _ = store
                     .log_event("ship", &format!("#{fid} PR merged: {url}"), None, Some(fid))
                     .await;
@@ -3709,13 +3843,16 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
                     summary.errors += 1;
                     continue;
                 }
-                let _ = store
-                    .set_finding_verdict(
-                        fid,
-                        FindingStatus::Closed,
-                        "PR closed without merge; awaiting harvest",
-                    )
-                    .await;
+                log_write_failure(
+                    store
+                        .set_finding_verdict(
+                            fid,
+                            FindingStatus::Closed,
+                            "PR closed without merge; awaiting harvest",
+                        )
+                        .await,
+                    format_args!("#{fid}: verdict -> closed"),
+                );
                 let _ = store
                     .log_event(
                         "verdict",
@@ -3813,7 +3950,10 @@ pub async fn sync_prs(store: &Store, cfg: &Config) -> SyncResult {
             attention_since: attention_since_val,
             clear_addressed,
         };
-        let _ = store.sync_pr_open(fid, &data).await;
+        log_write_failure(
+            store.sync_pr_open(fid, &data).await,
+            format_args!("#{fid}: recording synced PR state"),
+        );
 
         if attention.is_some() && attention.as_deref() != prev_attention {
             let _ = store
@@ -3891,7 +4031,10 @@ async fn engage_target(
                 pr_number = num,
                 "self-healed missing pr_number from pr_url"
             );
-            let _ = store.set_pr_number(fid, num).await;
+            log_write_failure(
+                store.set_pr_number(fid, num).await,
+                format_args!("#{fid}: self-healed pr_number -> {num}"),
+            );
             num
         } else {
             let _ = store
@@ -4087,15 +4230,18 @@ async fn withdraw_pr(
             // fingerprint or head_sha changes), and the error event
             // below is what surfaces it in the meantime.
             tracing::warn!(finding = fid, pr = pr_number, error = %err, "close_pr failed");
-            let _ = store
-                .mark_pr_engaged(
-                    fid,
-                    ps.last_activity_at.unwrap_or_else(now_ms),
-                    now_ms(),
-                    ps.attention_fingerprint.as_deref(),
-                    ps.head_sha.as_deref(),
-                )
-                .await;
+            log_write_failure(
+                store
+                    .mark_pr_engaged(
+                        fid,
+                        ps.last_activity_at.unwrap_or_else(now_ms),
+                        now_ms(),
+                        ps.attention_fingerprint.as_deref(),
+                        ps.head_sha.as_deref(),
+                    )
+                    .await,
+                format_args!("#{fid}: marking PR engaged"),
+            );
             let _ = store
                 .log_event(
                     "error",
@@ -4278,7 +4424,10 @@ async fn record_engage(
     match published {
         Err(fail) => {
             if state == JobState::Done {
-                let _ = store.fail_job(job, fail.as_str()).await;
+                log_write_failure(
+                    store.fail_job(job, fail.as_str()).await,
+                    format_args!("job {job}: failing ({fail})"),
+                );
             }
             let tail = crate::util::tail(stdout_tail, 300);
             // Only a suspension keeps its tree; any other outcome ends the
@@ -4314,9 +4463,12 @@ async fn record_engage(
                 ps.attention_fingerprint.as_deref()
             };
             let addressed_sha = if pushed { None } else { ps.head_sha.as_deref() };
-            let _ = store
-                .mark_pr_engaged(fid, engaged_mark, now_ms(), addressed_fp, addressed_sha)
-                .await;
+            log_write_failure(
+                store
+                    .mark_pr_engaged(fid, engaged_mark, now_ms(), addressed_fp, addressed_sha)
+                    .await,
+                format_args!("#{fid}: marking PR engaged"),
+            );
             let did: Vec<&str> = [("pushed", pushed), ("replied", replied)]
                 .iter()
                 .filter(|(_, on)| *on)
@@ -4339,7 +4491,10 @@ async fn record_engage(
         }
     }
     if finding.budget_override == Some(BudgetOverride::Once) {
-        let _ = store.set_budget_override(fid, None).await;
+        log_write_failure(
+            store.set_budget_override(fid, None).await,
+            format_args!("#{fid}: clearing one-shot budget override"),
+        );
     }
 }
 
@@ -4383,9 +4538,11 @@ pub async fn run_engage(
             resume.map(|r| r.session_file.as_path()),
         )
         .await?;
-    let state = record_job(store, start.job, &rr, model, resume)
-        .await
-        .unwrap_or(JobState::Failed);
+    let state = log_write_failure(
+        record_job(store, start.job, &rr, model, resume).await,
+        format_args!("job {}: recording outcome", start.job),
+    )
+    .unwrap_or(JobState::Failed);
     let mut summary = CycleSummary {
         kind: Some(FindingJobKind::Engage.into()),
         finding_id: Some(fid),
@@ -4410,7 +4567,10 @@ pub async fn run_engage(
         // reloads the finding: left set, the closed PR's harvest would run
         // prioritized and jump the queue on it.
         if finding.budget_override == Some(BudgetOverride::Once) {
-            let _ = store.set_budget_override(fid, None).await;
+            log_write_failure(
+                store.set_budget_override(fid, None).await,
+                format_args!("#{fid}: clearing one-shot budget override"),
+            );
         }
         withdraw_pr(store, fid, &start, &reason, &mut summary).await
     } else {
@@ -4588,10 +4748,20 @@ async fn harvest_prefetch_failed(
             .await;
         return;
     }
-    let streak = store.record_harvest_attempt(fid, key).await.unwrap_or(1);
+    let streak = log_write_failure(
+        store.record_harvest_attempt(fid, key).await,
+        format_args!("#{fid}: recording harvest attempt"),
+    )
+    .unwrap_or(1);
     if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
-        let _ = store.mark_pr_harvested(fid, now_ms()).await;
-        let _ = store.clear_harvest_attempts(fid).await;
+        log_write_failure(
+            store.mark_pr_harvested(fid, now_ms()).await,
+            format_args!("#{fid}: marking PR harvested"),
+        );
+        log_write_failure(
+            store.clear_harvest_attempts(fid).await,
+            format_args!("#{fid}: clearing harvest attempts"),
+        );
         let _ = store.log_event("error",
             &format!("harvest #{fid}: gave up after {streak} identical failures (PR/MR {what} failed: {e}) -- not reviewed, will not retry"),
             None, Some(fid),
@@ -4662,7 +4832,10 @@ pub async fn run_harvest(
                 pr_number = num,
                 "self-healed missing pr_number from pr_url"
             );
-            let _ = store.set_pr_number(fid, num).await;
+            log_write_failure(
+                store.set_pr_number(fid, num).await,
+                format_args!("#{fid}: self-healed pr_number -> {num}"),
+            );
             num
         } else {
             let _ = store
@@ -4836,9 +5009,11 @@ pub async fn run_harvest(
             resume.map(|r| r.session_file.as_path()),
         )
         .await?;
-    let state = record_job(store, job, &rr, model, resume)
-        .await
-        .unwrap_or(JobState::Failed);
+    let state = log_write_failure(
+        record_job(store, job, &rr, model, resume).await,
+        format_args!("job {job}: recording outcome"),
+    )
+    .unwrap_or(JobState::Failed);
 
     // Follow-ups and the closure verdict are read from the tree, so before
     // it is released. The release itself is state-checked: a suspended
@@ -4877,7 +5052,10 @@ pub async fn run_harvest(
         summary.outcome = Some("suspended".into());
         summary.worktree = Some(worktree.to_string_lossy().into_owned());
         if override_mode == Some(BudgetOverride::Once) {
-            let _ = store.set_budget_override(fid, None).await;
+            log_write_failure(
+                store.set_budget_override(fid, None).await,
+                format_args!("#{fid}: clearing one-shot budget override"),
+            );
         }
         return Ok(summary);
     }
@@ -4921,13 +5099,23 @@ pub async fn run_harvest(
     if let Some(failure) = failure {
         let key = &failure.streak_key;
         let detail = &failure.detail;
-        let streak = store.record_harvest_attempt(fid, key).await.unwrap_or(1);
+        let streak = log_write_failure(
+            store.record_harvest_attempt(fid, key).await,
+            format_args!("#{fid}: recording harvest attempt"),
+        )
+        .unwrap_or(1);
         if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
             // Given up on, the finding keeps whatever status it has:
             // `closed`, never suppressed, for a closed PR nobody could
             // classify.
-            let _ = store.mark_pr_harvested(fid, now_ms()).await;
-            let _ = store.clear_harvest_attempts(fid).await;
+            log_write_failure(
+                store.mark_pr_harvested(fid, now_ms()).await,
+                format_args!("#{fid}: marking PR harvested"),
+            );
+            log_write_failure(
+                store.clear_harvest_attempts(fid).await,
+                format_args!("#{fid}: clearing harvest attempts"),
+            );
             let _ = store.log_event("error",
                 &format!("harvest #{fid}: gave up after {streak} identical failures ({detail}) -- not reviewed, will not retry"),
                 Some(job), Some(fid),
@@ -4946,7 +5134,10 @@ pub async fn run_harvest(
         }
         summary.failure = Some(detail.clone());
         if override_mode == Some(BudgetOverride::Once) {
-            let _ = store.set_budget_override(fid, None).await;
+            log_write_failure(
+                store.set_budget_override(fid, None).await,
+                format_args!("#{fid}: clearing one-shot budget override"),
+            );
         }
         return Ok(summary);
     }
@@ -4979,7 +5170,10 @@ pub async fn run_harvest(
                 summary.outcome = Some("retry".into());
                 summary.failure = Some(format!("recording the classification failed: {e}"));
                 if override_mode == Some(BudgetOverride::Once) {
-                    let _ = store.set_budget_override(fid, None).await;
+                    log_write_failure(
+                        store.set_budget_override(fid, None).await,
+                        format_args!("#{fid}: clearing one-shot budget override"),
+                    );
                 }
                 return Ok(summary);
             }
@@ -5006,10 +5200,16 @@ pub async fn run_harvest(
             }
         }
     } else {
-        let _ = store.mark_pr_harvested(fid, now_ms()).await;
+        log_write_failure(
+            store.mark_pr_harvested(fid, now_ms()).await,
+            format_args!("#{fid}: marking PR harvested"),
+        );
         "reviewed for follow-ups".to_owned()
     };
-    let _ = store.clear_harvest_attempts(fid).await;
+    log_write_failure(
+        store.clear_harvest_attempts(fid).await,
+        format_args!("#{fid}: clearing harvest attempts"),
+    );
     let _ = store
         .log_event(
             "harvest",
@@ -5020,7 +5220,10 @@ pub async fn run_harvest(
         .await;
     summary.outcome = Some("harvested".into());
     if override_mode == Some(BudgetOverride::Once) {
-        let _ = store.set_budget_override(fid, None).await;
+        log_write_failure(
+            store.set_budget_override(fid, None).await,
+            format_args!("#{fid}: clearing one-shot budget override"),
+        );
     }
     Ok(summary)
 }
@@ -5369,7 +5572,10 @@ async fn run_cycle_inner(
         Ok(result) => result,
         Err(e) => {
             if let Some((repo_id, kind)) = rotation {
-                let _ = store.set_last_kind_at(repo_id, kind).await;
+                log_write_failure(
+                    store.set_last_kind_at(repo_id, kind).await,
+                    format_args!("repo {repo_id}: recording last {kind} run"),
+                );
             }
             return Err(e);
         }
@@ -5377,7 +5583,10 @@ async fn run_cycle_inner(
     if let Some((repo_id, kind)) = rotation
         && attempt_ended(&result)
     {
-        let _ = store.set_last_kind_at(repo_id, kind).await;
+        log_write_failure(
+            store.set_last_kind_at(repo_id, kind).await,
+            format_args!("repo {repo_id}: recording last {kind} run"),
+        );
     }
 
     if sync.is_some() {
