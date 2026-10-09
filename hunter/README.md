@@ -112,7 +112,11 @@ new ──recheck──> new / wontfix / rejected
 - **`queued` → `fixing` → `pr_open`** — a fix/apply worker verifies the
   finding and ships a draft PR, declines (`NOT-A-BUG.md`/`DECLINED.md`),
   or pauses. A requeued checkpoint continues in its original worktree and
-  transcript instead of recreating the branch.
+  transcript instead of recreating the branch. A decline's first line
+  classifies it with the closed-PR harvest's words and lands the same
+  way: superseded / duplicate / obsolete → `superseded`, wrong →
+  `rejected`, unwanted → `wontfix`; a decline that classifies nothing
+  goes back to `new` for triage.
 - **`blocked`** — valid work waiting on a verification prerequisite,
   dependency, or human decision. The full reason is stored with the job;
   the fix job becomes a suspended checkpoint, keeping committed work,

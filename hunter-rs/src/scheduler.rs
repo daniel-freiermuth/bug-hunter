@@ -2844,8 +2844,12 @@ enum FixOutcome {
     /// The worker wrote `BLOCKED.md` (`from_tree`), or an attempt resumed
     /// against a blocker ended without any outcome: hold the checkpoint.
     Blocked { report: String, from_tree: bool },
-    /// `NOT-A-BUG.md` / `DECLINED.md`: the finding is rejected.
-    Declined { reason: String },
+    /// `NOT-A-BUG.md` / `DECLINED.md`: the finding takes the status its
+    /// classification maps to ([`parse_decline`]).
+    Declined {
+        class: Option<ClosureClass>,
+        reason: String,
+    },
     /// The branch is pushed and its draft PR exists (`recovered`: it
     /// already did).
     Shipped { pr_url: String, recovered: bool },
@@ -2873,6 +2877,41 @@ async fn hold_blocked(store: &Store, fid: i64, job: i64, report: &str) -> anyhow
 /// report. Only a file that cannot be read at all is an error.
 fn read_report(path: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+}
+
+/// A declined fix's report, as the finding will record it.
+///
+/// The first line names the classification (`Classification: superseded`;
+/// Markdown emphasis around it is ignored) and the explanation follows.
+/// The reason is `"<classification>: <explanation>"`, the shape a closed-PR
+/// harvest records. A report whose first line names no classification, or
+/// that explains nothing after it, keeps its whole text and has none:
+/// nothing then says the premise failed, so nothing may suppress it.
+fn parse_decline(report: &str) -> (Option<ClosureClass>, String) {
+    let body = report.trim_start();
+    let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
+    let rest = rest.trim();
+    let label: String = first
+        .chars()
+        .filter(|c| !matches!(c, '*' | '`' | '_' | '#'))
+        .collect();
+    let class = label
+        .split_once(':')
+        .filter(|(key, _)| key.trim().eq_ignore_ascii_case("classification"))
+        .and_then(|(_, word)| {
+            word.trim()
+                .to_ascii_lowercase()
+                .parse::<ClosureClass>()
+                .ok()
+        })
+        .filter(|_| !rest.is_empty());
+    let reason = match class {
+        Some(class) => format!("{class}: {rest}"),
+        None => report.to_owned(),
+    };
+    // The bound every verdict reason gets: a suppressing one is injected
+    // into every later scan's suppression list.
+    (class, reason.chars().take(500).collect())
 }
 
 /// Read the worker's result and decide the attempt's outcome. Shipping is
@@ -2913,9 +2952,8 @@ async fn conclude_fix(
         }
     };
     if declined {
-        return Ok(FixOutcome::Declined {
-            reason: report.unwrap_or_default().chars().take(500).collect(),
-        });
+        let (class, reason) = parse_decline(&report.unwrap_or_default());
+        return Ok(FixOutcome::Declined { class, reason });
     }
     if let Some(report) = report {
         return Ok(FixOutcome::Blocked {
@@ -3089,26 +3127,35 @@ async fn hold_blocked_fix(
 }
 
 /// A fix the worker declined (`NOT-A-BUG.md` / `DECLINED.md`): the finding
-/// is rejected with the worker's reason.
-async fn reject_declined_fix(
+/// takes its classification's status with the worker's reason, as a closed
+/// PR's does. Only `wrong` and `unwanted` suppress; most declines are work
+/// that landed another way, and rejecting those told every later scan to
+/// stop reporting valid findings. An unclassified decline goes back to
+/// triage (`new`), like an `abandoned` closure.
+async fn record_declined_fix(
     store: &Store,
     fid: i64,
     job: i64,
+    class: Option<ClosureClass>,
     reason: &str,
     summary: &mut CycleSummary,
 ) {
-    let _ = store
-        .set_finding_verdict(fid, FindingStatus::Rejected, reason)
-        .await;
+    let status = class.map_or(FindingStatus::New, ClosureClass::status);
+    let _ = store.set_finding_verdict(fid, status, reason).await;
     let _ = store.clear_fix_attempts(fid).await;
     let first_line: String = reason
         .lines()
         .next()
         .map(|l| l.chars().take(120).collect())
         .unwrap_or_default();
-    let message = format!("#{fid} rejected by worker: {first_line}");
+    let message = match class {
+        Some(class) => format!("#{fid} declined by worker as {class} -> {status}: {first_line}"),
+        None => {
+            format!("#{fid} declined by worker without a classification -> {status}: {first_line}")
+        }
+    };
     let _ = fix_event(store, "fix", fid, job, message).await;
-    summary.outcome = Some("rejected".into());
+    summary.outcome = Some(status.as_str().into());
     release_claim(store, fid).await;
 }
 
@@ -3131,8 +3178,8 @@ async fn record_fix_outcome(
         FixOutcome::Blocked { report, from_tree } => {
             return hold_blocked_fix(store, fid, start, &report, from_tree, summary).await;
         }
-        FixOutcome::Declined { reason } => {
-            reject_declined_fix(store, fid, job, &reason, summary).await;
+        FixOutcome::Declined { class, reason } => {
+            record_declined_fix(store, fid, job, class, &reason, summary).await;
             return Ok(());
         }
         FixOutcome::Shipped { pr_url, recovered } => {
@@ -3262,6 +3309,10 @@ pub async fn run_fix(
         start.previous_blocker.as_ref(),
     )
     .await?;
+    let concluded = matches!(
+        outcome,
+        FixOutcome::Declined { .. } | FixOutcome::Shipped { .. }
+    );
     record_fix_outcome(
         store,
         finding,
@@ -3271,9 +3322,8 @@ pub async fn run_fix(
         &mut summary,
     )
     .await?;
-    if state == JobState::Suspended
-        && let Some(outcome @ ("rejected" | "pr_open")) = summary.outcome.as_deref()
-    {
+    if state == JobState::Suspended && concluded {
+        let outcome = summary.outcome.as_deref().unwrap_or_default();
         retire_concluded(store, start.job, outcome).await;
     }
     close_workspace(store, &start.ws).await;
