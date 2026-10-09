@@ -26,6 +26,12 @@ export function datetime(ms: number | null): string {
   return DAY_FMT.format(ms) + " " + TIME_FMT.format(ms);
 }
 
+/** Epoch ms → "2:05 PM" when it falls on today's local date, else "Sep 14 2:05 PM". */
+export function clock(ms: number | null): string {
+  if (!ms) return "\u2013";
+  return new Date(ms).toDateString() === new Date().toDateString() ? ts(ms) : datetime(ms);
+}
+
 /** Epoch ms → countdown "2h05m" / "45m" / "-3m" */
 export function countdown(ms: number | null): string {
   if (!ms) return "";
