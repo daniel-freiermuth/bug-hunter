@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { store } from "./lib/api.svelte";
   import { navigation } from "./lib/navigation.svelte";
+  import * as scrollMemory from "./lib/scrollMemory";
   import StatusPage from "./pages/StatusPage.svelte";
   import InboxPage from "./pages/InboxPage.svelte";
   import KanbanPage from "./pages/KanbanPage.svelte";
@@ -36,6 +37,45 @@
     navigation.sync();
   }
 
+  // Scroll position per history entry. `navigate` fires while the entry
+  // being left is still current, and `pagehide` covers reload and close.
+  let scroller = $state<HTMLElement | null>(null);
+
+  function saveScroll() {
+    if (scroller) scrollMemory.save(scroller);
+  }
+
+  // What the entry being shown needs once it has rendered: its saved
+  // position, or for a new entry the top. A new entry on another page
+  // starts at the top anyway (a fresh scroll container); this covers a
+  // filter or sort change, which stays on the page.
+  let arrival: { saved: scrollMemory.ScrollState | null; fresh: boolean } = {
+    saved: scrollMemory.saved(),
+    fresh: false,
+  };
+
+  function onEntryChange(event: NavigationCurrentEntryChangeEvent) {
+    // updateCurrentEntry() (saving a position) reports itself with no type.
+    if (event.navigationType === null) return;
+    const traversed = event.navigationType === "traverse" || event.navigationType === "reload";
+    arrival = { saved: scrollMemory.saved(), fresh: !traversed };
+  }
+
+  let cancelRestore = () => {};
+  $effect(() => {
+    // Once per entry, after it has rendered. Two entries can share a URL
+    // (Back between them changes no hash), and a replace keeps the entry
+    // but changes the URL, so follow both.
+    void navigation.hash;
+    void navigation.entry;
+    const el = scroller;
+    if (!el) return;
+    cancelRestore();
+    if (arrival.saved) cancelRestore = scrollMemory.restore(el, arrival.saved, () => store.summary !== null);
+    // A deep link places its finding itself (AllFindingsPage).
+    else if (arrival.fresh && navigation.route.focusId == null) el.scrollTo({ top: 0, behavior: "instant" });
+  });
+
   let loggingOut = $state(false);
   let logoutError = $state<string | null>(null);
 
@@ -52,12 +92,19 @@
     store.start();
     window.addEventListener("hashchange", onHashChange);
     window.addEventListener("popstate", onHashChange);
+    window.addEventListener("pagehide", saveScroll);
+    window.navigation.addEventListener("navigate", saveScroll);
+    window.navigation.addEventListener("currententrychange", onEntryChange);
   });
 
   onDestroy(() => {
     store.stopPolling();
+    cancelRestore();
     window.removeEventListener("hashchange", onHashChange);
     window.removeEventListener("popstate", onHashChange);
+    window.removeEventListener("pagehide", saveScroll);
+    window.navigation.removeEventListener("navigate", saveScroll);
+    window.navigation.removeEventListener("currententrychange", onEntryChange);
   });
 </script>
 
@@ -158,7 +205,7 @@
     <!-- Each page owns its scroll container, so a page switch starts at the
          top instead of inheriting the previous page's offset. -->
     {#key page}
-      <div class="page-scroll page-enter">
+      <div class="page-scroll page-enter" bind:this={scroller}>
         {#if page === "status"}
           <StatusPage />
         {:else if page === "inbox"}

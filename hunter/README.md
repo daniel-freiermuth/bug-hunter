@@ -381,6 +381,13 @@ changed since the link was made), only that filter is dropped; an unknown
 number shows a "not found" notice. Changing filters or sort keeps the focus
 while the card stays visible; a filter that hides it drops the focus.
 
+Back, Forward and reload return each page to where it was scrolled. Long
+card lists come back to the card that was at the top of the view, not to a
+pixel offset. A new navigation, including a filter or sort change, starts
+at the top, or at the focused finding; and a saved position wins over a
+link's finding, so Back to a `#findings:123` view returns to where you had
+scrolled, not to F#123.
+
 ## Users
 
 The dashboard and every API route need a login. Accounts are local

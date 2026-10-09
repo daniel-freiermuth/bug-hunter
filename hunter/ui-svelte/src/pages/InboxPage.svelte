@@ -32,7 +32,7 @@
       <p class="empty-sub">No new findings to triage. Check back after the next hunt cycle.</p>
     </div>
   {:else}
-    <div class="card-list">
+    <div class="card-list" data-scroll-list>
       {#each displayed as finding (finding.id)}
         <FindingCard {finding} actions={true} />
       {/each}
