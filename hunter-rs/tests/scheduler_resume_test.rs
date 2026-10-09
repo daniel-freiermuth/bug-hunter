@@ -569,15 +569,14 @@ async fn a_chain_out_of_attempts_is_retired_and_the_cycle_falls_through() {
 
     let picked = pick_next(&store, &cfg, None).await.unwrap();
 
+    // Normal selection, and not the abandoned hunt again: the chain's
+    // turn is over, so the rotation moves on to the repo's next scan.
     assert!(
         matches!(
             picked,
-            Some(Candidate::Repo {
-                kind: RepoJobKind::Hunt,
-                ..
-            })
+            Some(Candidate::Repo { kind, .. }) if kind != RepoJobKind::Hunt
         ),
-        "must fall through to normal selection, got {picked:?}"
+        "must fall through to normal selection past the hunt, got {picked:?}"
     );
     let (state, reason, notes) = job_row(&pool, newest).await;
     assert_eq!(state, JobState::Failed.as_str());

@@ -1,17 +1,18 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Rotation fairness: what an unsuccessful analysis attempt does to
+//! Rotation fairness: what an unsuccessful rotation-scan attempt does to
 //! `last_<kind>_at`.
 //!
-//! `run_cycle_inner` bumps that timestamp when an analysis-kind attempt
-//! did not succeed, so a kind that fails forever stops being the
-//! perpetual "oldest" pick and its siblings get a turn. The condition
-//! that decides "did not succeed" is one boolean expression, and the two
-//! cases below are its edges: a kill is a failed turn and must bump, a
+//! `run_cycle_inner` bumps that timestamp when a rotation scan's attempt
+//! — hunt or analysis — did not succeed, so a scan that fails forever
+//! stops being the perpetual "oldest" pick and everything else gets a
+//! turn. The condition that decides "ran to an end" is
+//! `attempt_ended`, and the cases below are its edges: a kill, a
+//! failure and a partly invalid ingest are failed turns and must bump, a
 //! suspension is a pause and must not.
 //!
 //! Driven through `run_cycle` rather than the executor, because the bump
-//! lives in the cycle and not in `run_analysis_job` — calling the
-//! executor directly would assert on nothing at all.
+//! lives in the cycle and not in the runners — calling an executor
+//! directly would assert on nothing at all.
 
 mod support;
 
@@ -382,4 +383,210 @@ async fn a_killed_resume_of_an_analysis_chain_bumps_the_rotation_timestamp() {
         "after test_gap's chain is killed the next-stalest kind must be \
          selected, got {picked:?}"
     );
+}
+
+/// A `test_gap` attempt that ingests some entries and rejects others has
+/// not succeeded — the runner leaves its timestamp alone — so the cycle
+/// bumps it. Without the bump the scan is re-run straight away.
+#[tokio::test]
+async fn a_partly_invalid_analysis_attempt_bumps_the_rotation_timestamp() {
+    let (_dir, path, _pool, cfg) = fixture("rotation-partly-invalid").await;
+    let store = Store::connect(&path).await.unwrap();
+    let out_dir = cfg.work_root.join("out");
+    let backend = ScriptedBackend::new(move |tree| {
+        let origin = tree
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let body = serde_json::json!([
+            {
+                "fingerprint": "alpha:src/e.rs:m:test-gap", "type": "test_gap",
+                "file": "src/e.rs", "severity": "medium", "confidence": 0.8,
+                "summary": "untested", "missing_tests": ["boundary: empty"],
+                "test_file": "tests/e.rs"
+            },
+            { "type": "test_gap" }
+        ]);
+        std::fs::write(
+            out_dir.join(format!("job{origin}.test_gaps.json")),
+            body.to_string(),
+        )
+        .unwrap();
+        support::done()
+    });
+
+    let summary = run_cycle(&store, &cfg, &backend, None).await;
+
+    assert_eq!(summary.state, Some(JobState::Done), "{summary:?}");
+    let ingest = summary.ingest.expect("the output was ingested");
+    assert_eq!((ingest.inserted, ingest.invalid), (1, 1), "{ingest:?}");
+    assert!(last_test_gap_at(&store).await > STALE_TEST_GAP);
+}
+
+// -- hunts ---------------------------------------------------------------------
+
+/// Two cloned repos whose only due scan is a hunt: `alpha` (repo 1, never
+/// hunted to a watermark, the stalest) and `beta` (repo 2, due).
+async fn two_hunts_due(label: &str) -> (TempDir, Store, Config) {
+    let dir = TempDir::new(label);
+    let (path, pool) = support::fresh_pool(&dir, "rotation-hunt").await;
+    let alpha = GitRepo::with_branch(&dir, "feature");
+    let alpha_clone = dir.subdir("repos").join("repo-1");
+    std::fs::rename(&alpha.work, &alpha_clone).unwrap();
+    // beta is never run in these tests; its clone only has to exist.
+    let beta_clone = dir.subdir("repos").join("repo-2");
+    let now = hunter::util::now_ms();
+    sqlx::query(
+        "INSERT INTO repos \
+         (id, name, url, path, forge, default_branch, enabled, added_at, last_hunt_at, \
+          last_test_gap_at, last_dep_update_at, last_refactor_at, last_modernization_at, \
+          last_standards_at) VALUES \
+         (1, 'alpha', ?1, ?2, 'github', 'main', 1, 1000, ?4, ?6, ?6, ?6, ?6, ?6), \
+         (2, 'beta', 'https://example.com/beta.git', ?3, 'github', 'main', 1, 1000, ?5, \
+          ?6, ?6, ?6, ?6, ?6)",
+    )
+    .bind(alpha.origin.to_string_lossy().to_string())
+    .bind(alpha_clone.to_string_lossy().to_string())
+    .bind(beta_clone.to_string_lossy().to_string())
+    .bind(STALE_HUNT)
+    .bind(now - 2 * 86_400_000)
+    .bind(now)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+    std::fs::write(
+        dir.subdir("playbooks").join("hunt.md"),
+        "hunt {{REPO_PATH}} {{DIFF_RANGE}} -> {{OUT_PATH}}\n",
+    )
+    .unwrap();
+    let mut cfg = Config::load(dir.path()).expect("load config");
+    cfg.work_root = dir.subdir("work_root");
+    let store = Store::connect(&path).await.unwrap();
+    (dir, store, cfg)
+}
+
+/// After `alpha`'s hunt attempt, the turn has to pass to `beta`; and
+/// `alpha`'s watermark must not move, so its retry reviews the same
+/// commits.
+async fn assert_turn_passed_to_beta(store: &Store, cfg: &Config) {
+    let alpha = store.get_repo_by_id(1).await.unwrap().unwrap();
+    assert!(
+        alpha.last_hunt_at.unwrap() > STALE_HUNT,
+        "the attempt is recorded"
+    );
+    assert_eq!(alpha.last_hunt_sha, None, "but nothing is marked hunted");
+    let picked = pick_next(store, cfg, None).await.unwrap();
+    assert!(
+        matches!(
+            picked,
+            Some(Candidate::Repo {
+                kind: RepoJobKind::Hunt,
+                repo_id: 2,
+                ..
+            })
+        ),
+        "beta's hunt must get the next turn, got {picked:?}"
+    );
+}
+
+/// A hunt whose worker fails is a turn taken. Left unrecorded, it would
+/// be re-picked every cycle, holding the stalest slot forever and
+/// starving every other repo's hunt.
+#[tokio::test]
+async fn a_failed_hunt_passes_the_turn_on() {
+    let (_dir, store, cfg) = two_hunts_due("rotation-hunt-failed").await;
+    let backend = ScriptedBackend::new(|_| RunResult {
+        exit_code: Some(1),
+        ..support::done()
+    });
+
+    let summary = run_cycle(&store, &cfg, &backend, None).await;
+
+    assert_eq!(summary.repo.as_deref(), Some("alpha"));
+    assert_eq!(summary.state, Some(JobState::Failed), "{summary:?}");
+    assert_turn_passed_to_beta(&store, &cfg).await;
+}
+
+/// A hunt that finishes but files one invalid finding beside a valid one
+/// does not advance its watermark. Left unrecorded, the attempt would be
+/// re-run every few seconds.
+#[tokio::test]
+async fn a_partly_invalid_hunt_passes_the_turn_on() {
+    let (_dir, store, cfg) = two_hunts_due("rotation-hunt-invalid").await;
+    let out_dir = cfg.work_root.join("out");
+    let backend = ScriptedBackend::new(move |tree| {
+        let origin = tree
+            .parent()
+            .unwrap()
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        let body = serde_json::json!([
+            {
+                "fingerprint": "alpha:README.md:seed:1", "type": "bug", "file": "README.md",
+                "line": 1, "bug_class": "boundary", "severity": "high", "confidence": 0.9,
+                "summary": "real", "detail": "d", "evidence_plan": "e"
+            },
+            { "type": "bug" }
+        ]);
+        std::fs::write(
+            out_dir.join(format!("job{origin}.findings.json")),
+            body.to_string(),
+        )
+        .unwrap();
+        support::done()
+    });
+
+    let summary = run_cycle(&store, &cfg, &backend, None).await;
+
+    assert_eq!(summary.state, Some(JobState::Done), "{summary:?}");
+    let ingest = summary.ingest.expect("the output was ingested");
+    assert_eq!((ingest.inserted, ingest.invalid), (1, 1), "{ingest:?}");
+    assert_turn_passed_to_beta(&store, &cfg).await;
+}
+
+/// A hunt chain the give-up ceiling abandons hands the turn on like an
+/// analysis chain does: otherwise the selection that abandons it starts
+/// the same hunt fresh, chain after chain, and no other repo is hunted.
+#[tokio::test]
+async fn an_abandoned_hunt_chain_passes_the_turn_on() {
+    let (_dir, store, cfg) = two_hunts_due("rotation-hunt-given-up").await;
+    let backend = stopped_worker("wallclock", true);
+
+    // Selection retires the chain at the ceiling and, in that same pick,
+    // must move on to beta.
+    let mut attempts = 0;
+    while !matches!(
+        pick_next(&store, &cfg, None).await.unwrap(),
+        Some(Candidate::Repo { repo_id: 2, .. })
+    ) {
+        assert!(attempts < 10, "the give-up ceiling never retired the chain");
+        let summary = run_cycle(&store, &cfg, &backend, None).await;
+        assert_eq!(summary.repo.as_deref(), Some("alpha"), "{summary:?}");
+        assert_eq!(summary.state, Some(JobState::Suspended), "{summary:?}");
+        attempts += 1;
+    }
+    assert!(
+        attempts > 1,
+        "the chain was resumed before it was abandoned"
+    );
+    assert_turn_passed_to_beta(&store, &cfg).await;
+}
+
+/// A hunt whose fetch fails never gets as far as a job; the runner's
+/// error still ends its turn, or every cycle would retry the fetch ahead
+/// of every other repo's hunt.
+#[tokio::test]
+async fn a_hunt_whose_fetch_fails_passes_the_turn_on() {
+    let (dir, store, cfg) = two_hunts_due("rotation-hunt-fetch").await;
+    // `GitRepo` puts alpha's origin here; without it, the fetch fails.
+    std::fs::remove_dir_all(dir.join("origin.git")).unwrap();
+
+    let summary = run_cycle(&store, &cfg, &ScriptedBackend::noop(), None).await;
+
+    assert!(summary.error.is_some(), "{summary:?}");
+    assert_turn_passed_to_beta(&store, &cfg).await;
 }

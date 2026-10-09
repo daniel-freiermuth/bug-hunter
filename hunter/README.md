@@ -203,6 +203,15 @@ The cost ceiling applies only when the historical typical estimate is
 positive. An absent or zero estimate is not a zero-token allowance;
 the attempt ceiling and provider budget still bound the run.
 
+A rotation scan (tier 7) that does not succeed — the worker fails or is
+killed, the job crashes, or it finishes without output or with any invalid
+entry — still counts as that scan's turn: its `last_<kind>_at` moves to now,
+so it is retried after its interval instead of being picked again at once
+and starving every other repo. A failed hunt leaves its watermark where it
+was, so the retry reviews the same commits. A suspended attempt is not a
+turn taken; tier 6 continues it, and a chain abandoned at the give-up
+ceiling counts as one.
+
 A repeatedly-failing item (same failure reason, consecutive attempts) gives
 up after a bounded streak rather than looping forever — this applies
 uniformly to fix retries, recheck retries, and harvest retries. A resume

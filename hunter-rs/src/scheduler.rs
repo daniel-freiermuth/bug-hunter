@@ -656,18 +656,18 @@ async fn resume_plan(store: &Store, cfg: &Config, job: Job) -> anyhow::Result<Op
             job.kind, repo.name
         );
         // The chain's turn is over. Every attempt in it was a suspension,
-        // which the cycle's starvation bump leaves alone, so an analysis
+        // which the cycle's starvation bump leaves alone, so a rotation
         // kind's timestamp is still as old as before the chain started:
         // rotation would pick the same work fresh in this very selection
-        // and repeat the whole chain, while its siblings never ran.
+        // and repeat the whole chain, while everything else waited. Hunts
+        // included: a hunt's watermark stays where it was, so the next
+        // hunt reviews the same commits after the scan interval.
         //
         // Bumped before the retirement: once retired, the chain is no
         // longer resumable and nothing would retry a bump that failed,
         // whereas a retirement that fails after a bump leaves the row
         // suspended and the next selection runs both writes again.
-        if let JobKind::Repo(kind) = job.kind
-            && kind.is_analysis()
-        {
+        if let JobKind::Repo(kind) = job.kind {
             let _ = store.set_last_kind_at(job.repo_id, kind).await;
         }
         // Best-effort: the summary preview runs this same function
@@ -5042,6 +5042,121 @@ pub async fn run_cycle(
     }
 }
 
+/// Whether a rotation scan's attempt ran to an end — done, killed or
+/// failed — and so took that scan's turn. (One that crashed is an `Err`
+/// from its runner, which the cycle bumps on its own.)
+///
+/// Whether it succeeded does not matter here: a clean success has its
+/// runner advance `last_{kind}_at` to now already, so bumping it again
+/// changes nothing. Suspended and denied attempts did not end: the first
+/// is continued by the resume tier, the second never started.
+fn attempt_ended(result: &CycleSummary) -> bool {
+    matches!(
+        result.state,
+        Some(JobState::Done | JobState::Killed | JobState::Failed)
+    )
+}
+
+/// Run the picked candidate through its kind's executor.
+///
+/// Exhaustive dispatch on Candidate variant and sub-kind.
+async fn dispatch(
+    store: &Store,
+    cfg: &Config,
+    backend: &dyn Backend,
+    candidate: &Candidate,
+) -> anyhow::Result<CycleSummary> {
+    match candidate {
+        Candidate::Finding {
+            kind, finding_id, ..
+        } => run_finding_job(store, cfg, backend, *kind, *finding_id, None).await,
+        Candidate::Repo { kind, repo_id, .. } => {
+            run_repo_job(store, cfg, backend, *kind, *repo_id, None).await
+        }
+        // A resume runs through the executor of the kind that was
+        // suspended — so ingest, watermarks and PR handling are that
+        // kind's own, unchanged. Logged here rather than in `pick_next`,
+        // which the summary endpoint also calls on every poll.
+        Candidate::Resume { plan, .. } => {
+            let _ = store
+                .log_event(
+                    "resume",
+                    &format!(
+                        "resume {} {}: job {} -> reserving {} tok \
+                         (ctx {} + max({} - {}, {}))",
+                        plan.kind,
+                        plan.repo,
+                        plan.predecessor_id,
+                        plan.anticipated,
+                        plan.ctx,
+                        plan.typical,
+                        plan.chain_spent,
+                        min_useful(plan.ctx)
+                    ),
+                    Some(plan.predecessor_id),
+                    plan.finding_id,
+                )
+                .await;
+            let resume = Some(plan.as_ref());
+            match plan.kind {
+                JobKind::Repo(kind) => {
+                    run_repo_job(store, cfg, backend, kind, plan.repo_id, resume).await
+                }
+                JobKind::Finding(kind) => {
+                    // A finding-kind job always recorded its target, so a
+                    // row without one is corrupt rather than merely odd.
+                    let fid = plan
+                        .finding_id
+                        .ok_or_else(|| anyhow::anyhow!("resume of a {kind} job with no finding"))?;
+                    run_finding_job(store, cfg, backend, kind, fid, resume).await
+                }
+            }
+        }
+    }
+}
+
+async fn run_repo_job(
+    store: &Store,
+    cfg: &Config,
+    backend: &dyn Backend,
+    kind: RepoJobKind,
+    repo_id: i64,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<CycleSummary> {
+    let repo = store
+        .get_repo_by_id(repo_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
+    match kind {
+        RepoJobKind::Hunt => run_hunt(store, cfg, &repo, backend, resume).await,
+        RepoJobKind::TestGap => run_test_gap(store, cfg, &repo, backend, resume).await,
+        RepoJobKind::DepUpdate => run_dep_update(store, cfg, &repo, backend, resume).await,
+        RepoJobKind::Refactor => run_refactor(store, cfg, &repo, backend, resume).await,
+        RepoJobKind::Modernization => run_modernize(store, cfg, &repo, backend, resume).await,
+        RepoJobKind::Standards => run_standards(store, cfg, &repo, backend, resume).await,
+    }
+}
+
+async fn run_finding_job(
+    store: &Store,
+    cfg: &Config,
+    backend: &dyn Backend,
+    kind: FindingJobKind,
+    finding_id: i64,
+    resume: Option<&ResumePlan>,
+) -> anyhow::Result<CycleSummary> {
+    let finding = store
+        .get_finding(finding_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("finding {finding_id} not found"))?;
+    match kind {
+        FindingJobKind::Engage => run_engage(store, cfg, &finding, backend, resume).await,
+        FindingJobKind::Harvest => run_harvest(store, cfg, &finding, backend, resume).await,
+        FindingJobKind::Recheck => run_recheck(store, cfg, &finding, backend, resume).await,
+        FindingJobKind::Fix => run_fix(store, cfg, &finding, backend, resume).await,
+    }
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "the scheduler's priority ladder: each tier is an ordered \
@@ -5102,152 +5217,47 @@ async fn run_cycle_inner(
         });
     };
 
-    // Exhaustive dispatch on Candidate variant and sub-kind.
-    let mut result = match &candidate {
-        Candidate::Finding {
-            kind, finding_id, ..
-        } => {
-            let finding = store
-                .get_finding(*finding_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("finding {finding_id} not found"))?;
-            match kind {
-                FindingJobKind::Engage => run_engage(store, cfg, &finding, backend, None).await?,
-                FindingJobKind::Harvest => run_harvest(store, cfg, &finding, backend, None).await?,
-                FindingJobKind::Recheck => run_recheck(store, cfg, &finding, backend, None).await?,
-                FindingJobKind::Fix => run_fix(store, cfg, &finding, backend, None).await?,
-            }
-        }
-        Candidate::Repo { kind, repo_id, .. } => {
-            let repo = store
-                .get_repo_by_id(*repo_id)
-                .await?
-                .ok_or_else(|| anyhow::anyhow!("repo {repo_id} not found"))?;
-            match kind {
-                RepoJobKind::Hunt => run_hunt(store, cfg, &repo, backend, None).await?,
-                RepoJobKind::TestGap => run_test_gap(store, cfg, &repo, backend, None).await?,
-                RepoJobKind::DepUpdate => run_dep_update(store, cfg, &repo, backend, None).await?,
-                RepoJobKind::Refactor => run_refactor(store, cfg, &repo, backend, None).await?,
-                RepoJobKind::Modernization => {
-                    run_modernize(store, cfg, &repo, backend, None).await?
-                }
-                RepoJobKind::Standards => run_standards(store, cfg, &repo, backend, None).await?,
-            }
-        }
-        // A resume runs through the executor of the kind that was
-        // suspended — so ingest, watermarks and PR handling are that
-        // kind's own, unchanged. Logged here rather than in `pick_next`,
-        // which the summary endpoint also calls on every poll.
-        Candidate::Resume { plan, .. } => {
-            let _ = store
-                .log_event(
-                    "resume",
-                    &format!(
-                        "resume {} {}: job {} -> reserving {} tok \
-                         (ctx {} + max({} - {}, {}))",
-                        plan.kind,
-                        plan.repo,
-                        plan.predecessor_id,
-                        plan.anticipated,
-                        plan.ctx,
-                        plan.typical,
-                        plan.chain_spent,
-                        min_useful(plan.ctx)
-                    ),
-                    Some(plan.predecessor_id),
-                    plan.finding_id,
-                )
-                .await;
-            let resume = Some(plan.as_ref());
-            match plan.kind {
-                JobKind::Repo(kind) => {
-                    let repo = store
-                        .get_repo_by_id(plan.repo_id)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("repo {} not found", plan.repo_id))?;
-                    match kind {
-                        RepoJobKind::Hunt => run_hunt(store, cfg, &repo, backend, resume).await?,
-                        RepoJobKind::TestGap => {
-                            run_test_gap(store, cfg, &repo, backend, resume).await?
-                        }
-                        RepoJobKind::DepUpdate => {
-                            run_dep_update(store, cfg, &repo, backend, resume).await?
-                        }
-                        RepoJobKind::Refactor => {
-                            run_refactor(store, cfg, &repo, backend, resume).await?
-                        }
-                        RepoJobKind::Modernization => {
-                            run_modernize(store, cfg, &repo, backend, resume).await?
-                        }
-                        RepoJobKind::Standards => {
-                            run_standards(store, cfg, &repo, backend, resume).await?
-                        }
-                    }
-                }
-                JobKind::Finding(kind) => {
-                    // A finding-kind job always recorded its target, so a
-                    // row without one is corrupt rather than merely odd.
-                    let fid = plan
-                        .finding_id
-                        .ok_or_else(|| anyhow::anyhow!("resume of a {kind} job with no finding"))?;
-                    let finding = store
-                        .get_finding(fid)
-                        .await?
-                        .ok_or_else(|| anyhow::anyhow!("finding {fid} not found"))?;
-                    match kind {
-                        FindingJobKind::Engage => {
-                            run_engage(store, cfg, &finding, backend, resume).await?
-                        }
-                        FindingJobKind::Harvest => {
-                            run_harvest(store, cfg, &finding, backend, resume).await?
-                        }
-                        FindingJobKind::Recheck => {
-                            run_recheck(store, cfg, &finding, backend, resume).await?
-                        }
-                        FindingJobKind::Fix => {
-                            run_fix(store, cfg, &finding, backend, resume).await?
-                        }
-                    }
-                }
-            }
-        }
-    };
-
-    // Starvation prevention for rotation kinds: bump the timestamp on
-    // failed/killed/done-without-output/done-with-all-invalid so this
-    // kind doesn't monopolise the rotation forever. This is SEPARATE from
-    // run_analysis_job's success-gated timestamp (which governs this kind's
-    // own retry cadence) — this block ensures OTHER kinds get a turn.
+    let dispatched = dispatch(store, cfg, backend, &candidate).await;
+    // Starvation prevention for rotation kinds: a scan whose attempt ended
+    // has its `last_{kind}_at` bumped, so it is retried after its interval
+    // instead of being re-picked at once. The runners only advance that
+    // timestamp (and, for hunt, the `last_hunt_sha` watermark) on a clean
+    // success — done, an output file, no invalid entry — so without this
+    // an attempt that keeps failing would be the stalest work in the
+    // rotation forever: re-run every cycle, and every other repo's scans
+    // starved behind it. The bump records the attempt, not success; the
+    // hunt watermark stays where it was, so the retry reviews the same
+    // commits again.
     //
-    // Suspended is deliberately absent from `failed` below. A cap kill is
-    // a pause, and re-selecting that work is no longer this bump's job:
-    // the resume tier claims it by id at a priority above rotation. Were
-    // it bumped here it would be counted as a turn taken, while the work
-    // itself had not started. A chain that never finishes is retired by
-    // the give-up ceiling, which bumps the timestamp itself (`resume_plan`):
-    // that is where the chain's turn ends.
+    // Suspended is deliberately absent. A cap kill is a pause, and
+    // re-selecting that work is no longer this bump's job: the resume
+    // tier claims it by id at a priority above rotation. Were it bumped
+    // here it would be counted as a turn taken, while the work itself had
+    // not finished. A chain that never finishes is retired by the give-up
+    // ceiling, which bumps the timestamp itself (`resume_plan`): that is
+    // where the chain's turn ends.
     //
     // A resumed attempt counts exactly like a fresh one. When it ends
     // killed or failed the chain is over and the resume tier has nothing
     // left to claim, so without the bump rotation would start the same
     // work fresh.
-    //
-    // `is_analysis()` covers standards here where the Python twin's list
-    // does not, because standards exists only in this daemon — the twin
-    // has no such kind to starve.
-    if let JobKind::Repo(kind) = candidate.job_kind()
-        && kind.is_analysis()
-    {
-        let failed = matches!(result.state, Some(JobState::Killed | JobState::Failed))
-            || result.error.is_some()
-            || (result.state == Some(JobState::Done) && result.ingest.is_none())
-            || result
-                .ingest
-                .as_ref()
-                .is_some_and(|i| i.inserted == 0 && i.invalid > 0);
-        if failed {
-            let _ = store.set_last_kind_at(candidate.repo_id(), kind).await;
+    let rotation = match candidate.job_kind() {
+        JobKind::Repo(kind) => Some((candidate.repo_id(), kind)),
+        JobKind::Finding(_) => None,
+    };
+    let mut result = match dispatched {
+        Ok(result) => result,
+        Err(e) => {
+            if let Some((repo_id, kind)) = rotation {
+                let _ = store.set_last_kind_at(repo_id, kind).await;
+            }
+            return Err(e);
         }
+    };
+    if let Some((repo_id, kind)) = rotation
+        && attempt_ended(&result)
+    {
+        let _ = store.set_last_kind_at(repo_id, kind).await;
     }
 
     if sync.is_some() {
