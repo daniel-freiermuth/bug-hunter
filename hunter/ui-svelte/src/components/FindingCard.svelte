@@ -20,6 +20,13 @@
   // them on every 5s poll — froze the page for seconds. An off-screen card
   // keeps its place with an empty box of its last rendered height (an
   // estimate until it has rendered once).
+  //
+  // The box is a child, never a height on the card itself: the browser's
+  // scroll anchoring holds a visible card in place while cards above it
+  // change size, but a change to the anchor's own `height` switches that
+  // off for the frame. After any jump into unrendered cards (a scrollbar
+  // drag, a deep link) the anchor is a placeholder about to mount, so the
+  // content would slide by everything that mounted above it.
   const ESTIMATED_HEIGHT_PX = 180;
   let near = $state(false);
   let lastHeight = $state<number | null>(null);
@@ -162,10 +169,11 @@
 <div
   class="card {sevClass(finding.severity)}"
   id="finding-{finding.id}"
-  style:height={live ? null : `${lastHeight ?? ESTIMATED_HEIGHT_PX}px`}
   {@attach nearViewport(onVisibility)}
 >
-  {#if live}
+  {#if !live}
+    <div class="placeholder" style:--placeholder-height="{lastHeight ?? ESTIMATED_HEIGHT_PX}px"></div>
+  {:else}
     <!-- Header row: id + type pill + severity dot/text + confidence + category + status pill (right) -->
     <div class="card-header">
       <a class="fid" href="#findings:{finding.id}" title="Open finding #{finding.id}">F#{finding.id}</a>
@@ -380,16 +388,22 @@
 <style>
   /* ── Card ────────────────────────────────────────────────────── */
   .card {
+    /* Shared with .placeholder, which subtracts them from the card height. */
+    --card-pad-block: 0.75rem;
+    --card-border: 1px;
     background: var(--bg-card);
     border-radius: var(--radius-md);
-    padding: 0.75rem 0.875rem;
+    padding: var(--card-pad-block) 0.875rem;
     margin-bottom: 0.5rem;
-    border: 1px solid var(--border);
+    border: var(--card-border) solid var(--border);
     border-left: 3px solid var(--text-dim);
     transition: transform var(--transition), box-shadow var(--transition),
                 border-color var(--transition);
     overflow: hidden;
     min-width: 0;
+  }
+  .placeholder {
+    height: calc(var(--placeholder-height) - 2 * var(--card-pad-block) - 2 * var(--card-border));
   }
   .card:hover {
     transform: translateY(-1px);
