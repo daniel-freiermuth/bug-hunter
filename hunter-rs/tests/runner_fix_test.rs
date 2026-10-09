@@ -1103,51 +1103,64 @@ async fn a_block_that_cannot_be_recorded_returns_the_finding_to_queued() {
     assert_eq!(finding.status.as_str(), "queued");
 }
 
-/// A modernization finding gets its own branch prefix and playbook.
+/// Each kind gets its own branch prefix and playbook, and every one of
+/// them hands the worker the decline classification the scheduler parses:
+/// a playbook without it leaves every decline unclassified, back at `new`.
 #[tokio::test]
-async fn a_modernization_fix_uses_its_branch_and_playbook() {
-    let f = fixture("fix-modernize").await;
-    std::fs::write(
-        f.cfg.root.join("playbooks").join("apply_modernization.md"),
-        "modernize {{WORKTREE}}\n",
-    )
-    .unwrap();
-    let repo_id = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
-    let (fid, _) = f
-        .store
-        .upsert_finding(
-            repo_id,
-            &FindingInsert {
-                fingerprint: "fp-modernize-1".to_owned(),
-                file: "src/lib.rs".to_owned(),
-                severity: hunter::domain::Severity::Medium,
-                confidence: 0.9,
-                summary: "Move to the new API".to_owned(),
-                ..Default::default()
-            },
-            "modernization",
-            None,
+async fn each_fix_kind_gets_its_branch_and_playbook_with_the_decline_classes() {
+    for (kind, template, prefix) in [
+        ("bug", "fix.md", "fix"),
+        ("refactor", "apply_improvement.md", "improve"),
+        ("modernization", "apply_modernization.md", "modernize"),
+    ] {
+        let f = fixture("fix-kinds").await;
+        std::fs::write(
+            f.cfg.root.join("playbooks").join(template),
+            format!("{prefix} {{{{WORKTREE}}}}\n{{{{DECLINE_CLASSIFICATION}}}}\n"),
         )
-        .await
         .unwrap();
-    f.store
-        .set_finding_status(fid, hunter::domain::FindingStatus::Queued)
-        .await
-        .unwrap();
-    let finding = f.store.get_finding(fid).await.unwrap().unwrap();
-    let worker = ScriptedBackend::noop();
-    let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
-        .await
-        .unwrap();
-    assert_eq!(
-        summary.branch.as_deref(),
-        Some(format!("modernize/move-to-the-new-api-{fid}").as_str())
-    );
-    assert!(
-        worker.runs()[0].prompt.starts_with("modernize "),
-        "{}",
-        worker.runs()[0].prompt
-    );
+        let repo_id = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
+        let (fid, _) = f
+            .store
+            .upsert_finding(
+                repo_id,
+                &FindingInsert {
+                    fingerprint: format!("fp-{kind}-1"),
+                    file: "src/lib.rs".to_owned(),
+                    severity: hunter::domain::Severity::Medium,
+                    confidence: 0.9,
+                    summary: "Move to the new API".to_owned(),
+                    ..Default::default()
+                },
+                kind,
+                None,
+            )
+            .await
+            .unwrap();
+        f.store
+            .set_finding_status(fid, hunter::domain::FindingStatus::Queued)
+            .await
+            .unwrap();
+        let finding = f.store.get_finding(fid).await.unwrap().unwrap();
+        let worker = ScriptedBackend::noop();
+        let summary = hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.branch.as_deref(),
+            Some(format!("{prefix}/move-to-the-new-api-{fid}").as_str()),
+            "{kind}"
+        );
+        let prompt = &worker.runs()[0].prompt;
+        assert!(
+            prompt.starts_with(&format!("{prefix} ")),
+            "{kind}: {prompt}"
+        );
+        assert!(
+            prompt.contains(hunter::playbooks::DECLINE_CLASSIFICATION),
+            "{kind}: {prompt}"
+        );
+    }
 }
 
 /// A one-shot budget override is spent by the attempt it bought; an
