@@ -2,6 +2,7 @@
   import { store } from "../lib/api.svelte";
   import type { FindingOut } from "../lib/types";
   import { toast } from "../lib/toast.svelte";
+  import { placeAtTop, settle } from "../lib/scroll";
   import FilterBar from "../components/FilterBar.svelte";
   import FindingCard from "../components/FindingCard.svelte";
 
@@ -11,71 +12,42 @@
   let filterBar: { reveal: (finding: FindingOut) => void } | undefined = $state();
   const repoNames = $derived(new Map((store.summary?.repos ?? []).map((r) => [r.id, r.name])));
 
-  // Frames the focused card must hold still before the jump counts as done,
-  // and the most frames spent getting there.
-  const SETTLED_FRAMES = 3;
-  const MAX_SETTLE_FRAMES = 120;
+  // Each history entry places its finding once: later polls must not pull
+  // the view back to it after the user has scrolled on, but a new visit to
+  // the same finding (a new entry, on this still-mounted page) must.
+  let placedEntry: string | null = null;
+  let cancelPlace = () => {};
+  $effect(() => () => cancelPlace());
 
   $effect(() => {
-    if (focusId == null) return;
-    const target = `finding-${focusId}`;
-    let revealed = false;
-    let highlighted: HTMLElement | null = null;
-    let frame = 0;
-
-    // Off-screen cards are empty boxes of an estimated height
-    // (FindingCard), and every card near the viewport mounts and takes its
-    // real one. So one scroll lands wherever the estimate put the target --
-    // a smooth one also mounts every card it passes and lands thousands of
-    // pixels off. Jump instantly instead, and re-centre each frame until
-    // the cards around the target have mounted and it stops moving.
-    function settleOn(el: HTMLElement) {
-      let lastTop = Number.NaN;
-      let still = 0;
-      let frames = 0;
-      const step = () => {
-        el.scrollIntoView({ behavior: "instant", block: "center" });
-        const top = el.getBoundingClientRect().top;
-        still = Math.abs(top - lastTop) < 1 ? still + 1 : 0;
-        lastTop = top;
-        if (still < SETTLED_FRAMES && ++frames < MAX_SETTLE_FRAMES) {
-          frame = requestAnimationFrame(step);
-        }
-      };
-      frame = requestAnimationFrame(step);
+    const id = focusId;
+    const entry = window.navigation.currentEntry?.key ?? null;
+    // A jump still pending for another entry (one that cannot complete,
+    // like a short list's last card) must not move this one.
+    if (entry !== placedEntry) cancelPlace();
+    if (id == null || entry === placedEntry) return;
+    // Nothing to decide until the first poll has landed; summary and
+    // findings arrive together.
+    if (store.summary === null) return;
+    const finding = store.findings.find((f) => f.id === id);
+    if (!finding) {
+      placedEntry = entry;
+      toast(`F#${id} not found`, false);
+      return;
     }
-
-    const interval = setInterval(() => {
-      const el = document.getElementById(target);
-      if (el) {
-        clearInterval(interval);
-        settleOn(el);
-        el.classList.add("highlight-focus");
-        highlighted = el;
-        return;
-      }
-      // Nothing to wait for until the first poll has landed; summary and
-      // findings arrive together.
-      if (store.summary === null) return;
-      const finding = store.findings.find((f) => f.id === focusId);
-      if (!finding) {
-        clearInterval(interval);
-        toast(`F#${focusId} not found`, false);
-        return;
-      }
-      // Finding exists in data but not rendered → filters are hiding it.
-      if (!revealed) {
-        revealed = true;
-        filterBar?.reveal(finding);
-      }
-    }, 50);
-    const giveUp = setTimeout(() => clearInterval(interval), 5000);
-    return () => {
-      clearInterval(interval);
-      clearTimeout(giveUp);
-      cancelAnimationFrame(frame);
-      highlighted?.classList.remove("highlight-focus");
-    };
+    // In the data but not in the list: filters hide it. Revealing changes
+    // the URL, the list follows, and this runs again.
+    if (!displayed.some((f) => f.id === id)) {
+      filterBar?.reveal(finding);
+      return;
+    }
+    placedEntry = entry;
+    // Effects run after the DOM update that rendered `displayed`. The cards
+    // around it may still be placeholders, too short to scroll it to the
+    // top yet: keep placing it while the list grows.
+    const el = document.getElementById(`finding-${id}`);
+    cancelPlace();
+    if (el?.parentElement) cancelPlace = settle(el.parentElement, () => placeAtTop(el));
   });
 </script>
 
@@ -103,7 +75,7 @@
   {:else}
     <div class="card-list">
       {#each displayed as finding (finding.id)}
-        <FindingCard {finding} actions={true} />
+        <FindingCard {finding} actions={true} focused={finding.id === focusId} />
       {/each}
     </div>
   {/if}
@@ -159,10 +131,5 @@
     max-width: 28rem;
     margin: 0 auto;
     line-height: 1.5;
-  }
-  :global(.highlight-focus) {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-    box-shadow: 0 0 12px rgba(78, 168, 222, 0.3), inset 0 0 0 1px rgba(78, 168, 222, 0.15);
   }
 </style>

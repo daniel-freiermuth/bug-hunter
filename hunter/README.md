@@ -373,8 +373,12 @@ deep-linked list explicit; future options are not silently admitted. Use
 the All control to return to an unrestricted selection. Defaults are omitted
 when controls update the URL.
 
-Card numbers (`F#123`) link to the focused finding view (`#findings:123`)
-and can be copied or opened in another tab.
+Card numbers (`F#123`) link to the finding on All Findings
+(`#findings:123`), carrying the current page's filters and sort, and can be
+copied or opened in another tab. The linked card is placed at the top of the
+list and outlined. If a carried filter hides it (its status or confidence
+changed since the link was made), only that filter is dropped; an unknown
+number shows a "not found" notice.
 
 ## Users
 

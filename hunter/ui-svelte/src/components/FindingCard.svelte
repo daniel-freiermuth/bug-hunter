@@ -6,7 +6,11 @@
   import { navigation } from "../lib/navigation.svelte";
   import FindingDetail from "./FindingDetail.svelte";
 
-  let { finding, actions = false }: { finding: FindingOut; actions?: boolean } = $props();
+  let {
+    finding,
+    actions = false,
+    focused = false,
+  }: { finding: FindingOut; actions?: boolean; focused?: boolean } = $props();
 
   let expanded = $state(false);
   // Absent when talking to a daemon that predates the field.
@@ -169,6 +173,7 @@
 
 <div
   class="card {sevClass(finding.severity)}"
+  class:focused
   id="finding-{finding.id}"
   {@attach nearViewport(onVisibility)}
 >
@@ -414,6 +419,12 @@
   .card.sev-high   { border-left-color: var(--sev-high); }
   .card.sev-medium { border-left-color: var(--sev-medium); }
   .card.sev-low    { border-left-color: var(--sev-low); }
+  /* The finding a deep link points at. */
+  .card.focused {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    box-shadow: 0 0 12px rgba(78, 168, 222, 0.3), inset 0 0 0 1px rgba(78, 168, 222, 0.15);
+  }
 
   /* ── Header ─────────────────────────────────────────────────── */
   .card-header {
