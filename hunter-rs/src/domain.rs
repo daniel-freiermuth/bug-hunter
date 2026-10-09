@@ -422,12 +422,6 @@ impl RepoJobKind {
         Self::Standards,
     ];
 
-    /// Everything except Hunt — the rotation-analysis types that get
-    /// starvation-prevention timestamp bumps on failure.
-    pub fn is_analysis(self) -> bool {
-        !matches!(self, Self::Hunt)
-    }
-
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Hunt => "hunt",

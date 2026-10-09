@@ -338,6 +338,143 @@ async fn pick_next_budget_override_jumps_the_queue() {
     );
 }
 
+// -- pick_next: the rotation's intervals ----------------------------------------
+
+const DAY_MS: i64 = 86_400_000;
+
+/// When each rotation scan of a repo last ran, as days before now.
+#[derive(Clone, Copy)]
+struct Ran {
+    hunt: f64,
+    test_gap: f64,
+    modernization: f64,
+    standards: f64,
+}
+
+/// Every scan ran just now: nothing is due.
+const FRESH: Ran = Ran {
+    hunt: 0.0,
+    test_gap: 0.0,
+    modernization: 0.0,
+    standards: 0.0,
+};
+
+/// An enabled, cloned repo (its path exists) whose scans last ran as
+/// `ran` says; `dep_update` and `refactor` ran just now.
+async fn seed_scanned_repo(pool: &SqlitePool, id: i64, name: &str, path: &Path, ran: Ran) {
+    let now = now_ms();
+    #[allow(clippy::cast_possible_truncation, reason = "whole milliseconds")]
+    let ago = |days: f64| now - (days * DAY_MS as f64) as i64;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, enabled, added_at, \
+         last_hunt_at, last_test_gap_at, last_dep_update_at, last_refactor_at, \
+         last_modernization_at, last_standards_at) \
+         VALUES (?1, ?2, 'https://example.com/r.git', ?3, 'github', 'main', 1, 1000, \
+                 ?4, ?5, ?6, ?6, ?7, ?8)",
+    )
+    .bind(id)
+    .bind(name)
+    .bind(path.to_string_lossy().to_string())
+    .bind(ago(ran.hunt))
+    .bind(ago(ran.test_gap))
+    .bind(now)
+    .bind(ago(ran.modernization))
+    .bind(ago(ran.standards))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// What `pick_next` selects for one repo that last ran as `ran`, under a
+/// 2-day scan interval and 30-day modernization and standards intervals.
+async fn rotation_pick(ran: Ran) -> Option<RepoJobKind> {
+    let (dir, path, pool) = fresh_db().await;
+    seed_scanned_repo(&pool, 1, "alpha", dir.path(), ran).await;
+    let store = open_store(pool, &path).await;
+    let mut cfg = test_config(3600.0);
+    cfg.scan_interval_days = 2.0;
+    match pick_next(&store, &cfg, None).await.unwrap() {
+        None => None,
+        Some(hunter::scheduler::Candidate::Repo { kind, .. }) => Some(kind),
+        Some(other) => panic!("expected a rotation pick, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_scan_is_due_only_once_its_interval_has_passed() {
+    let within = Ran {
+        test_gap: 1.5,
+        ..FRESH
+    };
+    assert_eq!(rotation_pick(within).await, None);
+    let past = Ran {
+        test_gap: 3.0,
+        ..FRESH
+    };
+    assert_eq!(rotation_pick(past).await, Some(RepoJobKind::TestGap));
+}
+
+#[tokio::test]
+async fn modernization_is_due_only_once_its_interval_has_passed() {
+    let within = Ran {
+        modernization: 20.0,
+        ..FRESH
+    };
+    assert_eq!(rotation_pick(within).await, None);
+    let past = Ran {
+        modernization: 40.0,
+        ..FRESH
+    };
+    assert_eq!(rotation_pick(past).await, Some(RepoJobKind::Modernization));
+}
+
+#[tokio::test]
+async fn standards_is_due_only_once_its_interval_has_passed() {
+    let within = Ran {
+        standards: 20.0,
+        ..FRESH
+    };
+    assert_eq!(rotation_pick(within).await, None);
+    let past = Ran {
+        standards: 40.0,
+        ..FRESH
+    };
+    assert_eq!(rotation_pick(past).await, Some(RepoJobKind::Standards));
+}
+
+/// A forced cycle picks the named repo's work, though another repo's is
+/// staler, and though the named repo is paused.
+#[tokio::test]
+async fn a_forced_repo_is_picked_over_a_staler_one() {
+    let (dir, path, pool) = fresh_db().await;
+    let stale = Ran {
+        hunt: 10.0,
+        ..FRESH
+    };
+    let due = Ran { hunt: 3.0, ..FRESH };
+    seed_scanned_repo(&pool, 1, "alpha", dir.path(), stale).await;
+    seed_scanned_repo(&pool, 2, "beta", dir.path(), due).await;
+    sqlx::query("UPDATE repos SET enabled = 0 WHERE id = 2")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let store = open_store(pool, &path).await;
+    let cfg = test_config(3600.0);
+
+    let unforced = pick_next(&store, &cfg, None).await.unwrap().unwrap();
+    assert_eq!(
+        unforced.repo_id(),
+        1,
+        "unforced, the stalest repo goes first"
+    );
+    let forced = pick_next(&store, &cfg, Some("beta"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(forced.repo_id(), 2);
+    assert_eq!(forced.job_kind(), RepoJobKind::Hunt.into());
+}
+
 // -- summary integration (oneshot router, NullBackend) -------------------------
 
 /// `/api/summary` over a queued fix finding (id 5) and no running job,

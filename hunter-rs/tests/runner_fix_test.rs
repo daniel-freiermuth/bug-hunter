@@ -161,6 +161,20 @@ async fn clean_repo_runs_the_fix() {
     assert_eq!(summary.outcome.as_deref(), Some("rejected"));
 }
 
+/// A cycle hands a queued finding to the fix runner: the same fix as
+/// above, picked and dispatched by `run_cycle` rather than called direct.
+#[tokio::test]
+async fn a_cycle_runs_the_queued_fix() {
+    let f = fixture("fix-cycle").await;
+    let backend =
+        ScriptedBackend::writing("NOT-A-BUG.md", "Classification: wrong\nmisread the code");
+
+    let summary = hunter::scheduler::run_cycle(&f.store, &f.cfg, &backend, None).await;
+
+    assert_eq!(summary.finding_id, Some(f.fid), "{summary:?}");
+    assert_eq!(summary.outcome.as_deref(), Some("rejected"), "{summary:?}");
+}
+
 // ---------------------------------------------------------------------------
 // The cap the job is granted
 // ---------------------------------------------------------------------------
