@@ -1,6 +1,7 @@
 <script lang="ts">
   import { store } from "../lib/api.svelte";
   import { ktok, pct } from "../lib/format";
+  import { navigation } from "../lib/navigation.svelte";
 
   let stats = $derived(store.stats);
   let totals = $derived(stats?.totals ?? null);
@@ -115,7 +116,7 @@
                   <tr>
                     <td>
                       <a
-                        href="#findings:{row.finding_id}"
+                        href={navigation.findingHref(row.finding_id)}
                         class="finding-link"
                       >
                         #{row.finding_id}

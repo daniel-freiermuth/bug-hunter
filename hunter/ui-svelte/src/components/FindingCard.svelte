@@ -3,6 +3,7 @@
   import type { FindingOut } from "../lib/types";
   import { isHttpUrl, pct, datetime, typeLabel } from "../lib/format";
   import { nearViewport } from "../lib/nearViewport";
+  import { navigation } from "../lib/navigation.svelte";
   import FindingDetail from "./FindingDetail.svelte";
 
   let { finding, actions = false }: { finding: FindingOut; actions?: boolean } = $props();
@@ -176,7 +177,7 @@
   {:else}
     <!-- Header row: id + type pill + severity dot/text + confidence + category + status pill (right) -->
     <div class="card-header">
-      <a class="fid" href="#findings:{finding.id}" title="Open finding #{finding.id}">F#{finding.id}</a>
+      <a class="fid" href={navigation.findingHref(finding.id)} title="Open finding #{finding.id}">F#{finding.id}</a>
       <span class="type-pill" title={finding.type}>{typeLabel(finding.type)}</span>
       <span class="sev-indicator {sevClass(finding.severity)}">
         <span class="sev-dot"></span>
@@ -242,13 +243,13 @@
     {#if finding.follow_up_of != null || followUps.length > 0}
       <div class="lineage">
         {#if finding.follow_up_of != null}
-          <span>follow-up of <a href="#findings:{finding.follow_up_of}">F#{finding.follow_up_of}</a></span>
+          <span>follow-up of <a href={navigation.findingHref(finding.follow_up_of)}>F#{finding.follow_up_of}</a></span>
         {/if}
         {#if followUps.length > 0}
           <span>
             follow-ups:
             {#each followUps as fid (fid)}
-              <a href="#findings:{fid}">F#{fid}</a>
+              <a href={navigation.findingHref(fid)}>F#{fid}</a>
             {/each}
           </span>
         {/if}
