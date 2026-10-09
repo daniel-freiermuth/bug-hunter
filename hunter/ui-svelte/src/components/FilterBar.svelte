@@ -1,9 +1,11 @@
 <script lang="ts">
+  // The filter controls. Which findings they leave, and in what order, is
+  // lib/findingFilter.ts: pages derive their list from the URL themselves.
   import type { FindingOut } from "../lib/types";
   import { SEV_RANK } from "../lib/format";
   import { Filter, needsSelector } from "../lib/filter.svelte";
   import { navigation } from "../lib/navigation.svelte";
-  import { FILTER_KEYS, readConfidence, readSelection, readSort, writeSelection, type FilterKey } from "../lib/filterUrl";
+  import { readConfidence, readSelection, readSort, writeSelection, type FilterKey } from "../lib/filterUrl";
   import MultiSelect from "./MultiSelect.svelte";
 
   let {
@@ -11,13 +13,11 @@
     prefix,
     showStatus = false,
     repoNames = new Map<number, string>(),
-    onFilter,
   }: {
     findings: FindingOut[];
     prefix: string;
     showStatus?: boolean;
     repoNames?: Map<number, string>;
-    onFilter: (filtered: FindingOut[]) => void;
   } = $props();
 
   // -- Extract unique values from the findings list -------------------------
@@ -54,79 +54,6 @@
     selectConfidence(value, sliding);
     sliding = true;
   }
-
-  // Every URL parameter that can hide a finding, and the test each applies.
-  const DIMENSIONS = [...FILTER_KEYS, "confidence"] as const;
-  type Dimension = (typeof DIMENSIONS)[number];
-
-  function accepts(f: FindingOut, dimension: Dimension): boolean {
-    switch (dimension) {
-      case "repo":
-        return repoFilter.accepts(repoNames.get(f.repo_id) ?? "unknown");
-      case "type":
-        return typeFilter.accepts(f.type);
-      case "class":
-        return f.category == null || categoryFilter.accepts(f.category);
-      case "severity":
-        return severityFilter.accepts(f.severity);
-      case "status":
-        return !showStatus || statusFilter.accepts(f.status);
-      case "confidence":
-        return f.confidence >= minConfidence / 100;
-    }
-  }
-
-  /**
-   * Make `finding` visible by dropping only the filters that hide it, so the
-   * rest of the view survives. A link carries the filters of the view it was
-   * made in, where the finding was visible; one that hides it now means the
-   * finding changed since (status moved on, a recheck changed confidence).
-   * Replaces the history entry: this corrects the navigation that opened the
-   * link, and Back should not land on the view that hid the finding.
-   */
-  export function reveal(finding: FindingOut) {
-    const hiding = DIMENSIONS.filter((dimension) => !accepts(finding, dimension));
-    if (hiding.length === 0) return;
-    navigation.updateParams((params) => {
-      for (const dimension of hiding) params.delete(dimension);
-    }, true);
-  }
-
-  // -- Derived filtered + sorted output -------------------------------------
-  const filtered = $derived.by(() => {
-    const out = findings.filter((f) => DIMENSIONS.every((dimension) => accepts(f, dimension)));
-
-    // Sort (in place: filter() already returned a fresh array)
-    switch (sortBy) {
-      case "severity":
-        out.sort((a, b) => {
-          const sd = (SEV_RANK[b.severity] ?? 0) - (SEV_RANK[a.severity] ?? 0);
-          if (sd !== 0) return sd;
-          return b.confidence - a.confidence;
-        });
-        break;
-      case "newest":
-        out.sort((a, b) => b.created_at - a.created_at);
-        break;
-      case "updated":
-        // updated_at, not created_at: a finding moves when it is
-        // triaged, fixed, or its PR changes state, so this surfaces what
-        // the daemon and you have just been working on rather than what
-        // happened to be found last.
-        out.sort((a, b) => b.updated_at - a.updated_at);
-        break;
-      case "oldest":
-        out.sort((a, b) => a.created_at - b.created_at);
-        break;
-    }
-
-    return out;
-  });
-
-  // -- Push filtered output whenever it changes -----------------------------
-  $effect(() => {
-    onFilter(filtered);
-  });
 </script>
 
 <div class="filter-bar">
