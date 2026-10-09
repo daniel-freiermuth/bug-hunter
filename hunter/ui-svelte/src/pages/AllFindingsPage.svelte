@@ -1,6 +1,7 @@
 <script lang="ts">
   import { store } from "../lib/api.svelte";
   import type { FindingOut } from "../lib/types";
+  import { toast } from "../lib/toast.svelte";
   import FilterBar from "../components/FilterBar.svelte";
   import FindingCard from "../components/FindingCard.svelte";
 
@@ -53,9 +54,17 @@
         highlighted = el;
         return;
       }
+      // Nothing to wait for until the first poll has landed; summary and
+      // findings arrive together.
+      if (store.summary === null) return;
+      const finding = store.findings.find((f) => f.id === focusId);
+      if (!finding) {
+        clearInterval(interval);
+        toast(`F#${focusId} not found`, false);
+        return;
+      }
       // Finding exists in data but not rendered → filters are hiding it.
-      const finding = revealed ? undefined : store.findings.find((f) => f.id === focusId);
-      if (finding) {
+      if (!revealed) {
         revealed = true;
         filterBar?.reveal(finding);
       }
