@@ -500,3 +500,95 @@ async fn upgrading_closes_jobs_left_queued() {
 
     drop(store);
 }
+
+/// Upgrading sends the blocker reports that predate `blocked` to triage.
+///
+/// Until `blocked` existed, a worker's BLOCKED.md rejected its finding and
+/// logged "#<id> blocked by worker: ...", which put valid work in the
+/// suppression corpus. 021 moves exactly those rejections to `new`,
+/// keeping the report as the reason. It leaves alone a rejection a human
+/// confirmed after the report, a worker's decline, and a finding that has
+/// left `rejected` since.
+///
+/// Seeded at the state just before 021 so that rolling forward executes it.
+#[tokio::test]
+async fn upgrading_sends_pre_blocked_reports_to_triage() {
+    let (_dir, path) = scratch("mig-pre-blocked");
+
+    let before_021 = sqlx::migrate!("./migrations")
+        .iter()
+        .position(|m| m.version == 21)
+        .expect("migration 021 exists");
+    let pool = seed_state(&path, before_021).await;
+    sqlx::query(
+        "INSERT INTO repos (id, name, url, path, forge, default_branch, added_at) \
+         VALUES (1, 'widget', 'https://e/w.git', '/wr/repos/repo-1', 'github', 'main', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // 1: blocked report. 2: blocked report, then a human's verdict.
+    // 3: a worker's decline. 4: blocked report, queued again since.
+    for (id, status, reason) in [
+        (1, "rejected", "# BLOCKED: needs Kotlin 2.2"),
+        (2, "rejected", "duplicate of #9"),
+        (3, "rejected", "# NOT-A-BUG: intended"),
+        (4, "queued", "# BLOCKED: needs a rig"),
+    ] {
+        sqlx::query(
+            "INSERT INTO findings (id, type, repo_id, fingerprint, severity, confidence, \
+             summary, status, verdict_reason, created_at, updated_at) \
+             VALUES (?1, 'bug', 1, 'fp-' || ?1, 'high', 0.9, 's', ?2, ?3, 1, 1)",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(reason)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO events (id, at, kind, message, finding_id) VALUES \
+         (1, 1, 'fix', '#1 blocked by worker: # BLOCKED: needs Kotlin 2.2', 1), \
+         (2, 1, 'fix', '#2 blocked by worker: # BLOCKED: needs a rig', 2), \
+         (3, 2, 'verdict', 'finding 2 [fp-2] -> rejected: duplicate of #9', 2), \
+         (4, 1, 'fix', '#3 rejected by worker: # NOT-A-BUG: intended', 3), \
+         (5, 1, 'fix', '#4 blocked by worker: # BLOCKED: needs a rig', 4)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let store = Store::connect(&path).await.expect("roll forward");
+
+    let mut got = Vec::new();
+    for id in 1..=4 {
+        let f = store.get_finding(id).await.unwrap().unwrap();
+        got.push((id, f.status, f.verdict_reason.unwrap()));
+    }
+    assert_eq!(
+        got,
+        vec![
+            (
+                1,
+                FindingStatus::New,
+                "# BLOCKED: needs Kotlin 2.2".to_owned()
+            ),
+            (2, FindingStatus::Rejected, "duplicate of #9".to_owned()),
+            (
+                3,
+                FindingStatus::Rejected,
+                "# NOT-A-BUG: intended".to_owned()
+            ),
+            (
+                4,
+                FindingStatus::Queued,
+                "# BLOCKED: needs a rig".to_owned()
+            ),
+        ],
+        "only the unreviewed blocker rejection moves to new, keeping its report"
+    );
+
+    drop(store);
+}
