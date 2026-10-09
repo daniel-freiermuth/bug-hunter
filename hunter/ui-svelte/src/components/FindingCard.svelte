@@ -23,8 +23,8 @@
   // Only cards on or near screen are mounted: the findings list runs to
   // thousands of cards, and mounting all of them — then re-rendering all of
   // them on every 5s poll — froze the page for seconds. An off-screen card
-  // keeps its place with an empty box of its last rendered height (an
-  // estimate until it has rendered once).
+  // keeps its place with an empty box of its last rendered height; until it
+  // has rendered once, the list's --card-estimate (see .placeholder).
   //
   // The box is a child, never a height on the card itself: the browser's
   // scroll anchoring holds a visible card in place while cards above it
@@ -32,7 +32,6 @@
   // off for the frame. After any jump into unrendered cards (a scrollbar
   // drag, a deep link) the anchor is a placeholder about to mount, so the
   // content would slide by everything that mounted above it.
-  const ESTIMATED_HEIGHT_PX = 180;
   let near = $state(false);
   let lastHeight = $state<number | null>(null);
   // Mid-interaction cards stay mounted off screen: unmounting would close an
@@ -178,7 +177,7 @@
   {@attach nearViewport(onVisibility)}
 >
   {#if !live}
-    <div class="placeholder" style:--placeholder-height="{lastHeight ?? ESTIMATED_HEIGHT_PX}px"></div>
+    <div class="placeholder" style:--placeholder-height={lastHeight == null ? null : `${lastHeight}px`}></div>
   {:else}
     <!-- Header row: id + type pill + severity dot/text + confidence + category + status pill (right) -->
     <div class="card-header">
@@ -408,8 +407,12 @@
     overflow: hidden;
     min-width: 0;
   }
+  /* --card-estimate is set on the list when restoring a scroll position
+     (lib/scrollMemory.ts), from the real height of the cards above it. */
   .placeholder {
-    height: calc(var(--placeholder-height) - 2 * var(--card-pad-block) - 2 * var(--card-border));
+    height: calc(
+      var(--placeholder-height, var(--card-estimate, 180px)) - 2 * var(--card-pad-block) - 2 * var(--card-border)
+    );
   }
   .card:hover {
     transform: translateY(-1px);
