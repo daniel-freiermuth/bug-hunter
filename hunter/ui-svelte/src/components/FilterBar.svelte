@@ -55,30 +55,48 @@
     sliding = true;
   }
 
-  export function clearFilters() {
+  // Every URL parameter that can hide a finding, and the test each applies.
+  const DIMENSIONS = [...FILTER_KEYS, "confidence"] as const;
+  type Dimension = (typeof DIMENSIONS)[number];
+
+  function accepts(f: FindingOut, dimension: Dimension): boolean {
+    switch (dimension) {
+      case "repo":
+        return repoFilter.accepts(repoNames.get(f.repo_id) ?? "unknown");
+      case "type":
+        return typeFilter.accepts(f.type);
+      case "class":
+        return f.category == null || categoryFilter.accepts(f.category);
+      case "severity":
+        return severityFilter.accepts(f.severity);
+      case "status":
+        return !showStatus || statusFilter.accepts(f.status);
+      case "confidence":
+        return f.confidence >= minConfidence / 100;
+    }
+  }
+
+  /**
+   * Make `finding` visible by dropping only the filters that hide it, so the
+   * rest of the view survives. A link carries the filters of the view it was
+   * made in, where the finding was visible; one that hides it now means the
+   * finding changed since (status moved on, a recheck changed confidence).
+   * Replaces the history entry: this corrects the navigation that opened the
+   * link, and Back should not land on the view that hid the finding.
+   */
+  export function reveal(finding: FindingOut) {
+    const hiding = DIMENSIONS.filter((dimension) => !accepts(finding, dimension));
+    if (hiding.length === 0) return;
     navigation.updateParams((params) => {
-      for (const key of FILTER_KEYS) params.delete(key);
-      params.delete("confidence");
-    });
+      for (const dimension of hiding) params.delete(dimension);
+    }, true);
   }
 
   // -- Derived filtered + sorted output -------------------------------------
   const filtered = $derived.by(() => {
-    let out = findings;
+    const out = findings.filter((f) => DIMENSIONS.every((dimension) => accepts(f, dimension)));
 
-    out = out.filter((f) => repoFilter.accepts(repoNames.get(f.repo_id) ?? "unknown"));
-    out = out.filter((f) => typeFilter.accepts(f.type));
-    out = out.filter((f) => f.category == null || categoryFilter.accepts(f.category));
-    out = out.filter((f) => severityFilter.accepts(f.severity));
-    if (showStatus) {
-      out = out.filter((f) => statusFilter.accepts(f.status));
-    }
-    if (minConfidence > 0) {
-      out = out.filter((f) => f.confidence >= minConfidence / 100);
-    }
-
-    // Sort
-    out = [...out];
+    // Sort (in place: filter() already returned a fresh array)
     switch (sortBy) {
       case "severity":
         out.sort((a, b) => {
