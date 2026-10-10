@@ -145,7 +145,7 @@ async fn a_test_gap_scan_sees_the_repos_bugs_and_may_file_one() {
         .split_once("KNOWN:")
         .expect("the stub template renders");
     assert!(
-        suppressions.contains("widget:src/lib.rs:intended:logic -- intended behavior"),
+        suppressions.contains("widget:src/lib.rs:intended:logic -- rejected: intended behavior"),
         "a rejected bug is a suppression: {prompt}"
     );
     assert!(

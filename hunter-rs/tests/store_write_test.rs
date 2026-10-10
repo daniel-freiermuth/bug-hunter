@@ -1051,7 +1051,13 @@ async fn record_closed_harvest_keeps_the_finding_pending_when_the_stamp_fails() 
     .unwrap();
 
     let err = store
-        .record_closed_harvest(1, FindingStatus::Superseded, "superseded: by #9", 5000)
+        .record_closed_harvest(
+            1,
+            FindingStatus::Superseded,
+            "superseded: by #9",
+            None,
+            5000,
+        )
         .await
         .expect_err("the injected failure must surface to the caller");
     assert!(
@@ -1082,7 +1088,13 @@ async fn record_closed_harvest_keeps_the_finding_pending_when_the_stamp_fails() 
         .await
         .unwrap();
     let classified = store
-        .record_closed_harvest(1, FindingStatus::Superseded, "superseded: by #9", 5000)
+        .record_closed_harvest(
+            1,
+            FindingStatus::Superseded,
+            "superseded: by #9",
+            None,
+            5000,
+        )
         .await
         .unwrap();
     assert!(classified);
@@ -1115,7 +1127,13 @@ async fn record_closed_harvest_keeps_a_verdict_a_human_set_meanwhile() {
         .unwrap();
 
     let classified = store
-        .record_closed_harvest(1, FindingStatus::Superseded, "superseded: by #9", 5000)
+        .record_closed_harvest(
+            1,
+            FindingStatus::Superseded,
+            "superseded: by #9",
+            None,
+            5000,
+        )
         .await
         .unwrap();
 
@@ -1128,6 +1146,44 @@ async fn record_closed_harvest_keeps_a_verdict_a_human_set_meanwhile() {
     assert_eq!(after.verdict_reason.as_deref(), Some("not worth it"));
     let ps = store.get_pr_state(1).await.unwrap().unwrap();
     assert_eq!(ps.harvested_at, Some(5000));
+}
+
+/// A reopen only applies to a finding that is still suppressed. One that
+/// moved on since the scan read it (here back to `queued`, as if an
+/// operator requeued it) keeps its status, analysis and anchor, and the
+/// caller is told nothing was reopened, so ingest neither counts nor logs
+/// a reopen that did not happen.
+#[tokio::test]
+async fn reopen_suppressed_leaves_a_finding_that_moved_on() {
+    let (_dir, path, pool) = fresh_db().await;
+    seed_repo_and_findings(&pool).await;
+    let store = rw_store(&path).await;
+    let anchor = hunter::store::VerdictAnchor {
+        sha: "abc".to_owned(),
+        files: vec!["src/lib.rs".to_owned()],
+        holds_while: None,
+    };
+    store
+        .set_anchored_verdict(1, FindingStatus::Rejected, "wrong: fine", Some(&anchor))
+        .await
+        .unwrap();
+    store
+        .set_finding_status(1, FindingStatus::Queued)
+        .await
+        .unwrap();
+    let before = store.get_finding(1).await.unwrap().unwrap();
+
+    let refiled = hunter::store::FindingInsert {
+        fingerprint: before.fingerprint.clone(),
+        summary: "filed again".to_owned(),
+        ..Default::default()
+    };
+    assert!(!store.reopen_suppressed(1, &refiled).await.unwrap());
+
+    let after = store.get_finding(1).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Queued);
+    assert_eq!(after.summary, before.summary);
+    assert_eq!(store.verdict_anchor(1).await.unwrap(), Some(anchor));
 }
 
 /// The `pr_state` upserts, each writing `pr_number` for finding 1.

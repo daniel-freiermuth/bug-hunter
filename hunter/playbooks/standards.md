@@ -28,7 +28,7 @@ A deviation from the coding standards document above that:
 Style preferences, minor naming differences, and TODO comments are
 NOT violations unless the standards document explicitly addresses them.
 
-# Known non-violations (suppression corpus)
+# Known non-violations (suppression corpus — each holds only while its reason does; see the rule at its top)
 {{SUPPRESSIONS}}
 
 # Already tracked standards findings

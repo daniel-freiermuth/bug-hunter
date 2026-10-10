@@ -269,6 +269,17 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// What a suppressing verdict was judged against (`verdict_anchors`): the
+/// commit the worker's tree was at, the files the verdict depends on, and
+/// the worker's one-line statement of the condition that makes it true.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerdictAnchor {
+    pub sha: String,
+    /// Repo-relative paths.
+    pub files: Vec<String>,
+    pub holds_while: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
@@ -538,13 +549,30 @@ impl Store {
         Ok(())
     }
 
-    /// Status transition with a verdict reason (rejected, wontfix).
+    /// Status transition with a verdict reason (rejected, wontfix). Any
+    /// anchor an earlier verdict left is removed in the same transaction:
+    /// it described that verdict, not this one.
     pub async fn set_finding_verdict(
         &self,
         finding_id: i64,
         status: FindingStatus,
         reason: &str,
     ) -> sqlx::Result<()> {
+        self.set_anchored_verdict(finding_id, status, reason, None)
+            .await
+    }
+
+    /// [`Self::set_finding_verdict`] for a worker's verdict, recording what
+    /// it was judged against (`anchor`) in the same transaction, or
+    /// removing the previous verdict's anchor when there is none.
+    pub async fn set_anchored_verdict(
+        &self,
+        finding_id: i64,
+        status: FindingStatus,
+        reason: &str,
+        anchor: Option<&VerdictAnchor>,
+    ) -> sqlx::Result<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = now_ms();
         sqlx::query!(
             "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 WHERE id = ?4",
@@ -553,15 +581,19 @@ impl Store {
             now,
             finding_id
         )
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        Self::write_anchor(&mut tx, finding_id, anchor).await?;
+        tx.commit().await?;
         Ok(())
     }
 
     /// [`Self::set_finding_verdict`], applied only while the finding is
     /// still at `from` (the status the caller just checked). `false` when
     /// something else moved it in between: the operator's verdict loses to
-    /// a job that claimed the finding meanwhile.
+    /// a job that claimed the finding meanwhile. An operator's verdict has
+    /// no tree to be anchored to, so it removes any anchor an earlier one
+    /// left.
     pub async fn set_verdict_if(
         &self,
         finding_id: i64,
@@ -569,6 +601,7 @@ impl Store {
         status: FindingStatus,
         reason: &str,
     ) -> sqlx::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let now = now_ms();
         let set = sqlx::query!(
             "UPDATE findings SET status = ?1, verdict_reason = ?2, updated_at = ?3 \
@@ -579,9 +612,177 @@ impl Store {
             finding_id,
             from
         )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if set {
+            Self::write_anchor(&mut tx, finding_id, None).await?;
+        }
+        tx.commit().await?;
+        Ok(set)
+    }
+
+    /// Replace `finding_id`'s verdict anchor with `anchor`, or remove it.
+    async fn write_anchor(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        finding_id: i64,
+        anchor: Option<&VerdictAnchor>,
+    ) -> sqlx::Result<()> {
+        let Some(anchor) = anchor else {
+            sqlx::query!(
+                "DELETE FROM verdict_anchors WHERE finding_id = ?1",
+                finding_id
+            )
+            .execute(&mut **tx)
+            .await?;
+            return Ok(());
+        };
+        let files = serde_json::to_string(&anchor.files).unwrap_or_else(|_| "[]".to_owned());
+        let now = now_ms();
+        sqlx::query!(
+            "INSERT INTO verdict_anchors (finding_id, sha, files, holds_while, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(finding_id) DO UPDATE SET sha = excluded.sha, files = excluded.files, \
+             holds_while = excluded.holds_while, created_at = excluded.created_at",
+            finding_id,
+            anchor.sha,
+            files,
+            anchor.holds_while,
+            now
+        )
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
+    }
+
+    /// The anchors of `repo_id`'s suppressed findings of `finding_type`,
+    /// keyed by finding id: the counterpart of [`Self::suppressions`].
+    pub async fn suppression_anchors(
+        &self,
+        repo_id: i64,
+        finding_type: &str,
+    ) -> sqlx::Result<BTreeMap<i64, VerdictAnchor>> {
+        let s1 = FindingStatus::Rejected;
+        let s2 = FindingStatus::Wontfix;
+        let rows = sqlx::query!(
+            "SELECT a.finding_id AS \"finding_id!\", a.sha, a.files, a.holds_while \
+             FROM verdict_anchors a JOIN findings f ON f.id = a.finding_id \
+             WHERE f.repo_id = ?1 AND f.type = ?2 AND f.status IN (?3, ?4)",
+            repo_id,
+            finding_type,
+            s1,
+            s2
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let files = serde_json::from_str(&r.files).unwrap_or_default();
+                (
+                    r.finding_id,
+                    VerdictAnchor {
+                        sha: r.sha,
+                        files,
+                        holds_while: r.holds_while,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// `finding_id`'s verdict anchor, if its verdict has one.
+    pub async fn verdict_anchor(&self, finding_id: i64) -> sqlx::Result<Option<VerdictAnchor>> {
+        let row = sqlx::query!(
+            "SELECT sha, files, holds_while FROM verdict_anchors WHERE finding_id = ?1",
+            finding_id
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| VerdictAnchor {
+            sha: r.sha,
+            files: serde_json::from_str(&r.files).unwrap_or_default(),
+            holds_while: r.holds_while,
+        }))
+    }
+
+    /// A scan re-checked an anchored verdict whose code had changed and
+    /// found it still holds: move the anchor to `sha`, the commit it was
+    /// re-checked at, so the next scan does not re-check it again, and
+    /// replace its condition when the scan restated it. Nothing moves once
+    /// the finding is no longer suppressed.
+    pub async fn reconfirm_anchor(
+        &self,
+        finding_id: i64,
+        sha: &str,
+        holds_while: Option<&str>,
+    ) -> sqlx::Result<()> {
+        let s1 = FindingStatus::Rejected;
+        let s2 = FindingStatus::Wontfix;
+        let now = now_ms();
+        sqlx::query!(
+            "UPDATE verdict_anchors SET sha = ?1, holds_while = COALESCE(?2, holds_while), \
+             created_at = ?3 \
+             WHERE finding_id = ?4 \
+               AND finding_id IN (SELECT id FROM findings WHERE status IN (?5, ?6))",
+            sha,
+            holds_while,
+            now,
+            finding_id,
+            s1,
+            s2
+        )
         .execute(&self.pool)
         .await?;
-        Ok(set.rows_affected() > 0)
+        Ok(())
+    }
+
+    /// Reopen a suppressed finding that a scan filed again: back to `new`
+    /// with the scan's analysis, its verdict and anchor gone. Only from a
+    /// suppressed status, so a finding something else moved meanwhile
+    /// keeps that. The caller decides whether the verdict had lapsed
+    /// ([`crate::suppression::reopen_if_changed`]). `true` when reopened.
+    pub async fn reopen_suppressed(
+        &self,
+        finding_id: i64,
+        row: &FindingInsert,
+    ) -> sqlx::Result<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now = now_ms();
+        let new = FindingStatus::New;
+        let s1 = FindingStatus::Rejected;
+        let s2 = FindingStatus::Wontfix;
+        let symbol = row.symbol.as_deref();
+        let detail = row.detail.as_deref();
+        let evidence_plan = row.evidence_plan.as_deref();
+        let reopened = sqlx::query!(
+            "UPDATE findings SET status = ?1, verdict_reason = NULL, symbol = ?2, line = ?3, \
+             severity = ?4, confidence = ?5, summary = ?6, detail = ?7, evidence_plan = ?8, \
+             updated_at = ?9 \
+             WHERE id = ?10 AND status IN (?11, ?12)",
+            new,
+            symbol,
+            row.line,
+            row.severity,
+            row.confidence,
+            row.summary,
+            detail,
+            evidence_plan,
+            now,
+            finding_id,
+            s1,
+            s2
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        if reopened {
+            Self::write_anchor(&mut tx, finding_id, None).await?;
+        }
+        tx.commit().await?;
+        Ok(reopened)
     }
 
     /// Retain a fix checkpoint without treating its blocker as a rejection.
@@ -3142,11 +3343,14 @@ impl Store {
     /// harvest still reviews the closure it finds in `pr_state`); either
     /// way the human's decision stands. The stamp lands regardless, since
     /// the PR was reviewed. Returns whether the classification applied.
+    /// The verdict's `anchor` (or the removal of an earlier one) lands with
+    /// the classification, never without it.
     pub async fn record_closed_harvest(
         &self,
         finding_id: i64,
         status: FindingStatus,
         reason: &str,
+        anchor: Option<&VerdictAnchor>,
         harvested_at: i64,
     ) -> sqlx::Result<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -3163,6 +3367,9 @@ impl Store {
         .await?
         .rows_affected()
             > 0;
+        if classified {
+            Self::write_anchor(&mut tx, finding_id, anchor).await?;
+        }
         sqlx::query!(
             "UPDATE pr_state SET harvested_at = ?1 WHERE finding_id = ?2",
             harvested_at,

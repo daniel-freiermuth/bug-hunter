@@ -1793,6 +1793,9 @@ async fn a_recheck_severity_outside_the_enum_is_not_stored() {
 /// every later scan is shown. Stale used to land as `wontfix`: all seven
 /// `wontfix` findings it set in production were code that had been
 /// removed or rewritten, suppressed as if someone had decided against them.
+/// The rejection is anchored to the commit the recheck's tree was at,
+/// watching the finding's file and the ones its `depends_on` names, here
+/// written as one string rather than an array.
 #[tokio::test]
 async fn a_stale_recheck_supersedes_and_only_an_invalid_one_suppresses() {
     for (verdict, status, suppressed) in [
@@ -1805,7 +1808,12 @@ async fn a_stale_recheck_supersedes_and_only_an_invalid_one_suppresses() {
         let cfg = test_config(dir.path());
         let out = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
         let worker = ScriptedBackend::new(move |_| {
-            let body = serde_json::json!({ "verdict": verdict, "reason": "src/x.rs:1 is gone" });
+            let body = serde_json::json!({
+                "verdict": verdict,
+                "reason": "src/x.rs:1 is gone",
+                "holds_while": "seed() returns early (src/x.rs:1)",
+                "depends_on": "src/x.rs:1, src/y.rs",
+            });
             std::fs::write(&out, body.to_string()).unwrap();
             support::done()
         });
@@ -1830,6 +1838,25 @@ async fn a_stale_recheck_supersedes_and_only_an_invalid_one_suppresses() {
             .iter()
             .any(|s| s.id == fid);
         assert_eq!(listed, suppressed, "{verdict}");
+        let anchor = store.suppression_anchors(1, "bug").await.unwrap();
+        let anchor = anchor.get(&fid);
+        if suppressed {
+            let pinned = store.pinned_sha(summary.job_id.unwrap()).await.unwrap();
+            assert_eq!(
+                anchor,
+                Some(&hunter::store::VerdictAnchor {
+                    sha: pinned.unwrap(),
+                    files: vec![
+                        "README.md".to_owned(),
+                        "src/x.rs".to_owned(),
+                        "src/y.rs".to_owned()
+                    ],
+                    holds_while: Some("seed() returns early (src/x.rs:1)".to_owned()),
+                }),
+            );
+        } else {
+            assert_eq!(anchor, None, "{verdict}");
+        }
     }
 }
 

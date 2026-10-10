@@ -81,12 +81,24 @@ type AnalysisBuilder = fn(
     &hunter::types::Repo,
     &Path,
     &str,
-    &[Finding],
+    &[playbooks::Suppression],
     &[Finding],
     &Path,
     i64,
     &str,
 ) -> anyhow::Result<String>;
+
+/// One suppression of each shape a scan can be shown.
+fn sample_suppression() -> playbooks::Suppression {
+    playbooks::Suppression {
+        fingerprint: "widget:src/lib.rs:parse:logic".to_owned(),
+        reason: "holds while parse rejects empty input (src/lib.rs:12)".to_owned(),
+        changed: Some(playbooks::Changed::Files {
+            since: "abc123".to_owned(),
+            files: vec!["src/lib.rs".to_owned()],
+        }),
+    }
+}
 
 fn analysis_cases() -> Vec<(&'static str, FindingType)> {
     vec![
@@ -102,7 +114,7 @@ fn analysis_cases() -> Vec<(&'static str, FindingType)> {
 fn hunt_prompt_renders() {
     let repo = sample_repo();
     let known = [sample_finding(FindingType::Bug)];
-    let suppressed = [sample_finding(FindingType::Bug)];
+    let suppressed = [sample_suppression()];
     let prompt = playbooks::build_hunt_prompt(
         &root(),
         &repo,
@@ -126,7 +138,7 @@ fn analysis_prompts_render() {
     let out = out_path();
     for (name, kind) in analysis_cases() {
         let known = [sample_finding(kind)];
-        let suppressed = [sample_finding(kind)];
+        let suppressed = [sample_suppression()];
         let build: AnalysisBuilder = match kind {
             FindingType::TestGap => playbooks::build_test_gap_prompt,
             FindingType::DepUpdate => playbooks::build_dep_update_prompt,

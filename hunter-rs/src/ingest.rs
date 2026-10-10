@@ -16,6 +16,10 @@ pub struct IngestResult {
     /// Of `duplicates`: open `dep_update` findings brought up to date with
     /// the entry that rediscovered them (`Store::refresh_dep_update`).
     pub refreshed: i64,
+    /// Of `duplicates`: suppressed findings whose verdict had lapsed (the
+    /// code it rests on changed), reopened by being filed again
+    /// (`suppression::reopen_if_changed`).
+    pub reopened: i64,
     pub invalid: i64,
 }
 
@@ -56,13 +60,23 @@ pub fn type_required_fields(finding_type: FindingType) -> &'static [&'static str
 /// Fields that must be non-empty lists (rather than non-empty strings).
 const LIST_REQUIRED_FIELDS: &[&str] = &["missing_tests"];
 
-/// Ingest findings from a JSON file whose entries may be `types`.
-#[allow(
-    clippy::too_many_lines,
-    reason = "per-entry validation followed by dedup and insert; the \
-              rejection reasons are accumulated into one `IngestResult`, so \
-              every branch needs the same mutable tally"
-)]
+/// What ingest does with an entry that matches a suppressed finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OnSuppressed {
+    /// Count it as a duplicate: the source never saw the suppression list,
+    /// so filing it says nothing about whether the verdict still holds.
+    Keep,
+    /// Reopen the finding if its verdict lapsed
+    /// ([`crate::suppression::reopen_if_changed`]): the source is a scan
+    /// that was shown the entry marked CHANGED and told to file it again
+    /// if its claim is true now.
+    ReopenIfLapsed,
+}
+
+/// Ingest findings from a JSON file whose entries may be `types`. An entry
+/// matching a suppressed finding is a duplicate. For a hunt or analysis
+/// scan, which was shown the suppression list, use
+/// [`ingest_scan_findings`].
 pub async fn ingest_findings(
     store: &Store,
     repo_id: i64,
@@ -70,6 +84,54 @@ pub async fn ingest_findings(
     types: EntryTypes,
     job: Option<i64>,
     source_finding: Option<i64>,
+) -> IngestResult {
+    ingest(
+        store,
+        repo_id,
+        findings_path,
+        types,
+        job,
+        source_finding,
+        OnSuppressed::Keep,
+    )
+    .await
+}
+
+/// [`ingest_findings`] for a hunt or analysis scan's findings: an entry
+/// filed again for a suppressed finding whose verdict lapsed reopens it.
+pub async fn ingest_scan_findings(
+    store: &Store,
+    repo_id: i64,
+    findings_path: &Path,
+    types: EntryTypes,
+    job: i64,
+) -> IngestResult {
+    ingest(
+        store,
+        repo_id,
+        findings_path,
+        types,
+        Some(job),
+        None,
+        OnSuppressed::ReopenIfLapsed,
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "per-entry validation followed by dedup and insert; the \
+              rejection reasons are accumulated into one `IngestResult`, so \
+              every branch needs the same mutable tally"
+)]
+async fn ingest(
+    store: &Store,
+    repo_id: i64,
+    findings_path: &Path,
+    types: EntryTypes,
+    job: Option<i64>,
+    source_finding: Option<i64>,
+    on_suppressed: OnSuppressed,
 ) -> IngestResult {
     let mut result = IngestResult::default();
     let text = match std::fs::read_to_string(findings_path) {
@@ -330,6 +392,39 @@ pub async fn ingest_findings(
             }
             Ok((fid, false)) => {
                 result.duplicates += 1;
+                if on_suppressed == OnSuppressed::ReopenIfLapsed {
+                    match crate::suppression::reopen_if_changed(store, repo_id, fid, job, &insert)
+                        .await
+                    {
+                        Ok(true) => {
+                            result.reopened += 1;
+                            let _ = store
+                                .log_event(
+                                    "verdict",
+                                    &format!(
+                                        "finding {fid} [{}] reopened: filed again after the \
+                                         code its verdict rests on changed",
+                                        insert.fingerprint
+                                    ),
+                                    job,
+                                    Some(fid),
+                                )
+                                .await;
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            let _ = store
+                                .log_event(
+                                    "error",
+                                    &format!("ingest: reopening #{fid} failed: {e}"),
+                                    job,
+                                    Some(fid),
+                                )
+                                .await;
+                        }
+                    }
+                }
                 if entry_type == FindingType::DepUpdate {
                     match store.refresh_dep_update(fid, &insert).await {
                         Ok(true) => result.refreshed += 1,

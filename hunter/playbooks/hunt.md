@@ -27,7 +27,7 @@ refactor opportunities are NOT bugs.
 Fresh feature code is where bugs live — weight recently-introduced code
 heavily. Bugs cluster: when you confirm one, inspect its siblings.
 
-# Known non-bugs (suppression corpus — do NOT re-file these or variants)
+# Known non-bugs (suppression corpus — each holds only while its reason does; see the rule at its top)
 {{SUPPRESSIONS}}
 
 # Already tracked (open findings — file only if yours is genuinely NOVEL)

@@ -143,6 +143,8 @@ fn close_reason(classification: &str) -> String {
         "classification": classification,
         "reason": "landed in #9",
         "evidence": "abc1234",
+        "holds_while": "the guard at src/z.rs:3 rejects it",
+        "depends_on": ["src/z.rs:3"],
     })
     .to_string()
 }
@@ -249,7 +251,9 @@ async fn a_refix_of_an_abandoned_pr_is_harvested_when_it_merges() {
 }
 
 /// Each classification lands as its status, with the reason and the
-/// evidence as the verdict. Only `wrong` and `unwanted` suppress.
+/// evidence as the verdict. Only `wrong` and `unwanted` suppress, and only
+/// `wrong` is anchored to the commit the harvest judged: `unwanted` is the
+/// maintainers' decision, which no code change lapses.
 #[tokio::test]
 async fn each_classification_lands_as_its_status() {
     let bins = FakeBins::acquire("harvest-classes");
@@ -293,6 +297,28 @@ async fn each_classification_lands_as_its_status() {
             ps.harvested_at.is_some(),
             "{class}: must be marked harvested"
         );
+        let anchors = f
+            .store
+            .suppression_anchors(finding.repo_id, finding.kind.as_str())
+            .await
+            .unwrap();
+        let anchor = anchors.get(&f.fid);
+        if after.status == FindingStatus::Rejected {
+            let anchor = anchor.unwrap_or_else(|| panic!("{class}: not anchored"));
+            let judged = f.store.pinned_sha(summary.job_id.unwrap()).await.unwrap();
+            assert_eq!(Some(&anchor.sha), judged.as_ref(), "{class}");
+            assert!(
+                anchor.files.contains(&"src/z.rs".to_owned()),
+                "{class}: {anchor:?}"
+            );
+            assert_eq!(
+                anchor.holds_while.as_deref(),
+                Some("the guard at src/z.rs:3 rejects it"),
+                "{class}"
+            );
+        } else {
+            assert_eq!(anchor, None, "{class}");
+        }
     }
 }
 
@@ -377,6 +403,75 @@ async fn follow_ups_are_filed_with_their_provenance() {
             && e.job_id == Some(job)
             && e.message.contains("+1 follow-up")),
         "the filing must be logged against the reviewed finding: {events:?}"
+    );
+}
+
+/// A follow-up that shares a rejected finding's fingerprint is a duplicate,
+/// even when that rejection has lapsed (here: its commit cannot be compared
+/// with anything, which marks it CHANGED for a scan). Only a hunt or
+/// analysis scan reopens a lapsed rejection, because only a scan is shown
+/// the suppression list and told to re-check it before filing. The harvest
+/// worker never saw it, and its tree may be the PR's head rather than the
+/// default branch the verdict was judged against.
+#[tokio::test]
+async fn a_follow_up_never_reopens_a_rejected_finding() {
+    let bins = FakeBins::acquire("harvest-followup-rejected");
+    gh_default(&bins);
+    let f = fixture("harvest-followup-rejected", FindingStatus::Closed).await;
+    let repo_id = f.store.get_finding(f.fid).await.unwrap().unwrap().repo_id;
+    let (rejected, _) = f
+        .store
+        .upsert_finding(
+            repo_id,
+            &FindingInsert {
+                fingerprint: "widget:src/lib.rs:left-open".to_owned(),
+                file: "src/lib.rs".to_owned(),
+                severity: hunter::domain::Severity::Low,
+                confidence: 0.5,
+                summary: "judged wrong".to_owned(),
+                ..Default::default()
+            },
+            "bug",
+            None,
+        )
+        .await
+        .unwrap();
+    let anchor = hunter::store::VerdictAnchor {
+        sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        files: vec!["src/lib.rs".to_owned()],
+        holds_while: Some("nothing reaches it".to_owned()),
+    };
+    f.store
+        .set_anchored_verdict(
+            rejected,
+            FindingStatus::Rejected,
+            "wrong: unreachable",
+            Some(&anchor),
+        )
+        .await
+        .unwrap();
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let backend = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("CLOSE-REASON.json"), close_reason("superseded")).unwrap();
+        std::fs::write(tree.join("FOLLOW-UPS.json"), FOLLOW_UP).unwrap();
+        support::done()
+    });
+
+    let summary = run_harvest(&f.store, &f.cfg, &finding, &backend, None)
+        .await
+        .unwrap();
+
+    let ingest = summary.ingest.as_ref().expect("follow-ups ingested");
+    assert_eq!(
+        (ingest.inserted, ingest.duplicates, ingest.reopened),
+        (0, 1, 0)
+    );
+    let after = f.store.get_finding(rejected).await.unwrap().unwrap();
+    assert_eq!(after.status, FindingStatus::Rejected);
+    assert_eq!(after.summary, "judged wrong");
+    assert_eq!(
+        f.store.verdict_anchor(rejected).await.unwrap(),
+        Some(anchor)
     );
 }
 

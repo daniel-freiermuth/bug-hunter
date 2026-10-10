@@ -46,21 +46,66 @@ pub fn render<S: BuildHasher>(template: &str, slots: &HashMap<&str, String, S>) 
     Ok(out)
 }
 
-/// Rejected/wontfix findings as a suppression corpus block.
-pub fn suppressions_block(suppressions: &[Finding]) -> String {
+/// One entry of the suppression list a scan is shown
+/// ([`crate::suppression::suppression_list`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Suppression {
+    pub fingerprint: String,
+    /// The verdict's condition (`holds while ...`) when the worker stated
+    /// one, else its recorded reason.
+    pub reason: String,
+    /// Whether the code the verdict depends on changed since it was given.
+    /// `None`: unchanged, or the verdict is not anchored to a commit.
+    pub changed: Option<Changed>,
+}
+
+/// How an anchored verdict's code changed since its commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Changed {
+    /// These watched files differ between the verdict's commit and the
+    /// scanned one.
+    Files { since: String, files: Vec<String> },
+    /// The verdict's commit could not be compared with the scanned one.
+    Unknown { since: String },
+}
+
+/// Rejected/wontfix findings as a suppression corpus block, opened by the
+/// rule for reading it. `reconfirmed` is where the scan records the
+/// CHANGED verdicts it re-checked and found still holding
+/// ([`crate::suppression::apply_reconfirmations`]).
+pub fn suppressions_block(suppressions: &[Suppression], reconfirmed: &Path) -> String {
     if suppressions.is_empty() {
         return "(none yet)".to_owned();
     }
-    suppressions
-        .iter()
-        .map(|s| {
-            let fp = &s.fingerprint;
-            let reason = s
-                .verdict_reason
-                .as_deref()
-                .unwrap_or("(no reason recorded)");
-            format!("- {fp} -- {reason}")
-        })
+    let rule = format!(
+        "\
+Each entry was decided against the code as it was then.
+- An entry marked CHANGED was judged at a commit whose code it depends on
+  has changed since. Re-check its claim against the current code.
+  - If the claim is true now, file it again with the SAME fingerprint: that
+    reopens the finding. Say in its detail what changed since the verdict.
+  - If the verdict still holds, record that in {}, a JSON array of
+    {{\"fingerprint\": \"...\", \"holds_while\": \"the condition as it stands now\"}}
+    entries. It moves the verdict forward to this commit, so the next scan
+    does not re-check it.
+- Any other entry: do not re-file it or a variant of it.",
+        reconfirmed.display()
+    );
+    let entries = suppressions.iter().map(|s| {
+        let mark = match &s.changed {
+            None => String::new(),
+            Some(Changed::Files { since, files }) => {
+                format!(" [CHANGED since {since}: {}]", files.join(", "))
+            }
+            Some(Changed::Unknown { since }) => {
+                format!(" [CHANGED: the verdict's commit {since} is not in this history]")
+            }
+        };
+        format!("- {} -- {}{mark}", s.fingerprint, s.reason)
+    });
+    std::iter::once(rule)
+        .chain(std::iter::once(String::new()))
+        .chain(entries)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -259,7 +304,7 @@ pub fn build_hunt_prompt(
     tree: &Path,
     diff_range: &str,
     scope_note: &str,
-    suppressions: &[Finding],
+    suppressions: &[Suppression],
     known: &[Finding],
     out_path: &Path,
     max_findings: i64,
@@ -276,7 +321,13 @@ pub fn build_hunt_prompt(
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("DIFF_RANGE", diff_range.to_owned());
     slots.insert("SCOPE_NOTE", scope_note.to_owned());
-    slots.insert("SUPPRESSIONS", suppressions_block(suppressions));
+    slots.insert(
+        "SUPPRESSIONS",
+        suppressions_block(
+            suppressions,
+            &crate::suppression::reconfirmed_path(out_path),
+        ),
+    );
     slots.insert("KNOWN_FINDINGS", known_block(known));
     slots.insert("OUT_PATH", out_path.display().to_string());
     slots.insert("MAX_FINDINGS", max_findings.to_string());
@@ -308,7 +359,36 @@ told not to report the finding again. The others do not. When in doubt
 between a word that suppresses and one that does not, pick the one that
 does not: a wrongly suppressed finding is never reported again. A decline
 file whose first line is not a valid classification sends the finding
-back to the operator's triage.";
+back to the operator's triage.
+
+For `wrong`, follow the classification line directly with two more lines,
+then the explanation:
+
+    Holds while: <the condition>
+    Depends on: <path>, <path>";
+
+/// What a rejecting verdict states about itself, spliced into every
+/// playbook that can give one (fix declines, the closed-PR harvest,
+/// recheck) so that all three describe the same two fields the scheduler
+/// anchors the verdict with (`crate::suppression`).
+pub const VERDICT_CONDITION: &str = "\
+A verdict that the finding is wrong (`wrong`, `invalid`) is a claim about
+the code as it is now, and every later scan of this repository is told to
+trust it until that code changes. So state what it rests on:
+- holds while: ONE sentence naming the condition in the current code
+  that makes the verdict true, specific enough that a later reader can
+  check it, e.g. \"get_data_in_window drops the first time bin
+  (src/plot_area.rs:141)\". Not a restatement of the verdict.
+- depends on: the repository paths that condition lives in. When any of
+  them changes, later scans are told to re-check the verdict instead of
+  trusting it. Name the file the condition is in, even when it is not
+  the finding's own file: that is the change that would make the finding
+  true again.";
+
+/// The decline instructions a fix playbook gets (`{{DECLINE_CLASSIFICATION}}`).
+fn decline_instructions() -> String {
+    format!("{DECLINE_CLASSIFICATION}\n\n{VERDICT_CONDITION}")
+}
 
 pub fn build_fix_prompt(
     root: &Path,
@@ -326,7 +406,7 @@ pub fn build_fix_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("REPO_NOTES", notes);
-    slots.insert("DECLINE_CLASSIFICATION", DECLINE_CLASSIFICATION.to_owned());
+    slots.insert("DECLINE_CLASSIFICATION", decline_instructions());
     render(&template, &slots)
 }
 
@@ -346,7 +426,7 @@ pub fn build_apply_improvement_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("REPO_NOTES", notes);
-    slots.insert("DECLINE_CLASSIFICATION", DECLINE_CLASSIFICATION.to_owned());
+    slots.insert("DECLINE_CLASSIFICATION", decline_instructions());
     render(&template, &slots)
 }
 
@@ -366,7 +446,7 @@ pub fn build_apply_modernization_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("REPO_NOTES", notes);
-    slots.insert("DECLINE_CLASSIFICATION", DECLINE_CLASSIFICATION.to_owned());
+    slots.insert("DECLINE_CLASSIFICATION", decline_instructions());
     render(&template, &slots)
 }
 
@@ -545,6 +625,7 @@ pub fn build_harvest_closed_prompt(
     slots.insert("FEEDBACK", feedback_blocks(pr, Voice::Maintainer, 8000));
     slots.insert("BOT_FEEDBACK", feedback_blocks(pr, Voice::Bot, 6000));
     slots.insert("REPO_NOTES", notes);
+    slots.insert("VERDICT_CONDITION", VERDICT_CONDITION.to_owned());
     render(&template, &slots)
 }
 
@@ -564,6 +645,7 @@ pub fn build_recheck_prompt(
     slots.insert("FINDING_JSON", finding_json(finding));
     slots.insert("OUT_PATH", out_path.display().to_string());
     slots.insert("REPO_NOTES", notes);
+    slots.insert("VERDICT_CONDITION", VERDICT_CONDITION.to_owned());
     render(&template, &slots)
 }
 
@@ -575,7 +657,7 @@ fn build_analysis_prompt(
     repo: &Repo,
     tree: &Path,
     scope_note: &str,
-    suppressions: &[Finding],
+    suppressions: &[Suppression],
     known: &[Finding],
     out_path: &Path,
     max_items: i64,
@@ -589,7 +671,13 @@ fn build_analysis_prompt(
     slots.insert("REPO_PATH", tree.display().to_string());
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("SCOPE_NOTE", scope_note.to_owned());
-    slots.insert("SUPPRESSIONS", suppressions_block(suppressions));
+    slots.insert(
+        "SUPPRESSIONS",
+        suppressions_block(
+            suppressions,
+            &crate::suppression::reconfirmed_path(out_path),
+        ),
+    );
     slots.insert(known_slot, known_block(known));
     slots.insert("OUT_PATH", out_path.display().to_string());
     slots.insert(max_slot, max_items.to_string());
@@ -602,7 +690,7 @@ pub fn build_test_gap_prompt(
     repo: &Repo,
     tree: &Path,
     scope_note: &str,
-    suppressions: &[Finding],
+    suppressions: &[Suppression],
     known: &[Finding],
     out_path: &Path,
     max_findings: i64,
@@ -629,7 +717,7 @@ pub fn build_dep_update_prompt(
     repo: &Repo,
     tree: &Path,
     scope_note: &str,
-    suppressions: &[Finding],
+    suppressions: &[Suppression],
     known: &[Finding],
     out_path: &Path,
     max_findings: i64,
@@ -656,7 +744,7 @@ pub fn build_refactor_prompt(
     repo: &Repo,
     tree: &Path,
     scope_note: &str,
-    suppressions: &[Finding],
+    suppressions: &[Suppression],
     known: &[Finding],
     out_path: &Path,
     max_findings: i64,
@@ -683,7 +771,7 @@ pub fn build_modernization_prompt(
     repo: &Repo,
     tree: &Path,
     scope_note: &str,
-    suppressions: &[Finding],
+    suppressions: &[Suppression],
     known: &[Finding],
     out_path: &Path,
     max_findings: i64,
@@ -710,7 +798,7 @@ pub fn build_standards_prompt(
     repo: &Repo,
     tree: &Path,
     scope_note: &str,
-    suppressions: &[Finding],
+    suppressions: &[Suppression],
     known: &[Finding],
     out_path: &Path,
     max_findings: i64,
@@ -737,7 +825,13 @@ pub fn build_standards_prompt(
     slots.insert("REPO_PATH", tree.display().to_string());
     slots.insert("REPO_NAME", repo.name.clone());
     slots.insert("SCOPE_NOTE", scope_note.to_owned());
-    slots.insert("SUPPRESSIONS", suppressions_block(suppressions));
+    slots.insert(
+        "SUPPRESSIONS",
+        suppressions_block(
+            suppressions,
+            &crate::suppression::reconfirmed_path(out_path),
+        ),
+    );
     slots.insert("KNOWN_FINDINGS", known_block(known));
     slots.insert("STANDARDS", standards_content.clone());
     slots.insert("OUT_PATH", out_path.display().to_string());

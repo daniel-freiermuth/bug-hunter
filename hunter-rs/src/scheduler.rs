@@ -776,7 +776,7 @@ use std::path::PathBuf;
 
 use crate::backend::{Backend, JobClass, Verdict};
 use crate::forge::{self, CheckConclusion, GhCheckRun, Mergeable, PrView, ReviewDecision};
-use crate::ingest::{EntryTypes, IngestResult, ingest_findings};
+use crate::ingest::{EntryTypes, IngestResult, ingest_findings, ingest_scan_findings};
 use crate::playbooks;
 use crate::types::RunResult;
 use crate::workspace::{TreeSpec, Workspace};
@@ -1661,10 +1661,9 @@ pub async fn run_hunt(
         .join(format!("job{out_job}.findings.json"));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
-    let suppressions = store
-        .suppressions(rid, FindingType::Bug.as_str())
-        .await
-        .unwrap_or_default();
+    let suppressions =
+        crate::suppression::suppression_list(store, repo, &[FindingType::Bug.as_str()], &pinned)
+            .await;
     let known = store
         .known_active(rid, FindingType::Bug.as_str())
         .await
@@ -1715,23 +1714,23 @@ pub async fn run_hunt(
     };
 
     if out_path.exists() {
-        let counts = ingest_findings(
+        let counts = ingest_scan_findings(
             store,
             rid,
             &out_path,
             EntryTypes::Fixed(FindingType::Bug),
-            Some(job),
-            None,
+            job,
         )
         .await;
         let _ = store
             .log_event(
                 "hunt",
                 &format!(
-                    "{rname}: job {job} {state} over {}... +{} new / {} dup / {} invalid ({} tok)",
+                    "{rname}: job {job} {state} over {}... +{} new / {} dup ({} reopened) / {} invalid ({} tok)",
                     &diff_range[..25.min(diff_range.len())],
                     counts.inserted,
                     counts.duplicates,
+                    counts.reopened,
                     counts.invalid,
                     rr.tokens_new
                 ),
@@ -1773,6 +1772,14 @@ pub async fn run_hunt(
             )
             .await;
     }
+    crate::suppression::apply_reconfirmations(
+        store,
+        repo,
+        &[FindingType::Bug.as_str()],
+        &out_path,
+        &pinned,
+    )
+    .await;
     close_workspace(store, &ws).await;
     Ok(summary)
 }
@@ -1877,6 +1884,12 @@ pub async fn run_recheck(
         updated_confidence: Option<f64>,
         #[serde(default)]
         updated_severity: Option<String>,
+        /// For `invalid`: the condition in the current code that makes the
+        /// finding wrong, and the paths it rests on ([`crate::suppression`]).
+        #[serde(default)]
+        holds_while: Option<String>,
+        #[serde(default, deserialize_with = "crate::suppression::de_paths")]
+        depends_on: Vec<String>,
     }
 
     let fid = finding.id;
@@ -1957,7 +1970,7 @@ pub async fn run_recheck(
         }
     };
     let job = created.id;
-    let (ws, _pinned) = match open_workspace(
+    let (ws, pinned) = match open_workspace(
         store,
         cfg,
         &repo,
@@ -2174,12 +2187,20 @@ pub async fn run_recheck(
             "stale"
         }
         RecheckOutcome::Invalid => {
+            let anchor = crate::suppression::verdict_anchor(
+                FindingStatus::Rejected,
+                &pinned,
+                finding,
+                verdict_obj.holds_while.as_deref(),
+                &verdict_obj.depends_on,
+            );
             log_write_failure(
                 store
-                    .set_finding_verdict(
+                    .set_anchored_verdict(
                         fid,
                         FindingStatus::Rejected,
                         &format!("recheck: {reason}"),
+                        anchor.as_ref(),
                     )
                     .await,
                 format_args!("#{fid}: verdict -> rejected"),
@@ -2232,7 +2253,7 @@ type AnalysisPromptBuilder = fn(
     &Repo,
     &Path,
     &str,
-    &[Finding],
+    &[playbooks::Suppression],
     &[Finding],
     &Path,
     i64,
@@ -2383,7 +2404,7 @@ async fn run_analysis_job(
         Err(e) => return job_refused(kind.into(), Some(rname), None, e),
     };
     let job = created.id;
-    let (ws, _pinned) = match open_workspace(
+    let (ws, pinned) = match open_workspace(
         store,
         cfg,
         repo,
@@ -2410,11 +2431,13 @@ async fn run_analysis_job(
         .join(format!("job{out_job}.{}.json", spec.out_plural));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
 
-    let mut suppressions = Vec::new();
+    let types: Vec<&str> = std::iter::once(&spec.finding_type)
+        .chain(spec.also_files)
+        .map(|ft| ft.as_str())
+        .collect();
+    let suppressions = crate::suppression::suppression_list(store, repo, &types, &pinned).await;
     let mut known = Vec::new();
-    for ft in std::iter::once(&spec.finding_type).chain(spec.also_files) {
-        let ft = ft.as_str();
-        suppressions.extend(store.suppressions(rid, ft).await.unwrap_or_default());
+    for ft in &types {
         known.extend(store.known_active(rid, ft).await.unwrap_or_default());
     }
     let repo_notes = Store::repo_notes(&cfg.work_root, rid);
@@ -2458,14 +2481,17 @@ async fn run_analysis_job(
     };
 
     if out_path.exists() {
-        let counts =
-            ingest_findings(store, rid, &out_path, spec.entry_types(), Some(job), None).await;
+        let counts = ingest_scan_findings(store, rid, &out_path, spec.entry_types(), job).await;
         let _ = store
             .log_event(
                 kind.as_str(),
                 &format!(
-                    "{rname}: job {job} {state} -- +{} new / {} dup / {} invalid ({} tok)",
-                    counts.inserted, counts.duplicates, counts.invalid, rr.tokens_new
+                    "{rname}: job {job} {state} -- +{} new / {} dup ({} reopened) / {} invalid ({} tok)",
+                    counts.inserted,
+                    counts.duplicates,
+                    counts.reopened,
+                    counts.invalid,
+                    rr.tokens_new
                 ),
                 Some(job),
                 None,
@@ -2492,6 +2518,7 @@ async fn run_analysis_job(
             )
             .await;
     }
+    crate::suppression::apply_reconfirmations(store, repo, &types, &out_path, &pinned).await;
     close_workspace(store, &ws).await;
     Ok(summary)
 }
@@ -2786,6 +2813,8 @@ struct FixStart {
     repo: Repo,
     job: i64,
     ws: Workspace,
+    /// The commit the chain's tree was created at (`jobs.pinned_sha`).
+    pinned: String,
     branch: String,
     cap: Option<i64>,
     /// The report a resumed blocked chain works against.
@@ -2914,7 +2943,7 @@ async fn start_fix(
     if !matches!(opened, Ok(Ok(_))) {
         release_claim(store, fid).await;
     }
-    let (ws, _pinned) = match opened? {
+    let (ws, pinned) = match opened? {
         Ok(opened) => opened,
         Err(failed) => return Ok(Err(failed)),
     };
@@ -2922,6 +2951,7 @@ async fn start_fix(
         repo,
         job: created.id,
         ws,
+        pinned,
         branch,
         cap,
         previous_blocker,
@@ -3052,10 +3082,7 @@ enum FixOutcome {
     Blocked { report: String, from_tree: bool },
     /// `NOT-A-BUG.md` / `DECLINED.md`: the finding takes the status its
     /// classification maps to ([`parse_decline`]).
-    Declined {
-        class: Option<ClosureClass>,
-        reason: String,
-    },
+    Declined(Decline),
     /// The branch is pushed and its draft PR exists (`recovered`: it
     /// already did).
     Shipped { pr_url: String, recovered: bool },
@@ -3086,38 +3113,94 @@ fn read_report(path: &Path) -> std::io::Result<String> {
 }
 
 /// A declined fix's report, as the finding will record it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Decline {
+    class: Option<ClosureClass>,
+    /// `"<classification>: <explanation>"`, or the whole report when it
+    /// classifies nothing.
+    reason: String,
+    /// The `Holds while:` line: the condition in the code that makes the
+    /// verdict true.
+    holds_while: Option<String>,
+    /// The `Depends on:` paths the verdict rests on.
+    depends_on: Vec<String>,
+}
+
+/// Parse a declined fix's report.
 ///
 /// The first line names the classification (`Classification: superseded`;
-/// Markdown emphasis around it is ignored) and the explanation follows.
-/// The reason is `"<classification>: <explanation>"`, the shape a closed-PR
-/// harvest records. A report whose first line names no classification, or
-/// that explains nothing after it, keeps its whole text and has none:
-/// nothing then says the premise failed, so nothing may suppress it.
-fn parse_decline(report: &str) -> (Option<ClosureClass>, String) {
+/// Markdown emphasis around it is ignored). Optional `Holds while:` and
+/// `Depends on:` lines may follow it directly, and the explanation comes
+/// after them. The reason is `"<classification>: <explanation>"`, the
+/// shape a closed-PR harvest records. A report whose first line names no
+/// classification, or that explains nothing after it, keeps its whole text
+/// and has none: nothing then says the premise failed, so nothing may
+/// suppress it.
+fn parse_decline(report: &str) -> Decline {
     let body = report.trim_start();
     let (first, rest) = body.split_once('\n').unwrap_or((body, ""));
-    let rest = rest.trim();
-    let label: String = first
-        .chars()
-        .filter(|c| !matches!(c, '*' | '`' | '_' | '#'))
-        .collect();
-    let class = label
-        .split_once(':')
-        .filter(|(key, _)| key.trim().eq_ignore_ascii_case("classification"))
+    let class = header(first)
+        .filter(|(key, _)| key == "classification")
         .and_then(|(_, word)| {
-            word.trim()
+            word.trim_matches('`')
                 .to_ascii_lowercase()
                 .parse::<ClosureClass>()
                 .ok()
-        })
-        .filter(|_| !rest.is_empty());
-    let reason = match class {
-        Some(class) => format!("{class}: {rest}"),
-        None => report.to_owned(),
+        });
+    let mut holds_while = None;
+    let mut depends_on = Vec::new();
+    let mut lines = rest.lines().peekable();
+    while let Some(line) = lines.peek() {
+        match header(line) {
+            Some((key, value)) if key == "holds while" => holds_while = Some(value),
+            Some((key, value)) if key == "depends on" => depends_on.extend(
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned),
+            ),
+            _ if line.trim().is_empty() => {}
+            _ => break,
+        }
+        lines.next();
+    }
+    let explanation = lines.collect::<Vec<_>>().join("\n");
+    let explanation = explanation.trim();
+    let class = class.filter(|_| !explanation.is_empty());
+    let Some(class) = class else {
+        return Decline {
+            class: None,
+            reason: report.chars().take(500).collect(),
+            holds_while: None,
+            depends_on: Vec::new(),
+        };
     };
     // The bound every verdict reason gets: a suppressing one is injected
     // into every later scan's suppression list.
-    (class, reason.chars().take(500).collect())
+    Decline {
+        class: Some(class),
+        reason: format!("{class}: {explanation}")
+            .chars()
+            .take(500)
+            .collect(),
+        holds_while,
+        depends_on,
+    }
+}
+
+/// A `Key: value` header line of a worker's report, its key lowercased and
+/// stripped of Markdown emphasis and a list bullet (`- **Holds while:**`),
+/// its value stripped of surrounding emphasis.
+fn header(line: &str) -> Option<(String, String)> {
+    let (key, value) = line.split_once(':')?;
+    let key: String = key
+        .chars()
+        .filter(|c| !matches!(c, '*' | '`' | '_' | '#'))
+        .collect();
+    let key = key.trim().trim_start_matches('-').trim();
+    let value = value.trim_matches(|c: char| c == '*' || c.is_whitespace());
+    Some((key.to_ascii_lowercase(), value.to_owned()))
 }
 
 /// Read the worker's result and decide the attempt's outcome. Shipping is
@@ -3158,8 +3241,9 @@ async fn conclude_fix(
         }
     };
     if declined {
-        let (class, reason) = parse_decline(&report.unwrap_or_default());
-        return Ok(FixOutcome::Declined { class, reason });
+        return Ok(FixOutcome::Declined(parse_decline(
+            &report.unwrap_or_default(),
+        )));
     }
     if let Some(report) = report {
         return Ok(FixOutcome::Blocked {
@@ -3341,18 +3425,36 @@ async fn hold_blocked_fix(
 /// PR's does. Only `wrong` and `unwanted` suppress; most declines are work
 /// that landed another way, and rejecting those told every later scan to
 /// stop reporting valid findings. An unclassified decline goes back to
-/// triage (`new`), like an `abandoned` closure.
+/// triage (`new`), like an `abandoned` closure. A suppressing verdict is
+/// anchored to the commit the fix's tree was created at.
 async fn record_declined_fix(
     store: &Store,
-    fid: i64,
-    job: i64,
-    class: Option<ClosureClass>,
-    reason: &str,
+    finding: &Finding,
+    start: &FixStart,
+    decline: Decline,
     summary: &mut CycleSummary,
 ) {
+    let fid = finding.id;
+    let job = start.job;
+    let Decline {
+        class,
+        reason,
+        holds_while,
+        depends_on,
+    } = decline;
+    let reason = reason.as_str();
     let status = class.map_or(FindingStatus::New, ClosureClass::status);
+    let anchor = crate::suppression::verdict_anchor(
+        status,
+        &start.pinned,
+        finding,
+        holds_while.as_deref(),
+        &depends_on,
+    );
     log_write_failure(
-        store.set_finding_verdict(fid, status, reason).await,
+        store
+            .set_anchored_verdict(fid, status, reason, anchor.as_ref())
+            .await,
         format_args!("#{fid}: verdict -> {status}"),
     );
     log_write_failure(
@@ -3394,8 +3496,8 @@ async fn record_fix_outcome(
         FixOutcome::Blocked { report, from_tree } => {
             return hold_blocked_fix(store, fid, start, &report, from_tree, summary).await;
         }
-        FixOutcome::Declined { class, reason } => {
-            record_declined_fix(store, fid, job, class, &reason, summary).await;
+        FixOutcome::Declined(decline) => {
+            record_declined_fix(store, finding, start, decline, summary).await;
             return Ok(());
         }
         FixOutcome::Shipped { pr_url, recovered } => {
@@ -4950,7 +5052,7 @@ pub async fn run_harvest(
         }
     };
     let job = created.id;
-    let (ws, _pinned) = match open_workspace(
+    let (ws, pinned) = match open_workspace(
         store,
         cfg,
         &repo,
@@ -5148,8 +5250,29 @@ pub async fn run_harvest(
     // and why a verdict a human set in the meantime is kept.
     let reviewed = if let Some(Ok(verdict)) = &closure {
         let status = verdict.class.status();
+        // The verdict is about the default branch. A cold harvest's tree is
+        // at its tip; a continued one's tree is the PR's head, so the tip
+        // is read from the clone instead.
+        let judged_at = if resume.is_some() {
+            let clone = PathBuf::from(&repo.path);
+            let tip = format!("origin/{}", repo.default_branch);
+            tokio::task::spawn_blocking(move || crate::workspace::resolve(&clone, &tip))
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| pinned.clone())
+        } else {
+            pinned.clone()
+        };
+        let anchor = crate::suppression::verdict_anchor(
+            status,
+            &judged_at,
+            finding,
+            verdict.holds_while.as_deref(),
+            &verdict.depends_on,
+        );
         match store
-            .record_closed_harvest(fid, status, &verdict.reason, now_ms())
+            .record_closed_harvest(fid, status, &verdict.reason, anchor.as_ref(), now_ms())
             .await
         {
             Err(e) => {
@@ -5246,6 +5369,10 @@ struct CloseVerdict {
     class: ClosureClass,
     /// `verdict_reason`: `"<classification>: <reason>"`, plus the evidence.
     reason: String,
+    /// The condition in the current code that makes a suppressing verdict
+    /// true, and the paths it rests on ([`crate::suppression`]).
+    holds_while: Option<String>,
+    depends_on: Vec<String>,
 }
 
 /// `CLOSE-REASON.json` as `harvest-closed.md` asks for it.
@@ -5255,6 +5382,10 @@ struct CloseReasonFile {
     reason: String,
     #[serde(default)]
     evidence: Option<String>,
+    #[serde(default)]
+    holds_while: Option<String>,
+    #[serde(default, deserialize_with = "crate::suppression::de_paths")]
+    depends_on: Vec<String>,
 }
 
 /// Read and check the closed-PR harvest's verdict file.
@@ -5306,6 +5437,8 @@ fn read_close_reason(worktree: &Path) -> Result<CloseVerdict, CloseFailure> {
     Ok(CloseVerdict {
         class,
         reason: full.chars().take(500).collect(),
+        holds_while: file.holds_while,
+        depends_on: file.depends_on,
     })
 }
 
