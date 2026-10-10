@@ -160,19 +160,22 @@ fn classifying(body: String) -> ScriptedBackend {
 /// A worker stopped at the cap with a transcript: what the harness
 /// reports as a suspension.
 fn suspending() -> ScriptedBackend {
-    ScriptedBackend::new(|tree| {
-        let session = tree.parent().unwrap().join("session").join("session.jsonl");
-        RunResult {
-            exit_code: None,
-            killed_reason: Some("cap".to_owned()),
-            tokens_new: 30_000,
-            calls: 3,
-            session_file: Some(session.to_string_lossy().into_owned()),
-            duration_s: 1.0,
-            stdout_tail: "stopped".to_owned(),
-            usage_delta: None,
-        }
-    })
+    ScriptedBackend::new(suspended_at)
+}
+
+/// What the harness reports for a worker in `tree` stopped at the cap.
+fn suspended_at(tree: &std::path::Path) -> RunResult {
+    let session = tree.parent().unwrap().join("session").join("session.jsonl");
+    RunResult {
+        exit_code: None,
+        killed_reason: Some("cap".to_owned()),
+        tokens_new: 30_000,
+        calls: 3,
+        session_file: Some(session.to_string_lossy().into_owned()),
+        duration_s: 1.0,
+        stdout_tail: "stopped".to_owned(),
+        usage_delta: None,
+    }
 }
 
 /// A closed, unharvested PR whose finding is `closed` is picked for its
@@ -630,6 +633,87 @@ async fn a_harvest_given_up_on_files_its_last_follow_ups() {
             (Some("stuck".into()), 1)
         ]
     );
+}
+
+/// A suspending worker that has written the `FOLLOW_UP` entry by then.
+fn suspending_with_follow_up() -> ScriptedBackend {
+    ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("FOLLOW-UPS.json"), FOLLOW_UP).unwrap();
+        suspended_at(tree)
+    })
+}
+
+/// Resume the suspended harvest `pick_next` offers with `worker`.
+async fn resume_harvest(f: &Fixture, worker: &ScriptedBackend) -> hunter::scheduler::CycleSummary {
+    let plan = match pick_next(&f.store, &f.cfg, None).await.unwrap() {
+        Some(Candidate::Resume { plan, .. }) => *plan,
+        other => panic!("expected the suspended harvest to be resumed, got {other:?}"),
+    };
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    run_harvest(&f.store, &f.cfg, &finding, worker, Some(&plan))
+        .await
+        .unwrap()
+}
+
+/// A suspension files nothing: its tree keeps FOLLOW-UPS.json, and the
+/// resume that lands files it. A resume that fails is retried cold, which
+/// files the same open work under its own slug, so the suspended run's
+/// follow-ups must not have been filed either.
+#[tokio::test]
+async fn a_suspended_harvest_files_its_follow_ups_once() {
+    let bins = FakeBins::acquire("harvest-suspend-followups");
+    gh_default(&bins);
+    for resume_lands in [true, false] {
+        let f = fixture("harvest-suspend-followups", FindingStatus::Closed).await;
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let suspended = run_harvest(
+            &f.store,
+            &f.cfg,
+            &finding,
+            &suspending_with_follow_up(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(suspended.outcome.as_deref(), Some("suspended"));
+        assert_eq!(
+            filed(&f, "widget:src/lib.rs:left-open").await,
+            0,
+            "a suspension files nothing: {suspended:?}"
+        );
+
+        if resume_lands {
+            let resumed = resume_harvest(&f, &classifying(close_reason("superseded"))).await;
+            assert_eq!(resumed.outcome.as_deref(), Some("harvested"), "{resumed:?}");
+            assert_eq!(
+                filed(&f, "widget:src/lib.rs:left-open").await,
+                1,
+                "the landed resume files what the suspension left: {resumed:?}"
+            );
+            continue;
+        }
+        let resumed = resume_harvest(&f, &classifying(close_reason("maybe"))).await;
+        assert_eq!(resumed.outcome.as_deref(), Some("retry"), "{resumed:?}");
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let cold = run_harvest(
+            &f.store,
+            &f.cfg,
+            &finding,
+            &classifying_with_follow_up(close_reason("superseded"), "widget:src/lib.rs:still-open"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(cold.outcome.as_deref(), Some("harvested"), "{cold:?}");
+        assert_eq!(
+            (
+                filed(&f, "widget:src/lib.rs:left-open").await,
+                filed(&f, "widget:src/lib.rs:still-open").await
+            ),
+            (0, 1),
+            "the same work must be filed once"
+        );
+    }
 }
 
 /// A classification the database refuses to record leaves the finding
