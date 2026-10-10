@@ -2109,32 +2109,274 @@ async fn resume_with_a_zero_cost_estimate_uses_the_attempt_limit_not_a_zero_cost
     );
 }
 
-// -- the summary preview writes nothing --------------------------------------
+// -- a given-up chain is a failed attempt ------------------------------------
 
-/// The summary's preview changes nothing: a chain the scheduler would
-/// give up is left for the scheduler to retire — the dashboard polls the
-/// preview, paused or not.
+/// A worker killed at wallclock after doing work, with a transcript: a
+/// suspension, like a cap kill.
+fn suspended_at_wallclock(session: &Path) -> RunResult {
+    std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+    std::fs::write(session, "").unwrap();
+    RunResult {
+        killed_reason: Some("wallclock".to_owned()),
+        ..suspended_at_cap(session)
+    }
+}
+
+/// A recheck whose worker overruns its wall clock on every attempt ends
+/// "stuck" back in the inbox, as three killed attempts did before
+/// wallclock kills became suspensions.
+///
+/// Every attempt is a suspension, which never counts toward the failure
+/// streak, so the only bound is the chain's give-up ceiling. Uncounted,
+/// the give-up left the finding `rechecking`, the recheck tier started a
+/// fresh chain in the same cycle, and the finding took every cycle
+/// forever: no hunt or other work ever ran.
 #[tokio::test]
-async fn the_summary_preview_does_not_retire_a_given_up_chain() {
+async fn a_recheck_that_keeps_overrunning_ends_stuck_instead_of_restarting_forever() {
+    let (dir, path, pool) = fresh_db().await;
+    let store = rw_store(&path).await;
+    let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
+    let cfg = test_config(dir.path());
+    // The transcript is in the session directory of the chain being run.
+    let overrunning = ScriptedBackend::new(|tree| {
+        suspended_at_wallclock(&tree.parent().unwrap().join("session").join("session.jsonl"))
+    });
+
+    // Three chains of MAX_RESUME_ATTEMPTS each: the third give-up is the
+    // third identical failure.
+    let mut kinds = Vec::new();
+    for _ in 0..12 {
+        let summary = hunter::scheduler::run_cycle(&store, &cfg, &overrunning, None).await;
+        kinds.push(summary.kind.map(|k| k.to_string()));
+    }
+    let next = pick_next(&store, &cfg, None).await.unwrap();
+
+    let finding = store.get_finding(fid).await.unwrap().unwrap();
+    assert_eq!(
+        finding.status,
+        FindingStatus::New,
+        "cycles: {kinds:?}, next: {next:?}"
+    );
+    assert!(
+        !matches!(
+            next,
+            Some(Candidate::Finding { .. } | Candidate::Resume { .. })
+        ),
+        "the finding must stop taking the cycle, got {next:?}"
+    );
+}
+
+/// A suspended chain of `MAX_RESUME_ATTEMPTS` attempts at finding `fid`'s
+/// `kind` work, ids `first..first + 4`, in the workspace of chain `first`.
+async fn seed_finding_chain(pool: &SqlitePool, dir: &TempDir, kind: &str, fid: i64, first: i64) {
+    let session = seed_session_in(dir, first, CTX);
+    for id in first..first + 4 {
+        sqlx::query(
+            "INSERT INTO jobs \
+             (id, kind, repo_id, finding_id, state, session_file, killed_reason, tokens_new, \
+              resumed_from, started_at, finished_at, pinned_sha) \
+             VALUES (?1, ?2, 1, ?3, 'suspended', ?4, 'wallclock', 10000, ?5, 1000, 2000, 'pinned')",
+        )
+        .bind(id)
+        .bind(kind)
+        .bind(fid)
+        .bind(session.to_string_lossy().to_string())
+        .bind((id > first).then_some(id - 1))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+}
+
+/// Finding 1 on repo 1 in `status`, with a merged pull request.
+async fn seed_finding_in(pool: &SqlitePool, status: &str) {
+    sqlx::query(
+        "INSERT INTO findings \
+         (id, type, repo_id, fingerprint, severity, confidence, summary, status, \
+          created_at, updated_at) \
+         VALUES (1, 'bug', 1, 'fp1', 'high', 0.9, 'bug 1', ?1, 1000, 1000)",
+    )
+    .bind(status)
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO pr_state (finding_id, pr_number, state, synced_at) \
+         VALUES (1, 1, 'MERGED', 5000)",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Give up three chains of `kind` work on finding 1, one per selection,
+/// and return what the streak and the finding looked like after each,
+/// whether the given-up chain is held as a blocked fix's checkpoint, and
+/// whether that same selection started finding 1's work fresh.
+async fn give_up_three_chains(
+    kind: &str,
+    status: &str,
+) -> Vec<(i64, FindingStatus, bool, bool, bool)> {
     let (dir, path, pool) = fresh_db().await;
     seed_repo(&pool, &dir).await;
     seed_history(&pool).await;
-    let session = seed_session(&dir);
-    let newest = seed_chain(&pool, &session, &[10_000; 4]).await;
+    seed_finding_in(&pool, status).await;
     let store = rw_store(&path).await;
     let cfg = test_config(dir.path());
 
-    preview_next(&store, &cfg).await.unwrap();
+    let mut seen = Vec::new();
+    for first in [10, 20, 30] {
+        seed_finding_chain(&pool, &dir, kind, 1, first).await;
+        let next = pick_next(&store, &cfg, None).await.unwrap();
+        let fresh = matches!(next, Some(Candidate::Finding { finding_id: 1, .. }));
+        let (state, reason, _) = job_row(&pool, first + 3).await;
+        assert_eq!(reason.as_deref(), Some("give-up"));
+        let held = match state.as_str() {
+            "failed" => false,
+            "suspended" => store.job_blocker(first + 3).await.unwrap().is_some(),
+            other => panic!("given-up chain left {other}"),
+        };
+        let f = store.get_finding(1).await.unwrap().unwrap();
+        let ps = store.get_pr_state(1).await.unwrap().unwrap();
+        let streak = match kind {
+            "fix" => f.fix_attempts,
+            "recheck" => f.recheck_attempts,
+            _ => ps.harvest_attempts,
+        };
+        seen.push((streak, f.status, ps.harvested_at.is_some(), held, fresh));
+    }
+    seen
+}
+
+/// Each given-up fix chain is one failed fix attempt, and the fix starts
+/// over; the third holds the finding blocked, with that chain as its
+/// checkpoint, like any three identical failures, and starts nothing.
+#[tokio::test]
+async fn a_given_up_fix_chain_counts_toward_the_failure_streak() {
+    let seen = give_up_three_chains("fix", "queued").await;
+    assert_eq!(
+        seen,
+        [
+            (1, FindingStatus::Queued, false, false, true),
+            (2, FindingStatus::Queued, false, false, true),
+            (0, FindingStatus::Blocked, false, true, false),
+        ]
+    );
+}
+
+/// Each given-up recheck chain is one failed recheck, and the recheck
+/// starts over; the third sends the finding back to the inbox.
+#[tokio::test]
+async fn a_given_up_recheck_chain_counts_toward_the_failure_streak() {
+    let seen = give_up_three_chains("recheck", "rechecking").await;
+    assert_eq!(
+        seen,
+        [
+            (1, FindingStatus::Rechecking, false, false, true),
+            (2, FindingStatus::Rechecking, false, false, true),
+            (0, FindingStatus::New, false, false, false),
+        ]
+    );
+}
+
+/// Each given-up harvest chain is one failed harvest, and the harvest
+/// starts over; the third gives the PR up as harvested, unreviewed.
+#[tokio::test]
+async fn a_given_up_harvest_chain_counts_toward_the_failure_streak() {
+    let seen = give_up_three_chains("harvest", "merged").await;
+    assert_eq!(
+        seen,
+        [
+            (1, FindingStatus::Merged, false, false, true),
+            (2, FindingStatus::Merged, false, false, true),
+            (0, FindingStatus::Merged, true, false, false),
+        ]
+    );
+}
+
+/// Every streak event a given-up chain writes, through the one that ends
+/// the work, says why the chain was given up. The streak key alone
+/// ("resume chain gave up") left whoever triages the finding to dig the
+/// reason out of a separate `resume` event.
+#[tokio::test]
+async fn a_given_up_chains_streak_events_say_why_it_was_given_up() {
+    for (kind, status) in [
+        ("fix", "queued"),
+        ("recheck", "rechecking"),
+        ("harvest", "merged"),
+    ] {
+        let (dir, path, pool) = fresh_db().await;
+        seed_repo(&pool, &dir).await;
+        seed_history(&pool).await;
+        seed_finding_in(&pool, status).await;
+        let store = rw_store(&path).await;
+        let cfg = test_config(dir.path());
+        for first in [10, 20, 30] {
+            seed_finding_chain(&pool, &dir, kind, 1, first).await;
+            pick_next(&store, &cfg, None).await.unwrap();
+        }
+
+        let counted: Vec<String> = store
+            .recent_events(100)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.message.contains("resume chain gave up"))
+            .map(|e| e.message)
+            .collect();
+
+        assert_eq!(counted.len(), 3, "{kind}: {counted:?}");
+        assert!(
+            counted
+                .iter()
+                .all(|m| m.contains("giving up after") && m.contains("4 attempts, the limit")),
+            "{kind}: {counted:?}"
+        );
+    }
+}
+
+/// Finding 1 queued for a fix that has failed twice on given-up chains,
+/// with a third chain past the ceiling: the next selection holds it.
+async fn fix_one_give_up_from_blocked() -> (TempDir, PathBuf, SqlitePool) {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    seed_finding_in(&pool, "queued").await;
+    sqlx::query(
+        "UPDATE findings SET fix_attempts = 2, last_fix_failure = 'resume chain gave up' \
+         WHERE id = 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_finding_chain(&pool, &dir, "fix", 1, 30).await;
+    (dir, path, pool)
+}
+
+/// The summary's preview changes nothing: a chain the scheduler would
+/// give up, and count as the failure that holds the finding, is left for
+/// the scheduler — the dashboard polls the preview, paused or not.
+#[tokio::test]
+async fn the_summary_preview_neither_retires_nor_counts_a_given_up_chain() {
+    let (dir, path, pool) = fix_one_give_up_from_blocked().await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+
+    let previewed = preview_next(&store, &cfg).await.unwrap();
     let after_preview = (
-        job_row(&pool, newest).await.0,
-        resume_events(&pool, newest).await.len(),
+        job_row(&pool, 33).await.0,
+        store.get_finding(1).await.unwrap().unwrap().fix_attempts,
     );
     pick_next(&store, &cfg, None).await.unwrap();
     let after_pick = (
-        job_row(&pool, newest).await.0,
-        resume_events(&pool, newest).await.len(),
+        job_row(&pool, 33).await.0,
+        store.get_finding(1).await.unwrap().unwrap().status,
     );
 
-    assert_eq!(after_preview, ("suspended".to_owned(), 0));
-    assert_eq!(after_pick, (JobState::Failed.as_str().to_owned(), 1));
+    assert!(
+        matches!(previewed, Some(Candidate::Finding { finding_id: 1, .. })),
+        "{previewed:?}"
+    );
+    assert_eq!(after_preview, ("suspended".to_owned(), 2));
+    assert_eq!(after_pick, ("suspended".to_owned(), FindingStatus::Blocked));
 }

@@ -229,8 +229,9 @@ async fn list_attention(store: &Store) -> sqlx::Result<Vec<Finding>> {
 /// The scheduler's own selection. On the way it retires suspensions that
 /// can never be continued — a chain past the give-up ceiling, or one
 /// whose working directory is gone — which [`resume_plan`] does as it
-/// skips over them. [`preview_next`] makes the same selection and writes
-/// nothing.
+/// skips over them, and counts a finding tier's given-up chain as a
+/// failed attempt ([`count_given_up_chain`]). [`preview_next`] makes the
+/// same selection and writes nothing.
 pub async fn pick_next(
     store: &Store,
     cfg: &Config,
@@ -243,10 +244,12 @@ pub async fn pick_next(
 /// without any of its writes.
 ///
 /// The dashboard polls this, scheduler paused or not, and a poll must not
-/// do the scheduler's work: retiring a chain or bumping a rotation
-/// timestamp. A suspension the scheduler would retire is only skipped
-/// here, so the preview names the fresh start a given-up chain makes way
-/// for.
+/// do the scheduler's work: retiring a chain, bumping a rotation
+/// timestamp, or counting a given-up chain against its finding, which can
+/// send the finding to the inbox, hold it blocked or give its PR up. A
+/// suspension the scheduler would retire is only skipped here, so the
+/// preview names the fresh start a given-up chain makes way for, even
+/// where the scheduler's count ends that work instead.
 pub async fn preview_next(store: &Store, cfg: &Config) -> anyhow::Result<Option<Candidate>> {
     select(store, cfg, None, Pick::Preview).await
 }
@@ -261,6 +264,11 @@ enum Pick {
 }
 
 /// [`pick_next`], or with [`Pick::Preview`] [`preview_next`].
+#[allow(
+    clippy::too_many_lines,
+    reason = "one tier after another in priority order; splitting it would \
+              scatter the order that is the whole point of the function"
+)]
 async fn select(
     store: &Store,
     cfg: &Config,
@@ -298,7 +306,11 @@ async fn select(
         (FindingJobKind::Fix, &queued),
     ] {
         if let Some(f) = items.iter().find(|f| f.budget_override.is_some()) {
-            return Ok(Some(finding_pick(store, cfg, kind, f, mode).await?));
+            return match finding_pick(store, cfg, kind, f, mode).await? {
+                Some(c) => Ok(Some(c)),
+                // Its given-up chain just ended `f`'s work: select again.
+                None => Box::pin(select(store, cfg, force_repo, mode)).await,
+            };
         }
     }
 
@@ -312,7 +324,11 @@ async fn select(
         (FindingJobKind::Fix, queued.last()),
     ] {
         if let Some(f) = oldest {
-            return Ok(Some(finding_pick(store, cfg, kind, f, mode).await?));
+            return match finding_pick(store, cfg, kind, f, mode).await? {
+                Some(c) => Ok(Some(c)),
+                // Its given-up chain just ended `f`'s work: select again.
+                None => Box::pin(select(store, cfg, force_repo, mode)).await,
+            };
         }
     }
 
@@ -579,11 +595,11 @@ async fn pick_resume(
         if force_id.is_some_and(|rid| job.repo_id != rid) {
             continue;
         }
-        if let Some(plan) = resume_plan(store, cfg, job, mode).await? {
+        if let Resumable::Yes(plan) = resume_plan(store, cfg, job, mode).await? {
             return Ok(Some(Candidate::Resume {
                 label: (!plan.repo.is_empty()).then(|| plan.repo.clone()),
                 budget_override: None,
-                plan: Box::new(plan),
+                plan,
             }));
         }
     }
@@ -598,31 +614,104 @@ async fn pick_resume(
 /// floor plus everything the suspended attempt already spent. The
 /// replacement keeps the tier's position, label and budget override;
 /// only the plan differs.
+///
+/// `None` when a chain given up here was the failure that ended `f`'s
+/// work ([`count_given_up_chain`]): `f` is no longer this tier's to pick.
 async fn finding_pick(
     store: &Store,
     cfg: &Config,
     kind: FindingJobKind,
     f: &Finding,
     mode: Pick,
-) -> anyhow::Result<Candidate> {
+) -> anyhow::Result<Option<Candidate>> {
     let fresh = finding_candidate(kind, f);
     let job_kind = JobKind::from(kind);
     for job in store.list_resumable_jobs().await? {
         if job.finding_id != Some(f.id) || job.kind != job_kind {
             continue;
         }
-        if let Some(plan) = resume_plan(store, cfg, job, mode).await? {
-            return Ok(Candidate::Resume {
-                label: fresh.label().map(str::to_owned),
-                budget_override: fresh.budget_override(),
-                plan: Box::new(plan),
-            });
+        let job_id = job.id;
+        match resume_plan(store, cfg, job, mode).await? {
+            Resumable::Yes(plan) => {
+                return Ok(Some(Candidate::Resume {
+                    label: fresh.label().map(str::to_owned),
+                    budget_override: fresh.budget_override(),
+                    plan,
+                }));
+            }
+            Resumable::GaveUp(why) => {
+                if count_given_up_chain(store, kind, f.id, job_id, &why).await {
+                    return Ok(None);
+                }
+            }
+            Resumable::No => {}
         }
     }
-    Ok(fresh)
+    Ok(Some(fresh))
 }
 
-/// How to continue one resumable job, or `None` when it cannot be.
+/// The failure a given-up chain records in its finding's streak.
+const CHAIN_GAVE_UP: &str = "resume chain gave up";
+
+/// Count a chain of this finding tier's work that the give-up ceiling
+/// retired (`why`) as one failed attempt at that work.
+///
+/// Every attempt in the chain was a suspension, and a suspension never
+/// counts toward the streak, so without this the finding is still in its
+/// tier when the chain ends: the tier starts the work fresh in the same
+/// cycle, and a worker that overruns its wall clock every time takes
+/// every cycle forever. Counted through the executors' own failure paths
+/// ([`handle_recheck_failure`], [`record_fix_failure`],
+/// [`record_harvest_failure`]), three given-up chains in a row end the
+/// work exactly as three identical failures do. Only here, where `f` is
+/// known to still be in this tier: the resume tier also retires chains,
+/// for findings a human may since have moved on.
+///
+/// True when this count ended the work, so the finding has left its
+/// tier. Engage has no failure streak to count into.
+async fn count_given_up_chain(
+    store: &Store,
+    kind: FindingJobKind,
+    fid: i64,
+    job: i64,
+    why: &str,
+) -> bool {
+    let failure = CHAIN_GAVE_UP;
+    let mut summary = CycleSummary::default();
+    match kind {
+        FindingJobKind::Recheck => {
+            let detail = format!("{failure}: {why}");
+            handle_recheck_failure(store, &mut summary, fid, job, failure, &detail, None).await;
+            summary.outcome.as_deref() == Some("stuck")
+        }
+        // Only a hold that landed sets `blocked`; one that failed has put
+        // the finding back to `queued`.
+        FindingJobKind::Fix => {
+            if let Err(e) = record_fix_failure(store, fid, job, failure, why, &mut summary).await {
+                let message = format!("#{fid} {failure}; holding it blocked failed: {e}");
+                let _ = fix_event(store, "fix", fid, job, message).await;
+            }
+            summary.outcome.as_deref() == Some("blocked")
+        }
+        FindingJobKind::Harvest => {
+            let detail = format!("{failure}: {why}");
+            record_harvest_failure(store, fid, Some(job), failure, &detail).await
+        }
+        FindingJobKind::Engage => false,
+    }
+}
+
+/// What [`resume_plan`] made of one suspension.
+enum Resumable {
+    /// Continue it with this plan.
+    Yes(Box<ResumePlan>),
+    /// The chain was past the give-up ceiling, and is now retired: why.
+    GaveUp(String),
+    /// Not resumable for any other reason.
+    No,
+}
+
+/// How to continue one resumable job, or why it cannot be.
 ///
 /// Checks the two things the database cannot know. The chain's
 /// workspace must still hold its tree, and the transcript must live in
@@ -646,14 +735,14 @@ async fn resume_plan(
     cfg: &Config,
     job: Job,
     mode: Pick,
-) -> anyhow::Result<Option<ResumePlan>> {
+) -> anyhow::Result<Resumable> {
     // Non-NULL by the query's own filter; a row that lost its path
     // between the read and here is simply not resumable.
     let Some(session_file) = job.session_file.as_deref().map(PathBuf::from) else {
-        return Ok(None);
+        return Ok(Resumable::No);
     };
     let Some(repo) = store.get_repo_by_id(job.repo_id).await? else {
-        return Ok(None);
+        return Ok(Resumable::No);
     };
     let origin_job_id = store.resume_origin_job(job.id).await?;
     let workspace = crate::workspace::Workspace::for_chain(
@@ -682,7 +771,7 @@ async fn resume_plan(
                     .log_event("resume", &msg, Some(job.id), job.finding_id)
                     .await;
             }
-            return Ok(None);
+            return Ok(Resumable::No);
         }
     };
 
@@ -726,7 +815,7 @@ async fn resume_plan(
             job.kind, repo.name
         );
         if mode == Pick::Preview {
-            return Ok(None);
+            return Ok(Resumable::No);
         }
         // The chain's turn is over. Every attempt in it was a suspension,
         // which the cycle's starvation bump leaves alone, so a rotation
@@ -744,14 +833,20 @@ async fn resume_plan(
             let _ = store.set_last_kind_at(job.repo_id, kind).await;
         }
         // Best-effort: the candidate is skipped either way, so a failed
-        // write only defers the record.
-        let _ = store
+        // write only defers the record — and only a landed retirement is
+        // reported as a give-up, so the chain is counted once.
+        let retired = store
             .retire_suspended_job(job.id, JobState::Failed, Some("give-up"), &msg)
-            .await;
+            .await
+            .is_ok();
         let _ = store
             .log_event("resume", &msg, Some(job.id), job.finding_id)
             .await;
-        return Ok(None);
+        return Ok(if retired {
+            Resumable::GaveUp(msg)
+        } else {
+            Resumable::No
+        });
     }
 
     // An unreadable transcript, or one with no usage record at all,
@@ -767,7 +862,7 @@ async fn resume_plan(
     // event per poll would bury the log. `run_cycle_inner` logs it
     // when the cycle actually acts on the candidate.
 
-    Ok(Some(ResumePlan {
+    Ok(Resumable::Yes(Box::new(ResumePlan {
         kind: job.kind,
         repo_id: job.repo_id,
         repo: repo.name,
@@ -782,7 +877,7 @@ async fn resume_plan(
         typical: z,
         chain_spent,
         handoff: false,
-    }))
+    })))
 }
 
 /// Historical cost estimate for one (repo, kind): warm (finished a
@@ -1827,7 +1922,7 @@ pub async fn run_hunt(
 
 /// Handle a recheck that failed to produce a valid verdict: `failure` is
 /// the streak key that identical failures share, `detail` describes this
-/// one in the events.
+/// one in the events (for a given-up chain, also why it was given up).
 async fn handle_recheck_failure(
     store: &Store,
     summary: &mut CycleSummary,
@@ -3325,10 +3420,12 @@ async fn conclude_fix(
 /// [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure holds the finding
 /// blocked, with `job` as its checkpoint ([`hold_blocked`]); short of that
 /// the fix tier tries again. `detail` follows the failure in the report
-/// and the event: the worker's output tail.
+/// and the event: the worker's output tail, or why a chain gave up.
 ///
-/// A count that could not be recorded is reported as such and ends
-/// nothing.
+/// Every failed fix is counted here — a worker's ([`record_fix_outcome`])
+/// and a given-up resume chain ([`count_given_up_chain`]) alike — so the
+/// two cannot drift apart on what a stuck fix becomes. A count that could
+/// not be recorded is reported as such and ends nothing.
 async fn record_fix_failure(
     store: &Store,
     fid: i64,
@@ -4914,8 +5011,9 @@ async fn harvest_prefetch_failed(
 /// `closed`, never suppressed, for a closed PR nobody could classify.
 ///
 /// Every failed harvest is counted here — before its job exists
-/// ([`harvest_prefetch_failed`]) or by its worker ([`run_harvest`]) — so
-/// the two cannot drift apart on what a stuck harvest becomes.
+/// ([`harvest_prefetch_failed`]), by its worker ([`run_harvest`]), or as a
+/// given-up resume chain ([`count_given_up_chain`]) — so they cannot
+/// drift apart on what a stuck harvest becomes.
 ///
 /// True when the PR is now given up. A count or a give-up that could not
 /// be recorded is reported as such and ends nothing.
