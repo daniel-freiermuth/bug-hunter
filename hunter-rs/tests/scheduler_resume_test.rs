@@ -1833,6 +1833,80 @@ async fn a_stale_recheck_supersedes_and_only_an_invalid_one_suppresses() {
     }
 }
 
+/// A recheck that leaves no verdict is retried, and the third identical
+/// failure in a row sends the finding back to the inbox for a human with
+/// its streak cleared.
+#[tokio::test]
+async fn a_recheck_without_a_verdict_retries_then_returns_to_the_inbox() {
+    let (dir, path, pool) = fresh_db().await;
+    let store = rw_store(&path).await;
+    let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
+    let cfg = test_config(dir.path());
+    let silent = ScriptedBackend::new(|_| support::done());
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        let finding = store.get_finding(fid).await.unwrap().unwrap();
+        let summary = run_recheck(&store, &cfg, &finding, &silent, None)
+            .await
+            .unwrap();
+        let after = store.get_finding(fid).await.unwrap().unwrap();
+        seen.push((summary.outcome, after.status, after.recheck_attempts));
+    }
+
+    assert_eq!(
+        seen,
+        [
+            (Some("requeued".into()), FindingStatus::Rechecking, 1),
+            (Some("requeued".into()), FindingStatus::Rechecking, 2),
+            (Some("stuck".into()), FindingStatus::New, 0),
+        ],
+        "(outcome, status, recheck_attempts) per attempt"
+    );
+}
+
+/// Every end of a recheck attempt spends a `once` override — a
+/// suspension, a missing verdict, a landed verdict — and keeps an
+/// `exempt` one, which lasts until a human clears it.
+#[tokio::test]
+async fn every_end_of_a_recheck_attempt_spends_only_a_once_override() {
+    use hunter::domain::BudgetOverride;
+    for end in ["suspended", "requeued", "confirmed"] {
+        for (mode, left) in [
+            (BudgetOverride::Once, None),
+            (BudgetOverride::Exempt, Some(BudgetOverride::Exempt)),
+        ] {
+            let (dir, path, pool) = fresh_db().await;
+            let store = rw_store(&path).await;
+            let fid = repo_with_finding(&dir, &pool, &store, FindingStatus::Rechecking).await;
+            store.set_budget_override(fid, Some(mode)).await.unwrap();
+            let cfg = test_config(dir.path());
+            let out = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
+            let worker = ScriptedBackend::new(move |tree| match end {
+                "suspended" => {
+                    suspended_at_cap(&tree.parent().unwrap().join("session").join("session.jsonl"))
+                }
+                "requeued" => support::done(),
+                _ => {
+                    let body =
+                        serde_json::json!({ "verdict": "confirmed", "reason": "still there" });
+                    std::fs::write(&out, body.to_string()).unwrap();
+                    support::done()
+                }
+            });
+
+            let finding = store.get_finding(fid).await.unwrap().unwrap();
+            let summary = run_recheck(&store, &cfg, &finding, &worker, None)
+                .await
+                .unwrap();
+
+            assert_eq!(summary.outcome.as_deref(), Some(end), "{end} {mode}");
+            let after = store.get_finding(fid).await.unwrap().unwrap();
+            assert_eq!(after.budget_override, left, "{end} {mode} override");
+        }
+    }
+}
+
 /// Minimal `gh pr view --json` payload that `view_pr_engage` can parse.
 const PR_VIEW_JSON: &str = r#"{"state":"MERGED","mergeable":"MERGEABLE","title":"a fix","body":"because","comments":[],"reviews":[],"statusCheckRollup":[],"headRefName":"feature","headRefOid":"deadbeef"}"#;
 
