@@ -3313,6 +3313,26 @@ impl Store {
         Ok(())
     }
 
+    /// Set a flagged PR's attention aside without engaging it: the engage
+    /// watermark moves to its latest activity and its static reasons count
+    /// as addressed at its current head, as an engage that did nothing
+    /// leaves them ([`Self::mark_pr_engaged`]), and the flag clears now
+    /// rather than at the next sync. New activity or a push raises it again.
+    pub async fn set_attention_aside(&self, finding_id: i64) -> sqlx::Result<()> {
+        let now = now_ms();
+        sqlx::query!(
+            "UPDATE pr_state SET last_engaged_activity_at = COALESCE(last_activity_at, ?1), \
+             addressed_fingerprint = attention_fingerprint, addressed_head_sha = head_sha, \
+             needs_attention = NULL, attention_since = NULL \
+             WHERE finding_id = ?2",
+            now,
+            finding_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Mark a merged PR as harvested.
     pub async fn mark_pr_harvested(&self, finding_id: i64, harvested_at: i64) -> sqlx::Result<()> {
         sqlx::query!(
