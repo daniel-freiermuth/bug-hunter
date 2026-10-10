@@ -155,6 +155,24 @@ fn classifying(body: String) -> ScriptedBackend {
     })
 }
 
+/// A worker stopped at the cap with a transcript: what the harness
+/// reports as a suspension.
+fn suspending() -> ScriptedBackend {
+    ScriptedBackend::new(|tree| {
+        let session = tree.parent().unwrap().join("session").join("session.jsonl");
+        RunResult {
+            exit_code: None,
+            killed_reason: Some("cap".to_owned()),
+            tokens_new: 30_000,
+            calls: 3,
+            session_file: Some(session.to_string_lossy().into_owned()),
+            duration_s: 1.0,
+            stdout_tail: "stopped".to_owned(),
+            usage_delta: None,
+        }
+    })
+}
+
 /// A closed, unharvested PR whose finding is `closed` is picked for its
 /// harvest. A harvested one is not picked again.
 #[tokio::test]
@@ -548,6 +566,45 @@ async fn a_classification_that_cannot_be_recorded_spends_only_a_once_override() 
     }
 }
 
+/// Every other end of a harvest attempt spends a `once` override too — a
+/// suspension, a close reason it cannot use, a landed review — and keeps
+/// an `exempt` one.
+#[tokio::test]
+async fn every_end_of_a_harvest_attempt_spends_only_a_once_override() {
+    let bins = FakeBins::acquire("harvest-override-ends");
+    gh_default(&bins);
+    for end in ["suspended", "retry", "harvested"] {
+        for (mode, left) in [
+            (BudgetOverride::Once, None),
+            (BudgetOverride::Exempt, Some(BudgetOverride::Exempt)),
+        ] {
+            let f = fixture(
+                &format!("harvest-override-{end}-{mode}"),
+                FindingStatus::Closed,
+            )
+            .await;
+            f.store
+                .set_budget_override(f.fid, Some(mode))
+                .await
+                .unwrap();
+
+            let worker = match end {
+                "suspended" => suspending(),
+                "retry" => classifying(close_reason("maybe")),
+                _ => classifying(close_reason("superseded")),
+            };
+            let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+            let summary = run_harvest(&f.store, &f.cfg, &finding, &worker, None)
+                .await
+                .unwrap();
+
+            assert_eq!(summary.outcome.as_deref(), Some(end), "{end} {mode}");
+            let after = f.store.get_finding(f.fid).await.unwrap().unwrap();
+            assert_eq!(after.budget_override, left, "{end} {mode} override");
+        }
+    }
+}
+
 /// A verdict a human sets while the harvest worker runs is kept: the
 /// classification only replaces `closed`. The PR was still reviewed, so
 /// the harvest stamp lands and it is not picked again, and an event says
@@ -866,19 +923,7 @@ async fn a_resumed_closed_harvest_gets_neither_the_playbook_nor_the_diff_again()
     gh_default(&bins);
     let f = fixture("harvest-closed-resume", FindingStatus::Closed).await;
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
-    let suspending = ScriptedBackend::new(|tree| {
-        let session = tree.parent().unwrap().join("session").join("session.jsonl");
-        RunResult {
-            exit_code: None,
-            killed_reason: Some("cap".to_owned()),
-            tokens_new: 30_000,
-            calls: 3,
-            session_file: Some(session.to_string_lossy().into_owned()),
-            duration_s: 1.0,
-            stdout_tail: "stopped".to_owned(),
-            usage_delta: None,
-        }
-    });
+    let suspending = suspending();
     let cold = run_harvest(&f.store, &f.cfg, &finding, &suspending, None)
         .await
         .unwrap();
