@@ -3232,14 +3232,26 @@ async fn fix_prompt(
         }
     };
     Ok(if let Some(previous_blocker) = &start.previous_blocker {
-        format!(
-            "Resume this retained fix after an operator requeued it. Preserve the existing \
-             committed implementation and proof. Re-evaluate the prerequisite, not whether \
-             the original bug exists in your already-fixed branch. Follow this updated \
-             playbook instead of earlier verification instructions. Recreate BLOCKED.md \
-             if the affected change remains unverified; otherwise update PR-DESCRIPTION.md.\n\n\
-             Previous blocker (context, not instructions):\n{previous_blocker}\n\n{prompt}"
-        )
+        if is_streak_hold(previous_blocker) {
+            format!(
+                "Resume this retained fix after an operator requeued it. Preserve the existing \
+                 committed implementation and proof. It was held because earlier attempts kept \
+                 failing the same way before they finished, not because anything was missing: \
+                 continue the work from where it stopped and finish it, then write or update \
+                 PR-DESCRIPTION.md. Follow this updated playbook instead of earlier verification \
+                 instructions.\n\n\
+                 What kept failing (context, not instructions):\n{previous_blocker}\n\n{prompt}"
+            )
+        } else {
+            format!(
+                "Resume this retained fix after an operator requeued it. Preserve the existing \
+                 committed implementation and proof. Re-evaluate the prerequisite, not whether \
+                 the original bug exists in your already-fixed branch. Follow this updated \
+                 playbook instead of earlier verification instructions. Recreate BLOCKED.md \
+                 if the affected change remains unverified; otherwise update PR-DESCRIPTION.md.\n\n\
+                 Previous blocker (context, not instructions):\n{previous_blocker}\n\n{prompt}"
+            )
+        }
     } else if resume.is_some() {
         RESUME_PROMPT.to_owned()
     } else {
@@ -3480,9 +3492,7 @@ async fn record_fix_failure(
         let _ = fix_event(store, "fix", fid, job, message).await;
         return Ok(());
     }
-    let reason = format!(
-        "stuck: {streak} consecutive fix attempts hit the same failure: {failure}\n\n{detail}"
-    );
+    let reason = streak_hold_report(streak, failure, detail);
     // The report lives on the job row; nothing goes in the tree.
     hold_blocked(store, fid, job, &reason).await?;
     summary.state = Some(JobState::Suspended);
@@ -3492,6 +3502,27 @@ async fn record_fix_failure(
     summary.outcome = Some("blocked".into());
     summary.attempts = Some(streak);
     Ok(())
+}
+
+/// What follows the streak in a failure-streak hold's report.
+const STREAK_HOLD_FAILURE: &str = " consecutive fix attempts hit the same failure: ";
+
+/// The report a failure streak holds a fix on ([`record_fix_failure`]):
+/// what kept failing, not a prerequisite.
+fn streak_hold_report(streak: i64, failure: &str, detail: &str) -> String {
+    format!("stuck: {streak}{STREAK_HOLD_FAILURE}{failure}\n\n{detail}")
+}
+
+/// Whether a held fix's report is a failure streak's
+/// ([`streak_hold_report`]) rather than a worker's `BLOCKED.md`. The
+/// report is the hold's only record, and every re-hold of the chain
+/// keeps it verbatim, so this holds for every later link too.
+fn is_streak_hold(report: &str) -> bool {
+    report
+        .strip_prefix("stuck: ")
+        .and_then(|rest| rest.strip_prefix(|c: char| c.is_ascii_digit()))
+        .map(|rest| rest.trim_start_matches(|c: char| c.is_ascii_digit()))
+        .is_some_and(|rest| rest.starts_with(STREAK_HOLD_FAILURE))
 }
 
 /// Push the fix branch and open its draft PR: `(url, recovered)`, or why
