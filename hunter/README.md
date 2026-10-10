@@ -245,6 +245,8 @@ that has never been resumed is never retired: one attempt's spend is by
 definition at least its own cap, and the largest attempt is discounted
 because one enormous attempt says the job is big, not that the chain is
 stuck.
+The dashboard's "what's next" preview makes the same selection without
+any of these writes; the scheduler does them when it selects.
 
 The initial attempt and every cap-killed attempt always count; any other
 resumed handoff with zero or unknown metered spend (e.g. a provider failure

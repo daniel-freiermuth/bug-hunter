@@ -226,17 +226,46 @@ async fn list_attention(store: &Store) -> sqlx::Result<Vec<Finding>> {
 /// (finding, kind) instead of starting that work over
 /// ([`finding_pick`]).
 ///
-/// Read-only but for retiring suspensions that can never be continued —
-/// a chain past the give-up ceiling, or one whose working directory is
-/// gone — which [`resume_plan`] does as it skips over them. Those writes
-/// are best-effort precisely because this function is also the
-/// `/api/summary` preview, which may hold a read-only handle — the
-/// candidate is skipped either way, and the scheduler's own next cycle
-/// records it.
+/// The scheduler's own selection. On the way it retires suspensions that
+/// can never be continued — a chain past the give-up ceiling, or one
+/// whose working directory is gone — which [`resume_plan`] does as it
+/// skips over them. [`preview_next`] makes the same selection and writes
+/// nothing.
 pub async fn pick_next(
     store: &Store,
     cfg: &Config,
     force_repo: Option<&str>,
+) -> anyhow::Result<Option<Candidate>> {
+    select(store, cfg, force_repo, Pick::Run).await
+}
+
+/// The `/api/summary` "what's next" preview: [`pick_next`]'s selection
+/// without any of its writes.
+///
+/// The dashboard polls this, scheduler paused or not, and a poll must not
+/// do the scheduler's work: retiring a chain or bumping a rotation
+/// timestamp. A suspension the scheduler would retire is only skipped
+/// here, so the preview names the fresh start a given-up chain makes way
+/// for.
+pub async fn preview_next(store: &Store, cfg: &Config) -> anyhow::Result<Option<Candidate>> {
+    select(store, cfg, None, Pick::Preview).await
+}
+
+/// Whether a selection records what it finds on the way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// The scheduler's own: [`pick_next`].
+    Run,
+    /// The summary's: [`preview_next`], which writes nothing.
+    Preview,
+}
+
+/// [`pick_next`], or with [`Pick::Preview`] [`preview_next`].
+async fn select(
+    store: &Store,
+    cfg: &Config,
+    force_repo: Option<&str>,
+    mode: Pick,
 ) -> anyhow::Result<Option<Candidate>> {
     let mut rechecking = findings_with_status(store, FindingStatus::Rechecking).await?;
     let mut attention = list_attention(store).await?;
@@ -269,7 +298,7 @@ pub async fn pick_next(
         (FindingJobKind::Fix, &queued),
     ] {
         if let Some(f) = items.iter().find(|f| f.budget_override.is_some()) {
-            return Ok(Some(finding_pick(store, cfg, kind, f).await?));
+            return Ok(Some(finding_pick(store, cfg, kind, f, mode).await?));
         }
     }
 
@@ -283,7 +312,7 @@ pub async fn pick_next(
         (FindingJobKind::Fix, queued.last()),
     ] {
         if let Some(f) = oldest {
-            return Ok(Some(finding_pick(store, cfg, kind, f).await?));
+            return Ok(Some(finding_pick(store, cfg, kind, f, mode).await?));
         }
     }
 
@@ -296,7 +325,7 @@ pub async fn pick_next(
     // re-cache ratio 1.00 across 112 production events) where restarting
     // costs a flat ~37,000-token session floor plus every token already
     // spent, and advances no watermark to show for it.
-    if let Some(c) = pick_resume(store, cfg, force_id).await? {
+    if let Some(c) = pick_resume(store, cfg, force_id, mode).await? {
         return Ok(Some(c));
     }
 
@@ -544,12 +573,13 @@ async fn pick_resume(
     store: &Store,
     cfg: &Config,
     force_id: Option<i64>,
+    mode: Pick,
 ) -> anyhow::Result<Option<Candidate>> {
     for job in store.list_resumable_jobs().await? {
         if force_id.is_some_and(|rid| job.repo_id != rid) {
             continue;
         }
-        if let Some(plan) = resume_plan(store, cfg, job).await? {
+        if let Some(plan) = resume_plan(store, cfg, job, mode).await? {
             return Ok(Some(Candidate::Resume {
                 label: (!plan.repo.is_empty()).then(|| plan.repo.clone()),
                 budget_override: None,
@@ -573,6 +603,7 @@ async fn finding_pick(
     cfg: &Config,
     kind: FindingJobKind,
     f: &Finding,
+    mode: Pick,
 ) -> anyhow::Result<Candidate> {
     let fresh = finding_candidate(kind, f);
     let job_kind = JobKind::from(kind);
@@ -580,7 +611,7 @@ async fn finding_pick(
         if job.finding_id != Some(f.id) || job.kind != job_kind {
             continue;
         }
-        if let Some(plan) = resume_plan(store, cfg, job).await? {
+        if let Some(plan) = resume_plan(store, cfg, job, mode).await? {
             return Ok(Candidate::Resume {
                 label: fresh.label().map(str::to_owned),
                 budget_override: fresh.budget_override(),
@@ -607,8 +638,15 @@ async fn finding_pick(
 /// cycle and never leaves the table. Refusing from inside the executor
 /// would be worse — this tier outranks repo rotation, so the same
 /// hopeless job would be picked every cycle, starving every rotation
-/// kind. Retiring it takes it out of the walk in this same cycle.
-async fn resume_plan(store: &Store, cfg: &Config, job: Job) -> anyhow::Result<Option<ResumePlan>> {
+/// kind. Retiring it takes it out of the walk in this same cycle. A
+/// [`Pick::Preview`] only skips it, and leaves the retirement to the
+/// scheduler's own next selection.
+async fn resume_plan(
+    store: &Store,
+    cfg: &Config,
+    job: Job,
+    mode: Pick,
+) -> anyhow::Result<Option<ResumePlan>> {
     // Non-NULL by the query's own filter; a row that lost its path
     // between the read and here is simply not resumable.
     let Some(session_file) = job.session_file.as_deref().map(PathBuf::from) else {
@@ -636,13 +674,14 @@ async fn resume_plan(store: &Store, cfg: &Config, job: Job) -> anyhow::Result<Op
                 job.id,
                 workspace.root.display()
             );
-            // Best-effort, like the give-up retirement below.
-            let _ = store
-                .retire_suspended_job(job.id, JobState::Killed, Some("workdir-gone"), &msg)
-                .await;
-            let _ = store
-                .log_event("resume", &msg, Some(job.id), job.finding_id)
-                .await;
+            if mode == Pick::Run {
+                let _ = store
+                    .retire_suspended_job(job.id, JobState::Killed, Some("workdir-gone"), &msg)
+                    .await;
+                let _ = store
+                    .log_event("resume", &msg, Some(job.id), job.finding_id)
+                    .await;
+            }
             return Ok(None);
         }
     };
@@ -686,6 +725,9 @@ async fn resume_plan(store: &Store, cfg: &Config, job: Job) -> anyhow::Result<Op
             "resume {} {}: giving up after {chain_spent} tok across the chain ({why})",
             job.kind, repo.name
         );
+        if mode == Pick::Preview {
+            return Ok(None);
+        }
         // The chain's turn is over. Every attempt in it was a suspension,
         // which the cycle's starvation bump leaves alone, so a rotation
         // kind's timestamp is still as old as before the chain started:
@@ -701,9 +743,8 @@ async fn resume_plan(store: &Store, cfg: &Config, job: Job) -> anyhow::Result<Op
         if let JobKind::Repo(kind) = job.kind {
             let _ = store.set_last_kind_at(job.repo_id, kind).await;
         }
-        // Best-effort: the summary preview runs this same function
-        // over a read-only handle. Either way the candidate is
-        // skipped, so a failed write only defers the record.
+        // Best-effort: the candidate is skipped either way, so a failed
+        // write only defers the record.
         let _ = store
             .retire_suspended_job(job.id, JobState::Failed, Some("give-up"), &msg)
             .await;
