@@ -18,7 +18,8 @@ use hunter::backend::{Backend, JobClass, Outlook, Verdict};
 use hunter::config::Config;
 use hunter::domain::{FindingJobKind, FindingStatus, JobKind, JobState, RepoJobKind};
 use hunter::scheduler::{
-    Candidate, ResumePlan, pick_next, record_job, run_fix, run_harvest, run_hunt, run_recheck,
+    Candidate, ResumePlan, pick_next, preview_next, record_job, run_fix, run_harvest, run_hunt,
+    run_recheck,
 };
 use hunter::server::{AppState, SchedulerHandle, router};
 use hunter::store::{FindingInsert, Store};
@@ -2106,4 +2107,34 @@ async fn resume_with_a_zero_cost_estimate_uses_the_attempt_limit_not_a_zero_cost
     assert!(
         matches!(picked, Some(Candidate::Resume { plan, .. }) if plan.predecessor_id == newest)
     );
+}
+
+// -- the summary preview writes nothing --------------------------------------
+
+/// The summary's preview changes nothing: a chain the scheduler would
+/// give up is left for the scheduler to retire — the dashboard polls the
+/// preview, paused or not.
+#[tokio::test]
+async fn the_summary_preview_does_not_retire_a_given_up_chain() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    let session = seed_session(&dir);
+    let newest = seed_chain(&pool, &session, &[10_000; 4]).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+
+    preview_next(&store, &cfg).await.unwrap();
+    let after_preview = (
+        job_row(&pool, newest).await.0,
+        resume_events(&pool, newest).await.len(),
+    );
+    pick_next(&store, &cfg, None).await.unwrap();
+    let after_pick = (
+        job_row(&pool, newest).await.0,
+        resume_events(&pool, newest).await.len(),
+    );
+
+    assert_eq!(after_preview, ("suspended".to_owned(), 0));
+    assert_eq!(after_pick, (JobState::Failed.as_str().to_owned(), 1));
 }

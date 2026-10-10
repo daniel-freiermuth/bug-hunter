@@ -327,13 +327,14 @@ async fn summary(State(state): State<AppState>) -> Result<Json<Summary>, ApiErro
     let scheduler_overdrive = state.scheduler.overdrive.load(Ordering::SeqCst);
 
     // "What's next" preview (`server.Handler._summary`): only when nothing is
-    // running, from the SAME pick_next/decide the scheduler itself uses.
-    // pick_next errors are swallowed to None (the `try`/`except` around
+    // running, from the SAME selection the scheduler itself makes, minus its
+    // writes (`preview_next`), and the same decide.
+    // preview_next errors are swallowed to None (the `try`/`except` around
     // `pick_next` in `server.Handler._summary`); anticipated_tokens/decide
     // errors propagate (500), as in Python where only pick_next sits inside
     // the try.
     let next_candidate: Option<NextCandidate> = if current_job.is_none() {
-        match scheduler::pick_next(store, &state.config, None).await {
+        match scheduler::preview_next(store, &state.config).await {
             Ok(Some(c)) => {
                 let anticipated =
                     scheduler::candidate_reservation(store, &state.config, &c).await?;
