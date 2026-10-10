@@ -2150,7 +2150,23 @@ pub async fn run_recheck(
     .await?
     {
         Ok(opened) => opened,
-        Err(failed) => return Ok(failed),
+        Err(mut failed) => {
+            // A failed recheck under the fixed [`TREE_NOT_MADE`], as a fix's
+            // is ([`count_unmade_tree`]). Uncounted, the finding stays
+            // rechecking and the recheck tier takes it again every cycle.
+            // No worker ran, so a one-shot override is not spent.
+            let note = failed.failure.clone().unwrap_or_default();
+            return Ok(handle_recheck_failure(
+                store,
+                &mut failed,
+                fid,
+                job,
+                TREE_NOT_MADE,
+                &note,
+                None,
+            )
+            .await);
+        }
     };
     let out_path = cfg.work_root.join("out").join(format!("recheck{fid}.json"));
     let _ = std::fs::create_dir_all(out_path.parent().unwrap_or(Path::new(".")));
@@ -3508,7 +3524,7 @@ async fn record_fix_failure(
 }
 
 /// How [`open_workspace`] reports a tree it could not make, and the
-/// failure a fix that hit it records in its streak.
+/// failure a fix or recheck that hit it records in its streak.
 const TREE_NOT_MADE: &str = "workspace not created";
 
 /// Count a fix whose tree could not be made ([`open_workspace`] has failed
