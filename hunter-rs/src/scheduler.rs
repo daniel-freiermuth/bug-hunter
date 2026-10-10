@@ -667,8 +667,14 @@ const CHAIN_GAVE_UP: &str = "resume chain gave up";
 /// known to still be in this tier: the resume tier also retires chains,
 /// for findings a human may since have moved on.
 ///
+/// Engage has no failure streak: its tier is a flag that the PR's next
+/// change raises again, so a given-up engage chain sets the flag aside
+/// ([`Store::set_attention_aside`]) as an engage that did nothing would.
+/// That drops the PR out of review until it changes, so it is logged as
+/// an `error`, with the reason, as an aborted withdrawal is.
+///
 /// True when this count ended the work, so the finding has left its
-/// tier. Engage has no failure streak to count into.
+/// tier.
 async fn count_given_up_chain(
     store: &Store,
     kind: FindingJobKind,
@@ -697,7 +703,21 @@ async fn count_given_up_chain(
             let detail = format!("{failure}: {why}");
             record_harvest_failure(store, fid, Some(job), failure, &detail).await
         }
-        FindingJobKind::Engage => false,
+        FindingJobKind::Engage => {
+            let set_aside = store.set_attention_aside(fid).await;
+            let message = match &set_aside {
+                Ok(()) => {
+                    format!("#{fid} {failure}: {why}; attention set aside until the PR changes")
+                }
+                Err(e) => {
+                    format!("#{fid} {failure}: {why}; setting its attention aside failed: {e}")
+                }
+            };
+            let _ = store
+                .log_event("error", &message, Some(job), Some(fid))
+                .await;
+            set_aside.is_ok()
+        }
     }
 }
 

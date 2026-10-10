@@ -2335,6 +2335,68 @@ async fn a_given_up_chains_streak_events_say_why_it_was_given_up() {
     }
 }
 
+/// A given-up engage chain sets its PR's attention aside, as an engage
+/// that did nothing would: the engage tier lets go of it, and only the
+/// PR's next change flags it again. That drops the PR out of the review
+/// column, so it is logged as an error that says why the chain was given
+/// up, as an aborted withdrawal is.
+///
+/// Engage is the highest finding tier, and has no failure streak to
+/// count into, so left alone the tier started the same engage fresh
+/// after every given-up chain, forever.
+#[tokio::test]
+async fn a_given_up_engage_chain_sets_the_prs_attention_aside() {
+    let (dir, path, pool) = fresh_db().await;
+    seed_repo(&pool, &dir).await;
+    seed_history(&pool).await;
+    seed_flagged_finding(&pool, 1).await;
+    sqlx::query(
+        "UPDATE pr_state SET last_activity_at = 4000, last_engaged_activity_at = 3000, \
+         attention_fingerprint = 'checks:ci', head_sha = 'head1' WHERE finding_id = 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_finding_chain(&pool, &dir, "engage", 1, 10).await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+
+    let next = pick_next(&store, &cfg, None).await.unwrap();
+
+    assert!(
+        !matches!(
+            next,
+            Some(Candidate::Finding { .. } | Candidate::Resume { .. })
+        ),
+        "the engage tier must let go of the PR, got {next:?}"
+    );
+    assert_eq!(job_row(&pool, 13).await.1.as_deref(), Some("give-up"));
+    let ps = store.get_pr_state(1).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            ps.needs_attention,
+            ps.last_engaged_activity_at,
+            ps.addressed_fingerprint.as_deref(),
+            ps.addressed_head_sha.as_deref(),
+        ),
+        (None, Some(4000), Some("checks:ci"), Some("head1"))
+    );
+    let event = store
+        .recent_events(100)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.job_id == Some(13))
+        .expect("the give-up must be logged against the retired job");
+    assert_eq!(event.kind, "error", "{event:?}");
+    assert!(
+        event.message.contains("resume chain gave up")
+            && event.message.contains("giving up after")
+            && event.message.contains("4 attempts, the limit"),
+        "{event:?}"
+    );
+}
+
 /// Finding 1 queued for a fix that has failed twice on given-up chains,
 /// with a third chain past the ceiling: the next selection holds it.
 async fn fix_one_give_up_from_blocked() -> (TempDir, PathBuf, SqlitePool) {
