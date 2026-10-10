@@ -166,6 +166,23 @@ fn pr(overrides: &Value) -> String {
     v.to_string()
 }
 
+/// Script `gh`: `view` for the PR view, and push permission for whoever
+/// commented. `sync_prs` asks the forge whether each comment's author can
+/// push (`forge::github_can_push`), and only then counts the comment as
+/// feedback; answering every call with the view would fail that lookup and
+/// the sync with it.
+fn serve_pr(bins: &FakeBins, view: &str) {
+    bins.script(
+        "gh",
+        &format!(
+            "case \"$*\" in\n\
+             \x20 *collaborators/*/permission*) echo true; exit 0 ;;\n\
+             esac\n\
+             cat <<'__PR_EOF__'\n{view}\n__PR_EOF__\nexit 0"
+        ),
+    );
+}
+
 fn comment_at(created_at: &str) -> Value {
     json!([{ "author": { "login": "reviewer" }, "body": "hm", "createdAt": created_at }])
 }
@@ -190,7 +207,7 @@ async fn a_merged_pr_moves_its_finding_to_merged_and_drops_attention() {
     f.seed(Some("conflict"), Some("mergeable:CONFLICTING"), 1, 1)
         .await;
     let bins = FakeBins::acquire("sync-merged");
-    bins.ok("gh", &pr(&json!({ "state": "MERGED" })));
+    serve_pr(&bins, &pr(&json!({ "state": "MERGED" })));
 
     let result = f.sync().await;
 
@@ -218,7 +235,7 @@ async fn a_pr_open_finding_without_a_url_is_requeued() {
     let f = fixture("sync-no-url").await;
     f.store.set_finding_pr_open(f.fid, "").await.unwrap();
     let bins = FakeBins::acquire("sync-no-url");
-    bins.ok("gh", &pr(&json!({})));
+    serve_pr(&bins, &pr(&json!({})));
 
     let result = f.sync().await;
 
@@ -235,7 +252,7 @@ async fn an_unparseable_pr_url_is_an_error_and_stays_pr_open() {
         .await
         .unwrap();
     let bins = FakeBins::acquire("sync-bad-url");
-    bins.ok("gh", &pr(&json!({})));
+    serve_pr(&bins, &pr(&json!({})));
 
     let result = f.sync().await;
 
@@ -283,8 +300,8 @@ async fn a_failing_pr_view_is_an_error_and_stays_pr_open() {
 async fn the_first_sync_baselines_the_watermark_past_existing_activity() {
     let f = fixture("sync-first-baseline").await;
     let bins = FakeBins::acquire("sync-first-baseline");
-    bins.ok(
-        "gh",
+    serve_pr(
+        &bins,
         &pr(&json!({
             "comments": comment_at("2026-01-02T04:00:00Z"),
             "reviews": [{ "body": "", "state": "COMMENTED", "submittedAt": "2026-01-02T03:30:00Z" }],
@@ -307,8 +324,8 @@ async fn the_first_sync_baselines_the_watermark_past_existing_activity() {
 async fn the_first_sync_baseline_takes_updated_at_when_it_is_latest() {
     let f = fixture("sync-first-updated").await;
     let bins = FakeBins::acquire("sync-first-updated");
-    bins.ok(
-        "gh",
+    serve_pr(
+        &bins,
         &pr(&json!({
             "updatedAt": "2026-01-02T04:00:00Z",
             "comments": comment_at(UPDATED),
@@ -328,8 +345,8 @@ async fn activity_after_the_watermark_is_new_comments() {
     let f = fixture("sync-new-comments").await;
     f.seed(None, None, UPDATED_MS, 1).await;
     let bins = FakeBins::acquire("sync-new-comments");
-    bins.ok(
-        "gh",
+    serve_pr(
+        &bins,
         &pr(&json!({ "comments": comment_at("2026-01-02T04:00:00Z") })),
     );
     let before = now_ms();
@@ -361,8 +378,8 @@ async fn activity_after_the_watermark_is_new_comments() {
 async fn static_reasons_are_flagged_and_fingerprinted() {
     let f = fixture("sync-static").await;
     let bins = FakeBins::acquire("sync-static");
-    bins.ok(
-        "gh",
+    serve_pr(
+        &bins,
         &pr(&json!({
             "reviewDecision": "CHANGES_REQUESTED",
             "mergeable": "CONFLICTING",
@@ -397,15 +414,15 @@ async fn passing_or_absent_checks_raise_nothing() {
     let f = fixture("sync-checks-clean").await;
     let bins = FakeBins::acquire("sync-checks-clean");
 
-    bins.ok("gh", &pr(&json!({})));
+    serve_pr(&bins, &pr(&json!({})));
     f.sync().await;
     let ps = f.pr_state().await;
     assert_eq!(ps.checks, None, "no rollup is no summary, not \"0 pass\"");
     assert_eq!(ps.attention_fingerprint, None);
     assert_eq!(ps.needs_attention, None);
 
-    bins.ok(
-        "gh",
+    serve_pr(
+        &bins,
         &pr(&json!({
             "statusCheckRollup": [
                 { "name": "build", "conclusion": "SUCCESS" },
@@ -434,7 +451,10 @@ const CHANGES_REQUESTED_FP: &str = "review:CHANGES_REQUESTED";
 async fn a_declined_reason_is_not_reflagged_on_the_same_head() {
     let f = fixture("sync-suppressed").await;
     let bins = FakeBins::acquire("sync-suppressed");
-    bins.ok("gh", &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })));
+    serve_pr(
+        &bins,
+        &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })),
+    );
     f.sync().await;
     assert_eq!(
         f.pr_state().await.needs_attention.as_deref(),
@@ -466,12 +486,15 @@ async fn a_declined_reason_is_not_reflagged_on_the_same_head() {
 async fn suppression_does_not_hide_new_comments() {
     let f = fixture("sync-suppressed-comment").await;
     let bins = FakeBins::acquire("sync-suppressed-comment");
-    bins.ok("gh", &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })));
+    serve_pr(
+        &bins,
+        &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })),
+    );
     f.sync().await;
     f.mark_declined(CHANGES_REQUESTED_FP, SHA).await;
 
-    bins.ok(
-        "gh",
+    serve_pr(
+        &bins,
         &pr(&json!({
             "reviewDecision": "CHANGES_REQUESTED",
             "comments": comment_at("2026-01-02T04:00:00Z"),
@@ -493,12 +516,15 @@ async fn suppression_does_not_hide_new_comments() {
 async fn a_push_lifts_suppression() {
     let f = fixture("sync-push-lifts").await;
     let bins = FakeBins::acquire("sync-push-lifts");
-    bins.ok("gh", &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })));
+    serve_pr(
+        &bins,
+        &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })),
+    );
     f.sync().await;
     f.mark_declined(CHANGES_REQUESTED_FP, SHA).await;
 
-    bins.ok(
-        "gh",
+    serve_pr(
+        &bins,
         &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED", "headRefOid": "cafef00d" })),
     );
     let result = f.sync().await;
@@ -516,12 +542,15 @@ async fn a_push_lifts_suppression() {
 async fn a_changed_reason_lifts_suppression() {
     let f = fixture("sync-reason-lifts").await;
     let bins = FakeBins::acquire("sync-reason-lifts");
-    bins.ok("gh", &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })));
+    serve_pr(
+        &bins,
+        &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })),
+    );
     f.sync().await;
     f.mark_declined(CHANGES_REQUESTED_FP, SHA).await;
 
-    bins.ok(
-        "gh",
+    serve_pr(
+        &bins,
         &pr(&json!({
             "reviewDecision": "CHANGES_REQUESTED",
             "statusCheckRollup": [{ "name": "test", "conclusion": "FAILURE" }],
@@ -560,12 +589,15 @@ async fn attention_since_moves_only_when_the_reason_changes() {
     .await;
     let bins = FakeBins::acquire("sync-attention-since");
 
-    bins.ok("gh", &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })));
+    serve_pr(
+        &bins,
+        &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED" })),
+    );
     f.sync().await;
     assert_eq!(f.pr_state().await.attention_since, Some(42), "unchanged");
 
-    bins.ok(
-        "gh",
+    serve_pr(
+        &bins,
         &pr(&json!({ "reviewDecision": "CHANGES_REQUESTED", "mergeable": "CONFLICTING" })),
     );
     let before = now_ms();
@@ -577,7 +609,7 @@ async fn attention_since_moves_only_when_the_reason_changes() {
     );
     assert!(ps.attention_since.unwrap() >= before, "restamped: {ps:?}");
 
-    bins.ok("gh", &pr(&json!({})));
+    serve_pr(&bins, &pr(&json!({})));
     f.sync().await;
     let ps = f.pr_state().await;
     assert_eq!(ps.needs_attention, None);
@@ -610,7 +642,7 @@ async fn forge_timestamps_are_read_as_utc_epoch_ms() {
         ("", 0),
     ];
     for &(stamp, want) in cases {
-        bins.ok("gh", &pr(&json!({ "comments": comment_at(stamp) })));
+        serve_pr(&bins, &pr(&json!({ "comments": comment_at(stamp) })));
         let result = f.sync().await;
         assert_eq!(result.errors, 0, "{stamp:?}: {result:?}");
         assert_eq!(f.pr_state().await.last_activity_at, Some(want), "{stamp:?}");
