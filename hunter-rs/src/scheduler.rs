@@ -5382,12 +5382,15 @@ pub async fn run_harvest(
         ),
         _ => None,
     };
-    // A failed attempt that will be tried again -- a failed handoff by the
-    // cold harvest, any other the harvest did not give up on by the retry
-    // -- is reviewed again from scratch, follow-ups included, and the next
-    // worker files the same open work under slugs of its own. So only an
+    // An attempt that will be continued or tried again files no
+    // follow-ups. A failed handoff is reviewed again cold, and any other
+    // failure the harvest did not give up on is retried; either is a
+    // review from scratch, and its worker files the same open work under
+    // slugs of its own. A suspension keeps its tree and FOLLOW-UPS.json for
+    // the resume, whose last run files them, but a chain that is given up
+    // or whose resume fails ends in that cold review too. So only an
     // attempt nothing will redo files its follow-ups.
-    let redone = failure.is_some() && gave_up != Some(true);
+    let redone = state == JobState::Suspended || (failure.is_some() && gave_up != Some(true));
     // Follow-ups and the closure verdict are read from the tree, so before
     // it is released. The release itself is state-checked: a suspended
     // harvest keeps its tree for the resume, where this used to drop it
