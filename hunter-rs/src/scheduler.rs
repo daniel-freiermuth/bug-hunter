@@ -5391,11 +5391,27 @@ pub async fn run_harvest(
     // or whose resume fails ends in that cold review too. So only an
     // attempt nothing will redo files its follow-ups.
     let redone = state == JobState::Suspended || (failure.is_some() && gave_up != Some(true));
-    // Follow-ups and the closure verdict are read from the tree, so before
-    // it is released. The release itself is state-checked: a suspended
-    // harvest keeps its tree for the resume, where this used to drop it
-    // after every run.
+    // Follow-ups are read from the tree, so before it is released. The
+    // release itself is state-checked: a suspended harvest keeps its tree
+    // for the resume, where this used to drop it after every run.
     let followups = if redone {
+        // Logged, so the follow-ups left unfiled are not silently dropped
+        // (see `ingest_followups`).
+        if worktree.join("FOLLOW-UPS.json").exists() {
+            let why = if state == JobState::Suspended {
+                "kept for the resume"
+            } else {
+                "the attempt will be redone"
+            };
+            let _ = store
+                .log_event(
+                    "harvest",
+                    &format!("#{fid}: FOLLOW-UPS.json not filed: {why}"),
+                    Some(job),
+                    Some(fid),
+                )
+                .await;
+        }
         None
     } else {
         ingest_followups(store, repo.id, &worktree, fid, job, "harvest").await
