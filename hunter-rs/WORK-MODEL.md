@@ -20,7 +20,7 @@ It came out of the review of #56. That PR fixed one runaway loop, but it showed 
 | An engage that fails without suspending (the worker doesn't reach `Done`, the push or the reply fails) leaves the attention flag set. Engage is the highest finding tier, so the PR is picked again every cycle, with no counter. | `record_engage` (Err arm), see the comment in `withdraw_pr` |
 | A given-up engage chain only sets the PR's attention aside. That is visible as an `error` event, not as a state. | `count_given_up_chain`, `Store::set_attention_aside` |
 | A `backend.run` error isn't counted for any kind. The cycle fails, and the same work is picked again 5 minutes later. | `run_*`, `daemon::compute_sleep_s` |
-| A tree that can't be made (`open_workspace` fails) isn't counted for any kind. The work stays in its tier and is picked again every cycle. #5 fixes this for fix (and is asked to cover recheck and harvest). | `start_fix`, `run_recheck`, `run_harvest`, `start_engage` |
+| A tree that can't be made (`open_workspace` fails) isn't counted for harvest and engage. The work stays in its tier and is picked again every cycle. #5 fixed this for fix and recheck. | `run_harvest`, `start_engage` |
 
 ---
 
@@ -242,7 +242,7 @@ Walking every path turned up these. Each needs a decision before or during imple
 | G6 | A PR closed on the forge and then reopened | `sync_prs` only revisits `pr_open` findings, so a reopened PR stays `closed` in hunter. [INFERENCE] | Out of scope; listed so it isn't forgotten. |
 | G7 | What a by-hand harvest of a merged PR means | Nothing can retry or skip a given-up merged harvest | For `merged`, the action is "mark harvested", not "classify". It records that the PR was never reviewed. |
 | G8 | Re-entering a tier | A finding that returns to `new` (abandoned, confirmed) and is queued again opens a new PR. `pr_state` streaks reset only when `pr_number` changes. | Leaving a tier resets the work item's streak and checkpoint (§6.3), so a second PR starts clean whatever its number. |
-| G9 | A tree that can't be made, before any worker runs | `open_workspace` fails the job and the runner returns without counting. Recheck, harvest and engage outrank fix, so any of them starves everything below. #5 counts it for fix under the fixed key `workspace not created`, and is asked to do the same for recheck and harvest. | A failure for every kind (§7), with the fixed key and git's reason as detail. The hold that follows has no checkpoint: no worker ran. |
+| G9 | A tree that can't be made, before any worker runs | `open_workspace` fails the job and the runner returns without counting. Harvest and engage outrank fix, so either of them starves everything below. #5 counts it for fix and recheck under the fixed key `workspace not created`; harvest waits for its hold (step 6), because a harvest given up today can't be recovered. | A failure for every kind (§7), with the fixed key and git's reason as detail. The hold that follows has no checkpoint: no worker ran. |
 
 ---
 
@@ -527,9 +527,9 @@ One PR, rebase-merged, each commit compiling and green on its own, with its own 
 3. **Dep-update guard** (§5.6, G2): first a test for today's case, a paused fix whose `queued` dep-update finding is handed over or refreshed; then both skip a finding whose fix work item has a checkpoint or an active hold.
 4. **`work_holds`**: hold and release in one place; one shared "held" query for the tiers, the preview and the sweep; the ceiling counted since the last release. Migrate blocked fixes; remove `FindingStatus::Blocked`, `jobs.blocker`, `operator_requeued`, the prefix check and the re-hold rule.
 5. **Recheck** onto holds: a streak and the ceiling end in a hold instead of `new`.
-6. **Harvest** onto holds: a streak ends in a hold instead of stamping `harvested_at`.
+6. **Harvest** onto holds: a streak ends in a hold instead of stamping `harvested_at`. This step also counts the two harvest failures parked until holds exist: a failing default-branch fetch (#62) and a tree that can't be made (dropped from #5, kept on the branch `fix/harvest-unmade-tree`).
 7. **Engage** onto holds: active while `pr_open` (G1); a streak for the Err arm, withdraw failures and pre-worker errors; remove `set_attention_aside`.
-8. **Runner errors and unmade trees** counted as failures for every kind, whichever of them #5 doesn't already cover.
+8. **Runner errors** counted as failures for every kind, and an unmade tree for engage. #5 already counts an unmade tree for fix and recheck; harvest comes with step 6.
 9. **`BLOCKED.md` for every kind**: playbooks plus the report reading in each runner.
 10. **API and UI**: `holds` on `FindingOut`, `POST /api/hold/release`, the Needs-you section, prompts chosen by reason.
 11. **README, `BACKEND-CONTRACT.md`, and stale bits**: `JobState::Denied` (never written), "never a wallclock overrun", the `killed_reason` list in `types.rs`.
@@ -538,8 +538,8 @@ Steps 5–9 are independent of each other once step 4 is in. Step 3 fixes a prob
 
 ---
 
-## 16. Open questions
+## 16. Decisions on former open questions
 
-- **Move repo-level work** onto the same model (a `repo_work` table with a streak and a checkpoint, no holds) right after, or leave it?
-- **Should a released `stuck` hold keep its streak history**, so a fourth identical failure after a `continue` holds again immediately, or start from zero as proposed?
-- **`mark_harvested` for a merged PR** (G7): should it record anything beyond "never reviewed", e.g. a note the operator types?
+- **Repo-level work** stays out of scope. It moves onto the same model later, tracked in #92.
+- **A released `stuck` hold starts its streak from zero.** After a `continue`, the work item gets the full `MAX_CONSECUTIVE_SAME_FAILURE` again before the next hold.
+- **`mark_harvested` records only the release** (who, when, the action) on the hold row, no operator note.
