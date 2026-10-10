@@ -1784,13 +1784,16 @@ pub async fn run_hunt(
     Ok(summary)
 }
 
-/// Handle a recheck that failed to produce a valid verdict.
+/// Handle a recheck that failed to produce a valid verdict: `failure` is
+/// the streak key that identical failures share, `detail` describes this
+/// one in the events.
 async fn handle_recheck_failure(
     store: &Store,
     summary: &mut CycleSummary,
     fid: i64,
     job: i64,
     failure: &str,
+    detail: &str,
     override_mode: Option<BudgetOverride>,
 ) -> CycleSummary {
     let streak = log_write_failure(
@@ -1810,7 +1813,7 @@ async fn handle_recheck_failure(
         let _ = store
             .log_event(
                 "recheck",
-                &format!("#{fid} gave up after {streak} identical failures ({failure}); back to inbox for human triage"),
+                &format!("#{fid} gave up after {streak} identical failures ({detail}); back to inbox for human triage"),
                 Some(job),
                 Some(fid),
             )
@@ -1820,7 +1823,7 @@ async fn handle_recheck_failure(
         let _ = store
             .log_event(
                 "recheck",
-                &format!("#{fid}: job {job} {failure} -- will retry"),
+                &format!("#{fid}: job {job} {detail} -- will retry"),
                 Some(job),
                 Some(fid),
             )
@@ -2089,9 +2092,16 @@ pub async fn run_recheck(
         } else {
             "unparseable verdict file".to_owned()
         };
-        return Ok(
-            handle_recheck_failure(store, &mut summary, fid, job, &failure, override_mode).await,
-        );
+        return Ok(handle_recheck_failure(
+            store,
+            &mut summary,
+            fid,
+            job,
+            &failure,
+            &failure,
+            override_mode,
+        )
+        .await);
     };
     let Some(ref outcome) = verdict_obj.verdict else {
         return Ok(handle_recheck_failure(
@@ -2099,6 +2109,7 @@ pub async fn run_recheck(
             &mut summary,
             fid,
             job,
+            "missing verdict field",
             "missing verdict field",
             override_mode,
         )
@@ -2228,6 +2239,7 @@ pub async fn run_recheck(
                 &mut summary,
                 fid,
                 job,
+                &failure,
                 &failure,
                 override_mode,
             )
@@ -3088,10 +3100,9 @@ enum FixOutcome {
     Shipped { pr_url: String, recovered: bool },
     /// The worker stopped mid-work and its tree and transcript are kept.
     Suspended,
-    /// The same failure for the `streak`th time in a row: held as blocked.
-    Stuck { failure: String, streak: i64 },
-    /// No PR this time; the fix tier tries again.
-    Incomplete { failure: String },
+    /// No PR this time: counted in the finding's failure streak
+    /// ([`record_fix_failure`]).
+    Failed { failure: String },
 }
 
 /// Hold a claimed fix as blocked ([`Store::block_fix_job`]). The claim
@@ -3204,8 +3215,7 @@ fn header(line: &str) -> Option<(String, String)> {
 }
 
 /// Read the worker's result and decide the attempt's outcome. Shipping is
-/// part of deciding (a push or a PR that fails is an incomplete attempt),
-/// and so is counting the failure streak.
+/// part of deciding (a push or a PR that fails is a failed attempt).
 async fn conclude_fix(
     store: &Store,
     finding: &Finding,
@@ -3272,16 +3282,46 @@ async fn conclude_fix(
         // streak would turn three pauses of one healthy fix into "stuck".
         return Ok(FixOutcome::Suspended);
     }
+    Ok(FixOutcome::Failed { failure })
+}
+
+/// Count a failed fix attempt in the finding's streak. The
+/// [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure holds the finding
+/// blocked, with `job` as its checkpoint ([`hold_blocked`]); short of that
+/// the fix tier tries again. `detail` follows the failure in the report
+/// and the event: the worker's output tail.
+async fn record_fix_failure(
+    store: &Store,
+    fid: i64,
+    job: i64,
+    failure: &str,
+    detail: &str,
+    summary: &mut CycleSummary,
+) -> anyhow::Result<()> {
+    summary.failure = Some(failure.to_owned());
+    summary.outcome = Some("requeued".into());
     let streak = log_write_failure(
-        store.record_fix_attempt(fid, &failure).await,
+        store.record_fix_attempt(fid, failure).await,
         format_args!("#{fid}: recording fix attempt"),
     )
     .unwrap_or(1);
-    Ok(if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
-        FixOutcome::Stuck { failure, streak }
-    } else {
-        FixOutcome::Incomplete { failure }
-    })
+    if streak < MAX_CONSECUTIVE_SAME_FAILURE {
+        let message = format!("#{fid} incomplete ({failure}). tail: {detail}");
+        let _ = fix_event(store, "fix", fid, job, message).await;
+        return Ok(());
+    }
+    let reason = format!(
+        "stuck: {streak} consecutive fix attempts hit the same failure: {failure}\n\n{detail}"
+    );
+    // The report lives on the job row; nothing goes in the tree.
+    hold_blocked(store, fid, job, &reason).await?;
+    summary.state = Some(JobState::Suspended);
+    let message =
+        format!("#{fid} gave up after {streak} identical failures ({failure}). tail: {detail}");
+    let _ = fix_event(store, "fix", fid, job, message).await;
+    summary.outcome = Some("blocked".into());
+    summary.attempts = Some(streak);
+    Ok(())
 }
 
 /// Push the fix branch and open its draft PR: `(url, recovered)`, or why
@@ -3534,38 +3574,8 @@ async fn record_fix_outcome(
             summary.outcome = Some("suspended".into());
             summary.worktree = Some(start.ws.tree.to_string_lossy().into_owned());
         }
-        FixOutcome::Stuck { failure, streak } => {
-            let reason = format!(
-                "stuck: {streak} consecutive fix attempts hit the same failure: {failure}\n\n{tail}"
-            );
-            // The report lives on the job row; nothing goes in the tree.
-            hold_blocked(store, fid, job, &reason).await?;
-            summary.state = Some(JobState::Suspended);
-            let _ = fix_event(
-                store,
-                "fix",
-                fid,
-                job,
-                format!(
-                    "#{fid} gave up after {streak} identical failures ({failure}). tail: {tail}"
-                ),
-            )
-            .await;
-            summary.outcome = Some("blocked".into());
-            summary.failure = Some(failure);
-            summary.attempts = Some(streak);
-        }
-        FixOutcome::Incomplete { failure } => {
-            let _ = fix_event(
-                store,
-                "fix",
-                fid,
-                job,
-                format!("#{fid} incomplete ({failure}). tail: {tail}"),
-            )
-            .await;
-            summary.outcome = Some("requeued".into());
-            summary.failure = Some(failure);
+        FixOutcome::Failed { failure } => {
+            record_fix_failure(store, fid, job, &failure, tail, summary).await?;
         }
     }
     if finding.budget_override == Some(BudgetOverride::Once) {
@@ -4850,34 +4860,53 @@ async fn harvest_prefetch_failed(
             .await;
         return;
     }
+    let detail = format!("PR/MR {what} failed: {e}");
+    record_harvest_failure(store, fid, None, key, &detail).await;
+}
+
+/// Count a failed harvest in the finding's streak, `key` naming the
+/// failure and `detail` describing it. The
+/// [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure gives the PR up,
+/// unreviewed, as harvested; the finding keeps whatever status it has:
+/// `closed`, never suppressed, for a closed PR nobody could classify.
+///
+/// Every failed harvest is counted here — before its job exists
+/// ([`harvest_prefetch_failed`]) or by its worker ([`run_harvest`]) — so
+/// the two cannot drift apart on what a stuck harvest becomes.
+///
+/// True when the PR is now given up.
+async fn record_harvest_failure(
+    store: &Store,
+    fid: i64,
+    job: Option<i64>,
+    key: &str,
+    detail: &str,
+) -> bool {
+    let log = |message: String| async move {
+        let _ = store.log_event("error", &message, job, Some(fid)).await;
+    };
     let streak = log_write_failure(
         store.record_harvest_attempt(fid, key).await,
         format_args!("#{fid}: recording harvest attempt"),
     )
     .unwrap_or(1);
-    if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
-        log_write_failure(
-            store.mark_pr_harvested(fid, now_ms()).await,
-            format_args!("#{fid}: marking PR harvested"),
-        );
-        log_write_failure(
-            store.clear_harvest_attempts(fid).await,
-            format_args!("#{fid}: clearing harvest attempts"),
-        );
-        let _ = store.log_event("error",
-            &format!("harvest #{fid}: gave up after {streak} identical failures (PR/MR {what} failed: {e}) -- not reviewed, will not retry"),
-            None, Some(fid),
-        ).await;
-    } else {
-        let _ = store
-            .log_event(
-                "error",
-                &format!("harvest #{fid}: PR/MR {what} failed: {e}, will retry"),
-                None,
-                Some(fid),
-            )
-            .await;
+    if streak < MAX_CONSECUTIVE_SAME_FAILURE {
+        log(format!("harvest #{fid}: {detail}, will retry")).await;
+        return false;
     }
+    log_write_failure(
+        store.mark_pr_harvested(fid, now_ms()).await,
+        format_args!("#{fid}: marking PR harvested"),
+    );
+    log_write_failure(
+        store.clear_harvest_attempts(fid).await,
+        format_args!("#{fid}: clearing harvest attempts"),
+    );
+    log(format!(
+        "harvest #{fid}: gave up after {streak} identical failures ({detail}) -- not reviewed, will not retry"
+    ))
+    .await;
+    true
 }
 
 /// Run harvest job (`scheduler.run_harvest`).
@@ -5199,41 +5228,10 @@ pub async fn run_harvest(
         return Ok(summary);
     }
     if let Some(failure) = failure {
-        let key = &failure.streak_key;
         let detail = &failure.detail;
-        let streak = log_write_failure(
-            store.record_harvest_attempt(fid, key).await,
-            format_args!("#{fid}: recording harvest attempt"),
-        )
-        .unwrap_or(1);
-        if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
-            // Given up on, the finding keeps whatever status it has:
-            // `closed`, never suppressed, for a closed PR nobody could
-            // classify.
-            log_write_failure(
-                store.mark_pr_harvested(fid, now_ms()).await,
-                format_args!("#{fid}: marking PR harvested"),
-            );
-            log_write_failure(
-                store.clear_harvest_attempts(fid).await,
-                format_args!("#{fid}: clearing harvest attempts"),
-            );
-            let _ = store.log_event("error",
-                &format!("harvest #{fid}: gave up after {streak} identical failures ({detail}) -- not reviewed, will not retry"),
-                Some(job), Some(fid),
-            ).await;
-            summary.outcome = Some("stuck".into());
-        } else {
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!("harvest #{fid}: {detail}, will retry"),
-                    Some(job),
-                    Some(fid),
-                )
-                .await;
-            summary.outcome = Some("retry".into());
-        }
+        let gave_up =
+            record_harvest_failure(store, fid, Some(job), &failure.streak_key, detail).await;
+        summary.outcome = Some(if gave_up { "stuck" } else { "retry" }.into());
         summary.failure = Some(detail.clone());
         if override_mode == Some(BudgetOverride::Once) {
             log_write_failure(
