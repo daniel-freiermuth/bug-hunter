@@ -122,7 +122,9 @@ not read the line, cite the file and the symbol instead.
     "classification": "superseded",
     "reason": "one or two sentences: why it closed, with the evidence",
     "evidence": "the commit/PR/file:line that proves it, e.g. abc1234 or #12 or src/x.rs:40",
-    "maintainer_quote": "the maintainer's words, verbatim"
+    "maintainer_quote": "the maintainer's words, verbatim",
+    "holds_while": "for wrong: the condition in the current code the verdict rests on",
+    "depends_on": ["for wrong: the paths that condition lives in"]
   }
   ```
   `classification` is exactly one of the six words in step 3, lowercase,
@@ -133,6 +135,11 @@ not read the line, cite the file and the symbol instead.
   empty or out, and `evidence` must show from the current code why the
   premise was wrong. For the other classifications it is optional. Never
   invent or paraphrase a quote: copy it exactly as written, or leave it out.
+  `holds_while` and `depends_on` are REQUIRED for `wrong`
+  and ignored for the others:
+
+{{VERDICT_CONDITION}}
+
 - FOLLOW-UPS.json at the worktree root, NOT COMMITTED, OPTIONAL: only if
   step 5 verified real, still-open work. A JSON array; the scheduler ingests
   it into the finding queue. Each entry MUST set its own "type" (bug |

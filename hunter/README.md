@@ -149,6 +149,22 @@ new ──recheck──> new / superseded / rejected
 - **`rejected` / `wontfix`** (with a required reason) become the
   **suppression corpus**: injected into every future hunt/analysis prompt
   for that repo+type so the same already-decided issue isn't re-proposed.
+  A `rejected` suppression holds only while its reason does. A worker's
+  rejection (a `wrong` decline or closed-PR harvest, an `invalid` recheck)
+  states the condition it rests on (`holds while`) and the paths that
+  condition lives in (`depends on`), and is anchored to the commit it
+  judged (`verdict_anchors`). The prompt shows each entry's status, reason
+  and condition, and marks an entry `CHANGED` once its paths differ
+  between that commit and the scanned one. The scan then re-checks it:
+  filing it again under the same fingerprint reopens the finding (`new`,
+  with the new analysis); recording it in the scan's reconfirmation file
+  (`<findings file>.reconfirmed.json`) moves the anchor to the scanned
+  commit, so it is not re-checked on every run. `wontfix` and an
+  operator's verdict are decisions, not claims about the code, so they
+  have no anchor and stay unconditional. The limit is the worker's
+  `depends on`: a change outside the named paths (finding 20's verdict
+  rested on a trim in a file other than the finding's own) lapses
+  nothing.
 - **`note`** — informational, no action expected.
 - **Recheck** (UI button, human-triggered only) re-evaluates a `new`
   finding against the *current* codebase with an adversarially skeptical
@@ -617,6 +633,12 @@ loginctl enable-linger $USER   # keep it running after you log out
 
 After a rebuild, `systemctl --user restart hunter.service`; `just build`
 deliberately does not reach into the service manager itself.
+
+Upgrading across migration 022 (`verdict_anchors`): suppressions that
+existed before it have no anchor and stay unconditional until a new verdict
+replaces them. To anchor them, insert `verdict_anchors` rows only after the
+daemon has started once on the new binary, which runs the migrations; a
+table created by hand beforehand makes the migration fail at startup.
 
 It idles at zero token cost between cycles and wakes on a smart-sleep
 policy: right after a job with more queued work → drain immediately;

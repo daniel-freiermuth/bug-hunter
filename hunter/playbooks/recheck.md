@@ -53,7 +53,9 @@ Final verdict JSON schema:
   "updated_summary": "improved one-liner (or original if unchanged)",
   "updated_detail": "improved analysis (or original if unchanged)",
   "updated_confidence": 0.0,
-  "updated_severity": "high|medium|low"
+  "updated_severity": "high|medium|low",
+  "holds_while": "for invalid: the condition in the current code the verdict rests on",
+  "depends_on": ["for invalid: the paths that condition lives in"]
 }
 ```
 
@@ -66,6 +68,9 @@ Final verdict JSON schema:
 - **invalid**: The original analysis was wrong. Your reason MUST cite
   specific code evidence for why (e.g. "the guard at src/baz.rs:117
   prevents the claimed null dereference — the original analysis missed the
-  early return on line 115").
+  early return on line 115"). `holds_while` and `depends_on` are REQUIRED
+  for invalid and ignored otherwise:
+
+{{VERDICT_CONDITION}}
 
 Then stop.

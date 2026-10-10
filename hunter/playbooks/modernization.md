@@ -86,7 +86,7 @@ Before filing:
   quote the result; proposing a pipeline step that would immediately fail is worse than no
   finding at all
 
-# Known non-candidates (suppression corpus — do NOT re-file these or variants)
+# Known non-candidates (suppression corpus — each holds only while its reason does; see the rule at its top)
 {{SUPPRESSIONS}}
 
 # Already tracked (open modernizations — file only if yours is genuinely NOVEL)

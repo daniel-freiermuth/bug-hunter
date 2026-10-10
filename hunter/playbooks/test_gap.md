@@ -46,7 +46,7 @@ the wrong thing" is a bug.
 }
 ```
 
-# Known non-candidates (suppression corpus — do NOT re-file these or variants)
+# Known non-candidates (suppression corpus — each holds only while its reason does; see the rule at its top)
 Rejected gaps and rejected bugs alike.
 {{SUPPRESSIONS}}
 

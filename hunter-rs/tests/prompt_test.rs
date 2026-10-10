@@ -29,7 +29,7 @@ type AnalysisBuilder = fn(
     &Repo,
     &Path,
     &str,
-    &[Finding],
+    &[playbooks::Suppression],
     &[Finding],
     &Path,
     i64,

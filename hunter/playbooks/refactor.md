@@ -41,7 +41,7 @@ Focus on safe, mechanical improvements with LOW RISK:
 
 NOT refactors: Style preferences, subjective improvements, architectural changes, introducing new abstractions.
 
-# Known non-candidates (suppression corpus — do NOT re-file these or variants)
+# Known non-candidates (suppression corpus — each holds only while its reason does; see the rule at its top)
 {{SUPPRESSIONS}}
 
 # Already tracked (open refactorings — file only if yours is genuinely NOVEL)
