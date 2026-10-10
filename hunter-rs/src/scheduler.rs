@@ -5030,10 +5030,11 @@ async fn continue_into_harvest(
 }
 
 /// Record a harvest that failed before its job row exists. Nothing else
-/// records such an attempt: left alone, a PR whose view or diff never loads
-/// stays unharvested, and as the oldest pending one it is picked again on
-/// every cycle, starving the tier. `key` leaves out the error text so repeats
-/// of one outage count as identical.
+/// records such an attempt: left alone, a PR whose default branch never
+/// fetches or whose view or diff never loads stays unharvested, and as the
+/// oldest pending one it is picked again on every cycle, starving the tier
+/// and every tier below it. `key` leaves out the error text so repeats of
+/// one outage count as identical.
 ///
 /// Not for a handoff: it is an extra chance, not one of the harvest's own
 /// attempts, and counting it would cost the cold harvest, which still
@@ -5052,7 +5053,7 @@ async fn harvest_prefetch_failed(
             .log_event(
                 "error",
                 &format!(
-                    "harvest #{fid}: PR/MR {what} failed: {e}; counted no attempt, \
+                    "harvest #{fid}: {what} failed: {e}; counted no attempt, \
                      it will be harvested cold"
                 ),
                 None,
@@ -5061,7 +5062,7 @@ async fn harvest_prefetch_failed(
             .await;
         return;
     }
-    let detail = format!("PR/MR {what} failed: {e}");
+    let detail = format!("{what} failed: {e}");
     record_harvest_failure(store, fid, None, key, &detail).await;
 }
 
@@ -5197,6 +5198,7 @@ pub async fn run_harvest(
     // here on: a fresh default branch to compare against, the diff and
     // the full playbook. Only its tree and transcript are inherited.
     let fresh = resume.is_none_or(|p| p.handoff);
+    let handoff = resume.is_some_and(|p| p.handoff);
     // Fetch the default branch into the clone for a fresh attempt; a cold
     // tree is added at it once the job exists, and a handoff's worker
     // reads it as `origin/<default>`. Never on a resume: the chain
@@ -5211,17 +5213,8 @@ pub async fn run_harvest(
         .unwrap_or((127, "spawn error".to_owned()));
         if rc != 0 {
             let tail = crate::util::tail(&out, 300);
-            let _ = store
-                .log_event(
-                    "error",
-                    &format!(
-                        "harvest #{fid}: fetch {} failed: {tail}",
-                        repo.default_branch
-                    ),
-                    None,
-                    Some(fid),
-                )
-                .await;
+            let what = format!("fetch {}", repo.default_branch);
+            harvest_prefetch_failed(store, fid, handoff, "fetch failed", &what, &tail).await;
             anyhow::bail!("fetch failed: {tail}");
         }
     }
@@ -5245,11 +5238,10 @@ pub async fn run_harvest(
     };
 
     let fg = forge::forge_for(repo.forge);
-    let handoff = resume.is_some_and(|p| p.handoff);
     let pr = match fg.view_pr_engage(&repo.url, pr_number, &cfg.review_bots) {
         Ok(p) => p,
         Err(e) => {
-            harvest_prefetch_failed(store, fid, handoff, "pr view failed", "view", &e).await;
+            harvest_prefetch_failed(store, fid, handoff, "pr view failed", "PR/MR view", &e).await;
             anyhow::bail!("PR/MR view failed");
         }
     };
@@ -5261,7 +5253,8 @@ pub async fn run_harvest(
         match fg.pr_diff(&repo.url, pr_number) {
             Ok(d) => d,
             Err(e) => {
-                harvest_prefetch_failed(store, fid, handoff, "pr diff failed", "diff", &e).await;
+                harvest_prefetch_failed(store, fid, handoff, "pr diff failed", "PR/MR diff", &e)
+                    .await;
                 anyhow::bail!("PR/MR diff failed");
             }
         }

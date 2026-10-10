@@ -1057,6 +1057,59 @@ async fn a_failing_pr_view_counts_toward_the_streak() {
     );
 }
 
+/// The same for a clone whose default branch will not fetch, which comes
+/// before the view: here the clone is gone, as migration 007 leaves a repo
+/// whose directory was not moved. Uncounted, the harvest is picked on
+/// every cycle and the hunt that would re-clone never runs.
+#[tokio::test]
+async fn a_failing_fetch_counts_toward_the_streak() {
+    let bins = FakeBins::acquire("harvest-fetch-fails");
+    gh_default(&bins);
+    let f = fixture("harvest-fetch-fails", FindingStatus::Merged).await;
+    f.store.mark_pr_merged(f.fid, 7, 2).await.unwrap();
+    let repo = f.store.list_repos().await.unwrap().remove(0);
+    std::fs::remove_dir_all(&repo.path).unwrap();
+    let never_runs = ScriptedBackend::new(|_| panic!("no worker without a fetched clone"));
+
+    for attempt in 1..=3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        let err = run_harvest(&f.store, &f.cfg, &finding, &never_runs, None)
+            .await
+            .expect_err("a failed fetch fails the harvest");
+        assert!(err.to_string().contains("fetch failed"), "{err}");
+
+        let ps = f.store.get_pr_state(f.fid).await.unwrap().unwrap();
+        let picked = pick_next(&f.store, &f.cfg, None).await.unwrap();
+        let still_pending = matches!(
+            picked,
+            Some(Candidate::Finding {
+                kind: FindingJobKind::Harvest,
+                finding_id,
+                ..
+            }) if finding_id == f.fid
+        );
+        if attempt < 3 {
+            assert_eq!(ps.harvest_attempts, attempt, "attempt {attempt}");
+            assert_eq!(ps.harvested_at, None, "retried, not given up");
+            assert!(still_pending, "attempt {attempt}: {picked:?}");
+        } else {
+            assert!(ps.harvested_at.is_some(), "given up at the limit");
+            assert!(
+                !still_pending,
+                "a given-up PR must not be picked: {picked:?}"
+            );
+        }
+    }
+
+    let events = f.store.recent_events(50).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "error" && e.message.contains("gave up after 3")),
+        "{events:?}"
+    );
+}
+
 /// The cold review runs in a tree at the default branch, which does not
 /// hold the PR's changes: the prompt must say so and carry the diff.
 #[tokio::test]
