@@ -837,8 +837,8 @@ async fn a_failed_pr_view_bails_before_the_job() {
     let (backend, seen) = recording(|_| {});
     let err = f.run(&backend).await.expect_err("engage must refuse");
     assert_eq!(err.to_string(), "PR/MR view failed");
-    assert!(f.jobs().await.is_empty());
-    assert!(seen.get().is_none());
+    assert!(f.jobs().await.is_empty(), "no job row may be written");
+    assert!(seen.get().is_none(), "the worker must not run");
     assert!(
         f.events("error")
             .await
