@@ -1437,7 +1437,7 @@ async fn open_workspace(
             Ok(Ok((ws, sha)))
         }
         Err(why) => {
-            let note = format!("workspace not created: {why}");
+            let note = format!("{TREE_NOT_MADE}: {why}");
             store.fail_unstarted_job(created.id, &note).await?;
             let _ = store
                 .log_event(
@@ -3166,12 +3166,13 @@ async fn start_fix(
         Some(fid),
     )
     .await;
-    if !matches!(opened, Ok(Ok(_))) {
+    // A tree that could not be made releases the claim once it is counted.
+    if opened.is_err() {
         release_claim(store, fid).await;
     }
     let (ws, pinned) = match opened? {
         Ok(opened) => opened,
-        Err(failed) => return Ok(Err(failed)),
+        Err(failed) => return Ok(Err(count_unmade_tree(store, fid, created.id, failed).await?)),
     };
     Ok(Ok(FixStart {
         repo,
@@ -3515,12 +3516,14 @@ async fn conclude_fix(
 /// [`MAX_CONSECUTIVE_SAME_FAILURE`]th identical failure holds the finding
 /// blocked, with `job` as its checkpoint ([`hold_blocked`]); short of that
 /// the fix tier tries again. `detail` follows the failure in the report
-/// and the event: the worker's output tail, or why a chain gave up.
+/// and the event: the worker's output tail, why a chain gave up, or why
+/// a tree could not be made.
 ///
-/// Every failed fix is counted here — a worker's ([`record_fix_outcome`])
-/// and a given-up resume chain ([`count_given_up_chain`]) alike — so the
-/// two cannot drift apart on what a stuck fix becomes. A count that could
-/// not be recorded is reported as such and ends nothing.
+/// Every failed fix is counted here — a worker's ([`record_fix_outcome`]),
+/// a given-up resume chain ([`count_given_up_chain`]) and a tree that could
+/// not be made ([`count_unmade_tree`]) alike — so they cannot drift apart
+/// on what a stuck fix becomes. A count that could not be recorded is
+/// reported as such and ends nothing.
 async fn record_fix_failure(
     store: &Store,
     fid: i64,
@@ -3555,6 +3558,39 @@ async fn record_fix_failure(
     summary.outcome = Some("blocked".into());
     summary.attempts = Some(streak);
     Ok(())
+}
+
+/// How [`open_workspace`] reports a tree it could not make, and the
+/// failure a fix that hit it records in its streak.
+const TREE_NOT_MADE: &str = "workspace not created";
+
+/// Count a fix whose tree could not be made ([`open_workspace`] has failed
+/// its job and logged why) as a failed attempt ([`record_fix_failure`]),
+/// then release the claim. Uncounted, the finding would go back to
+/// `queued` unchanged, the oldest-first pick would take it again every
+/// cycle, and no other queued fix would run. The streak records the fixed
+/// [`TREE_NOT_MADE`], not the reason: that quotes git, which can name this
+/// job's own tree, so it differs on every attempt and would reset the
+/// streak each time. The reason follows it in the report, and the summary
+/// keeps it whole.
+async fn count_unmade_tree(
+    store: &Store,
+    fid: i64,
+    job: i64,
+    mut summary: CycleSummary,
+) -> anyhow::Result<CycleSummary> {
+    let note = summary.failure.take().unwrap_or_default();
+    let why = note
+        .strip_prefix(TREE_NOT_MADE)
+        .and_then(|rest| rest.strip_prefix(": "))
+        .unwrap_or(&note);
+    // Counted while the claim still holds the finding, as a worker's
+    // failure is ([`record_fix_outcome`]).
+    let counted = record_fix_failure(store, fid, job, TREE_NOT_MADE, why, &mut summary).await;
+    release_claim(store, fid).await;
+    counted?;
+    summary.failure = Some(note);
+    Ok(summary)
 }
 
 /// What follows the streak in a failure-streak hold's report.
