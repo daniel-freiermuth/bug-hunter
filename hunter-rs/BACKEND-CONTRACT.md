@@ -231,7 +231,10 @@ after the finding is claimed (so a verdict given since selection still
 wins) but before a successor job exists; if it cannot be,
 the checkpoint is held `blocked` again, still resumable, instead of being
 retried into the same failure.
-Repeated identical fix failures become blocked, not rejected.
+Repeated identical fix failures become blocked, not rejected. A tree that
+cannot be created counts as such a failure (fingerprint `workspace not
+created`); with no worker run behind it, that hold has no transcript, so
+requeueing it starts the fix fresh.
 
 **A finding suspension resumes only at its kind's status:** fix=queued, recheck=rechecking, engage=pr_open, harvest=merged/closed (`Store::list_resumable_jobs`). Repo-job suspensions retain their existing selection. Any other finding suspension, except a fix at `blocked` (held for the operator) or `fixing` (claimed by `run_fix`), is retired `killed` / `finding-moved` by `Store::retire_stranded_suspensions` at the start of every workspace sweep; otherwise nothing would ever end it and the sweep would keep its tree forever.
 
