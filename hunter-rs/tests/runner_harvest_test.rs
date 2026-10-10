@@ -553,6 +553,18 @@ fn classifying_with_follow_up(close: String, fingerprint: &'static str) -> Scrip
     })
 }
 
+/// Whether a `harvest` event says the finding's FOLLOW-UPS.json was left
+/// unfiled for `why`.
+async fn unfiled_because(f: &Fixture, why: &str) -> bool {
+    let expected = format!("#{}: FOLLOW-UPS.json not filed: {why}", f.fid);
+    f.store
+        .recent_events(50)
+        .await
+        .unwrap()
+        .iter()
+        .any(|e| e.kind == "harvest" && e.finding_id == Some(f.fid) && e.message == expected)
+}
+
 /// A harvest that will be retried is reviewed again from scratch,
 /// follow-ups included, and the retry picks its own slugs: filing the
 /// failed attempt's follow-ups would file the same open work twice. Only
@@ -578,6 +590,10 @@ async fn a_retried_harvest_files_no_follow_ups() {
         filed(&f, "widget:src/lib.rs:left-open").await,
         0,
         "a retried attempt files nothing: {first:?}"
+    );
+    assert!(
+        unfiled_because(&f, "the attempt will be redone").await,
+        "the unfiled follow-ups are logged, not silently dropped"
     );
 
     let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
@@ -680,6 +696,10 @@ async fn a_suspended_harvest_files_its_follow_ups_once() {
             filed(&f, "widget:src/lib.rs:left-open").await,
             0,
             "a suspension files nothing: {suspended:?}"
+        );
+        assert!(
+            unfiled_because(&f, "kept for the resume").await,
+            "the unfiled follow-ups are logged, not silently dropped"
         );
 
         if resume_lands {
