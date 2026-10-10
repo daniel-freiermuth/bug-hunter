@@ -740,7 +740,7 @@ enum Resumable {
 /// it edit files that are not there. A row from before per-chain
 /// workspaces fails this too: its transcript and tree are in the old
 /// layout, and its row has no pinned commit. And the chain must be under
-/// the give-up ceiling.
+/// the give-up ceiling, unless it is a held fix an operator requeued.
 ///
 /// Failing either is permanent, so the job is retired here rather than
 /// skipped. A skip leaves the row `suspended`: it is offered again every
@@ -824,7 +824,17 @@ async fn resume_plan(
     let excess = chain_spent - chain.max_single;
     let too_many = chain.attempts >= MAX_RESUME_ATTEMPTS;
     let too_costly = z > 0 && chain.attempts >= 2 && excess > GIVE_UP_MULTIPLE * z;
-    if too_many || too_costly {
+    // A fix chain carrying a blocker was held for an operator, and only
+    // an operator queues a held fix again. The ceiling bounds what the
+    // scheduler resumes on its own; this resume is the operator's call,
+    // and bounded by it: an attempt of a held chain that does not finish
+    // is held again ([`conclude_fix`]). Giving it up instead would turn
+    // "Resume fix" into a fresh start that discards the checkpoint —
+    // and every chain given up for good is held past the ceiling.
+    let operator_requeued = (too_many || too_costly)
+        && job.kind == JobKind::Finding(FindingJobKind::Fix)
+        && store.job_blocker(job.id).await?.is_some();
+    if (too_many || too_costly) && !operator_requeued {
         let why = if too_many {
             format!("{} attempts, the limit", chain.attempts)
         } else {
