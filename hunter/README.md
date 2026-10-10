@@ -123,8 +123,10 @@ new ──recheck──> new / superseded / rejected
   uncommitted reports, and its transcript. It is NOT suppressed and cannot
   resume automatically. Resolve the prerequisite and select **Resume fix**
   in Kanban; this queues the retained checkpoint under normal budget rules.
-  Repeated unsuccessful fix attempts become blocked, not rejected. Only
-  the scheduler sets `blocked`; it is not a verdict.
+  Repeated unsuccessful fix attempts become blocked, not rejected; their
+  stored reason is what kept failing, and resuming one asks the worker to
+  finish the work rather than re-evaluate a prerequisite. Only the
+  scheduler sets `blocked`; it is not a verdict.
 - **`pr_open`** — tracked via `sync_prs` (free — `gh pr view`, no worker)
   every cycle: merged → `merged`; closed unmerged → `closed`; new
   comments/reviews, `CHANGES_REQUESTED`, merge conflicts, or failing checks

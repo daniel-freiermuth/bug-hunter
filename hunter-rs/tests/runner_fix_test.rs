@@ -734,6 +734,79 @@ async fn repeated_identical_fix_failures_become_blocked_at_the_limit() {
     assert_eq!(f.store.job_blocker(last_job.unwrap()).await.unwrap(), shown);
 }
 
+/// The prompt a requeued held fix resumes with: requeue it, resume its
+/// checkpoint once, and return what the worker was told.
+async fn resumed_hold_prompt(f: &Fixture) -> String {
+    f.store
+        .set_finding_status(f.fid, hunter::domain::FindingStatus::Queued)
+        .await
+        .unwrap();
+    let Some(hunter::scheduler::Candidate::Resume { plan, .. }) =
+        hunter::scheduler::pick_next(&f.store, &f.cfg, None)
+            .await
+            .unwrap()
+    else {
+        panic!("requeued held work must resume");
+    };
+    let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+    let worker = ScriptedBackend::staged(|_, session| {
+        let mut result = support::done();
+        result.session_file = session.map(|path| path.to_string_lossy().into_owned());
+        result
+    });
+    hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &worker, Some(&plan))
+        .await
+        .unwrap();
+    worker.runs()[0].prompt.clone()
+}
+
+/// A held fix resumes against what held it. A worker's `BLOCKED.md` names
+/// a prerequisite to re-evaluate. A failure streak names none, only what
+/// kept failing, so its resume asks the worker to finish: told to
+/// re-evaluate a prerequisite and recreate `BLOCKED.md`, it could hold
+/// the fix again over nothing, without any progress.
+#[tokio::test]
+async fn a_held_fix_resumes_against_what_held_it() {
+    let f = fixture("fix-streak-resume").await;
+    let unfinished = ScriptedBackend::new(|tree| {
+        std::fs::write(tree.join("candidate.txt"), "partial fix\n").unwrap();
+        git(tree, &["add", "candidate.txt"]);
+        git(tree, &["commit", "-m", "partial candidate"]);
+        let session = tree.parent().unwrap().join("session/session.jsonl");
+        std::fs::write(
+            &session,
+            "{\"message\":{\"role\":\"assistant\",\"usage\":{\"input\":1000,\"output\":100}}}\n",
+        )
+        .unwrap();
+        let mut result = support::done();
+        result.session_file = Some(session.to_string_lossy().into_owned());
+        result
+    });
+    for _ in 0..3 {
+        let finding = f.store.get_finding(f.fid).await.unwrap().unwrap();
+        hunter::scheduler::run_fix(&f.store, &f.cfg, &finding, &unfinished, None)
+            .await
+            .unwrap();
+    }
+    let streak = resumed_hold_prompt(&f).await;
+    let (reported, _, _, _) = blocked_fixture().await;
+    let report = resumed_hold_prompt(&reported).await;
+
+    assert!(
+        streak.contains("3 consecutive fix attempts hit the same failure: no PR-DESCRIPTION.md"),
+        "{streak}"
+    );
+    assert!(
+        !streak.contains("prerequisite") && !streak.contains("BLOCKED.md"),
+        "{streak}"
+    );
+    assert!(report.contains("Missing supported compiler"), "{report}");
+    assert!(
+        report.contains("Re-evaluate the prerequisite") && report.contains("BLOCKED.md"),
+        "{report}"
+    );
+}
+
 /// A resume of a chain that was never blocked (a cap suspension) is the
 /// plain continuation, and ending without an outcome is a plain requeue.
 #[tokio::test]
