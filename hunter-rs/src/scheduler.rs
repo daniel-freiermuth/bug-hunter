@@ -1796,39 +1796,34 @@ async fn handle_recheck_failure(
     detail: &str,
     override_mode: Option<BudgetOverride>,
 ) -> CycleSummary {
-    let streak = log_write_failure(
-        store.record_recheck_attempt(fid, failure).await,
-        format_args!("#{fid}: recording recheck attempt"),
-    )
-    .unwrap_or(1);
-    if streak >= MAX_CONSECUTIVE_SAME_FAILURE {
-        log_write_failure(
-            store.set_finding_status(fid, FindingStatus::New).await,
-            format_args!("#{fid}: status -> new"),
-        );
-        log_write_failure(
-            store.clear_recheck_attempts(fid).await,
-            format_args!("#{fid}: clearing recheck attempts"),
-        );
+    let log = |message: String| async move {
         let _ = store
-            .log_event(
-                "recheck",
-                &format!("#{fid} gave up after {streak} identical failures ({detail}); back to inbox for human triage"),
-                Some(job),
-                Some(fid),
-            )
+            .log_event("recheck", &message, Some(job), Some(fid))
             .await;
-        summary.outcome = Some("stuck".into());
-    } else {
-        let _ = store
-            .log_event(
-                "recheck",
-                &format!("#{fid}: job {job} {detail} -- will retry"),
-                Some(job),
-                Some(fid),
-            )
+    };
+    summary.outcome = Some("requeued".into());
+    match store.record_recheck_attempt(fid, failure).await {
+        Err(e) => {
+            log(format!(
+                "#{fid}: job {job} {detail} -- will retry (not counted: {e})"
+            ))
             .await;
-        summary.outcome = Some("requeued".into());
+        }
+        Ok(streak) if streak < MAX_CONSECUTIVE_SAME_FAILURE => {
+            log(format!("#{fid}: job {job} {detail} -- will retry")).await;
+        }
+        Ok(streak) => {
+            if let Err(e) = store.set_finding_status(fid, FindingStatus::New).await {
+                log(format!("#{fid} {streak} identical failures ({detail}), but sending it back to the inbox failed: {e}; will retry")).await;
+            } else {
+                log_write_failure(
+                    store.clear_recheck_attempts(fid).await,
+                    format_args!("#{fid}: clearing recheck attempts"),
+                );
+                log(format!("#{fid} gave up after {streak} identical failures ({detail}); back to inbox for human triage")).await;
+                summary.outcome = Some("stuck".into());
+            }
+        }
     }
     if override_mode == Some(BudgetOverride::Once) {
         log_write_failure(
@@ -3290,6 +3285,9 @@ async fn conclude_fix(
 /// blocked, with `job` as its checkpoint ([`hold_blocked`]); short of that
 /// the fix tier tries again. `detail` follows the failure in the report
 /// and the event: the worker's output tail.
+///
+/// A count that could not be recorded is reported as such and ends
+/// nothing.
 async fn record_fix_failure(
     store: &Store,
     fid: i64,
@@ -3300,11 +3298,15 @@ async fn record_fix_failure(
 ) -> anyhow::Result<()> {
     summary.failure = Some(failure.to_owned());
     summary.outcome = Some("requeued".into());
-    let streak = log_write_failure(
-        store.record_fix_attempt(fid, failure).await,
-        format_args!("#{fid}: recording fix attempt"),
-    )
-    .unwrap_or(1);
+    let streak = match store.record_fix_attempt(fid, failure).await {
+        Ok(streak) => streak,
+        Err(e) => {
+            let message =
+                format!("#{fid} incomplete ({failure}), not counted: {e}. tail: {detail}");
+            let _ = fix_event(store, "fix", fid, job, message).await;
+            return Ok(());
+        }
+    };
     if streak < MAX_CONSECUTIVE_SAME_FAILURE {
         let message = format!("#{fid} incomplete ({failure}). tail: {detail}");
         let _ = fix_event(store, "fix", fid, job, message).await;
@@ -4874,7 +4876,8 @@ async fn harvest_prefetch_failed(
 /// ([`harvest_prefetch_failed`]) or by its worker ([`run_harvest`]) — so
 /// the two cannot drift apart on what a stuck harvest becomes.
 ///
-/// True when the PR is now given up.
+/// True when the PR is now given up. A count or a give-up that could not
+/// be recorded is reported as such and ends nothing.
 async fn record_harvest_failure(
     store: &Store,
     fid: i64,
@@ -4885,19 +4888,27 @@ async fn record_harvest_failure(
     let log = |message: String| async move {
         let _ = store.log_event("error", &message, job, Some(fid)).await;
     };
-    let streak = log_write_failure(
-        store.record_harvest_attempt(fid, key).await,
-        format_args!("#{fid}: recording harvest attempt"),
-    )
-    .unwrap_or(1);
+    let streak = match store.record_harvest_attempt(fid, key).await {
+        Ok(streak) => streak,
+        Err(e) => {
+            log(format!(
+                "harvest #{fid}: {detail}, will retry (not counted: {e})"
+            ))
+            .await;
+            return false;
+        }
+    };
     if streak < MAX_CONSECUTIVE_SAME_FAILURE {
         log(format!("harvest #{fid}: {detail}, will retry")).await;
         return false;
     }
-    log_write_failure(
-        store.mark_pr_harvested(fid, now_ms()).await,
-        format_args!("#{fid}: marking PR harvested"),
-    );
+    if let Err(e) = store.mark_pr_harvested(fid, now_ms()).await {
+        log(format!(
+            "harvest #{fid}: {streak} identical failures ({detail}), but giving it up failed: {e}; will retry"
+        ))
+        .await;
+        return false;
+    }
     log_write_failure(
         store.clear_harvest_attempts(fid).await,
         format_args!("#{fid}: clearing harvest attempts"),
