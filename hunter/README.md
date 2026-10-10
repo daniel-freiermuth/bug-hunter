@@ -251,7 +251,10 @@ on every attempt would have its finding's tier start it fresh forever.
 Engage has no streak: a given-up engage chain sets the PR's attention
 aside, as an engage that did nothing would, until the PR's next comment,
 review or push flags it again; it is logged as an `error` event with the
-give-up reason, since the PR has left review.
+give-up reason, since the PR has left review. The ceiling bounds what
+the scheduler continues on its own, so it does not apply to a blocked
+fix an operator selects **Resume fix** on: that resumes the held
+checkpoint, and any attempt of it that does not finish is held again.
 The dashboard's "what's next" preview makes the same selection without
 any of these writes; the scheduler does them when it selects.
 

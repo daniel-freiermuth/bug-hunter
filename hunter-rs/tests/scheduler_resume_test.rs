@@ -2442,3 +2442,28 @@ async fn the_summary_preview_neither_retires_nor_counts_a_given_up_chain() {
     assert_eq!(after_preview, ("suspended".to_owned(), 2));
     assert_eq!(after_pick, ("suspended".to_owned(), FindingStatus::Blocked));
 }
+
+/// "Resume fix" on a fix held after its third given-up chain resumes
+/// that chain. Every chain given up for good is past the ceiling, so
+/// giving it up again turned the operator's resume into a fresh start
+/// that left the checkpoint behind.
+#[tokio::test]
+async fn a_held_fix_an_operator_requeues_resumes_past_the_ceiling() {
+    let (dir, path, pool) = fix_one_give_up_from_blocked().await;
+    let store = rw_store(&path).await;
+    let cfg = test_config(dir.path());
+    pick_next(&store, &cfg, None).await.unwrap();
+    assert_eq!(
+        store.get_finding(1).await.unwrap().unwrap().status,
+        FindingStatus::Blocked
+    );
+
+    store
+        .set_finding_status(1, FindingStatus::Queued)
+        .await
+        .unwrap();
+    let plan = resume_plan_of(pick_next(&store, &cfg, None).await.unwrap());
+
+    assert_eq!(plan.predecessor_id, 33);
+    assert_eq!(job_row(&pool, 33).await.0, "suspended");
+}
