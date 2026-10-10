@@ -3524,7 +3524,7 @@ async fn record_fix_failure(
 }
 
 /// How [`open_workspace`] reports a tree it could not make, and the
-/// failure a fix or recheck that hit it records in its streak.
+/// failure a fix, recheck or harvest that hit it records in its streak.
 const TREE_NOT_MADE: &str = "workspace not created";
 
 /// Count a fix whose tree could not be made ([`open_workspace`] has failed
@@ -5124,9 +5124,10 @@ async fn harvest_prefetch_failed(
 /// `closed`, never suppressed, for a closed PR nobody could classify.
 ///
 /// Every failed harvest is counted here — before its job exists
-/// ([`harvest_prefetch_failed`]), by its worker ([`run_harvest`]), or as a
-/// given-up resume chain ([`count_given_up_chain`]) — so they cannot
-/// drift apart on what a stuck harvest becomes.
+/// ([`harvest_prefetch_failed`]), without a tree or by its worker
+/// ([`run_harvest`]), or as a given-up resume chain
+/// ([`count_given_up_chain`]) — so they cannot drift apart on what a stuck
+/// harvest becomes.
 ///
 /// True when the PR is now given up. A count or a give-up that could not
 /// be recorded is reported as such and ends nothing.
@@ -5360,7 +5361,17 @@ pub async fn run_harvest(
     .await?
     {
         Ok(opened) => opened,
-        Err(failed) => return Ok(failed),
+        Err(mut failed) => {
+            // A failed harvest under the fixed [`TREE_NOT_MADE`], as a fix's
+            // is ([`count_unmade_tree`]). Uncounted, the PR stays pending
+            // and the harvest tier takes it again every cycle. Only a cold
+            // harvest makes a tree, so this is never a handoff. No worker
+            // ran, so a one-shot override is not spent.
+            let note = failed.failure.clone().unwrap_or_default();
+            let gave_up = record_harvest_failure(store, fid, Some(job), TREE_NOT_MADE, &note).await;
+            failed.outcome = Some(if gave_up { "stuck" } else { "retry" }.into());
+            return Ok(failed);
+        }
     };
     let worktree = ws.tree.clone();
     let repo_notes = Store::repo_notes(&cfg.work_root, repo.id);
